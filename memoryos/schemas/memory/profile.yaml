@@ -1,0 +1,24 @@
+memory_type: profile
+directory: profile
+description: Stable identity and background facts about the user.
+operation_mode: upsert
+merge_op: patch
+route_group: stable
+overview_title: Stable User Profile
+content_template: |
+  {{ content }}
+embedding_template: |
+  profile
+  {{ title }}
+  {{ tags }}
+  {{ abstract }}
+  {{ content }}
+overview_template: |
+  # {{ overview_title }}
+
+  - memory_count: {{ memory_count }}
+  - evidence_count: {{ evidence_count }}
+  - top_tags: {{ top_tags }}
+
+  ## Strongest memories
+  {{ strongest_memories }}

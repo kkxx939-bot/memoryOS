@@ -1,0 +1,24 @@
+memory_type: policy
+directory: policies
+description: Permission and risk boundaries for autonomous action.
+operation_mode: explicit_only
+merge_op: immutable
+route_group: stable
+overview_title: Autonomy Policies
+content_template: |
+  {{ content }}
+embedding_template: |
+  policy
+  {{ title }}
+  {{ tags }}
+  {{ abstract }}
+  {{ content }}
+overview_template: |
+  # {{ overview_title }}
+
+  - memory_count: {{ memory_count }}
+  - evidence_count: {{ evidence_count }}
+  - top_tags: {{ top_tags }}
+
+  ## Strongest memories
+  {{ strongest_memories }}

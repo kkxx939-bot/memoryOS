@@ -1,0 +1,24 @@
+memory_type: feedback
+directory: feedback
+description: User acceptance, rejection, correction, or annoyance signals.
+operation_mode: append_then_aggregate
+merge_op: patch
+route_group: recent
+overview_title: User Feedback
+content_template: |
+  {{ content }}
+embedding_template: |
+  feedback
+  {{ title }}
+  {{ tags }}
+  {{ abstract }}
+  {{ content }}
+overview_template: |
+  # {{ overview_title }}
+
+  - memory_count: {{ memory_count }}
+  - evidence_count: {{ evidence_count }}
+  - top_tags: {{ top_tags }}
+
+  ## Strongest memories
+  {{ strongest_memories }}

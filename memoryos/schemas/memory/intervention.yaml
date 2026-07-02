@@ -1,0 +1,24 @@
+memory_type: intervention
+directory: interventions
+description: Robot or assistant actions taken in past situations.
+operation_mode: append_then_aggregate
+merge_op: patch
+route_group: recent
+overview_title: Agent Interventions
+content_template: |
+  {{ content }}
+embedding_template: |
+  intervention
+  {{ title }}
+  {{ tags }}
+  {{ abstract }}
+  {{ content }}
+overview_template: |
+  # {{ overview_title }}
+
+  - memory_count: {{ memory_count }}
+  - evidence_count: {{ evidence_count }}
+  - top_tags: {{ top_tags }}
+
+  ## Strongest memories
+  {{ strongest_memories }}

@@ -1,0 +1,24 @@
+memory_type: case
+directory: cases
+description: Reusable problem, context, action, and outcome examples.
+operation_mode: add_only
+merge_op: replace
+route_group: relevant
+overview_title: Reusable Episodes
+content_template: |
+  {{ content }}
+embedding_template: |
+  case
+  {{ title }}
+  {{ tags }}
+  {{ abstract }}
+  {{ content }}
+overview_template: |
+  # {{ overview_title }}
+
+  - memory_count: {{ memory_count }}
+  - evidence_count: {{ evidence_count }}
+  - top_tags: {{ top_tags }}
+
+  ## Strongest memories
+  {{ strongest_memories }}
