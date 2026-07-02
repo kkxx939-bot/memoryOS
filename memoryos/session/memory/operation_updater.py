@@ -152,11 +152,11 @@ class MemoryOperationUpdater:
             except FileNotFoundError:
                 continue
             backlink = {
-                "from": source_uri,
-                "to": target,
+                "from": target,
+                "to": source_uri,
                 "link_type": str(link.get("link_type", "related_to")),
                 "description": str(link.get("description", "")),
                 "weight": max(0.0, min(1.0, float(link.get("weight", 0.5) or 0.5))),
             }
-            backlinks = self._merge_links(current.get("backlinks", []), [backlink], source_uri=source_uri)
+            backlinks = self._merge_links(current.get("backlinks", []), [backlink], source_uri=target)
             self.store.update_memory(target, user_id=user_id, metadata_patch={"backlinks": backlinks})

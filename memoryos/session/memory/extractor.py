@@ -8,7 +8,7 @@ from typing import Protocol
 from .models import MEMORY_TYPES
 
 
-MEMORY_ACTIONS = {"add", "update", "ignore"}
+MEMORY_ACTIONS = {"add", "update", "delete", "ignore"}
 
 
 class TextGenerationProvider(Protocol):
@@ -80,12 +80,15 @@ class RuleBasedExtractor:
         else:
             memory_type = "event"
         title = text[:24].strip(" ，,。.") or "extracted memory"
+        tags = [memory_type]
+        if memory_type == "policy":
+            tags.append("explicit_user_intent")
         return MemoryOperation(
             action="add",
             memory_type=memory_type,
             title=title,
             text=text,
-            tags=[memory_type],
+            tags=tags,
         )
 
     def strip_injected_context(self, text: str) -> str:
@@ -124,7 +127,7 @@ class JsonLLMMemoryExtractor:
 Extract only durable, useful memories. Do not store injected <personal-memory> context.
 Return strict JSON. No markdown. No commentary.
 
-Allowed actions: add, update, ignore.
+Allowed actions: add, update, delete, ignore.
 Allowed memory_type values: {memory_types}.
 
 Schema:
@@ -148,6 +151,8 @@ Schema:
 }}
 
 Use update only when the input clearly revises an existing memory and target is known.
+Use delete when the user explicitly asks to forget/remove a known memory and target is known.
+For policy memories, add tag "explicit_user_intent" only when the user explicitly states the rule or permission boundary.
 Use ignore for transient chatter, duplicate injected context, or low-value facts.
 
 Transcript:
@@ -156,7 +161,12 @@ Transcript:
 
     def parse_response(self, response: str) -> list[MemoryOperation]:
         payload = self._load_json(response)
-        raw_operations = payload.get("operations", payload if isinstance(payload, list) else [])
+        if isinstance(payload, dict):
+            raw_operations = payload.get("operations", [])
+        elif isinstance(payload, list):
+            raw_operations = payload
+        else:
+            raw_operations = []
         if not isinstance(raw_operations, list):
             raise ValueError("LLM memory response must contain an operations list")
         operations = []
@@ -173,6 +183,9 @@ Transcript:
                 title = title or "ignored"
                 text = text or raw.get("rationale", "ignored")
                 tags = tags or ["ignore"]
+            if action == "delete":
+                title = title or "delete memory"
+                text = text or raw.get("rationale", "delete requested")
             if not title or not text:
                 raise ValueError("Memory add/update operations require title and text")
             operations.append(

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import sqlite3
 from copy import deepcopy
 from datetime import date
@@ -14,6 +16,7 @@ from ..session.memory.models import MEMORY_TYPES, TYPE_DIR, MemoryItem, summariz
 from ..session.memory.schema import MEMORY_TYPE_SPECS, memory_type_spec, render_template, validate_metadata
 from ..models.embeddings import EmbeddingProvider, HashingEmbeddingProvider, cosine_similarity
 from ..models.rerank import RerankProvider, rerank_with_fallback
+from .paths import safe_join, safe_relative_path, validate_identifier
 
 
 class MemoryStore:
@@ -30,6 +33,7 @@ class MemoryStore:
         self.rerank_provider = rerank_provider
 
     def init(self, user_id: str) -> None:
+        validate_identifier(user_id, "user_id")
         self.index_dir.mkdir(parents=True, exist_ok=True)
         user_root = self.root / "user" / user_id
         for directory in TYPE_DIR.values():
@@ -55,6 +59,28 @@ class MemoryStore:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         return conn
+
+    def _write_text_atomic(self, path: Path, content: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        tmp_path.write_text(content, encoding="utf-8")
+        os.replace(tmp_path, path)
+
+    def _ensure_embedding_columns(self, conn: sqlite3.Connection) -> None:
+        existing = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(memory_embeddings)").fetchall()
+        }
+        columns = {
+            "provider": "TEXT NOT NULL DEFAULT ''",
+            "model": "TEXT NOT NULL DEFAULT ''",
+            "dimension": "INTEGER NOT NULL DEFAULT 0",
+            "content_hash": "TEXT NOT NULL DEFAULT ''",
+            "embedding_version": "TEXT NOT NULL DEFAULT 'v1'",
+        }
+        for name, ddl in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE memory_embeddings ADD COLUMN {name} {ddl}")
 
     def _init_db(self) -> None:
         with self._connect() as conn:
@@ -99,10 +125,16 @@ class MemoryStore:
                     user_id TEXT NOT NULL,
                     path TEXT NOT NULL UNIQUE,
                     embedding TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    provider TEXT NOT NULL DEFAULT '',
+                    model TEXT NOT NULL DEFAULT '',
+                    dimension INTEGER NOT NULL DEFAULT 0,
+                    content_hash TEXT NOT NULL DEFAULT '',
+                    embedding_version TEXT NOT NULL DEFAULT 'v1'
                 )
                 """
             )
+            self._ensure_embedding_columns(conn)
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS memory_directory_layers (
@@ -120,18 +152,21 @@ class MemoryStore:
             )
 
     def add_memory(self, item: MemoryItem) -> Path:
+        validate_identifier(item.user_id, "user_id")
         self._init_db()
-        path = self.root / item.path
+        path = safe_join(self.root, item.path or "")
+        item.path = safe_relative_path(self.root, path)
         path.parent.mkdir(parents=True, exist_ok=True)
         metadata = self._normalize_metadata(item.metadata(), item.text)
         validate_metadata(metadata)
         content = render_memory_markdown(metadata, item.text)
-        path.write_text(content, encoding="utf-8")
+        self._write_text_atomic(path, content)
         self._upsert_index(metadata, item.text)
         self._refresh_directory_layers(path.parent)
         return path
 
     def upsert_profile(self, user_id: str, text: str, mode: str = "append") -> dict[str, Any]:
+        validate_identifier(user_id, "user_id")
         return self._upsert_fixed_memory(
             user_id=user_id,
             rel_path=str(PurePosixPath("user") / user_id / "profile" / "user-profile.md"),
@@ -144,6 +179,7 @@ class MemoryStore:
         )
 
     def update_daily_behavior(self, user_id: str, text: str, day: str | None = None, mode: str = "append") -> dict[str, Any]:
+        validate_identifier(user_id, "user_id")
         day = day or date.today().isoformat()
         return self._upsert_fixed_memory(
             user_id=user_id,
@@ -164,6 +200,7 @@ class MemoryStore:
         day: str | None = None,
         tags: list[str] | None = None,
     ) -> dict[str, Any]:
+        validate_identifier(user_id, "user_id")
         day = day or date.today().isoformat()
         tags = ["event", event_type, day, *(tags or [])]
         event = MemoryItem(
@@ -175,7 +212,7 @@ class MemoryStore:
             source=f"event:{event_type}",
         )
         event_path = self.add_memory(event)
-        log_path = self.root / "user" / user_id / "daily" / day / "events.jsonl"
+        log_path = safe_join(self.root, PurePosixPath("user") / user_id / "daily" / day / "events.jsonl")
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_entry = {
             "created_at": utc_now(),
@@ -199,11 +236,12 @@ class MemoryStore:
         }
 
     def read_memory(self, rel_path: str) -> tuple[dict[str, Any], str]:
-        path = self.root / rel_path
+        path = safe_join(self.root, rel_path)
         content = path.read_text(encoding="utf-8")
         return parse_memory_markdown(content)
 
     def resolve_memory(self, identifier: str, user_id: str) -> dict[str, Any]:
+        validate_identifier(user_id, "user_id")
         self._init_db()
         with self._connect() as conn:
             row = conn.execute(
@@ -227,6 +265,7 @@ class MemoryStore:
         tags: list[str] | None = None,
         metadata_patch: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        validate_identifier(user_id, "user_id")
         current = self.resolve_memory(identifier, user_id)
         metadata, body = self.read_memory(current["path"])
         before = {"metadata": deepcopy(metadata), "content": body}
@@ -242,15 +281,16 @@ class MemoryStore:
         metadata["abstract"] = summarize_text(body)
         metadata = self._normalize_metadata(metadata, body)
         validate_metadata(metadata)
-        path = self.root / current["path"]
-        path.write_text(render_memory_markdown(metadata, body), encoding="utf-8")
+        path = safe_join(self.root, current["path"])
+        self._write_text_atomic(path, render_memory_markdown(metadata, body))
         self._upsert_index(metadata, body)
         self._refresh_directory_layers(path.parent)
         return {"uri": current["path"], "before": before, "after": {"metadata": metadata, "content": body}}
 
     def delete_memory(self, identifier: str, user_id: str) -> dict[str, Any]:
+        validate_identifier(user_id, "user_id")
         current = self.resolve_memory(identifier, user_id)
-        path = self.root / current["path"]
+        path = safe_join(self.root, current["path"])
         metadata, body = self.read_memory(current["path"])
         if path.exists():
             path.unlink()
@@ -262,6 +302,7 @@ class MemoryStore:
         return {"uri": current["path"], "metadata": metadata, "deleted_content": body}
 
     def merge_memory(self, target_identifier: str, source_identifier: str, user_id: str) -> dict[str, Any]:
+        validate_identifier(user_id, "user_id")
         target = self.resolve_memory(target_identifier, user_id)
         source = self.resolve_memory(source_identifier, user_id)
         if target["id"] == source["id"]:
@@ -297,7 +338,7 @@ class MemoryStore:
     ) -> dict[str, Any]:
         if mode not in {"append", "replace"}:
             raise ValueError("mode must be 'append' or 'replace'")
-        path = self.root / rel_path
+        path = safe_join(self.root, rel_path)
         if path.exists():
             metadata, body = self.read_memory(rel_path)
             before = {"metadata": deepcopy(metadata), "content": body}
@@ -314,7 +355,7 @@ class MemoryStore:
             metadata["path"] = rel_path
             metadata = self._normalize_metadata(metadata, new_body)
             validate_metadata(metadata)
-            path.write_text(render_memory_markdown(metadata, new_body), encoding="utf-8")
+            self._write_text_atomic(path, render_memory_markdown(metadata, new_body))
             self._upsert_index(metadata, new_body)
             self._refresh_directory_layers(path.parent)
             return {
@@ -344,6 +385,9 @@ class MemoryStore:
     def _upsert_index(self, metadata: dict[str, Any], body: str) -> None:
         metadata = self._normalize_metadata(metadata, body)
         validate_metadata(metadata)
+        embedding_text = self._embedding_text(metadata, body)
+        embedding = self.embedding_provider.embed(embedding_text)
+        embedding_meta = self._embedding_metadata(embedding_text, embedding)
         with self._connect() as conn:
             conn.execute("DELETE FROM memories WHERE id = ?", (metadata["id"],))
             conn.execute("DELETE FROM memory_fts WHERE id = ?", (metadata["id"],))
@@ -394,15 +438,24 @@ class MemoryStore:
             )
             conn.execute(
                 """
-                INSERT OR REPLACE INTO memory_embeddings (id, user_id, path, embedding, updated_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO memory_embeddings
+                (
+                    id, user_id, path, embedding, updated_at,
+                    provider, model, dimension, content_hash, embedding_version
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     metadata["id"],
                     metadata["user_id"],
                     metadata["path"],
-                    json.dumps(self.embedding_provider.embed(self._embedding_text(metadata, body))),
+                    json.dumps(embedding),
                     metadata["updated_at"],
+                    embedding_meta["provider"],
+                    embedding_meta["model"],
+                    embedding_meta["dimension"],
+                    embedding_meta["content_hash"],
+                    embedding_meta["embedding_version"],
                 ),
             )
 
@@ -412,10 +465,13 @@ class MemoryStore:
         user_id: str,
         memory_type: str | None = None,
         limit: int = 8,
+        touch: bool = False,
     ) -> list[dict[str, Any]]:
+        validate_identifier(user_id, "user_id")
         self._init_db()
         rows = self._keyword_search_rows(query, user_id, memory_type, limit)
-        rows = self._touch_access(rows)
+        if touch:
+            rows = self._touch_access(rows)
         return [self._row_to_dict(row) for row in rows]
 
     def hybrid_search(
@@ -424,7 +480,9 @@ class MemoryStore:
         user_id: str,
         memory_type: str | None = None,
         limit: int = 8,
+        touch: bool = False,
     ) -> list[dict[str, Any]]:
+        validate_identifier(user_id, "user_id")
         self._init_db()
         candidate_limit = max(limit * 3, 12)
         keyword_rows = self._keyword_search_rows(query, user_id, memory_type, candidate_limit)
@@ -456,7 +514,9 @@ class MemoryStore:
         ranked.sort(key=lambda row: row["final_score"], reverse=True)
         self._rerank_memory_candidates(query, ranked)
         ranked.sort(key=lambda row: row["final_score"], reverse=True)
-        rows = self._touch_access(ranked[:limit])
+        rows = ranked[:limit]
+        if touch:
+            rows = self._touch_access(rows)
         return [self._row_to_dict(row) for row in rows]
 
     def _keyword_search_rows(
@@ -494,6 +554,7 @@ class MemoryStore:
         return ranked
 
     def list_recent(self, user_id: str, limit: int = 8) -> list[dict[str, Any]]:
+        validate_identifier(user_id, "user_id")
         self._init_db()
         with self._connect() as conn:
             rows = conn.execute(
@@ -507,7 +568,8 @@ class MemoryStore:
             ).fetchall()
         return [self._row_to_dict(row) for row in rows]
 
-    def list_by_type(self, user_id: str, memory_type: str, limit: int = 8) -> list[dict[str, Any]]:
+    def list_by_type(self, user_id: str, memory_type: str, limit: int = 8, touch: bool = False) -> list[dict[str, Any]]:
+        validate_identifier(user_id, "user_id")
         self._init_db()
         with self._connect() as conn:
             rows = conn.execute(
@@ -519,10 +581,13 @@ class MemoryStore:
                 """,
                 (user_id, memory_type, limit),
             ).fetchall()
-        rows = self._touch_access([dict(row) for row in rows])
+        rows = [dict(row) for row in rows]
+        if touch:
+            rows = self._touch_access(rows)
         return [self._row_to_dict(row) for row in rows]
 
     def lifecycle_report(self, user_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        validate_identifier(user_id, "user_id")
         self._init_db()
         self._refresh_lifecycle_scores(user_id=user_id)
         with self._connect() as conn:
@@ -551,6 +616,7 @@ class MemoryStore:
         max_hotness: float = 0.12,
         allowed_types: set[str] | None = None,
     ) -> dict[str, Any]:
+        validate_identifier(user_id, "user_id")
         self._init_db()
         self._refresh_lifecycle_scores(user_id=user_id)
         allowed_types = allowed_types or {"event", "case", "feedback", "intervention"}
@@ -597,6 +663,8 @@ class MemoryStore:
         }
 
     def reindex(self, user_id: str | None = None) -> None:
+        if user_id:
+            validate_identifier(user_id, "user_id")
         self._init_db()
         with self._connect() as conn:
             if user_id:
@@ -897,6 +965,27 @@ class MemoryStore:
             },
         )
 
+    def _embedding_metadata(self, text: str, embedding: list[float]) -> dict[str, Any]:
+        provider = type(self.embedding_provider).__name__
+        model = str(getattr(self.embedding_provider, "model", getattr(self.embedding_provider, "model_name", provider)))
+        return {
+            "provider": provider,
+            "model": model,
+            "dimension": len(embedding),
+            "content_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "embedding_version": f"{provider}:{model}:{len(embedding)}",
+        }
+
+    def _embedding_row_matches_provider(self, row: dict[str, Any]) -> bool:
+        provider = str(row.get("provider", ""))
+        model = str(row.get("model", ""))
+        dimension = int(row.get("dimension", 0) or 0)
+        current_provider = type(self.embedding_provider).__name__
+        current_model = str(getattr(self.embedding_provider, "model", getattr(self.embedding_provider, "model_name", current_provider)))
+        if not provider and not model and dimension == 0:
+            return True
+        return provider == current_provider and model == current_model and dimension > 0
+
     def _embedding_search_rows(
         self,
         query: str,
@@ -921,6 +1010,8 @@ class MemoryStore:
         scored = []
         for row in rows:
             data = dict(row)
+            if not self._embedding_row_matches_provider(data):
+                continue
             embedding = json.loads(data.pop("embedding"))
             score = cosine_similarity(query_embedding, embedding)
             if score <= 0:
@@ -1019,7 +1110,7 @@ class MemoryStore:
         score: float,
         state: str,
     ) -> None:
-        path = self.root / rel_path
+        path = safe_join(self.root, rel_path)
         if not path.exists():
             return
         metadata, body = parse_memory_markdown(path.read_text(encoding="utf-8"))
@@ -1030,7 +1121,7 @@ class MemoryStore:
         metadata["hotness"] = score
         metadata["lifecycle_state"] = state
         validate_metadata(metadata)
-        path.write_text(render_memory_markdown(metadata, body), encoding="utf-8")
+        self._write_text_atomic(path, render_memory_markdown(metadata, body))
 
     def _fetch_rows_in_order(self, memory_ids: list[str], extras: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
         if not memory_ids:

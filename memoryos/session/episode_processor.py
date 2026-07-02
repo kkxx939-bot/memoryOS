@@ -15,6 +15,7 @@ from ..retrieve.behavior_patterns import BehaviorPatternStore
 from ..retrieve.orchestrator import RetrievalOrchestrator
 from ..observe.context import ObservationContext
 from ..storage.memory_store import MemoryStore
+from ..storage.paths import validate_identifier
 from .memory.update_service import MemoryUpdateContext, MemoryUpdateService
 
 
@@ -42,6 +43,8 @@ class EpisodeProcessor:
         retrieval_limit: int = 8,
         memory_write_timing: str = "after_prediction",
     ) -> dict:
+        validate_identifier(user_id, "user_id")
+        validate_identifier(episode_id, "episode_id")
         self.store.init(user_id)
         if memory_write_timing not in {"before_prediction", "after_prediction", "deferred"}:
             raise ValueError("memory_write_timing must be before_prediction, after_prediction, or deferred")
@@ -223,6 +226,8 @@ class EpisodeProcessor:
         )
 
     def commit_pending_memory(self, user_id: str, episode_id: str) -> dict:
+        validate_identifier(user_id, "user_id")
+        validate_identifier(episode_id, "episode_id")
         path = self._episode_dir(user_id, episode_id) / "pending_memory_operations.json"
         if not path.exists():
             return self._empty_memory_diff(episode_id)
@@ -258,6 +263,8 @@ class EpisodeProcessor:
         correction: str | None = None,
         corrects_memory: bool = False,
     ) -> dict:
+        validate_identifier(user_id, "user_id")
+        validate_identifier(episode_id, "episode_id")
         self.store.init(user_id)
         reward = max(-1.0, min(1.0, float(reward)))
         episode_result = self._read_episode_result(user_id, episode_id)
@@ -316,6 +323,12 @@ class EpisodeProcessor:
                 event_type="memory_correction",
                 text=f"Episode {episode_id} memory correction: {correction}",
                 tags=["memory_correction", "feedback"],
+            )
+            feedback_record["memory_corrections"] = self._apply_memory_correction(
+                user_id=user_id,
+                episode_id=episode_id,
+                episode_result=episode_result,
+                correction=correction,
             )
         if actual_action:
             feedback_record["case_memory"] = self._record_case_memory(
@@ -399,6 +412,49 @@ class EpisodeProcessor:
             "predicted_action": predicted_action,
         }
 
+    def _apply_memory_correction(
+        self,
+        user_id: str,
+        episode_id: str,
+        episode_result: dict,
+        correction: str,
+    ) -> list[dict]:
+        prediction = episode_result.get("prediction", {})
+        used_memories = [str(path) for path in prediction.get("used_memories", []) if path]
+        updates = []
+        for rel_path in used_memories:
+            try:
+                current = self.store.resolve_memory(rel_path, user_id)
+            except FileNotFoundError:
+                continue
+            corrected_body = (
+                str(current.get("content", "")).rstrip()
+                + f"\n\n## Correction {utc_now()}\n\n"
+                + f"Episode {episode_id}: {correction.strip()}\n"
+            )
+            negative_count = int(current.get("negative_count", 0)) + 1
+            positive_count = int(current.get("positive_count", 1))
+            confidence = max(0.1, float(current.get("confidence", 0.7)) - 0.2)
+            update = self.store.update_memory(
+                rel_path,
+                user_id=user_id,
+                text=corrected_body,
+                metadata_patch={
+                    "negative_count": negative_count,
+                    "positive_count": positive_count,
+                    "confidence": confidence,
+                    "source": f"episode:{episode_id}:correction",
+                },
+            )
+            updates.append(
+                {
+                    "uri": update["uri"],
+                    "confidence": confidence,
+                    "negative_count": negative_count,
+                }
+            )
+        return updates
+
     def _action_universe(
         self,
         available_actions: list[str],
@@ -455,6 +511,8 @@ class EpisodeProcessor:
         }
 
     def _episode_dir(self, user_id: str, episode_id: str) -> Path:
+        validate_identifier(user_id, "user_id")
+        validate_identifier(episode_id, "episode_id")
         path = self.store.root / "user" / user_id / "episodes" / episode_id
         path.mkdir(parents=True, exist_ok=True)
         return path

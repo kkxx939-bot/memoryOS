@@ -79,6 +79,10 @@ class MemoryUpdateService:
             self._apply_update(operation, context, diff_operations)
             return
 
+        if action == "delete":
+            self._apply_delete(operation, context, diff_operations)
+            return
+
         spec = memory_type_spec(operation.memory_type)
         if spec.operation_mode == "evidence_then_aggregate" and reason:
             self._store_evidence_first(operation, context, diff_operations, reason)
@@ -125,8 +129,33 @@ class MemoryUpdateService:
             }
         )
 
+    def _apply_delete(self, operation: MemoryOperation, context: MemoryUpdateContext, diff_operations: dict[str, list]) -> None:
+        if not operation.target:
+            record = self.operation_record(operation)
+            record["reason"] = "delete operation missing target"
+            diff_operations["ignores"].append(record)
+            return
+        deletion = self.store.delete_memory(operation.target, user_id=context.user_id)
+        diff_operations["deletes"].append(
+            {
+                "uri": deletion["uri"],
+                "memory_type": operation.memory_type,
+                "metadata": deletion["metadata"],
+                "deleted_content": deletion["deleted_content"],
+                "rationale": operation.rationale,
+            }
+        )
+
     def _apply_profile(self, operation: MemoryOperation, context: MemoryUpdateContext, diff_operations: dict[str, list]) -> None:
-        result = self.store.upsert_profile(context.user_id, operation.text, mode="append")
+        current = self.store.search("User Profile", context.user_id, memory_type="profile", limit=1)
+        compact_text = operation.text.strip()
+        if current:
+            body = str(current[0].get("content", "")).strip()
+            if compact_text and compact_text not in body:
+                compact_text = self._compact_profile_text(body, compact_text)
+            elif body:
+                compact_text = body
+        result = self.store.upsert_profile(context.user_id, compact_text, mode="replace")
         bucket = "adds" if result["operation"] == "create" else "updates"
         diff_operations[bucket].append(
             {
@@ -445,6 +474,19 @@ class MemoryUpdateService:
         if operation.text.strip() in body:
             return body
         return body + f"\n\n## Update {utc_now()}\n\n{operation.text.strip()}\n"
+
+    def _compact_profile_text(self, current_body: str, new_text: str) -> str:
+        current_lines = [line.strip() for line in current_body.splitlines() if line.strip() and not line.startswith("#")]
+        new_lines = [line.strip() for line in new_text.splitlines() if line.strip() and not line.startswith("#")]
+        seen = set()
+        compacted = []
+        for line in [*current_lines, *new_lines]:
+            key = line.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            compacted.append(line)
+        return "\n".join(compacted[-20:]).strip()
 
     def _rolling_aggregate_text(self, memory_type: str, items: list[dict[str, Any]]) -> str:
         lines = [

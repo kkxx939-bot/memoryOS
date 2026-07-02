@@ -175,7 +175,7 @@ class MemoryStoreTest(unittest.TestCase):
             self.assertEqual(before["active_count"], 0)
             self.assertEqual(before["lifecycle_state"], "warm")
 
-            results = store.search("computer smoke", user_id="gulf")
+            results = store.search("computer smoke", user_id="gulf", touch=True)
             self.assertEqual(len(results), 1)
             self.assertEqual(results[0]["active_count"], 1)
             self.assertIsNotNone(results[0]["last_accessed_at"])
@@ -237,6 +237,122 @@ class MemoryStoreTest(unittest.TestCase):
             updated = store.resolve_memory(item.path or "", "gulf")
             self.assertIn("24 and 26", updated["content"])
             self.assertNotIn("不要写入这段", provider.prompt)
+
+    def test_json_llm_extractor_accepts_top_level_list_payload(self) -> None:
+        provider = FakeProvider(
+            [
+                {
+                    "action": "add",
+                    "memory_type": "preference",
+                    "title": "quiet reminders",
+                    "text": "User prefers quiet reminders.",
+                    "tags": ["preference"],
+                    "confidence": 0.9,
+                }
+            ]
+        )
+
+        operations = JsonLLMMemoryExtractor(provider).extract([{"role": "user", "text": "remember this"}])
+
+        self.assertEqual(len(operations), 1)
+        self.assertEqual(operations[0].memory_type, "preference")
+
+    def test_delete_memory_operation_removes_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp))
+            store.init("gulf")
+            item = MemoryItem(
+                user_id="gulf",
+                memory_type="preference",
+                title="obsolete preference",
+                text="User used to prefer loud reminders.",
+                tags=["preference"],
+            )
+            store.add_memory(item)
+            service = MemoryUpdateService(store)
+
+            diff = service.apply(
+                [
+                    MemoryOperation(
+                        action="delete",
+                        memory_type="preference",
+                        title="forget obsolete preference",
+                        text="User asked to forget this preference.",
+                        tags=["preference", "explicit_user_intent"],
+                        target=item.path,
+                    )
+                ],
+                MemoryUpdateContext(user_id="gulf", source="test", diff_id="delete-test", explicit_user_intent=True),
+            )
+
+            self.assertEqual(diff["summary"]["total_deletes"], 1)
+            with self.assertRaises(FileNotFoundError):
+                store.resolve_memory(item.path or "", "gulf")
+
+    def test_rule_based_policy_marker_sets_explicit_intent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            operation = SessionManager(MemoryStore(Path(tmp))).extractor.extract(
+                [{"role": "user", "text": "记住：以后不要自动开空调"}]
+            )[0]
+
+        self.assertEqual(operation.memory_type, "policy")
+        self.assertIn("explicit_user_intent", operation.tags)
+
+    def test_session_commit_is_idempotent_and_uses_message_offset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp))
+            store.init("gulf")
+            sessions = SessionManager(store)
+            sessions.add_message("gulf", "demo", "user", "记住：alpha123 是一次性事实。")
+
+            first = sessions.commit("gulf", "demo")
+            second = sessions.commit("gulf", "demo")
+            sessions.add_message("gulf", "demo", "user", "记住：beta456 是一次性事实。")
+            third = sessions.commit("gulf", "demo")
+
+            self.assertEqual(first["summary"]["total_adds"], 1)
+            self.assertTrue(second["idempotent"])
+            self.assertEqual(third["committed_message_count"], 1)
+            alpha_events = [
+                row for row in store.search("alpha123", user_id="gulf", memory_type="event")
+                if "/daily/" not in row["path"]
+            ]
+            beta_events = [
+                row for row in store.search("beta456", user_id="gulf", memory_type="event")
+                if "/daily/" not in row["path"]
+            ]
+            self.assertEqual(len(alpha_events), 1)
+            self.assertEqual(len(beta_events), 1)
+
+    def test_path_traversal_inputs_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp))
+
+            with self.assertRaises(ValueError):
+                store.init("../gulf")
+            with self.assertRaises(ValueError):
+                SessionManager(store).add_message("gulf", "../demo", "user", "hello")
+            with self.assertRaises(ValueError):
+                EpisodeProcessor(store).process(user_id="gulf", episode_id="../ep", scene="hello")
+
+    def test_search_does_not_touch_hotness_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp))
+            store.init("gulf")
+            item = MemoryItem(
+                user_id="gulf",
+                memory_type="preference",
+                title="quiet preference",
+                text="User prefers quiet reminders.",
+                tags=["preference"],
+            )
+            store.add_memory(item)
+
+            results = store.search("quiet reminders", user_id="gulf")
+            resolved = store.resolve_memory(item.path or "", "gulf")
+
+            self.assertEqual(results[0]["active_count"], 0)
+            self.assertEqual(resolved["active_count"], 0)
 
     def test_hybrid_search_can_use_embedding_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -347,7 +463,8 @@ class MemoryStoreTest(unittest.TestCase):
             target = store.resolve_memory(profile["uri"], "gulf")
             self.assertEqual(created["page_id"], 101)
             self.assertEqual(created["links"][0]["to"], profile["uri"])
-            self.assertEqual(target["backlinks"][0]["from"], created_uri)
+            self.assertEqual(target["backlinks"][0]["from"], profile["uri"])
+            self.assertEqual(target["backlinks"][0]["to"], created_uri)
 
     def test_reinforcement_policy_ledger_updates_predicted_and_actual_actions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

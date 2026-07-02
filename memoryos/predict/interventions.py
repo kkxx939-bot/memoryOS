@@ -28,6 +28,8 @@ class InterventionDecision:
 
 
 class InterventionSelector:
+    PHYSICAL_ACTIONS = {"turn_on_ac", "open_ac", "unlock_door", "send_message", "place_order"}
+
     def select(
         self,
         candidate: Candidate | None,
@@ -47,9 +49,17 @@ class InterventionSelector:
 
         options = []
         preferred = self._preferred_interventions(candidate.action)
-        available_preferred = [action for action in preferred if action in available_actions]
+        available_preferred = [
+            action
+            for action in preferred
+            if action in available_actions and self._permission_allows(action, available_actions, policy_stats)
+        ]
         if not available_preferred:
-            available_preferred = available_actions or ["do_nothing"]
+            available_preferred = [
+                action
+                for action in (available_actions or ["do_nothing"])
+                if self._permission_allows(action, available_actions, policy_stats)
+            ] or ["do_nothing"]
 
         for rank, action in enumerate(available_preferred):
             preference_score = max(0.0, 1.0 - rank * 0.18)
@@ -116,6 +126,14 @@ class InterventionSelector:
             return 0.5
         average = float(entry.get("average_reward", 0.0))
         return max(0.0, min(1.0, (average + 1.0) / 2.0))
+
+    def _permission_allows(self, action: str, available_actions: list[str], policy_stats: dict) -> bool:
+        if action not in self.PHYSICAL_ACTIONS:
+            return True
+        permission = policy_stats.get(f"permission::{action}", {})
+        if permission.get("allowed_without_confirmation") is True:
+            return True
+        return False
 
     def _action_aliases(self, action: str) -> list[str]:
         groups = [
