@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import json
 
-from memoryos.application.feedback.feedback_event_store import FeedbackEventStore
-from memoryos.application.learning.learning_service import LearningProcessor
-from memoryos.infrastructure.repositories.memory_repository import MemoryStore
-from memoryos.infrastructure.safety.path_safety import validate_identifier
+from memoryos.adapters.events.jsonl_outbox import FeedbackEventStore
+from memoryos.ports.repositories.memory_repository import MemoryRepository
+from memoryos.security.path_safety import validate_identifier
+from memoryos.services.learning.learning_service import LearningProcessor
 
 
 class ReplayWorker:
-    def __init__(self, store: MemoryStore) -> None:
+    def __init__(self, store: MemoryRepository) -> None:
         self.store = store
         self.events = FeedbackEventStore(store.root)
         self.learning = LearningProcessor(store)

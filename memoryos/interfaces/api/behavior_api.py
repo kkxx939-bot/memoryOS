@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from memoryos.application.learning.behavior_patterns import BehaviorPatternStore
-from memoryos.infrastructure.repositories.memory_repository import MemoryStore
+from memoryos.ports.repositories.memory_repository import MemoryRepository
+from memoryos.services.learning.behavior_patterns import BehaviorPatternStore
 
 
-def behavior_patterns(store: MemoryStore, payload: dict) -> dict:
+def behavior_patterns(store: MemoryRepository, payload: dict) -> dict:
     distribution = BehaviorPatternStore(store.root).distribution_for_scene(
         user_id=str(payload["user_id"]),
         retrieval_query=str(payload.get("query", "")),

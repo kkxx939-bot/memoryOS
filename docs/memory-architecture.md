@@ -77,9 +77,9 @@ candidate generation -> feature scoring -> ranking -> top prediction
 候选生成和排序是两个模块：
 
 ```text
-memoryos/application/prediction/candidate_generator.py      -> 生成用户行为候选
-memoryos/application/prediction/candidate_ranker.py         -> 对用户行为候选提特征并排序
-memoryos/application/intervention/intervention_selector.py  -> 根据 top 行为候选选择系统动作
+memoryos/services/prediction/candidate_generator.py         -> 生成用户行为候选
+memoryos/services/prediction/candidate_ranker.py            -> 对用户行为候选提特征并排序
+memoryos/usecases/intervention/select_intervention.py       -> 根据 top 行为候选选择系统动作
 ```
 
 候选必须尽量全，排序才能工作。候选生成采用 pattern-first：
@@ -364,6 +364,6 @@ Relevant long-term memory:
 
 下一步不是直接把所有逻辑塞进模型，而是继续补两块：
 
-1. 根据实际 API 服务配置模型名和 base URL，开始真实 session/observation 抽取。
+1. 根据实际 API 服务配置模型名和 base URL，开始真实 session 与 observation 抽取。
 2. 用真实 embedding provider 重建 `memory_embeddings`。
 3. 增加预测层接口：`ObservationContext + retrieved memories -> predicted behavior -> intervention`。

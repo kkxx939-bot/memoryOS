@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from memoryos.infrastructure.repositories.memory_repository import MemoryStore
+from memoryos.ports.repositories.memory_repository import MemoryRepository
 
 
 class MemoryConsolidationWorker:
-    def __init__(self, store: MemoryStore) -> None:
+    def __init__(self, store: MemoryRepository) -> None:
         self.store = store
 
     def archive_cold(

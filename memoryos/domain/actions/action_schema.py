@@ -9,6 +9,7 @@ ACTION_SCHEMA_VERSION = "action_schema_v1"
 class ActionSpec:
     action: str
     need: str
+    action_type: str
     risk_level: str
     predictable: bool
     intervenable: bool
@@ -21,6 +22,7 @@ ACTION_SPECS = {
     "turn_on_ac": ActionSpec(
         action="turn_on_ac",
         need="cool_down",
+        action_type="device_command",
         risk_level="low",
         predictable=True,
         intervenable=True,
@@ -31,6 +33,7 @@ ACTION_SPECS = {
     "turn_on_fan": ActionSpec(
         action="turn_on_fan",
         need="cool_down",
+        action_type="device_command",
         risk_level="low",
         predictable=True,
         intervenable=True,
@@ -41,6 +44,7 @@ ACTION_SPECS = {
     "drink_water": ActionSpec(
         action="drink_water",
         need="hydrate",
+        action_type="system_suggestion",
         risk_level="none",
         predictable=True,
         intervenable=True,
@@ -51,6 +55,7 @@ ACTION_SPECS = {
     "take_shower": ActionSpec(
         action="take_shower",
         need="comfort",
+        action_type="private_behavior",
         risk_level="private",
         predictable=True,
         intervenable=False,
@@ -61,6 +66,7 @@ ACTION_SPECS = {
     "smoke": ActionSpec(
         action="smoke",
         need="habit_trigger",
+        action_type="user_behavior",
         risk_level="medium",
         predictable=True,
         intervenable=True,
@@ -71,6 +77,7 @@ ACTION_SPECS = {
     "organize_desk": ActionSpec(
         action="organize_desk",
         need="organize",
+        action_type="user_behavior",
         risk_level="none",
         predictable=True,
         intervenable=False,
@@ -81,6 +88,7 @@ ACTION_SPECS = {
     "continue_current_activity": ActionSpec(
         action="continue_current_activity",
         need="none",
+        action_type="system_noop",
         risk_level="none",
         predictable=True,
         intervenable=False,
@@ -111,9 +119,10 @@ def action_spec(action: str) -> ActionSpec:
         ActionSpec(
             action=canonical or "unknown",
             need="unknown",
+            action_type="unknown",
             risk_level="unknown",
             predictable=True,
-            intervenable=True,
+            intervenable=False,
             executable=False,
             requires_confirmation=True,
         ),

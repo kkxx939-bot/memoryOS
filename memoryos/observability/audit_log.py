@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from memoryos.domain.memory.memory_item import utc_now
-from memoryos.infrastructure.safety.path_safety import validate_identifier
+from memoryos.security.path_safety import validate_identifier
 
 
 class AuditLogger:

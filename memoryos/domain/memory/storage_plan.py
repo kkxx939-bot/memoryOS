@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from memoryos.application.memory.schema import MEMORY_TYPE_DESCRIPTIONS
-from memoryos.application.memory.weights import default_base_weight, default_temporal_scope
 from memoryos.domain.memory.memory_item import TYPE_DIR
 from memoryos.domain.memory.update_policy import update_policy
+from memoryos.services.memory.schema import MEMORY_TYPE_DESCRIPTIONS
+from memoryos.services.memory.weights import default_base_weight, default_temporal_scope
 
 
 @dataclass(frozen=True)

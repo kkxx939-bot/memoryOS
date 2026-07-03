@@ -4,17 +4,17 @@ import argparse
 import json
 from pathlib import Path
 
-from memoryos.application.memory.extractor import JsonLLMMemoryExtractor, RuleBasedExtractor
-from memoryos.application.session.session_manager import SessionManager
-from memoryos.domain.memory.memory_item import MemoryItem
-from memoryos.infrastructure.providers.embedding_provider import HashingEmbeddingProvider
-from memoryos.infrastructure.providers.openai_compatible import (
+from memoryos.adapters.persistence.sqlite.sqlite_memory_repository import MemoryStore, validate_memory_type
+from memoryos.adapters.providers.openai_compatible import (
     build_chat_provider_from_env,
     build_embedding_provider_from_env,
     build_rerank_provider_from_env,
 )
-from memoryos.infrastructure.repositories.memory_repository import MemoryStore, validate_memory_type
+from memoryos.domain.memory.memory_item import MemoryItem
 from memoryos.interfaces.hooks.memory_digest_hook import MemoryHook
+from memoryos.ports.providers.embedding_provider import HashingEmbeddingProvider
+from memoryos.services.memory.extractor import JsonLLMMemoryExtractor, RuleBasedExtractor
+from memoryos.usecases.session.commit_session import SessionManager
 from memoryos.workers.feedback_worker import FeedbackWorker
 from memoryos.workers.replay_worker import ReplayWorker
 
@@ -103,6 +103,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     reindex = sub.add_parser("reindex")
     add_root_user(reindex)
+
+    verify_index = sub.add_parser("verify-index")
+    add_root_user(verify_index)
 
     lifecycle = sub.add_parser("lifecycle-report")
     add_root_user(lifecycle)
@@ -226,6 +229,11 @@ def main() -> None:
     if args.command == "reindex":
         store.reindex(user_id=args.user)
         print("reindexed")
+        return
+
+    if args.command == "verify-index":
+        result = store.verify_index(user_id=args.user)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
         return
 
     if args.command == "lifecycle-report":

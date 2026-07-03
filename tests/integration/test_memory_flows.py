@@ -6,33 +6,35 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from memoryos.application.episode.episode_service import EpisodeProcessor
-from memoryos.application.episode.episode_state_machine import CLOSED, FEEDBACK_PENDING
-from memoryos.application.intervention.intervention_selector import InterventionSelector
-from memoryos.application.intervention.policy_gate import PermissionPolicyEngine
-from memoryos.application.learning.behavior_feedback import BehaviorStats
-from memoryos.application.learning.behavior_patterns import BehaviorPatternStore
-from memoryos.application.learning.rl_calibrator import ReinforcementPolicyLedger
-from memoryos.application.memory.extractor import JsonLLMMemoryExtractor, MemoryOperation
-from memoryos.application.memory.merge_ops import merge_op_factory
-from memoryos.application.memory.schema import memory_type_spec
-from memoryos.application.memory.update_service import MemoryUpdateContext, MemoryUpdateService
-from memoryos.application.memory.weights import score_memory_weight
-from memoryos.application.prediction.candidate_generator import Candidate
-from memoryos.application.prediction.candidate_ranker import CandidateRanker
-from memoryos.application.retrieval.memory_context_builder import MemoryContextBuilder
-from memoryos.application.session.session_manager import SessionManager
+from memoryos.adapters.persistence.filesystem.markdown_store import MarkdownStore
+from memoryos.adapters.persistence.sqlite.sqlite_memory_repository import MemoryStore
 from memoryos.domain.actions.action_schema import action_need, canonical_action
 from memoryos.domain.feedback.reward_result import compute_rewards
 from memoryos.domain.memory.memory_item import MemoryItem
 from memoryos.domain.memory.storage_plan import all_memory_storage_plans, memory_storage_plan
 from memoryos.domain.memory.update_policy import normalize_operation_for_policy, update_policy
 from memoryos.domain.scene.observation import ObservationContext
-from memoryos.infrastructure.repositories.memory_repository import MemoryStore
-from memoryos.infrastructure.stores.markdown_store import MarkdownStore
+from memoryos.domain.scene.scene_features import SceneFeatures
+from memoryos.domain.scene.scene_signature import stable_scene_signature
 from memoryos.interfaces.api.app import handle
 from memoryos.interfaces.hooks.memory_digest_hook import MemoryHook
 from memoryos.observability.audit_log import AuditLogger
+from memoryos.services.learning.behavior_feedback import BehaviorStats
+from memoryos.services.learning.behavior_patterns import BehaviorPatternStore
+from memoryos.services.learning.rl_calibrator import ReinforcementPolicyLedger
+from memoryos.services.memory.extractor import JsonLLMMemoryExtractor, MemoryOperation
+from memoryos.services.memory.merge_ops import merge_op_factory
+from memoryos.services.memory.schema import memory_type_spec
+from memoryos.services.memory.update_service import MemoryUpdateContext, MemoryUpdateService
+from memoryos.services.memory.weights import score_memory_weight
+from memoryos.services.policy.policy_gate import PermissionPolicyEngine
+from memoryos.services.prediction.candidate_generator import Candidate
+from memoryos.services.prediction.candidate_ranker import CandidateRanker
+from memoryos.services.retrieval.memory_context_builder import MemoryContextBuilder
+from memoryos.usecases.episode.episode_state_machine import CLOSED, FEEDBACK_PENDING
+from memoryos.usecases.episode.process_observation import EpisodeProcessor
+from memoryos.usecases.intervention.select_intervention import InterventionSelector
+from memoryos.usecases.session.commit_session import SessionManager
 from memoryos.workers.feedback_worker import FeedbackWorker
 from memoryos.workers.reindex_worker import ReindexWorker
 from memoryos.workers.replay_worker import ReplayWorker
@@ -1569,6 +1571,10 @@ class MemoryStoreTest(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertEqual(decision.max_allowed_action, "do_nothing")
 
+        unknown = PermissionPolicyEngine().authorize("unknown_robot_action", prediction_confidence=0.9)
+        self.assertFalse(unknown.allowed)
+        self.assertEqual(unknown.max_allowed_action, "do_nothing")
+
         selected = InterventionSelector().select(
             Candidate(action="take_shower", need="comfort", prior=0.9, score=0.9),
             available_actions=["ask_user", "do_nothing"],
@@ -1634,6 +1640,55 @@ class MemoryStoreTest(unittest.TestCase):
             retry_worker_result = FeedbackWorker(store).process_pending("gulf")
             self.assertEqual(retry_worker_result["processed"], 0)
             self.assertEqual(len(store.list_by_type("gulf", "case")), 1)
+
+    def test_memory_operation_log_tombstone_and_verify_index(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = MemoryStore(root)
+            store.init("gulf")
+            item = MemoryItem(
+                user_id="gulf",
+                memory_type="preference",
+                title="temporary preference",
+                text="User temporarily likes loud alerts.",
+                tags=["preference"],
+            )
+            store.add_memory(item)
+            healthy = store.verify_index("gulf")
+            self.assertTrue(healthy["healthy"])
+
+            deletion = store.delete_memory(item.path or "", "gulf")
+
+            self.assertIn("tombstone", deletion)
+            self.assertTrue((root / deletion["tombstone"]).exists())
+            operation_log = root / "user" / "gulf" / "events" / "memory_operations.jsonl"
+            self.assertTrue(operation_log.exists())
+            operation_text = operation_log.read_text(encoding="utf-8")
+            self.assertIn('"operation": "add_memory"', operation_text)
+            self.assertIn('"operation": "delete_memory"', operation_text)
+            self.assertIn('"status": "committed"', operation_text)
+            self.assertTrue(store.verify_index("gulf")["healthy"])
+
+    def test_scene_features_and_stable_signature_are_separate_from_raw_text(self) -> None:
+        first = ObservationContext(
+            raw_text="用户说太热了。",
+            location="room",
+            activity="arrive_home",
+            signals=["sweating"],
+            environment={"temperature": 30.2},
+        )
+        second = ObservationContext(
+            raw_text="换一种说法：房间很热。",
+            location="room",
+            activity="arrive_home",
+            signals=["sweating"],
+            environment={"temperature": 30.4},
+        )
+
+        first_signature = stable_scene_signature(SceneFeatures.from_observation(first))
+        second_signature = stable_scene_signature(SceneFeatures.from_observation(second))
+
+        self.assertEqual(first_signature, second_signature)
 
     def test_api_facade_worker_replay_reindex_and_markdown_store(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

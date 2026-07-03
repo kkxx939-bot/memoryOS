@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from memoryos.application.feedback.feedback_service import FeedbackService
-from memoryos.infrastructure.repositories.memory_repository import MemoryStore
+from memoryos.ports.repositories.memory_repository import MemoryRepository
+from memoryos.usecases.feedback.record_feedback import FeedbackService
 from memoryos.workers.feedback_worker import FeedbackWorker
 
 
-def record_feedback(store: MemoryStore, payload: dict) -> dict:
+def record_feedback(store: MemoryRepository, payload: dict) -> dict:
     return FeedbackService(store).record_feedback(
         user_id=str(payload["user_id"]),
         episode_id=str(payload["episode_id"]),
@@ -20,7 +20,7 @@ def record_feedback(store: MemoryStore, payload: dict) -> dict:
     )
 
 
-def process_feedback_outbox(store: MemoryStore, payload: dict | None = None) -> dict:
+def process_feedback_outbox(store: MemoryRepository, payload: dict | None = None) -> dict:
     payload = payload or {}
     limit = payload.get("limit")
     return FeedbackWorker(store).process_pending(

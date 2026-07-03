@@ -6,9 +6,9 @@ from pathlib import PurePosixPath
 from typing import Any
 from uuid import uuid4
 
-from memoryos.application.memory.lifecycle import classify_lifecycle, hotness_score
-from memoryos.application.memory.schema import MEMORY_TYPE_SPECS, memory_type_spec, type_description
-from memoryos.application.memory.weights import default_base_weight, default_temporal_scope, score_memory_weight
+from memoryos.services.memory.lifecycle import classify_lifecycle, hotness_score
+from memoryos.services.memory.schema import MEMORY_TYPE_SPECS, memory_type_spec, type_description
+from memoryos.services.memory.weights import default_base_weight, default_temporal_scope, score_memory_weight
 
 MEMORY_TYPES = set(MEMORY_TYPE_SPECS)
 

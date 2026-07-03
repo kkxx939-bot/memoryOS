@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from memoryos.infrastructure.repositories.memory_repository import MemoryStore
 from memoryos.interfaces.api.behavior_api import behavior_patterns
 from memoryos.interfaces.api.episode_api import process_episode
 from memoryos.interfaces.api.feedback_api import process_feedback_outbox, record_feedback
 from memoryos.interfaces.api.health_api import health
 from memoryos.interfaces.api.memory_api import build_digest, delete_memory, search_memory
+from memoryos.ports.repositories.memory_repository import MemoryRepository
 
 
 def routes() -> dict[str, str]:
@@ -21,7 +21,7 @@ def routes() -> dict[str, str]:
     }
 
 
-def handle(route: str, store: MemoryStore, payload: dict | None = None) -> dict:
+def handle(route: str, store: MemoryRepository, payload: dict | None = None) -> dict:
     payload = payload or {}
     if route not in routes():
         raise KeyError(f"Unknown API route: {route}")

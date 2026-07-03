@@ -3,16 +3,16 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from memoryos.application.episode.episode_state_machine import CLOSED, LEARNING_APPLIED
-from memoryos.application.feedback.feedback_event_store import FeedbackEventStore
-from memoryos.application.learning.learning_service import LearningProcessor
+from memoryos.adapters.events.jsonl_outbox import FeedbackEventStore
 from memoryos.domain.memory.memory_item import utc_now
-from memoryos.infrastructure.repositories.memory_repository import MemoryStore
 from memoryos.observability.audit_log import AuditLogger
+from memoryos.ports.repositories.memory_repository import MemoryRepository
+from memoryos.services.learning.learning_service import LearningProcessor
+from memoryos.usecases.episode.episode_state_machine import CLOSED, LEARNING_APPLIED
 
 
 class FeedbackWorker:
-    def __init__(self, store: MemoryStore) -> None:
+    def __init__(self, store: MemoryRepository) -> None:
         self.store = store
         self.events = FeedbackEventStore(store.root)
         self.learning = LearningProcessor(store)

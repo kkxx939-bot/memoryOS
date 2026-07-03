@@ -160,33 +160,36 @@ python3 main.py commit-session --root ./memory-root --user gulf --session demo
 - `记住: ...`
 - `remember: ...`
 
-后续可以把 `memoryos/application/memory/extractor.py` 里的 `RuleBasedExtractor` 替换成 `JsonLLMMemoryExtractor`。它不绑定具体模型 SDK，只要求 provider 返回 JSON memory operations。
+后续可以把 `memoryos/services/memory/extractor.py` 里的 `RuleBasedExtractor` 替换成 `JsonLLMMemoryExtractor`。它不绑定具体模型 SDK，只要求 provider 返回 JSON memory operations。
 
 ## 代码结构
 
 ```text
 memoryos/
 ├── domain/           # 业务对象和稳定规则：action、scene、memory、behavior、feedback、policy
-├── application/      # 业务流程编排：episode、session、memory、retrieval、prediction、intervention、feedback、learning
-├── infrastructure/   # 技术实现：repository、本地索引、provider、path safety
+├── usecases/         # 业务用例编排：episode、session、feedback、intervention
+├── services/         # 领域服务：memory、retrieval、prediction、learning、policy
+├── ports/            # 抽象端口：repository、index、provider、event
+├── adapters/         # 技术实现：SQLite、filesystem、provider、本地 outbox
 ├── interfaces/       # CLI、API、agent hook 等外部入口
-├── workers/          # 后台任务入口预留：feedback、pattern、memory、replay
-├── observability/    # audit、metrics、tracing、event log 预留
-├── config/           # 配置和依赖装配预留
-├── shared/           # 低层通用工具预留
-└── schemas/          # YAML memory type schema
+├── workers/          # 后台任务入口：feedback、memory、reindex、replay
+├── observability/    # audit、trace、metrics、explanation
+├── security/         # path safety、id validation 等安全工具
+├── config/           # 配置和依赖装配
+└── shared/           # 低层通用工具
 ```
 
 当前仍然是本地 Markdown + SQLite 实现，但代码边界已经按生产生命周期拆开：
 
 ```text
 Observation
-  -> application/retrieval
-  -> application/prediction
-  -> application/intervention + policy gate
-  -> application/feedback
-  -> application/learning
-  -> application/memory consolidation
+  -> usecases/episode
+  -> services/retrieval
+  -> services/prediction
+  -> usecases/intervention + services/policy
+  -> usecases/feedback
+  -> services/learning
+  -> services/memory consolidation
 ```
 
 ## Hook 注入边界

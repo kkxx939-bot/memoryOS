@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from memoryos.application.episode.episode_service import EpisodeProcessor
-from memoryos.infrastructure.repositories.memory_repository import MemoryStore
+from memoryos.ports.repositories.memory_repository import MemoryRepository
+from memoryos.usecases.episode.process_observation import EpisodeProcessor
 
 
-def process_episode(store: MemoryStore, payload: dict) -> dict:
+def process_episode(store: MemoryRepository, payload: dict) -> dict:
     return EpisodeProcessor(store).process(
         user_id=str(payload["user_id"]),
         episode_id=str(payload["episode_id"]),
