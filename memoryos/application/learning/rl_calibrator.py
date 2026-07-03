@@ -6,6 +6,7 @@ import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from memoryos.domain.actions.action_schema import action_spec, canonical_action
 from memoryos.domain.memory.memory_item import utc_now
 from memoryos.application.prediction.candidate_generator import Candidate
 
@@ -119,19 +120,10 @@ class ReinforcementPolicyLedger:
         memories: list[dict],
         behavior_patterns: list[dict],
     ) -> PolicyState:
+        stable_tags = self._stable_context_tags(context_tags)
         descriptor = {
-            "scene_signature": self._signature(scene),
-            "context_tags": sorted({str(tag) for tag in context_tags if tag}),
-            "memory_types": sorted({str(memory.get("type", "")) for memory in memories if memory.get("type")}),
-            "memory_paths": [str(memory.get("path", "")) for memory in memories[:8] if memory.get("path")],
-            "behavior_groups": sorted(
-                {
-                    str(pattern.get("group_id") or pattern.get("group_uri") or "")
-                    for pattern in behavior_patterns[:8]
-                    if pattern.get("group_id") or pattern.get("group_uri")
-                }
-            ),
-            "top_behavior_actions": [str(pattern.get("action", "")) for pattern in behavior_patterns[:5] if pattern.get("action")],
+            "scene_signature": self._signature(" ".join(stable_tags) or scene),
+            "context_tags": stable_tags,
         }
         key_material = json.dumps(descriptor, ensure_ascii=False, sort_keys=True)
         key = hashlib.sha256(key_material.encode("utf-8")).hexdigest()[:24]
@@ -208,13 +200,14 @@ class ReinforcementPolicyLedger:
         states = payload.setdefault("states", {})
         state_value = StateValue.from_dict(states.get(state_key, {}))
         state_value.visits += 1
-        actual = str(actual_action or "").strip()
-        predicted = str(predicted_action or prediction.get("selected_action") or "unknown")
+        actual = canonical_action(str(actual_action or "").strip())
+        predicted = canonical_action(str(predicted_action or prediction.get("selected_action") or "unknown"))
         predicted_success = bool(actual and predicted == actual)
         predicted_reward = reward if predicted_success else min(float(reward), -0.5)
         next_best_q = self._next_best_q(payload, next_state)
         self._update_action(state_value, predicted, predicted_reward, predicted_success, next_best_q)
-        if actual and actual != predicted:
+        actual_spec = action_spec(actual)
+        if actual and actual != predicted and actual_spec.intervenable and actual_spec.risk_level not in {"private", "high"}:
             self._update_action(state_value, actual, max(float(reward), 0.5), True, next_best_q)
         states[state_key] = state_value.to_dict()
         transition_record = {
@@ -244,6 +237,7 @@ class ReinforcementPolicyLedger:
             "updated": True,
             "state_key": state_key,
             "predicted_success": predicted_success,
+            "state_value": states[state_key],
             "predicted_action_value": states[state_key]["actions"].get(predicted, {}),
             "actual_action_value": states[state_key]["actions"].get(actual, {}) if actual else {},
             "transition": transition_record,
@@ -295,3 +289,44 @@ class ReinforcementPolicyLedger:
     def _signature(self, text: str) -> str:
         normalized = " ".join(str(text).lower().split())
         return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+    def _stable_context_tags(self, context_tags: list[str]) -> list[str]:
+        stable_prefixes = (
+            "location_",
+            "activity_",
+            "duration_",
+            "temperature_",
+            "humidity_",
+            "ac_status_",
+            "fan_status_",
+        )
+        stable_values = {
+            "morning",
+            "noon",
+            "afternoon",
+            "evening",
+            "night",
+            "very_hot",
+            "hot",
+            "slightly_hot",
+            "comfortable",
+            "cold",
+            "very_cold",
+            "hot_environment",
+            "cold_environment",
+            "humid_environment",
+            "sweating",
+            "says_hot",
+            "arrive_home",
+            "computer_work",
+            "computer_desk",
+            "room",
+        }
+        values = set()
+        for tag in context_tags:
+            value = str(tag).strip().lower()
+            if not value:
+                continue
+            if value in stable_values or any(value.startswith(prefix) for prefix in stable_prefixes):
+                values.add(value)
+        return sorted(values)

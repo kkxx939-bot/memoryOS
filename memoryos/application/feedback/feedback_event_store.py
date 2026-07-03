@@ -49,6 +49,27 @@ class FeedbackEventStore:
             self._append(self._outbox_path(user_id), updated)
         return updated
 
+    def pending_outbox_events(self, user_id: str | None = None, limit: int | None = None) -> list[dict]:
+        user_ids = [user_id] if user_id else self._user_ids()
+        pending: dict[str, dict] = {}
+        applied: set[str] = set()
+        for current_user_id in user_ids:
+            if not current_user_id:
+                continue
+            for event in self._read_jsonl(self._outbox_path(current_user_id)):
+                outbox_id = str(event.get("outbox_id", ""))
+                if not outbox_id:
+                    continue
+                if event.get("status") == "applied":
+                    applied.add(outbox_id)
+                    pending.pop(outbox_id, None)
+                    continue
+                if event.get("status") == "pending" and outbox_id not in applied:
+                    pending.setdefault(outbox_id, event)
+        rows = list(pending.values())
+        rows.sort(key=lambda item: str(item.get("created_at", "")))
+        return rows[:limit] if limit is not None else rows
+
     def _feedback_path(self, user_id: str) -> Path:
         return self.root / "user" / user_id / "events" / "feedback_events.jsonl"
 
@@ -59,6 +80,22 @@ class FeedbackEventStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fp:
             fp.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+
+    def _read_jsonl(self, path: Path) -> list[dict]:
+        if not path.exists():
+            return []
+        rows = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            rows.append(json.loads(line))
+        return rows
+
+    def _user_ids(self) -> list[str]:
+        user_root = self.root / "user"
+        if not user_root.exists():
+            return []
+        return sorted(path.name for path in user_root.iterdir() if path.is_dir())
 
     def _event_id(self, user_id: str, episode_id: str, payload: dict) -> str:
         stable_payload = {key: value for key, value in payload.items() if key != "created_at"}

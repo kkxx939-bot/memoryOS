@@ -29,6 +29,7 @@ from memoryos.domain.memory.storage_plan import all_memory_storage_plans, memory
 from memoryos.infrastructure.repositories.memory_repository import MemoryStore
 from memoryos.domain.memory.update_policy import normalize_operation_for_policy, update_policy
 from memoryos.application.learning.rl_calibrator import ReinforcementPolicyLedger
+from memoryos.workers.feedback_worker import FeedbackWorker
 
 
 class FakeProvider:
@@ -518,6 +519,59 @@ class MemoryStoreTest(unittest.TestCase):
             self.assertLess(update["predicted_action_value"]["normalized_value"], 0.5)
             self.assertGreater(update["actual_action_value"]["normalized_value"], 0.5)
 
+    def test_reinforcement_policy_state_ignores_retrieval_volatility(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = ReinforcementPolicyLedger(Path(tmp) / "policy_ledger.json")
+            first = ledger.build_state(
+                scene="用户回到房间，室温 30 度，出汗，说热。",
+                context_tags=["room", "arrive_home", "very_hot", "sweating", "says_hot"],
+                memories=[{"type": "habit", "path": "user/gulf/habits/a.md"}],
+                behavior_patterns=[{"group_id": "hot-room-a", "action": "open_ac"}],
+            )
+            second = ledger.build_state(
+                scene="用户回到房间，室温 30 度，出汗，说热。",
+                context_tags=["room", "arrive_home", "very_hot", "sweating", "says_hot"],
+                memories=[{"type": "case", "path": "user/gulf/cases/b.md"}],
+                behavior_patterns=[{"group_id": "hot-room-b", "action": "turn_on_fan"}],
+            )
+
+            self.assertEqual(first.key, second.key)
+            self.assertNotIn("memory_paths", first.descriptor)
+            self.assertNotIn("behavior_groups", first.descriptor)
+
+    def test_reinforcement_policy_does_not_promote_private_actual_action(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "user" / "gulf" / "rl" / "policy_ledger.json"
+            ledger = ReinforcementPolicyLedger(path)
+            state = ledger.build_state(
+                scene="user is sweating in a hot room",
+                context_tags=["room", "very_hot", "sweating"],
+                memories=[],
+                behavior_patterns=[],
+            )
+            ledger.record_prediction(
+                user_id="gulf",
+                episode_id="private-actual",
+                state=state,
+                candidates=[],
+                selected_action="turn_on_ac",
+                intervention_action="ask_user",
+                action_scores=ledger.action_scores(state, ["turn_on_ac", "take_shower"]),
+            )
+
+            update = ledger.record_feedback(
+                episode_id="private-actual",
+                predicted_action="turn_on_ac",
+                actual_action="take_shower",
+                reward=1.0,
+            )
+
+            self.assertTrue(update["updated"])
+            self.assertEqual(update["actual_action_value"], {})
+            state_actions = update["state_value"]["actions"]
+            self.assertIn("turn_on_ac", state_actions)
+            self.assertNotIn("take_shower", state_actions)
+
     def test_immutable_policy_update_reads_current_content_before_merge(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = MemoryStore(Path(tmp))
@@ -675,11 +729,14 @@ class MemoryStoreTest(unittest.TestCase):
             )
             self.assertEqual(feedback["reward"], -1.0)
             self.assertEqual(feedback["actual_action"], "organize_desk")
-            self.assertIn("behavior_update", feedback)
-            self.assertEqual(feedback["behavior_update"]["behavior_reward"], -1.0)
-            self.assertIn("policy_update", feedback)
+            self.assertEqual(feedback["learning_status"], "queued")
             self.assertFalse(feedback["corrects_memory"])
             self.assertTrue((Path(tmp) / "user" / "gulf" / "episodes" / "ep-1" / "feedback.jsonl").exists())
+            worker_result = FeedbackWorker(store).process_pending("gulf")
+            learning = worker_result["results"][0]["learning_result"]
+            self.assertIn("behavior_update", learning)
+            self.assertLess(learning["behavior_update"]["behavior_reward"], 0)
+            self.assertIn("policy_update", learning)
             self.assertTrue((Path(tmp) / "user" / "gulf" / "behavior_stats.json").exists())
             self.assertTrue((Path(tmp) / "user" / "gulf" / "policy_stats.json").exists())
             self.assertEqual(store.search("整理桌面", user_id="gulf"), [])
@@ -736,16 +793,24 @@ class MemoryStoreTest(unittest.TestCase):
                 action_params={"target_temperature": 25, "mode": "cool"},
                 spontaneity="after_prompt",
             )
-            closed = json.loads(
+            queued = json.loads(
                 (Path(tmp) / "user" / "gulf" / "episodes" / "ep-two-stage" / "episode_result.json").read_text(
                     encoding="utf-8"
                 )
             )
 
+            self.assertEqual(queued["episode_status"], "feedback_queued")
+            worker_result = FeedbackWorker(store).process_pending("gulf")
+            learning = worker_result["results"][0]["learning_result"]
+            closed = json.loads(
+                (Path(tmp) / "user" / "gulf" / "episodes" / "ep-two-stage" / "episode_result.json").read_text(
+                    encoding="utf-8"
+                )
+            )
             self.assertEqual(closed["episode_status"], "closed_with_feedback")
             self.assertEqual(closed["actual_action"], "open_ac")
             self.assertEqual(closed["action_params"]["target_temperature"], 25)
-            self.assertIn("case_memory", feedback)
+            self.assertIn("case_memory", learning)
             self.assertEqual(store.search("rawhot123", user_id="gulf"), [])
             cases = store.search("Actual action: open_ac", user_id="gulf", memory_type="case")
             self.assertGreaterEqual(len(cases), 1)
@@ -780,7 +845,9 @@ class MemoryStoreTest(unittest.TestCase):
                     actual_action="open_ac",
                 )
 
-            self.assertTrue(feedback["memory_consolidation"]["promoted"])
+            worker_result = FeedbackWorker(store).process_pending("gulf")
+            learning = worker_result["results"][-1]["learning_result"]
+            self.assertTrue(learning["memory_consolidation"]["promoted"])
             promoted = store.search("open_ac promoted_behavior_pattern", user_id="gulf", memory_type="habit")
             self.assertTrue(any("promoted_behavior_pattern" in " ".join(row["tags"]) for row in promoted))
 
@@ -1078,7 +1145,9 @@ class MemoryStoreTest(unittest.TestCase):
                 reward=1,
                 actual_action="open_ac",
             )
-            self.assertIn("case_memory", feedback)
+            self.assertEqual(feedback["learning_status"], "queued")
+            learning = FeedbackWorker(store).process_pending("gulf")["results"][0]["learning_result"]
+            self.assertIn("case_memory", learning)
             cases = store.list_by_type("gulf", "case")
             self.assertEqual(len(cases), 1)
             self.assertIn("actual_action:open_ac", cases[0]["tags"])
@@ -1476,12 +1545,15 @@ class MemoryStoreTest(unittest.TestCase):
                 intervention_result="accepted",
             )
 
-            self.assertEqual(feedback["learning_status"], "applied_sync_local")
+            self.assertEqual(feedback["learning_status"], "queued")
             self.assertEqual(feedback["feedback_event"]["event_type"], "FeedbackRecorded")
             self.assertIn("reward_breakdown", feedback)
             self.assertTrue((root / "user" / "gulf" / "events" / "feedback_events.jsonl").exists())
             self.assertTrue((root / "user" / "gulf" / "events" / "outbox_events.jsonl").exists())
 
+            worker_result = FeedbackWorker(store).process_pending("gulf")
+            self.assertEqual(worker_result["processed"], 1)
+            self.assertIn("case_memory", worker_result["results"][0]["learning_result"])
             closed = json.loads((root / "user" / "gulf" / "episodes" / "event-flow" / "episode_result.json").read_text())
             self.assertEqual(closed["episode_state"], CLOSED)
             self.assertIn("reward_model_version", closed["versions"])
@@ -1495,7 +1567,9 @@ class MemoryStoreTest(unittest.TestCase):
                 actual_action="open_ac",
                 intervention_result="accepted",
             )
-            self.assertTrue(retry["idempotent"])
+            self.assertEqual(retry["learning_status"], "queued")
+            retry_worker_result = FeedbackWorker(store).process_pending("gulf")
+            self.assertEqual(retry_worker_result["processed"], 0)
             self.assertEqual(len(store.list_by_type("gulf", "case")), 1)
 
 

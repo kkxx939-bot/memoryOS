@@ -5,21 +5,16 @@ from pathlib import Path
 
 from memoryos.domain.actions.action_schema import ACTION_SCHEMA_VERSION
 from memoryos.application.episode.episode_state_machine import (
-    CLOSED,
     CREATED,
     EPISODE_STATE_VERSION,
     FEEDBACK_PENDING,
-    FEEDBACK_RECEIVED,
     INTERVENTION_SELECTED,
-    LEARNING_APPLIED,
-    LEARNING_QUEUED,
     OBSERVED,
     PREDICTED,
     RETRIEVED,
 )
-from memoryos.domain.feedback.reward_result import REWARD_MODEL_VERSION, compute_rewards
-from memoryos.application.feedback.feedback_event_store import FeedbackEventStore
-from memoryos.application.learning.learning_service import LearningProcessor
+from memoryos.domain.feedback.reward_result import REWARD_MODEL_VERSION
+from memoryos.application.feedback.feedback_service import FeedbackService
 from memoryos.application.intervention.policy_gate import POLICY_VERSION
 from memoryos.domain.memory.memory_item import utc_now
 from memoryos.application.memory.extractor import MemoryOperation, RuleBasedExtractor
@@ -375,53 +370,18 @@ class EpisodeProcessor:
         correction: str | None = None,
         corrects_memory: bool = False,
     ) -> dict:
-        validate_identifier(user_id, "user_id")
-        validate_identifier(episode_id, "episode_id")
-        self.store.init(user_id)
-        reward = max(-1.0, min(1.0, float(reward)))
-        episode_result = self._read_episode_result(user_id, episode_id)
-        prediction = episode_result.get("prediction", {})
-        predicted_action = str(prediction.get("predicted_action", "unknown"))
-        recommended_intervention = str(prediction.get("recommended_intervention", "unknown"))
-        created_at = self._feedback_created_at(episode_result)
-        reward_breakdown = compute_rewards(
-            predicted_action=predicted_action,
+        return FeedbackService(self.store).record_feedback(
+            user_id=user_id,
+            episode_id=episode_id,
+            feedback=feedback,
+            reward=reward,
             actual_action=actual_action,
-            user_reward=reward,
-            intervention_action=recommended_intervention,
-            intervention_result=intervention_result or feedback,
-            actual_params=action_params or {},
+            action_params=action_params,
+            spontaneity=spontaneity,
+            intervention_result=intervention_result,
+            correction=correction,
+            corrects_memory=corrects_memory,
         )
-        event_payload = {
-            "user_id": user_id,
-            "episode_id": episode_id,
-            "created_at": created_at,
-            "feedback": feedback,
-            "reward": reward,
-            "reward_breakdown": reward_breakdown.to_dict(),
-            "predicted_action": predicted_action,
-            "actual_action": actual_action,
-            "action_params": action_params or {},
-            "spontaneity": spontaneity,
-            "intervention_result": intervention_result,
-            "recommended_intervention": recommended_intervention,
-            "correction": correction,
-            "corrects_memory": corrects_memory,
-        }
-        event_store = FeedbackEventStore(self.store.root)
-        feedback_event = event_store.append_feedback_event(user_id, episode_id, event_payload)
-        outbox_event = event_store.append_outbox_event(user_id, feedback_event)
-        feedback_record = LearningProcessor(self.store).apply_feedback_event(feedback_event, episode_result)
-        feedback_record["feedback_event"] = {
-            "event_id": feedback_event["event_id"],
-            "event_type": feedback_event["event_type"],
-            "created_at": feedback_event["created_at"],
-        }
-        feedback_record["outbox_event"] = event_store.mark_outbox_applied(outbox_event)
-        feedback_record["learning_status"] = "applied_sync_local"
-        self._append_episode_jsonl(user_id, episode_id, "feedback.jsonl", feedback_record)
-        self._close_episode_result(user_id, episode_id, episode_result, feedback_record)
-        return feedback_record
 
     def _apply_memory_operations(
         self,
@@ -455,42 +415,6 @@ class EpisodeProcessor:
         if not observation_context or not observation_context.observed_at:
             return None
         return observation_context.observed_at[:10]
-
-    def _feedback_created_at(self, episode_result: dict) -> str:
-        observation = episode_result.get("observation") or {}
-        observed_at = str(observation.get("observed_at") or "")
-        return observed_at or utc_now()
-
-    def _close_episode_result(
-        self,
-        user_id: str,
-        episode_id: str,
-        episode_result: dict,
-        feedback_record: dict,
-    ) -> None:
-        if not episode_result:
-            return
-        closed = dict(episode_result)
-        closed["episode_status"] = "closed_with_feedback"
-        closed["episode_state"] = CLOSED
-        closed["state_history"] = self._append_state_history(
-            episode_result.get("state_history", []),
-            [
-                (FEEDBACK_RECEIVED, "feedback event recorded"),
-                (LEARNING_QUEUED, "learning event appended to local outbox"),
-                (LEARNING_APPLIED, "learning processor applied feedback event"),
-                (CLOSED, "episode closed after feedback learning"),
-            ],
-        )
-        closed["versions"] = self._versions()
-        closed["closed_at"] = feedback_record["created_at"]
-        closed["actual_action"] = feedback_record.get("actual_action")
-        closed["action_params"] = feedback_record.get("action_params", {})
-        closed["spontaneity"] = feedback_record.get("spontaneity", "unknown")
-        closed["feedback"] = feedback_record.get("feedback")
-        closed["reward"] = feedback_record.get("reward")
-        closed["feedback_record"] = feedback_record
-        self._write_episode_file(user_id, episode_id, "episode_result.json", closed)
 
     def _action_universe(
         self,

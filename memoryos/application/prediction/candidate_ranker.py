@@ -18,7 +18,7 @@ class CandidateRanker:
         candidates = candidates or self.generator.generate(scene, memories)
         rl_action_scores = rl_action_scores or {}
         behavior_scores = {
-            str(item["action"]): float(item.get("weighted_behavior_reward", item.get("behavior_reward_score", 0.5)))
+            str(item["action"]): self._behavior_score(item)
             for item in (behavior_distribution or [])
         }
         ranked = []
@@ -28,10 +28,10 @@ class CandidateRanker:
             score = (
                 features["candidate_prior"] * 0.20
                 + features["structured_action_match"] * 0.20
-                + features["memory_support"] * 0.20
-                + features["behavior_reward"] * 0.15
+                + features["memory_support"] * 0.25
+                + features["behavior_reward"] * 0.20
                 + features["memory_hotness"] * 0.05
-                + features["rl_policy_score"] * 0.20
+                + features["rl_policy_score"] * 0.10
             )
             candidate.features = features
             candidate.memory_evidence = memory_evidence
@@ -129,3 +129,15 @@ class CandidateRanker:
             return 0.0
         combined = sum(float(item["combined_weight"]) for item in memory_evidence[:5])
         return round(max(0.0, min(1.0, combined)), 6)
+
+    def _behavior_score(self, item: dict) -> float:
+        if "probability" in item or "confidence" in item:
+            probability = float(item.get("probability", item.get("ratio", 0.0)) or 0.0)
+            avg_reward = float(item.get("avg_reward", item.get("average_reward", 0.0)) or 0.0)
+            reward_score = max(0.0, min(1.0, (avg_reward + 1.0) / 2.0))
+            confidence = float(item.get("confidence", item.get("evidence_confidence", 0.0)) or 0.0)
+            recency = float(item.get("recency_weight", 0.5) or 0.0)
+            negative_penalty = min(0.35, int(item.get("negative_count", 0)) * 0.08)
+            score = probability * 0.35 + reward_score * 0.25 + confidence * 0.25 + recency * 0.15 - negative_penalty
+            return round(max(0.0, min(1.0, score)), 6)
+        return float(item.get("weighted_behavior_reward", item.get("behavior_reward_score", 0.5)))

@@ -15,6 +15,7 @@ from memoryos.infrastructure.providers.embedding_provider import HashingEmbeddin
 from memoryos.interfaces.hooks.memory_digest_hook import MemoryHook
 from memoryos.application.session.session_manager import SessionManager
 from memoryos.infrastructure.repositories.memory_repository import MemoryStore, validate_memory_type
+from memoryos.workers.feedback_worker import FeedbackWorker
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -110,6 +111,10 @@ def build_parser() -> argparse.ArgumentParser:
     add_root_user(archive)
     archive.add_argument("--limit", type=int, default=20)
     archive.add_argument("--max-hotness", type=float, default=0.12)
+
+    process_feedback = sub.add_parser("process-feedback")
+    add_root_user(process_feedback)
+    process_feedback.add_argument("--limit", type=int, default=None)
 
     return parser
 
@@ -229,6 +234,11 @@ def main() -> None:
 
     if args.command == "archive-cold":
         result = store.archive_cold_memories(user_id=args.user, limit=args.limit, max_hotness=args.max_hotness)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.command == "process-feedback":
+        result = FeedbackWorker(store).process_pending(user_id=args.user, limit=args.limit)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
 

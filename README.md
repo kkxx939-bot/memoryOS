@@ -216,6 +216,7 @@ Observation
 
 ```python
 from memoryos import EpisodeProcessor, MemoryStore
+from memoryos.workers.feedback_worker import FeedbackWorker
 
 store = MemoryStore("./memory-root")
 episode = EpisodeProcessor(store)
@@ -229,7 +230,7 @@ result = episode.process(
     memory_write_timing="after_prediction",
 )
 
-episode.record_feedback(
+feedback = episode.record_feedback(
     user_id="gulf",
     episode_id="ep-1",
     feedback="prediction_wrong",
@@ -237,6 +238,16 @@ episode.record_feedback(
     actual_action="organize_desk",
     correction="用户只是整理桌面，不是准备抽烟。",
 )
+
+# record_feedback 只可靠记录反馈事件和 outbox，不直接做学习。
+# 本地开发可以显式跑 worker；生产环境后续换成后台 worker 消费 outbox。
+FeedbackWorker(store).process_pending(user_id="gulf")
+```
+
+CLI 中也可以显式消费 feedback outbox：
+
+```bash
+python3 main.py process-feedback --root ./memory-root --user gulf --limit 20
 ```
 
 结构化观察可以直接传 `ObservationContext`。系统会从中生成：
@@ -279,6 +290,14 @@ result = episode.process(
 也就是说，召回到某条记忆不代表它一定强影响预测。
 
 候选行为生成采用 pattern-first：优先从跨天聚合后的 `behavior_pattern` 生成候选；规则、记忆和 LLM 只作为样本不足时的补充。同一天重复几次不会直接形成高置信候选。干预动作由 `InterventionSelector` 单独选择，负反馈会先影响对应系统动作的选择，而不是默认改写记忆或污染行为候选。
+
+`record_feedback()` 会先写入：
+
+- `user/{user_id}/events/feedback_events.jsonl`
+- `user/{user_id}/events/outbox_events.jsonl`
+- 当前 episode 的 `feedback.jsonl`
+
+学习更新由 `FeedbackWorker` 消费 outbox 后执行。这样用户请求线程只负责可靠记录事实，行为模式、策略统计、RL 校准和长期记忆沉淀都在学习阶段完成。
 
 feedback 会拆成两条校准链路：
 
@@ -731,20 +750,30 @@ episode 结束后，调用 `record_feedback()`。
 反馈里最重要的是两类字段：
 
 ```python
-episode.record_feedback(
+feedback = episode.record_feedback(
     user_id="gulf",
     episode_id="hot-room-1",
     feedback="accepted",
     reward=1,
     actual_action="open_ac",
 )
+
+worker_result = FeedbackWorker(store).process_pending(user_id="gulf")
 ```
 
-它会写三处：
+`record_feedback()` 只做可靠入队：
 
 - `feedback.jsonl`：episode 级别审计日志。
-- `behavior_stats.json`：更新行为预测是否命中。
-- `policy_stats.json`：更新系统动作是否合适。
+- `feedback_events.jsonl`：不可丢的反馈事实。
+- `outbox_events.jsonl`：等待 worker 消费的学习事件。
+
+`FeedbackWorker.process_pending()` 消费 outbox 后才会更新：
+
+- `behavior_stats.json`：行为预测是否命中。
+- `behavior/{domain}/patterns/*.json`：相似行为 pattern 和 action distribution。
+- `policy_stats.json`：系统动作是否合适。
+- `rl/policy_ledger.json`：低风险行为预测校准。
+- `case` / `habit` 等长期记忆沉淀。
 
 如果预测错了：
 
