@@ -59,6 +59,19 @@ class FakeRerankProvider:
         return scores
 
 
+class FakeObservationExtractor:
+    def extract(self, messages: list[dict[str, str]]) -> list[MemoryOperation]:
+        return [
+            MemoryOperation(
+                action="add",
+                memory_type="event",
+                title="raw observation draft",
+                text="rawhot123 should remain an episode draft until feedback consolidation.",
+                tags=["event", "observation_draft"],
+            )
+        ]
+
+
 class MemoryStoreTest(unittest.TestCase):
     def test_add_search_and_digest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -688,6 +701,83 @@ class MemoryStoreTest(unittest.TestCase):
             self.assertIn("combined_weight", first_evidence)
             self.assertGreater(first_evidence["usage_weight"], 0)
 
+    def test_episode_observation_uses_two_stage_memory_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp))
+            episode = EpisodeProcessor(store, extractor=FakeObservationExtractor())
+
+            result = episode.process(
+                user_id="gulf",
+                episode_id="ep-two-stage",
+                scene="用户回家后出汗，说有点热。",
+                available_actions=["ask_user", "do_nothing"],
+            )
+
+            self.assertEqual(result["episode_status"], "predicted")
+            self.assertEqual(result["episode_log_timing"], "before_prediction")
+            self.assertEqual(result["memory_commit_timing"], "after_feedback")
+            self.assertEqual(result["memory_diff"]["summary"]["total_adds"], 0)
+            self.assertEqual(len(result["pending_memory_operations"]), 1)
+            self.assertEqual(store.search("rawhot123", user_id="gulf"), [])
+            self.assertTrue((Path(tmp) / "user" / "gulf" / "episodes" / "ep-two-stage" / "episode_log.json").exists())
+
+            feedback = episode.record_feedback(
+                user_id="gulf",
+                episode_id="ep-two-stage",
+                feedback="accepted",
+                reward=1,
+                actual_action="open_ac",
+                action_params={"target_temperature": 25, "mode": "cool"},
+                spontaneity="after_prompt",
+            )
+            closed = json.loads(
+                (Path(tmp) / "user" / "gulf" / "episodes" / "ep-two-stage" / "episode_result.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            self.assertEqual(closed["episode_status"], "closed_with_feedback")
+            self.assertEqual(closed["actual_action"], "open_ac")
+            self.assertEqual(closed["action_params"]["target_temperature"], 25)
+            self.assertIn("case_memory", feedback)
+            self.assertEqual(store.search("rawhot123", user_id="gulf"), [])
+            cases = store.search("Actual action: open_ac", user_id="gulf", memory_type="case")
+            self.assertGreaterEqual(len(cases), 1)
+            self.assertIn("Predicted candidates:", cases[0]["content"])
+            self.assertIn('"target_temperature": 25', cases[0]["content"])
+
+    def test_repeated_feedback_promotes_behavior_pattern_to_habit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp))
+            episode = EpisodeProcessor(store)
+            for index in range(3):
+                observed_at = (datetime(2026, 7, 1, 19, 0, tzinfo=timezone.utc) + timedelta(days=index)).isoformat()
+                episode_id = f"hot-room-promote-{index}"
+                episode.process(
+                    user_id="gulf",
+                    episode_id=episode_id,
+                    observation={
+                        "raw_text": "用户回到房间，出汗，说有点热。",
+                        "location": "room",
+                        "activity": "arrive_home",
+                        "observed_at": observed_at,
+                        "signals": ["hot", "sweating"],
+                        "environment": {"temperature": 30},
+                    },
+                    available_actions=["ask_user", "do_nothing"],
+                )
+                feedback = episode.record_feedback(
+                    user_id="gulf",
+                    episode_id=episode_id,
+                    feedback="accepted",
+                    reward=1,
+                    actual_action="open_ac",
+                )
+
+            self.assertTrue(feedback["memory_consolidation"]["promoted"])
+            promoted = store.search("open_ac promoted_behavior_pattern", user_id="gulf", memory_type="habit")
+            self.assertTrue(any("promoted_behavior_pattern" in " ".join(row["tags"]) for row in promoted))
+
     def test_memory_weight_temporal_scopes_decay_differently(self) -> None:
         now = datetime(2026, 7, 1, tzinfo=timezone.utc)
         recent_hot_weather_trigger = {
@@ -757,6 +847,10 @@ class MemoryStoreTest(unittest.TestCase):
                 actual_action="open_ac",
                 reward=1,
                 created_at=created_at,
+                predicted_candidates=[{"action": "open_ac", "score": 0.7}, {"action": "turn_on_fan", "score": 0.2}],
+                action_params={"target_temperature": 25, "mode": "cool"},
+                scene_features={"location": "room", "time_bucket": "evening", "thermal_level": "very_hot"},
+                spontaneity="after_prompt",
             )
 
             distribution = store.distribution_for_scene(
@@ -770,6 +864,57 @@ class MemoryStoreTest(unittest.TestCase):
             self.assertEqual(distribution[0]["match_level"], "semantic")
             self.assertEqual(distribution[0]["match_weight"], 0.7)
             self.assertLess(distribution[0]["prediction_coefficient"], distribution[0]["evidence_confidence"])
+            self.assertEqual(distribution[0]["action_distribution"][0]["action"], "open_ac")
+            self.assertEqual(distribution[0]["action_distribution"][0]["param_distribution"]["target_temperature"]["25"], 1.0)
+
+    def test_behavior_pattern_group_distribution_keeps_multiple_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = BehaviorPatternStore(Path(tmp))
+            scene = "用户回到房间 说热 出汗 room arrive_home hot sweating temperature_30 hot_environment"
+            tags = ["room", "arrive_home", "hot", "sweating", "temperature_30", "hot_environment"]
+            actions = [
+                ("open_ac", 1.0, {"target_temperature": 25}),
+                ("open_ac", 1.0, {"target_temperature": 26}),
+                ("turn_on_fan", 0.6, {"fan_speed": "auto"}),
+                ("drink_water", -0.2, {}),
+            ]
+            for index, (action, reward, params) in enumerate(actions):
+                store.record(
+                    user_id="gulf",
+                    episode_id=f"multi-action-{index}",
+                    retrieval_query=scene,
+                    context_tags=tags,
+                    predicted_action="seek_cooling",
+                    actual_action=action,
+                    reward=reward,
+                    created_at=(datetime(2026, 7, 1, tzinfo=timezone.utc) + timedelta(days=index)).isoformat(),
+                    action_params=params,
+                    predicted_candidates=[{"action": "open_ac", "score": 0.6}, {"action": "turn_on_fan", "score": 0.3}],
+                )
+
+            distribution = store.distribution_for_scene(
+                user_id="gulf",
+                retrieval_query=scene,
+                context_tags=tags,
+            )
+            top = distribution[0]
+            actions_by_name = {item["action"]: item for item in top["action_distribution"]}
+
+            self.assertIn("open_ac", actions_by_name)
+            self.assertIn("turn_on_fan", actions_by_name)
+            self.assertIn("drink_water", actions_by_name)
+            self.assertAlmostEqual(actions_by_name["open_ac"]["probability"], 0.5)
+            self.assertEqual(actions_by_name["open_ac"]["param_distribution"]["target_temperature"]["25"], 0.5)
+            self.assertEqual(actions_by_name["drink_water"]["negative_count"], 1)
+
+            candidates = EpisodeProcessor(MemoryStore(Path(tmp))).predictor.generator.generate(
+                scene,
+                memories=[],
+                behavior_patterns=distribution,
+            )
+            candidate_actions = {candidate.action for candidate in candidates}
+            self.assertIn("open_ac", candidate_actions)
+            self.assertIn("turn_on_fan", candidate_actions)
 
     def test_storage_plan_matches_memory_type_semantics(self) -> None:
         plans = {plan.memory_type: plan for plan in all_memory_storage_plans()}

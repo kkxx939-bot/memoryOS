@@ -54,6 +54,10 @@ class CandidateGenerator:
         behavior_patterns: list[dict],
     ) -> None:
         for item in behavior_patterns:
+            distribution = item.get("action_distribution") or []
+            if distribution:
+                self._add_behavior_distribution_candidates(candidates, item, distribution)
+                continue
             sample_count = int(item.get("sample_count", 0))
             distinct_days = int(item.get("distinct_days", 0))
             action = str(item["action"])
@@ -83,6 +87,53 @@ class CandidateGenerator:
                         ],
                     ],
                     reason="Aggregated behavior pattern supports this action as the user's likely outcome.",
+                ),
+            )
+
+    def _add_behavior_distribution_candidates(
+        self,
+        candidates: dict[str, Candidate],
+        pattern_item: dict,
+        distribution: list[dict],
+    ) -> None:
+        match_strength = float(pattern_item.get("similarity", 1.0)) * float(pattern_item.get("match_weight", 1.0))
+        distinct_days = int(pattern_item.get("distinct_days", 0))
+        for action_item in distribution:
+            action = str(action_item.get("action", ""))
+            if not action:
+                continue
+            probability = float(action_item.get("probability", action_item.get("ratio", 0.0)) or 0.0)
+            avg_reward = float(action_item.get("avg_reward", action_item.get("average_reward", 0.0)) or 0.0)
+            confidence = float(action_item.get("confidence", action_item.get("evidence_confidence", 0.0)) or 0.0)
+            recency_weight = float(action_item.get("recency_weight", 0.5) or 0.0)
+            if confidence < self.min_history_confidence and distinct_days < 2:
+                continue
+            if confidence < self.min_history_confidence and probability < 0.10:
+                continue
+            reward_score = max(0.0, min(1.0, (avg_reward + 1.0) / 2.0))
+            negative_penalty = min(0.30, int(action_item.get("negative_count", 0)) * 0.05)
+            prior = (
+                0.20
+                + probability * 0.30
+                + reward_score * 0.20
+                + confidence * 0.20
+                + recency_weight * 0.10
+            )
+            prior = max(0.0, min(0.95, prior * max(match_strength, 0.2) - negative_penalty))
+            self._merge_candidate(
+                candidates,
+                Candidate(
+                    action=action,
+                    need=self._need_for_action(action),
+                    prior=prior,
+                    sources=["behavior_pattern", "behavior_pattern_distribution"],
+                    evidence=[
+                        (
+                            f"behavior group {pattern_item.get('group_id', '')} supports {action}; "
+                            f"probability={probability:.2f}; reward={avg_reward:.2f}; confidence={confidence:.2f}"
+                        )
+                    ],
+                    reason="Similar behavior pattern distribution supports this candidate.",
                 ),
             )
 

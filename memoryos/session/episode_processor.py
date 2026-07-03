@@ -41,13 +41,21 @@ class EpisodeProcessor:
         messages: list[dict[str, str]] | None = None,
         available_actions: list[str] | None = None,
         retrieval_limit: int = 8,
-        memory_write_timing: str = "after_prediction",
+        memory_write_timing: str | None = None,
+        episode_log_timing: str = "before_prediction",
+        memory_commit_timing: str = "after_feedback",
     ) -> dict:
         validate_identifier(user_id, "user_id")
         validate_identifier(episode_id, "episode_id")
         self.store.init(user_id)
-        if memory_write_timing not in {"before_prediction", "after_prediction", "deferred"}:
-            raise ValueError("memory_write_timing must be before_prediction, after_prediction, or deferred")
+        if episode_log_timing != "before_prediction":
+            raise ValueError("episode_log_timing must be before_prediction")
+        if memory_commit_timing not in {"after_feedback", "explicit_or_after_feedback", "before_prediction", "deferred"}:
+            raise ValueError(
+                "memory_commit_timing must be after_feedback, explicit_or_after_feedback, before_prediction, or deferred"
+            )
+        if memory_write_timing is not None:
+            memory_commit_timing = self._legacy_memory_commit_timing(memory_write_timing)
         observation_context = self._observation_context(observation)
         if observation_context is None and scene is None:
             raise ValueError("scene or observation is required")
@@ -57,9 +65,32 @@ class EpisodeProcessor:
         available_actions = available_actions or ["ask_user", "do_nothing"]
         input_messages = messages or [{"role": "observation", "text": scene_text, "created_at": utc_now()}]
         memory_operations = self.extractor.extract(input_messages)
+        explicit_memory_operations = self._explicit_memory_operations(memory_operations, input_messages)
+        explicit_operation_ids = {id(operation) for operation in explicit_memory_operations}
+        draft_memory_operations = [
+            operation for operation in memory_operations if id(operation) not in explicit_operation_ids
+        ]
 
-        if memory_write_timing == "before_prediction":
+        self._write_episode_file(
+            user_id,
+            episode_id,
+            "episode_log.json",
+            {
+                "episode_id": episode_id,
+                "status": "pending",
+                "created_at": utc_now(),
+                "scene": scene_text,
+                "observation": observation_context.to_dict() if observation_context else None,
+                "retrieval_query": retrieval_query,
+                "context_tags": context_tags,
+                "messages": input_messages,
+            },
+        )
+
+        if memory_commit_timing == "before_prediction":
             memory_diff = self._apply_memory_operations(user_id, episode_id, memory_operations, observation_context)
+        elif memory_commit_timing in {"after_feedback", "explicit_or_after_feedback"} and explicit_memory_operations:
+            memory_diff = self._apply_memory_operations(user_id, episode_id, explicit_memory_operations, observation_context)
         else:
             memory_diff = self._empty_memory_diff(episode_id)
 
@@ -106,18 +137,26 @@ class EpisodeProcessor:
         )
 
         pending_memory_operations = []
-        if memory_write_timing == "after_prediction":
-            memory_diff = self._apply_memory_operations(user_id, episode_id, memory_operations, observation_context)
-        elif memory_write_timing == "deferred":
-            pending_memory_operations = [self.memory_updates.operation_record(operation) for operation in memory_operations]
+        if memory_commit_timing == "deferred":
+            pending_source_operations = memory_operations
+        else:
+            pending_source_operations = draft_memory_operations
+        if memory_commit_timing in {"after_feedback", "explicit_or_after_feedback", "deferred"}:
+            pending_memory_operations = [
+                self.memory_updates.operation_record(operation)
+                for operation in pending_source_operations
+            ]
 
         result = {
             "episode_id": episode_id,
+            "episode_status": "predicted",
             "processed_at": utc_now(),
             "scene": scene_text,
             "observation": observation_context.to_dict() if observation_context else None,
             "retrieval_query": retrieval_query,
             "context_tags": context_tags,
+            "episode_log_timing": episode_log_timing,
+            "memory_commit_timing": memory_commit_timing,
             "memory_write_timing": memory_write_timing,
             "memory_diff": memory_diff,
             "pending_memory_operations": pending_memory_operations,
@@ -156,6 +195,38 @@ class EpisodeProcessor:
                 {"episode_id": episode_id, "operations": pending_memory_operations},
             )
         return result
+
+    def _legacy_memory_commit_timing(self, memory_write_timing: str) -> str:
+        mapping = {
+            "before_prediction": "before_prediction",
+            "after_prediction": "explicit_or_after_feedback",
+            "deferred": "deferred",
+        }
+        if memory_write_timing not in mapping:
+            raise ValueError("memory_write_timing must be before_prediction, after_prediction, or deferred")
+        return mapping[memory_write_timing]
+
+    def _explicit_memory_operations(
+        self,
+        operations: list[MemoryOperation],
+        messages: list[dict[str, str]],
+    ) -> list[MemoryOperation]:
+        if self._messages_contain_explicit_memory_marker(messages):
+            return operations
+        explicit = []
+        for operation in operations:
+            tags = {str(tag) for tag in operation.tags}
+            if "explicit_user_intent" in tags or "user_confirmed" in tags:
+                explicit.append(operation)
+        return explicit
+
+    def _messages_contain_explicit_memory_marker(self, messages: list[dict[str, str]]) -> bool:
+        markers = getattr(self.extractor, "markers", ("记住：", "记住:", "remember:", "Remember:"))
+        for message in messages:
+            text = str(message.get("text", ""))
+            if any(marker in text for marker in markers):
+                return True
+        return False
 
     def _observation_context(self, observation: ObservationContext | dict | None) -> ObservationContext | None:
         if observation is None:
@@ -260,6 +331,9 @@ class EpisodeProcessor:
         feedback: str,
         reward: float,
         actual_action: str | None = None,
+        action_params: dict | None = None,
+        spontaneity: str = "unknown",
+        intervention_result: str = "",
         correction: str | None = None,
         corrects_memory: bool = False,
     ) -> dict:
@@ -271,7 +345,7 @@ class EpisodeProcessor:
         prediction = episode_result.get("prediction", {})
         predicted_action = str(prediction.get("predicted_action", "unknown"))
         recommended_intervention = str(prediction.get("recommended_intervention", "unknown"))
-        created_at = utc_now()
+        created_at = self._feedback_created_at(episode_result)
         behavior_update = BehaviorStats(self._behavior_stats_path(user_id)).record(
             retrieval_query=str(episode_result.get("retrieval_query") or episode_result.get("scene", "")),
             context_tags=[str(tag) for tag in episode_result.get("context_tags", [])],
@@ -290,6 +364,20 @@ class EpisodeProcessor:
                 actual_action=actual_action,
                 reward=reward,
                 created_at=created_at,
+                predicted_candidates=[
+                    {
+                        "action": candidate.get("action"),
+                        "score": candidate.get("score"),
+                        "prior": candidate.get("prior"),
+                        "sources": candidate.get("sources", []),
+                    }
+                    for candidate in episode_result.get("ranked_candidates", [])
+                ],
+                action_params=action_params or {},
+                scene_features=self._scene_features(episode_result),
+                spontaneity=spontaneity,
+                intervention=recommended_intervention,
+                intervention_result=intervention_result or feedback,
             )
         policy_update = PolicyStats(self._policy_stats_path(user_id)).record(
             predicted_action=predicted_action,
@@ -309,6 +397,9 @@ class EpisodeProcessor:
             "reward": reward,
             "predicted_action": predicted_action,
             "actual_action": actual_action,
+            "action_params": action_params or {},
+            "spontaneity": spontaneity,
+            "intervention_result": intervention_result,
             "recommended_intervention": recommended_intervention,
             "correction": correction,
             "corrects_memory": corrects_memory,
@@ -317,6 +408,7 @@ class EpisodeProcessor:
             "policy_update": policy_update,
             "rl_update": rl_update,
         }
+        consolidation = None
         if corrects_memory and correction:
             feedback_record["memory_event"] = self.store.record_event(
                 user_id=user_id,
@@ -336,9 +428,15 @@ class EpisodeProcessor:
                 episode_id=episode_id,
                 episode_result=episode_result,
                 actual_action=actual_action,
+                action_params=action_params or {},
+                spontaneity=spontaneity,
+                intervention_result=intervention_result or feedback,
                 reward=reward,
             )
+            consolidation = self._maybe_promote_behavior_pattern(user_id, pattern_update)
+            feedback_record["memory_consolidation"] = consolidation
         self._append_episode_jsonl(user_id, episode_id, "feedback.jsonl", feedback_record)
+        self._close_episode_result(user_id, episode_id, episode_result, feedback_record)
         return feedback_record
 
     def _apply_memory_operations(
@@ -374,12 +472,20 @@ class EpisodeProcessor:
             return None
         return observation_context.observed_at[:10]
 
+    def _feedback_created_at(self, episode_result: dict) -> str:
+        observation = episode_result.get("observation") or {}
+        observed_at = str(observation.get("observed_at") or "")
+        return observed_at or utc_now()
+
     def _record_case_memory(
         self,
         user_id: str,
         episode_id: str,
         episode_result: dict,
         actual_action: str,
+        action_params: dict,
+        spontaneity: str,
+        intervention_result: str,
         reward: float,
     ) -> dict:
         scene = str(episode_result.get("retrieval_query") or episode_result.get("scene") or "")
@@ -389,8 +495,14 @@ class EpisodeProcessor:
         text = "\n".join(
             [
                 f"Scene: {scene}",
+                f"Scene features: {json.dumps(self._scene_features(episode_result), ensure_ascii=False, sort_keys=True)}",
+                f"Predicted candidates: {json.dumps(self._predicted_candidate_snapshot(episode_result), ensure_ascii=False, sort_keys=True)}",
                 f"Predicted action: {predicted_action}",
                 f"Actual action: {actual_action}",
+                f"Action params: {json.dumps(action_params, ensure_ascii=False, sort_keys=True)}",
+                f"Spontaneity: {spontaneity}",
+                f"Intervention: {prediction.get('recommended_intervention', '')}",
+                f"Intervention result: {intervention_result}",
                 f"Reward: {reward}",
                 f"Episode: {episode_id}",
             ]
@@ -411,6 +523,156 @@ class EpisodeProcessor:
             "actual_action": actual_action,
             "predicted_action": predicted_action,
         }
+
+    def _scene_features(self, episode_result: dict) -> dict:
+        observation = episode_result.get("observation") or {}
+        if not isinstance(observation, dict):
+            return {}
+        environment = observation.get("environment") if isinstance(observation.get("environment"), dict) else {}
+        return {
+            "location": observation.get("location"),
+            "activity": observation.get("activity"),
+            "time_bucket": observation.get("time_of_day"),
+            "duration_minutes": observation.get("computed_duration_minutes"),
+            "thermal_level": observation.get("thermal_level"),
+            "signals": observation.get("signals", []),
+            "environment": environment,
+        }
+
+    def _predicted_candidate_snapshot(self, episode_result: dict) -> list[dict]:
+        snapshot = []
+        for candidate in episode_result.get("ranked_candidates", [])[:8]:
+            snapshot.append(
+                {
+                    "action": candidate.get("action"),
+                    "score": candidate.get("score"),
+                    "prior": candidate.get("prior"),
+                    "sources": candidate.get("sources", []),
+                }
+            )
+        return snapshot
+
+    def _maybe_promote_behavior_pattern(self, user_id: str, pattern_update: dict | None) -> dict | None:
+        if not pattern_update:
+            return None
+        pattern_uri = str(pattern_update.get("pattern_uri", ""))
+        if not pattern_uri:
+            return None
+        path = self.store.root / pattern_uri
+        if not path.exists():
+            return None
+        pattern = json.loads(path.read_text(encoding="utf-8"))
+        if not self._pattern_ready_for_long_term_memory(pattern):
+            return {
+                "promoted": False,
+                "reason": "insufficient repeated evidence",
+                "pattern_uri": pattern_uri,
+                "sample_count": int(pattern.get("sample_count", 0)),
+                "distinct_days": int(pattern.get("distinct_days", 0)),
+                "evidence_confidence": float(pattern.get("evidence_confidence", 0.0)),
+            }
+        action = str(pattern.get("action", ""))
+        domain = str(pattern.get("domain", "general"))
+        group_id = str(pattern.get("group_id", ""))
+        title = f"Behavior pattern: {action} in {domain}"
+        text = "\n".join(
+            [
+                f"When context matches behavior group {group_id}, the user's observed actual action is usually {action}.",
+                f"Domain: {domain}",
+                f"Samples: {int(pattern.get('sample_count', 0))}",
+                f"Distinct days: {int(pattern.get('distinct_days', 0))}",
+                f"Average reward: {float(pattern.get('average_reward', 0.0)):.3f}",
+                f"Evidence confidence: {float(pattern.get('evidence_confidence', 0.0)):.3f}",
+                f"Pattern URI: {pattern_uri}",
+            ]
+        )
+        tags = [
+            "habit",
+            "aggregated",
+            f"action:{action}",
+            f"domain:{domain}",
+            f"promoted_behavior_pattern:{group_id}",
+        ]
+        existing = self._existing_promoted_habit(user_id, group_id, action)
+        if existing:
+            update = self.store.update_memory(
+                existing["path"],
+                user_id=user_id,
+                title=title,
+                text=text,
+                tags=sorted(set([*existing.get("tags", []), *tags])),
+                metadata_patch={
+                    "confidence": float(pattern.get("evidence_confidence", 0.75)),
+                    "evidence_count": int(pattern.get("sample_count", 1)),
+                    "positive_count": int(pattern.get("sample_count", 1)),
+                    "negative_count": 0,
+                    "source": f"behavior_pattern:{pattern_uri}",
+                },
+            )
+            return {"promoted": True, "operation": "update", "uri": update["uri"], "pattern_uri": pattern_uri}
+        item = MemoryItem(
+            user_id=user_id,
+            memory_type="habit",
+            title=title,
+            text=text,
+            tags=tags,
+            source=f"behavior_pattern:{pattern_uri}",
+            confidence=float(pattern.get("evidence_confidence", 0.75)),
+            evidence_count=int(pattern.get("sample_count", 1)),
+            positive_count=int(pattern.get("sample_count", 1)),
+            negative_count=0,
+        )
+        created_path = self.store.add_memory(item)
+        return {
+            "promoted": True,
+            "operation": "create",
+            "uri": str(created_path.relative_to(self.store.root).as_posix()),
+            "pattern_uri": pattern_uri,
+        }
+
+    def _pattern_ready_for_long_term_memory(self, pattern: dict) -> bool:
+        return (
+            int(pattern.get("sample_count", 0)) >= 3
+            and int(pattern.get("distinct_days", 0)) >= 2
+            and float(pattern.get("average_reward", 0.0)) >= 0.5
+            and float(pattern.get("evidence_confidence", 0.0)) >= 0.65
+            and float(pattern.get("action_ratio", 1.0)) >= 0.6
+        )
+
+    def _existing_promoted_habit(self, user_id: str, group_id: str, action: str) -> dict | None:
+        rows = self.store.hybrid_search(
+            f"{group_id} {action}",
+            user_id=user_id,
+            memory_type="habit",
+            limit=8,
+        )
+        target_tag = f"promoted_behavior_pattern:{group_id}"
+        action_tag = f"action:{action}"
+        for row in rows:
+            tags = {str(tag) for tag in row.get("tags", [])}
+            if target_tag in tags and action_tag in tags:
+                return row
+        return None
+
+    def _close_episode_result(
+        self,
+        user_id: str,
+        episode_id: str,
+        episode_result: dict,
+        feedback_record: dict,
+    ) -> None:
+        if not episode_result:
+            return
+        closed = dict(episode_result)
+        closed["episode_status"] = "closed_with_feedback"
+        closed["closed_at"] = feedback_record["created_at"]
+        closed["actual_action"] = feedback_record.get("actual_action")
+        closed["action_params"] = feedback_record.get("action_params", {})
+        closed["spontaneity"] = feedback_record.get("spontaneity", "unknown")
+        closed["feedback"] = feedback_record.get("feedback")
+        closed["reward"] = feedback_record.get("reward")
+        closed["feedback_record"] = feedback_record
+        self._write_episode_file(user_id, episode_id, "episode_result.json", closed)
 
     def _apply_memory_correction(
         self,

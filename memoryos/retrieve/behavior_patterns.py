@@ -37,6 +37,12 @@ class BehaviorPatternStore:
         actual_action: str,
         reward: float,
         created_at: str | None = None,
+        predicted_candidates: list[dict] | None = None,
+        action_params: dict | None = None,
+        scene_features: dict | None = None,
+        spontaneity: str = "unknown",
+        intervention: str = "",
+        intervention_result: str = "",
     ) -> dict:
         created_at = created_at or utc_now()
         domain = self._domain(context_tags, retrieval_query)
@@ -62,8 +68,14 @@ class BehaviorPatternStore:
             "created_at": created_at,
             "retrieval_query": retrieval_query,
             "context_tags": context_tags,
+            "scene_features": scene_features or {},
+            "predicted_candidates": predicted_candidates or [],
             "predicted_action": predicted_action,
             "actual_action": actual_action,
+            "action_params": action_params or {},
+            "spontaneity": spontaneity,
+            "intervention": intervention,
+            "intervention_result": intervention_result,
             "reward": reward,
             "signatures": signatures,
         }
@@ -139,6 +151,7 @@ class BehaviorPatternStore:
                     "recent_30d_count": int(row.get("recent_30d_count", 0)),
                     "hotness": float(row.get("hotness", 0.0)),
                     "episodes": pattern.get("episodes", [])[-5:],
+                    "action_distribution": self._load_group_distribution(str(row.get("group_uri", ""))),
                 }
             )
         self._rerank_distribution(retrieval_query, items)
@@ -284,8 +297,17 @@ class BehaviorPatternStore:
                 {
                     "action": pattern.get("action"),
                     "sample_count": sample_count,
+                    "probability": round(ratio, 6),
                     "ratio": round(ratio, 6),
+                    "avg_reward": round(float(pattern.get("average_reward", 0.0)), 6),
+                    "average_reward": round(float(pattern.get("average_reward", 0.0)), 6),
                     "evidence_confidence": float(pattern.get("evidence_confidence", 0.0)),
+                    "confidence": float(pattern.get("evidence_confidence", 0.0)),
+                    "negative_count": self._negative_count(pattern),
+                    "last_seen_at": str(pattern.get("updated_at", "")),
+                    "recency_weight": self._recency_weight(str(pattern.get("updated_at", ""))),
+                    "param_distribution": self._param_distribution(pattern),
+                    "spontaneity_distribution": self._field_distribution(pattern, "spontaneity"),
                 }
             )
         action_distribution.sort(key=lambda item: item["sample_count"], reverse=True)
@@ -312,6 +334,7 @@ class BehaviorPatternStore:
             "top_action_margin": top_action_margin,
             "conflict_level": self._conflict_level(entropy, top_action_margin),
             "action_distribution": action_distribution,
+            "negative_actions": self._negative_actions(action_distribution),
             "patterns": [
                 {
                     "action": pattern.get("action"),
@@ -333,6 +356,80 @@ class BehaviorPatternStore:
             path = self._pattern_path(user_id, domain, group_id, str(pattern.get("action", "")))
             path.write_text(json.dumps(pattern, ensure_ascii=False, indent=2), encoding="utf-8")
             self._index_pattern(user_id, path, pattern)
+
+    def _load_group_distribution(self, group_uri: str) -> list[dict]:
+        if not group_uri:
+            return []
+        path = self.root / group_uri
+        group = self._load_pattern(path)
+        if not group:
+            return []
+        return list(group.get("action_distribution", []))
+
+    def _negative_count(self, pattern: dict) -> int:
+        episodes = pattern.get("episodes", [])
+        old = pattern.get("old_evidence_summary", {})
+        return sum(1 for episode in episodes if float(episode.get("reward", 0.0)) < 0) + int(old.get("negative_count", 0))
+
+    def _param_distribution(self, pattern: dict) -> dict:
+        counts: dict[str, dict[str, int]] = {}
+        for episode in pattern.get("episodes", []):
+            params = episode.get("action_params", {})
+            if not isinstance(params, dict):
+                continue
+            for key, value in params.items():
+                bucket = counts.setdefault(str(key), {})
+                bucket[str(value)] = bucket.get(str(value), 0) + 1
+        distribution = {}
+        for key, values in counts.items():
+            total = sum(values.values())
+            if total <= 0:
+                continue
+            distribution[key] = {
+                value: round(count / total, 6)
+                for value, count in sorted(values.items(), key=lambda item: item[1], reverse=True)
+            }
+        return distribution
+
+    def _field_distribution(self, pattern: dict, field_name: str) -> dict:
+        counts: dict[str, int] = {}
+        for episode in pattern.get("episodes", []):
+            value = str(episode.get(field_name, "") or "unknown")
+            counts[value] = counts.get(value, 0) + 1
+        total = sum(counts.values())
+        if total <= 0:
+            return {}
+        return {
+            value: round(count / total, 6)
+            for value, count in sorted(counts.items(), key=lambda item: item[1], reverse=True)
+        }
+
+    def _negative_actions(self, action_distribution: list[dict]) -> dict:
+        negative = {}
+        for item in action_distribution:
+            negative_count = int(item.get("negative_count", 0))
+            avg_reward = float(item.get("avg_reward", item.get("average_reward", 0.0)))
+            if negative_count <= 0 and avg_reward >= 0:
+                continue
+            action = str(item.get("action", ""))
+            negative[action] = {
+                "negative_count": negative_count,
+                "avg_reward": avg_reward,
+                "confidence": float(item.get("confidence", 0.0)),
+            }
+        return negative
+
+    def _recency_weight(self, value: str) -> float:
+        if not value:
+            return 0.0
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return 0.0
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        age_days = max((datetime.now(timezone.utc) - parsed).total_seconds() / 86400.0, 0.0)
+        return round(max(0.0, min(1.0, 1.0 / (1.0 + age_days / 14.0))), 6)
 
     def _refresh_layers(self, user_id: str) -> None:
         behavior_root = self.root / "user" / user_id / "behavior"
@@ -429,6 +526,7 @@ class BehaviorPatternStore:
             "sample_count": 0,
             "total_reward": 0.0,
             "total_support": 0.0,
+            "negative_count": 0,
             "distinct_days": [],
             "first_seen": "",
             "last_seen": "",
@@ -455,6 +553,8 @@ class BehaviorPatternStore:
                 reward=float(item.get("reward", 0.0)),
                 created_at=created_at,
             )
+            if float(item.get("reward", 0.0)) < 0:
+                summary["negative_count"] = int(summary.get("negative_count", 0)) + 1
             days.add(self._day(created_at))
             if not first_seen or created_at < first_seen:
                 first_seen = created_at

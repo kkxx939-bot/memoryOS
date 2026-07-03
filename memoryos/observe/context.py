@@ -68,6 +68,9 @@ class ObservationContext:
         temperature = self._number_from_environment("temperature")
         if temperature is not None:
             tags.append(f"temperature_{round(temperature)}")
+            thermal = self.thermal_level()
+            if thermal:
+                tags.append(thermal)
             if temperature >= 28:
                 tags.append("hot_environment")
             elif temperature <= 16:
@@ -128,10 +131,38 @@ class ObservationContext:
             "duration_minutes": self.duration_minutes,
             "computed_duration_minutes": self.computed_duration_minutes(),
             "time_of_day": self.time_of_day(),
+            "thermal_level": self.thermal_level(),
             "signals": self.signals,
             "environment": self.environment,
             "context_tags": self.context_tags(),
         }
+
+    def scene_features(self) -> dict:
+        return {
+            "location": self.location,
+            "activity": self.activity,
+            "time_bucket": self.time_of_day(),
+            "duration_minutes": self.computed_duration_minutes(),
+            "thermal_level": self.thermal_level(),
+            "signals": list(self.signals),
+            "environment": dict(self.environment),
+        }
+
+    def thermal_level(self) -> str | None:
+        temperature = self._number_from_environment("temperature")
+        if temperature is None:
+            return None
+        if temperature >= 30:
+            return "very_hot"
+        if temperature >= 27:
+            return "hot"
+        if temperature >= 24:
+            return "slightly_hot"
+        if temperature <= 12:
+            return "very_cold"
+        if temperature <= 16:
+            return "cold"
+        return "comfortable"
 
     def _number_from_environment(self, key: str) -> float | None:
         value = self.environment.get(key)
