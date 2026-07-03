@@ -19,6 +19,9 @@ from memoryos.domain.scene.scene_signature import stable_scene_signature
 from memoryos.interfaces.api.app import handle
 from memoryos.interfaces.hooks.memory_digest_hook import MemoryHook
 from memoryos.observability.audit_log import AuditLogger
+from memoryos.ports.providers.chat_provider import ChatRequest
+from memoryos.ports.providers.embedding_provider import EmbeddingResult, content_hash
+from memoryos.ports.providers.rerank_provider import RerankDocument
 from memoryos.services.learning.behavior_feedback import BehaviorStats
 from memoryos.services.learning.behavior_patterns import BehaviorPatternStore
 from memoryos.services.learning.rl_calibrator import ReinforcementPolicyLedger
@@ -41,30 +44,60 @@ from memoryos.workers.replay_worker import ReplayWorker
 
 
 class FakeProvider:
+    provider_name = "fake"
+    model = "fake-chat"
+
     def __init__(self, response: object) -> None:
         self.response = response
         self.prompt = ""
 
-    def complete(self, prompt: str) -> str:
-        self.prompt = prompt
+    def complete(self, request: ChatRequest | str) -> str:
+        self.prompt = request if isinstance(request, str) else request.messages[-1].content
         return json.dumps(self.response, ensure_ascii=False)
+
+    def health_check(self) -> dict[str, object]:
+        return {"ok": True, "provider": self.provider_name, "model": self.model}
 
 
 class FakeEmbeddingProvider:
+    provider_name = "fake"
+    model = "fake-embedding"
+    dimension = 3
+
     def embed(self, text: str) -> list[float]:
+        return self.embed_text(text).vector
+
+    def embed_text(self, text: str) -> EmbeddingResult:
         lowered = text.lower()
         if any(term in lowered for term in ("cooling", "air conditioning", "hot room")):
-            return [1.0, 0.0, 0.0]
-        if any(term in lowered for term in ("tea", "drink")):
-            return [0.0, 1.0, 0.0]
-        return [0.0, 0.0, 1.0]
+            vector = [1.0, 0.0, 0.0]
+        elif any(term in lowered for term in ("tea", "drink")):
+            vector = [0.0, 1.0, 0.0]
+        else:
+            vector = [0.0, 0.0, 1.0]
+        return EmbeddingResult(
+            vector=vector,
+            provider=self.provider_name,
+            model=self.model,
+            dimension=self.dimension,
+            content_hash=content_hash(text),
+        )
+
+    def embed_texts(self, texts: list[str]) -> list[EmbeddingResult]:
+        return [self.embed_text(text) for text in texts]
+
+    def health_check(self) -> dict[str, object]:
+        return {"ok": True, "provider": self.provider_name, "model": self.model}
 
 
 class FakeRerankProvider:
-    def rerank(self, query: str, documents: list[str]) -> list[float] | None:
+    provider_name = "fake"
+    model = "fake-rerank"
+
+    def rerank(self, query: str, documents: list[str] | list[RerankDocument]) -> list[float] | None:
         scores = []
         for document in documents:
-            lowered = document.lower()
+            lowered = document.text.lower() if isinstance(document, RerankDocument) else document.lower()
             if "cooling memory" in lowered or "actual=open_ac" in lowered:
                 scores.append(0.95)
             elif "tea memory" in lowered:
@@ -72,6 +105,9 @@ class FakeRerankProvider:
             else:
                 scores.append(0.2)
         return scores
+
+    def health_check(self) -> dict[str, object]:
+        return {"ok": True, "provider": self.provider_name, "model": self.model}
 
 
 class FakeObservationExtractor:

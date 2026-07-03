@@ -9,6 +9,7 @@ from memoryos.domain.memory.memory_item import utc_now
 from memoryos.domain.memory.update_policy import normalize_operation_for_policy
 from memoryos.ports.repositories.memory_repository import MemoryRepository
 from memoryos.services.memory.extractor import MemoryOperation
+from memoryos.services.memory.memory_operation_validator import MemoryOperationValidator
 from memoryos.services.memory.operation_resolver import MemoryOperationResolver, ResolvedMemoryOperation
 from memoryos.services.memory.operation_updater import MemoryOperationUpdater
 from memoryos.services.memory.schema import memory_type_spec
@@ -30,6 +31,7 @@ class MemoryUpdateService:
         self.min_evidence_days = min_evidence_days
         self.resolver = MemoryOperationResolver(store)
         self.updater = MemoryOperationUpdater(store)
+        self.validator = MemoryOperationValidator()
 
     def apply(self, operations: list[MemoryOperation], context: MemoryUpdateContext) -> dict:
         self.store.init(context.user_id)
@@ -62,6 +64,14 @@ class MemoryUpdateService:
     def _apply_one(self, operation: MemoryOperation, context: MemoryUpdateContext, diff_operations: dict[str, list]) -> None:
         if operation.action == "ignore":
             diff_operations["ignores"].append(self.operation_record(operation))
+            return
+
+        validation = self.validator.validate(operation, explicit_user_intent=context.explicit_user_intent)
+        if not validation.accepted:
+            record = self.operation_record(operation)
+            record["validation"] = validation.to_dict()
+            record["reason"] = validation.policy_decision
+            diff_operations["ignores"].append(record)
             return
 
         action, reason = normalize_operation_for_policy(
@@ -142,6 +152,14 @@ class MemoryUpdateService:
                 "memory_type": operation.memory_type,
                 "metadata": deletion["metadata"],
                 "deleted_content": deletion["deleted_content"],
+                "tombstone": deletion.get("tombstone"),
+                "index_delete_job": {
+                    "operation": "delete",
+                    "source_type": "memory",
+                    "source_id": deletion["metadata"].get("id", deletion["uri"]),
+                    "namespace": "memory",
+                    "status": "delete_pending",
+                },
                 "rationale": operation.rationale,
             }
         )

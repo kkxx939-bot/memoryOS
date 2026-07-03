@@ -7,6 +7,10 @@ def require_fields(payload: dict, fields: list[str]) -> None:
         raise ValueError(f"Missing required API payload field(s): {', '.join(missing)}")
 
 
+def require_user_payload(payload: dict) -> None:
+    require_fields(payload, ["user_id"])
+
+
 def optional_str_list(value: object) -> list[str]:
     if value is None:
         return []

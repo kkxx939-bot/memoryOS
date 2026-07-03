@@ -5,6 +5,7 @@ from memoryos.interfaces.api.episode_api import process_episode
 from memoryos.interfaces.api.feedback_api import record_feedback
 from memoryos.interfaces.api.health_api import health
 from memoryos.interfaces.api.memory_api import build_digest, delete_memory, search_memory
+from memoryos.interfaces.api.request_context import APIRequestContext
 from memoryos.interfaces.api.worker_api import (
     process_feedback_outbox,
     run_memory_consolidation,
@@ -30,7 +31,12 @@ def routes() -> dict[str, str]:
     }
 
 
-def handle(route: str, store: MemoryRepository, payload: dict | None = None) -> dict:
+def handle(
+    route: str,
+    store: MemoryRepository,
+    payload: dict | None = None,
+    context: APIRequestContext | None = None,
+) -> dict:
     payload = payload or {}
     if route not in routes():
         raise KeyError(f"Unknown API route: {route}")
@@ -41,13 +47,13 @@ def handle(route: str, store: MemoryRepository, payload: dict | None = None) -> 
     if route == "POST /episodes/feedback":
         return record_feedback(store, payload)
     if route == "POST /workers/feedback":
-        return process_feedback_outbox(store, payload)
+        return process_feedback_outbox(store, payload, context=context)
     if route == "POST /workers/reindex":
-        return run_reindex(store, payload)
+        return run_reindex(store, payload, context=context)
     if route == "POST /workers/replay":
-        return run_replay(store, payload)
+        return run_replay(store, payload, context=context)
     if route == "POST /workers/memory-consolidation":
-        return run_memory_consolidation(store, payload)
+        return run_memory_consolidation(store, payload, context=context)
     if route == "GET /memory/digest":
         return build_digest(store, payload)
     if route == "GET /memory/search":

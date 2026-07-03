@@ -1,0 +1,1 @@
+{"case_id":"hot_room_ac","query":"hot room sweating says hot","expected_ids":["memory_hot_room_ac"],"context_tags":["room","hot","sweating"]}

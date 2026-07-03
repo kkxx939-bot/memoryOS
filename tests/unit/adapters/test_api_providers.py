@@ -37,7 +37,7 @@ class APIProviderTest(unittest.TestCase):
             seen["authorization"] = request.headers.get("Authorization")
             return FakeHTTPResponse({"choices": [{"message": {"content": "{\"operations\": []}"}}]})
 
-        with patch("memoryos.adapters.providers.openai_compatible.urllib.request.urlopen", fake_urlopen):
+        with patch("memoryos.adapters.providers.openai_compatible.http_client.urllib.request.urlopen", fake_urlopen):
             provider = OpenAICompatibleChatProvider(
                 model="memory-llm",
                 base_url="https://api.example.test/v1",
@@ -61,10 +61,11 @@ class APIProviderTest(unittest.TestCase):
             seen["body"] = json.loads(request.data.decode("utf-8"))
             return FakeHTTPResponse({"data": [{"embedding": [3, 4]}]})
 
-        with patch("memoryos.adapters.providers.openai_compatible.urllib.request.urlopen", fake_urlopen):
+        with patch("memoryos.adapters.providers.openai_compatible.http_client.urllib.request.urlopen", fake_urlopen):
             provider = OpenAICompatibleEmbeddingProvider(
                 model="memory-embedding",
                 base_url="http://localhost:8000/v1",
+                normalize_embeddings=True,
             )
             result = provider.embed("hot room")
 
@@ -81,7 +82,7 @@ class APIProviderTest(unittest.TestCase):
             seen["body"] = json.loads(request.data.decode("utf-8"))
             return FakeHTTPResponse({"data": [{"embedding": [3, 4]}, {"embedding": [0, 5]}]})
 
-        with patch("memoryos.adapters.providers.openai_compatible.urllib.request.urlopen", fake_urlopen):
+        with patch("memoryos.adapters.providers.openai_compatible.http_client.urllib.request.urlopen", fake_urlopen):
             provider = OpenAICompatibleEmbeddingProvider(
                 model="memory-embedding",
                 base_url="http://localhost:8000/v1",
@@ -101,8 +102,8 @@ class APIProviderTest(unittest.TestCase):
             return FakeHTTPResponse({"choices": [{"message": {"content": "ok"}}]})
 
         with (
-            patch("memoryos.adapters.providers.openai_compatible.urllib.request.urlopen", fake_urlopen),
-            patch("memoryos.adapters.providers.openai_compatible.time.sleep", lambda _: None),
+            patch("memoryos.adapters.providers.openai_compatible.http_client.urllib.request.urlopen", fake_urlopen),
+            patch("memoryos.adapters.providers.openai_compatible.http_client.time.sleep", lambda _: None),
         ):
             provider = OpenAICompatibleChatProvider(
                 model="memory-llm",
@@ -130,7 +131,7 @@ class APIProviderTest(unittest.TestCase):
                 }
             )
 
-        with patch("memoryos.adapters.providers.openai_compatible.urllib.request.urlopen", fake_urlopen):
+        with patch("memoryos.adapters.providers.openai_compatible.http_client.urllib.request.urlopen", fake_urlopen):
             provider = OpenAICompatibleRerankProvider(
                 model="memory-rerank",
                 base_url="https://api.example.test/v1",

@@ -4,7 +4,7 @@ import json
 import re
 from dataclasses import dataclass, field
 
-from memoryos.services.memory.extractor import TextGenerationProvider
+from memoryos.ports.providers.chat_provider import ChatMessage, ChatProvider, ChatRequest, ModelResponse
 from memoryos.services.prediction.candidate_generator import CandidateGenerator
 from memoryos.services.prediction.candidate_ranker import CandidateRanker
 from memoryos.usecases.intervention.select_intervention import InterventionSelector
@@ -106,7 +106,7 @@ class RuleBasedPredictor:
 
 
 class JsonLLMPredictor:
-    def __init__(self, provider: TextGenerationProvider) -> None:
+    def __init__(self, provider: ChatProvider) -> None:
         self.provider = provider
 
     def predict(
@@ -115,8 +115,14 @@ class JsonLLMPredictor:
         memories: list[dict],
         available_actions: list[str],
     ) -> Prediction:
-        response = self.provider.complete(self.build_prompt(scene, memories))
-        payload = self._load_json(response)
+        response = self.provider.complete(
+            ChatRequest(
+                messages=[ChatMessage(role="user", content=self.build_prompt(scene, memories))],
+                prompt_version="prediction_v1",
+            )
+        )
+        text = response.text if isinstance(response, ModelResponse) else str(response)
+        payload = self._load_json(text)
         used_memories = payload.get("used_memories", [])
         if not isinstance(used_memories, list):
             raise ValueError("Prediction used_memories must be a list")

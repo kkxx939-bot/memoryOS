@@ -3,17 +3,11 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Protocol
 
 from memoryos.domain.memory.memory_item import MEMORY_TYPES
+from memoryos.ports.providers.chat_provider import ChatProvider, ModelResponse
 
 MEMORY_ACTIONS = {"add", "update", "delete", "ignore"}
-
-
-class TextGenerationProvider(Protocol):
-    def complete(self, prompt: str) -> str:
-        """Return a model response for the supplied prompt."""
-        ...
 
 
 @dataclass
@@ -104,7 +98,7 @@ class JsonLLMMemoryExtractor:
 
     injected_context_pattern = RuleBasedExtractor.injected_context_pattern
 
-    def __init__(self, provider: TextGenerationProvider) -> None:
+    def __init__(self, provider: ChatProvider) -> None:
         self.provider = provider
 
     def extract(self, messages: list[dict[str, str]]) -> list[MemoryOperation]:
@@ -112,8 +106,10 @@ class JsonLLMMemoryExtractor:
             {**message, "text": self.strip_injected_context(message.get("text", ""))}
             for message in messages
         ]
-        response = self.provider.complete(self.build_prompt(clean_messages))
-        return self.parse_response(response)
+        prompt = self.build_prompt(clean_messages)
+        response = self.provider.complete(prompt)
+        text = response.text if isinstance(response, ModelResponse) else str(response)
+        return self.parse_response(text)
 
     def build_prompt(self, messages: list[dict[str, str]]) -> str:
         transcript = "\n".join(
