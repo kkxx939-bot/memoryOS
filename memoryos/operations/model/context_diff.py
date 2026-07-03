@@ -1,0 +1,31 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from memoryos.core.ids import new_id
+from memoryos.core.time import utc_now
+from memoryos.operations.model.context_operation import ContextOperation
+
+
+@dataclass
+class ContextDiff:
+    user_id: str
+    operations: list[ContextOperation] = field(default_factory=list)
+    diff_id: str = ""
+    created_at: str = ""
+    schema_version: str = "context_diff_v1"
+
+    def __post_init__(self) -> None:
+        if not self.diff_id:
+            self.diff_id = new_id("diff")
+        if not self.created_at:
+            self.created_at = utc_now()
+
+    def to_dict(self) -> dict:
+        return {
+            "diff_id": self.diff_id,
+            "user_id": self.user_id,
+            "created_at": self.created_at,
+            "schema_version": self.schema_version,
+            "operations": [operation.to_dict() for operation in self.operations],
+        }
