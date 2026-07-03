@@ -133,7 +133,7 @@ User may want to smoke after sitting at the computer for a long time.
 | `event` | `append_only` | 事件是证据，不改写 |
 | `case` | `replace_or_version` | 相似案例可替换或版本化 |
  
-当前代码里的 `memoryos/storage/update_policy.py` 固化了这些规则。后续 extractor 产生 memory operation 后，应该先经过 update policy，再决定是否写入、转换为 event evidence、忽略或要求用户确认。
+当前代码里的 `memoryos/domain/memory/update_policy.py` 固化了这些规则。后续 extractor 产生 memory operation 后，应该先经过 update policy，再决定是否写入、转换为 event evidence、忽略或要求用户确认。
 
 下一步应该做：
 

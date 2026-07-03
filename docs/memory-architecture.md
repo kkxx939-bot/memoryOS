@@ -77,9 +77,9 @@ candidate generation -> feature scoring -> ranking -> top prediction
 候选生成和排序是两个模块：
 
 ```text
-memoryos/predict/candidates.py     -> 生成用户行为候选
-memoryos/predict/ranking.py        -> 对用户行为候选提特征并排序
-memoryos/predict/interventions.py  -> 根据 top 行为候选选择系统动作
+memoryos/application/prediction/candidate_generator.py      -> 生成用户行为候选
+memoryos/application/prediction/candidate_ranker.py         -> 对用户行为候选提特征并排序
+memoryos/application/intervention/intervention_selector.py  -> 根据 top 行为候选选择系统动作
 ```
 
 候选必须尽量全，排序才能工作。候选生成采用 pattern-first：

@@ -160,22 +160,33 @@ python3 main.py commit-session --root ./memory-root --user gulf --session demo
 - `记住: ...`
 - `remember: ...`
 
-后续可以把 `memoryos/session/memory/extractor.py` 里的 `RuleBasedExtractor` 替换成 `JsonLLMMemoryExtractor`。它不绑定具体模型 SDK，只要求 provider 返回 JSON memory operations。
+后续可以把 `memoryos/application/memory/extractor.py` 里的 `RuleBasedExtractor` 替换成 `JsonLLMMemoryExtractor`。它不绑定具体模型 SDK，只要求 provider 返回 JSON memory operations。
 
 ## 代码结构
 
 ```text
 memoryos/
-├── core/             # 通用 path/namespace/id 等基础能力预留
-├── session/          # EpisodeProcessor、SessionManager 会话编排
-│   └── memory/       # schema、merge、update、extractor、MemoryItem
-├── retrieve/         # memory context、behavior pattern、behavior feedback、digest hook
-├── predict/          # candidates、ranking、interventions、policy stats、predictors
-├── storage/          # MemoryStore、storage plan、update policy
-├── models/           # OpenAI-compatible LLM/embedding provider
-├── observe/          # ObservationContext 等观察上下文模型
-├── schemas/          # YAML memory type schema
-└── interfaces/       # CLI、本地调试入口
+├── domain/           # 业务对象和稳定规则：action、scene、memory、behavior、feedback、policy
+├── application/      # 业务流程编排：episode、session、memory、retrieval、prediction、intervention、feedback、learning
+├── infrastructure/   # 技术实现：repository、本地索引、provider、path safety
+├── interfaces/       # CLI、API、agent hook 等外部入口
+├── workers/          # 后台任务入口预留：feedback、pattern、memory、replay
+├── observability/    # audit、metrics、tracing、event log 预留
+├── config/           # 配置和依赖装配预留
+├── shared/           # 低层通用工具预留
+└── schemas/          # YAML memory type schema
+```
+
+当前仍然是本地 Markdown + SQLite 实现，但代码边界已经按生产生命周期拆开：
+
+```text
+Observation
+  -> application/retrieval
+  -> application/prediction
+  -> application/intervention + policy gate
+  -> application/feedback
+  -> application/learning
+  -> application/memory consolidation
 ```
 
 ## Hook 注入边界

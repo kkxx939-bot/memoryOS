@@ -1,0 +1,602 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from memoryos.domain.actions.action_schema import ACTION_SCHEMA_VERSION
+from memoryos.application.episode.episode_state_machine import (
+    CLOSED,
+    CREATED,
+    EPISODE_STATE_VERSION,
+    FEEDBACK_PENDING,
+    FEEDBACK_RECEIVED,
+    INTERVENTION_SELECTED,
+    LEARNING_APPLIED,
+    LEARNING_QUEUED,
+    OBSERVED,
+    PREDICTED,
+    RETRIEVED,
+)
+from memoryos.domain.feedback.reward_result import REWARD_MODEL_VERSION, compute_rewards
+from memoryos.application.feedback.feedback_event_store import FeedbackEventStore
+from memoryos.application.learning.learning_service import LearningProcessor
+from memoryos.application.intervention.policy_gate import POLICY_VERSION
+from memoryos.domain.memory.memory_item import utc_now
+from memoryos.application.memory.extractor import MemoryOperation, RuleBasedExtractor
+from memoryos.application.prediction.candidate_generator import Candidate
+from memoryos.application.intervention.intervention_selector import InterventionDecision, InterventionSelector
+from memoryos.application.learning.intervention_policy_stats import PolicyStats
+from memoryos.application.prediction.prediction_service import Prediction, RuleBasedPredictor
+from memoryos.application.learning.rl_calibrator import PolicyState, ReinforcementPolicyLedger
+from memoryos.application.retrieval.retrieval_service import RetrievalOrchestrator
+from memoryos.domain.scene.observation import ObservationContext
+from memoryos.infrastructure.repositories.memory_repository import MemoryStore
+from memoryos.infrastructure.safety.path_safety import validate_identifier
+from memoryos.application.memory.update_service import MemoryUpdateContext, MemoryUpdateService
+
+
+class EpisodeProcessor:
+    def __init__(
+        self,
+        store: MemoryStore,
+        extractor=None,
+        predictor=None,
+    ) -> None:
+        self.store = store
+        self.extractor = extractor or RuleBasedExtractor()
+        self.predictor = predictor or RuleBasedPredictor()
+        self.intervention_selector = InterventionSelector()
+        self.memory_updates = MemoryUpdateService(store)
+
+    def process(
+        self,
+        user_id: str,
+        episode_id: str,
+        scene: str | None = None,
+        observation: ObservationContext | dict | None = None,
+        messages: list[dict[str, str]] | None = None,
+        available_actions: list[str] | None = None,
+        retrieval_limit: int = 8,
+        memory_write_timing: str | None = None,
+        episode_log_timing: str = "before_prediction",
+        memory_commit_timing: str = "after_feedback",
+    ) -> dict:
+        validate_identifier(user_id, "user_id")
+        validate_identifier(episode_id, "episode_id")
+        self.store.init(user_id)
+        if episode_log_timing != "before_prediction":
+            raise ValueError("episode_log_timing must be before_prediction")
+        if memory_commit_timing not in {"after_feedback", "explicit_or_after_feedback", "before_prediction", "deferred"}:
+            raise ValueError(
+                "memory_commit_timing must be after_feedback, explicit_or_after_feedback, before_prediction, or deferred"
+            )
+        if memory_write_timing is not None:
+            memory_commit_timing = self._legacy_memory_commit_timing(memory_write_timing)
+        observation_context = self._observation_context(observation)
+        if observation_context is None and scene is None:
+            raise ValueError("scene or observation is required")
+        scene_text = observation_context.to_scene_text() if observation_context else str(scene)
+        retrieval_query = observation_context.to_retrieval_query() if observation_context else scene_text
+        context_tags = observation_context.context_tags() if observation_context else []
+        available_actions = available_actions or ["ask_user", "do_nothing"]
+        input_messages = messages or [{"role": "observation", "text": scene_text, "created_at": utc_now()}]
+        memory_operations = self.extractor.extract(input_messages)
+        explicit_memory_operations = self._explicit_memory_operations(memory_operations, input_messages)
+        explicit_operation_ids = {id(operation) for operation in explicit_memory_operations}
+        draft_memory_operations = [
+            operation for operation in memory_operations if id(operation) not in explicit_operation_ids
+        ]
+        prediction_state_history = self._state_history(
+            [
+                (CREATED, "episode accepted"),
+                (OBSERVED, "raw observation logged"),
+            ]
+        )
+
+        self._write_episode_file(
+            user_id,
+            episode_id,
+            "episode_log.json",
+            {
+                "episode_id": episode_id,
+                "status": "pending",
+                "episode_state": OBSERVED,
+                "state_history": prediction_state_history,
+                "versions": self._versions(),
+                "created_at": utc_now(),
+                "scene": scene_text,
+                "observation": observation_context.to_dict() if observation_context else None,
+                "retrieval_query": retrieval_query,
+                "context_tags": context_tags,
+                "messages": input_messages,
+            },
+        )
+
+        if memory_commit_timing == "before_prediction":
+            memory_diff = self._apply_memory_operations(user_id, episode_id, memory_operations, observation_context)
+        elif memory_commit_timing in {"after_feedback", "explicit_or_after_feedback"} and explicit_memory_operations:
+            memory_diff = self._apply_memory_operations(user_id, episode_id, explicit_memory_operations, observation_context)
+        else:
+            memory_diff = self._empty_memory_diff(episode_id)
+
+        retrieval = RetrievalOrchestrator(self.store, self._behavior_stats_path(user_id)).retrieve(
+            user_id=user_id,
+            query=retrieval_query,
+            context_tags=context_tags,
+            retrieval_limit=retrieval_limit,
+        )
+        memories = retrieval.memories_for_prediction()
+        policy_stats = PolicyStats(self._policy_stats_path(user_id)).load()
+        rl_ledger = ReinforcementPolicyLedger(self._rl_ledger_path(user_id))
+        rl_state = rl_ledger.build_state(
+            scene=scene_text,
+            context_tags=context_tags,
+            memories=memories,
+            behavior_patterns=retrieval.behavior_patterns,
+        )
+        action_universe = self._action_universe(available_actions, memories, retrieval.behavior_patterns, retrieval.behavior_distribution)
+        rl_action_scores = rl_ledger.action_scores(rl_state, action_universe)
+        ranked_candidates = self._rank_candidates(
+            scene_text,
+            memories,
+            available_actions,
+            policy_stats,
+            retrieval.behavior_patterns,
+            retrieval.behavior_distribution,
+            rl_action_scores,
+        )
+        intervention = self.intervention_selector.select(
+            ranked_candidates[0] if ranked_candidates else None,
+            available_actions,
+            policy_stats,
+        )
+        prediction = self._prediction_from_candidates(ranked_candidates, intervention)
+        prediction_state_history = self._state_history(
+            [
+                (CREATED, "episode accepted"),
+                (OBSERVED, "raw observation logged"),
+                (RETRIEVED, "historical memory and behavior context retrieved"),
+                (PREDICTED, "behavior candidates ranked"),
+                (INTERVENTION_SELECTED, "policy-gated intervention selected"),
+                (FEEDBACK_PENDING, "waiting for actual action or user feedback"),
+            ]
+        )
+        rl_prediction = rl_ledger.record_prediction(
+            user_id=user_id,
+            episode_id=episode_id,
+            state=rl_state,
+            candidates=ranked_candidates,
+            selected_action=prediction.predicted_action,
+            intervention_action=intervention.action,
+            action_scores=rl_action_scores,
+        )
+
+        pending_memory_operations = []
+        if memory_commit_timing == "deferred":
+            pending_source_operations = memory_operations
+        else:
+            pending_source_operations = draft_memory_operations
+        if memory_commit_timing in {"after_feedback", "explicit_or_after_feedback", "deferred"}:
+            pending_memory_operations = [
+                self.memory_updates.operation_record(operation)
+                for operation in pending_source_operations
+            ]
+
+        result = {
+            "episode_id": episode_id,
+            "episode_status": "predicted",
+            "episode_state": FEEDBACK_PENDING,
+            "state_history": prediction_state_history,
+            "versions": self._versions(),
+            "processed_at": utc_now(),
+            "scene": scene_text,
+            "observation": observation_context.to_dict() if observation_context else None,
+            "retrieval_query": retrieval_query,
+            "context_tags": context_tags,
+            "episode_log_timing": episode_log_timing,
+            "memory_commit_timing": memory_commit_timing,
+            "memory_write_timing": memory_write_timing,
+            "memory_diff": memory_diff,
+            "pending_memory_operations": pending_memory_operations,
+            "retrieval": retrieval.to_dict(),
+            "memory_context": retrieval.memory_context.to_dict(),
+            "architecture_layers": self._architecture_layers(
+                memories=memories,
+                retrieval=retrieval,
+                rl_state=rl_state,
+                intervention=intervention,
+            ),
+            "rl_state": rl_state.to_dict(),
+            "rl_prediction": rl_prediction,
+            "ranked_candidates": [candidate.to_dict() for candidate in ranked_candidates],
+            "behavior_patterns": retrieval.behavior_patterns,
+            "behavior_distribution": retrieval.behavior_distribution,
+            "intervention": intervention.to_dict(),
+            "prediction": prediction.to_dict(),
+            "retrieved_memories": [
+                {
+                    "id": memory["id"],
+                    "path": memory["path"],
+                    "type": memory["type"],
+                    "title": memory["title"],
+                    "score": memory.get("score"),
+                }
+                for memory in memories
+            ],
+        }
+        self._write_episode_file(user_id, episode_id, "episode_result.json", result)
+        if pending_memory_operations:
+            self._write_episode_file(
+                user_id,
+                episode_id,
+                "pending_memory_operations.json",
+                {"episode_id": episode_id, "operations": pending_memory_operations},
+            )
+        return result
+
+    def _legacy_memory_commit_timing(self, memory_write_timing: str) -> str:
+        mapping = {
+            "before_prediction": "before_prediction",
+            "after_prediction": "explicit_or_after_feedback",
+            "deferred": "deferred",
+        }
+        if memory_write_timing not in mapping:
+            raise ValueError("memory_write_timing must be before_prediction, after_prediction, or deferred")
+        return mapping[memory_write_timing]
+
+    def _explicit_memory_operations(
+        self,
+        operations: list[MemoryOperation],
+        messages: list[dict[str, str]],
+    ) -> list[MemoryOperation]:
+        if self._messages_contain_explicit_memory_marker(messages):
+            return operations
+        explicit = []
+        for operation in operations:
+            tags = {str(tag) for tag in operation.tags}
+            if "explicit_user_intent" in tags or "user_confirmed" in tags:
+                explicit.append(operation)
+        return explicit
+
+    def _messages_contain_explicit_memory_marker(self, messages: list[dict[str, str]]) -> bool:
+        markers = getattr(self.extractor, "markers", ("记住：", "记住:", "remember:", "Remember:"))
+        for message in messages:
+            text = str(message.get("text", ""))
+            if any(marker in text for marker in markers):
+                return True
+        return False
+
+    def _observation_context(self, observation: ObservationContext | dict | None) -> ObservationContext | None:
+        if observation is None:
+            return None
+        if isinstance(observation, ObservationContext):
+            return observation
+        allowed = {
+            "raw_text",
+            "location",
+            "activity",
+            "started_at",
+            "observed_at",
+            "duration_minutes",
+            "signals",
+            "environment",
+        }
+        return ObservationContext(**{key: value for key, value in observation.items() if key in allowed})
+
+    def _rank_candidates(
+        self,
+        scene: str,
+        memories: list[dict],
+        available_actions: list[str],
+        policy_stats: dict,
+        behavior_patterns: list[dict],
+        behavior_distribution: list[dict],
+        rl_action_scores: dict[str, float],
+    ) -> list[Candidate]:
+        if hasattr(self.predictor, "rank"):
+            return self.predictor.rank(
+                scene,
+                memories,
+                available_actions,
+                policy_stats,
+                behavior_patterns=behavior_patterns,
+                behavior_distribution=behavior_distribution,
+                rl_action_scores=rl_action_scores,
+            )
+        prediction = self.predictor.predict(scene, memories, available_actions)
+        return [
+            Candidate(
+                action=prediction.predicted_action,
+                need=prediction.predicted_need,
+                prior=prediction.confidence,
+                score=prediction.confidence,
+                reason=prediction.reason,
+                used_memories=prediction.used_memories,
+            )
+        ]
+
+    def _prediction_from_candidates(self, candidates: list[Candidate], intervention: InterventionDecision) -> Prediction:
+        if not candidates:
+            return Prediction(
+                predicted_action="unknown",
+                predicted_need="unknown",
+                confidence=0.0,
+                recommended_intervention=intervention.action,
+                reason="No candidates generated.",
+            )
+        top = candidates[0]
+        return Prediction(
+            predicted_action=top.action,
+            predicted_need=top.need,
+            confidence=max(0.0, min(1.0, top.score)),
+            recommended_intervention=intervention.action,
+            reason=top.reason,
+            used_memories=top.used_memories,
+        )
+
+    def commit_pending_memory(self, user_id: str, episode_id: str) -> dict:
+        validate_identifier(user_id, "user_id")
+        validate_identifier(episode_id, "episode_id")
+        path = self._episode_dir(user_id, episode_id) / "pending_memory_operations.json"
+        if not path.exists():
+            return self._empty_memory_diff(episode_id)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        operations = [
+            MemoryOperation(
+                action=raw["action"],
+                memory_type=raw["memory_type"],
+                title=raw["title"],
+                text=raw["text"],
+                tags=raw["tags"],
+                confidence=float(raw["confidence"]),
+                target=raw.get("target"),
+                rationale=raw.get("rationale", ""),
+                page_id=raw.get("page_id"),
+                links=raw.get("links", []),
+            )
+            for raw in payload.get("operations", [])
+        ]
+        episode_result = self._read_episode_result(user_id, episode_id)
+        observation_context = self._observation_context(episode_result.get("observation"))
+        diff = self._apply_memory_operations(user_id, episode_id, operations, observation_context)
+        path.unlink()
+        return diff
+
+    def record_feedback(
+        self,
+        user_id: str,
+        episode_id: str,
+        feedback: str,
+        reward: float,
+        actual_action: str | None = None,
+        action_params: dict | None = None,
+        spontaneity: str = "unknown",
+        intervention_result: str = "",
+        correction: str | None = None,
+        corrects_memory: bool = False,
+    ) -> dict:
+        validate_identifier(user_id, "user_id")
+        validate_identifier(episode_id, "episode_id")
+        self.store.init(user_id)
+        reward = max(-1.0, min(1.0, float(reward)))
+        episode_result = self._read_episode_result(user_id, episode_id)
+        prediction = episode_result.get("prediction", {})
+        predicted_action = str(prediction.get("predicted_action", "unknown"))
+        recommended_intervention = str(prediction.get("recommended_intervention", "unknown"))
+        created_at = self._feedback_created_at(episode_result)
+        reward_breakdown = compute_rewards(
+            predicted_action=predicted_action,
+            actual_action=actual_action,
+            user_reward=reward,
+            intervention_action=recommended_intervention,
+            intervention_result=intervention_result or feedback,
+            actual_params=action_params or {},
+        )
+        event_payload = {
+            "user_id": user_id,
+            "episode_id": episode_id,
+            "created_at": created_at,
+            "feedback": feedback,
+            "reward": reward,
+            "reward_breakdown": reward_breakdown.to_dict(),
+            "predicted_action": predicted_action,
+            "actual_action": actual_action,
+            "action_params": action_params or {},
+            "spontaneity": spontaneity,
+            "intervention_result": intervention_result,
+            "recommended_intervention": recommended_intervention,
+            "correction": correction,
+            "corrects_memory": corrects_memory,
+        }
+        event_store = FeedbackEventStore(self.store.root)
+        feedback_event = event_store.append_feedback_event(user_id, episode_id, event_payload)
+        outbox_event = event_store.append_outbox_event(user_id, feedback_event)
+        feedback_record = LearningProcessor(self.store).apply_feedback_event(feedback_event, episode_result)
+        feedback_record["feedback_event"] = {
+            "event_id": feedback_event["event_id"],
+            "event_type": feedback_event["event_type"],
+            "created_at": feedback_event["created_at"],
+        }
+        feedback_record["outbox_event"] = event_store.mark_outbox_applied(outbox_event)
+        feedback_record["learning_status"] = "applied_sync_local"
+        self._append_episode_jsonl(user_id, episode_id, "feedback.jsonl", feedback_record)
+        self._close_episode_result(user_id, episode_id, episode_result, feedback_record)
+        return feedback_record
+
+    def _apply_memory_operations(
+        self,
+        user_id: str,
+        episode_id: str,
+        extracted: list[MemoryOperation],
+        observation_context: ObservationContext | None = None,
+    ) -> dict:
+        diff = self.memory_updates.apply(
+            extracted,
+            MemoryUpdateContext(
+                user_id=user_id,
+                source=f"episode:{episode_id}",
+                diff_id=episode_id,
+                day=self._memory_update_day(observation_context),
+            ),
+        )
+        diff["episode_id"] = episode_id
+        self._write_episode_file(user_id, episode_id, "memory_diff.json", diff)
+        return diff
+
+    def _empty_memory_diff(self, episode_id: str) -> dict:
+        diff = self.memory_updates.empty_diff(episode_id)
+        diff["episode_id"] = episode_id
+        return diff
+
+    def _operation_record(self, memory: MemoryOperation) -> dict:
+        return self.memory_updates.operation_record(memory)
+
+    def _memory_update_day(self, observation_context: ObservationContext | None) -> str | None:
+        if not observation_context or not observation_context.observed_at:
+            return None
+        return observation_context.observed_at[:10]
+
+    def _feedback_created_at(self, episode_result: dict) -> str:
+        observation = episode_result.get("observation") or {}
+        observed_at = str(observation.get("observed_at") or "")
+        return observed_at or utc_now()
+
+    def _close_episode_result(
+        self,
+        user_id: str,
+        episode_id: str,
+        episode_result: dict,
+        feedback_record: dict,
+    ) -> None:
+        if not episode_result:
+            return
+        closed = dict(episode_result)
+        closed["episode_status"] = "closed_with_feedback"
+        closed["episode_state"] = CLOSED
+        closed["state_history"] = self._append_state_history(
+            episode_result.get("state_history", []),
+            [
+                (FEEDBACK_RECEIVED, "feedback event recorded"),
+                (LEARNING_QUEUED, "learning event appended to local outbox"),
+                (LEARNING_APPLIED, "learning processor applied feedback event"),
+                (CLOSED, "episode closed after feedback learning"),
+            ],
+        )
+        closed["versions"] = self._versions()
+        closed["closed_at"] = feedback_record["created_at"]
+        closed["actual_action"] = feedback_record.get("actual_action")
+        closed["action_params"] = feedback_record.get("action_params", {})
+        closed["spontaneity"] = feedback_record.get("spontaneity", "unknown")
+        closed["feedback"] = feedback_record.get("feedback")
+        closed["reward"] = feedback_record.get("reward")
+        closed["feedback_record"] = feedback_record
+        self._write_episode_file(user_id, episode_id, "episode_result.json", closed)
+
+    def _action_universe(
+        self,
+        available_actions: list[str],
+        memories: list[dict],
+        behavior_patterns: list[dict],
+        behavior_distribution: list[dict],
+    ) -> list[str]:
+        actions = {str(action) for action in available_actions if action}
+        for item in behavior_patterns:
+            if item.get("action"):
+                actions.add(str(item["action"]))
+        for item in behavior_distribution:
+            if item.get("action"):
+                actions.add(str(item["action"]))
+        for memory in memories:
+            for key in ("action", "actual_action", "predicted_action"):
+                if memory.get(key):
+                    actions.add(str(memory[key]))
+            for tag in memory.get("tags", []):
+                value = str(tag)
+                if value.startswith("action:") or value.startswith("actual_action:"):
+                    actions.add(value.split(":", 1)[1])
+            for line in str(memory.get("content", "")).splitlines():
+                if line.lower().strip().startswith("actual action:"):
+                    actions.add(line.split(":", 1)[1].strip())
+        return sorted(action for action in actions if action)
+
+    def _architecture_layers(
+        self,
+        memories: list[dict],
+        retrieval,
+        rl_state: PolicyState,
+        intervention: InterventionDecision,
+    ) -> dict:
+        return {
+            "fact_layer": {
+                "sources": ["episodes", "events", "feedback"],
+                "retrieved_event_count": sum(1 for memory in memories if memory.get("type") in {"event", "case", "feedback"}),
+            },
+            "semantic_memory_layer": {
+                "sources": ["profile", "preference", "habit", "trigger", "policy"],
+                "retrieved_memory_count": len(memories),
+                "route_trace": [route.to_dict() for route in retrieval.memory_context.route_trace],
+            },
+            "prediction_pattern_layer": {
+                "behavior_pattern_count": len(retrieval.behavior_patterns),
+                "behavior_distribution_count": len(retrieval.behavior_distribution),
+                "rl_state_key": rl_state.key,
+            },
+            "decision_layer": {
+                "intervention_action": intervention.action,
+                "intervention_reason": intervention.reason,
+                "policy_version": POLICY_VERSION,
+            },
+        }
+
+    def _versions(self) -> dict:
+        return {
+            "action_schema_version": ACTION_SCHEMA_VERSION,
+            "episode_state_version": EPISODE_STATE_VERSION,
+            "reward_model_version": REWARD_MODEL_VERSION,
+            "policy_version": POLICY_VERSION,
+            "ranker_version": "ranker_v1",
+        }
+
+    def _state_history(self, states: list[tuple[str, str]]) -> list[dict]:
+        created_at = utc_now()
+        return [{"state": state, "reason": reason, "at": created_at} for state, reason in states]
+
+    def _append_state_history(self, existing: list, states: list[tuple[str, str]]) -> list[dict]:
+        history = [item for item in existing if isinstance(item, dict)]
+        seen = {str(item.get("state", "")) for item in history}
+        for item in self._state_history(states):
+            if item["state"] not in seen:
+                history.append(item)
+                seen.add(item["state"])
+        return history
+
+    def _episode_dir(self, user_id: str, episode_id: str) -> Path:
+        validate_identifier(user_id, "user_id")
+        validate_identifier(episode_id, "episode_id")
+        path = self.store.root / "user" / user_id / "episodes" / episode_id
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _write_episode_file(self, user_id: str, episode_id: str, filename: str, payload: dict) -> None:
+        path = self._episode_dir(user_id, episode_id) / filename
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _append_episode_jsonl(self, user_id: str, episode_id: str, filename: str, payload: dict) -> None:
+        path = self._episode_dir(user_id, episode_id) / filename
+        with path.open("a", encoding="utf-8") as fp:
+            fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    def _read_episode_result(self, user_id: str, episode_id: str) -> dict:
+        path = self._episode_dir(user_id, episode_id) / "episode_result.json"
+        if not path.exists():
+            return {}
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def _policy_stats_path(self, user_id: str) -> Path:
+        return self.store.root / "user" / user_id / "policy_stats.json"
+
+    def _behavior_stats_path(self, user_id: str) -> Path:
+        return self.store.root / "user" / user_id / "behavior_stats.json"
+
+    def _rl_ledger_path(self, user_id: str) -> Path:
+        return self.store.root / "user" / user_id / "rl" / "policy_ledger.json"

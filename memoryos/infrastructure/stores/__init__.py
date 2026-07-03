@@ -1,0 +1,1 @@
+"""Low-level store adapters."""
