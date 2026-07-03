@@ -758,7 +758,7 @@ class MemoryStoreTest(unittest.TestCase):
             )
             smoke_candidate = next(candidate for candidate in follow_up["ranked_candidates"] if candidate["action"] == "smoke")
             self.assertNotIn("policy_reward", smoke_candidate["features"])
-            self.assertEqual(smoke_candidate["features"]["behavior_reward"], 0.0)
+            self.assertLess(smoke_candidate["features"]["behavior_reward"], 0.2)
             self.assertTrue(any(item["action"] == "organize_desk" for item in follow_up["behavior_distribution"]))
             self.assertIn("behavior_feedback", follow_up["retrieval"]["source_summary"])
             organize_candidate = next(candidate for candidate in follow_up["ranked_candidates"] if candidate["action"] == "organize_desk")

@@ -13,8 +13,15 @@ class PolicyStats:
         predicted_action: str,
         recommended_intervention: str,
         reward: float,
+        event_id: str = "",
     ) -> dict:
         data = self._load()
+        if event_id:
+            processed = data.setdefault("_processed_events", {})
+            if event_id in processed:
+                result = dict(processed[event_id])
+                result["idempotent"] = True
+                return result
         key = self._key(predicted_action, recommended_intervention)
         entry = data.setdefault(
             key,
@@ -29,8 +36,13 @@ class PolicyStats:
         entry["count"] += 1
         entry["total_reward"] = float(entry["total_reward"]) + reward
         entry["average_reward"] = entry["total_reward"] / entry["count"]
+        result = dict(entry)
+        result["event_id"] = event_id
+        result["idempotent"] = False
+        if event_id:
+            data.setdefault("_processed_events", {})[event_id] = result
         self._save(data)
-        return entry
+        return result
 
     def load(self) -> dict:
         return self._load()

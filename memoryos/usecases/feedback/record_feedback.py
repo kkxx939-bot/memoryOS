@@ -64,8 +64,7 @@ class FeedbackService:
             "correction": correction,
             "corrects_memory": corrects_memory,
         }
-        feedback_event = self.events.append_feedback_event(user_id, episode_id, event_payload)
-        outbox_event = self.events.append_outbox_event(user_id, feedback_event)
+        feedback_event, outbox_event = self.events.append_feedback_and_outbox(user_id, episode_id, event_payload)
         record = {
             "episode_id": episode_id,
             "created_at": created_at,

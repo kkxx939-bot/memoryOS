@@ -196,8 +196,15 @@ class ReinforcementPolicyLedger:
         actual_action: str | None,
         reward: float,
         next_state: PolicyState | None = None,
+        event_id: str = "",
     ) -> dict:
         payload = self._load()
+        if event_id:
+            processed = payload.setdefault("processed_feedback_events", {})
+            if event_id in processed:
+                result = dict(processed[event_id])
+                result["idempotent"] = True
+                return result
         prediction = payload.get("predictions", {}).get(episode_id)
         if not prediction:
             return {"updated": False, "reason": "prediction not found"}
@@ -221,8 +228,11 @@ class ReinforcementPolicyLedger:
                 "reward": reward,
                 "updated": False,
                 "reason": "predicted action is not safe for RL intervention calibration",
+                "event_id": event_id,
             }
             payload.setdefault("feedback", []).append(feedback_record)
+            if event_id:
+                payload.setdefault("processed_feedback_events", {})[event_id] = feedback_record
             self._save(payload)
             self._append_event("feedback_events.jsonl", feedback_record)
             return {
@@ -258,9 +268,12 @@ class ReinforcementPolicyLedger:
             "predicted_success": predicted_success,
             "state_value": states[state_key],
             "transition": transition_record,
+            "event_id": event_id,
         }
         payload.setdefault("feedback", []).append(feedback_record)
         payload.setdefault("transitions", []).append(transition_record)
+        if event_id:
+            payload.setdefault("processed_feedback_events", {})[event_id] = feedback_record
         self._save(payload)
         self._append_event("feedback_events.jsonl", feedback_record)
         return {

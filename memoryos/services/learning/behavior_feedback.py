@@ -25,8 +25,15 @@ class BehaviorStats:
         predicted_action: str,
         actual_action: str | None,
         reward: float,
+        event_id: str = "",
     ) -> dict:
         data = self._load()
+        if event_id:
+            processed = data.setdefault("processed_events", {})
+            if event_id in processed:
+                result = dict(processed[event_id])
+                result["idempotent"] = True
+                return result
         signatures = self.scene_signatures(retrieval_query, context_tags)
         behavior_reward = self._behavior_reward(predicted_action, actual_action, reward)
         updated_entry = {}
@@ -34,15 +41,20 @@ class BehaviorStats:
             bucket = self._bucket(data, level, signature, retrieval_query, context_tags)
             updated_entry = self._update_bucket(bucket, predicted_action, actual_action, behavior_reward)
 
-        self._save(data)
-        return {
+        result = {
             "signature": signatures["exact"],
             "signatures": signatures,
             "predicted_action": predicted_action,
             "actual_action": actual_action,
             "behavior_reward": behavior_reward,
             "entry": updated_entry,
+            "event_id": event_id,
+            "idempotent": False,
         }
+        if event_id:
+            data.setdefault("processed_events", {})[event_id] = result
+        self._save(data)
+        return result
 
     def distribution_for_scene(self, retrieval_query: str, context_tags: list[str]) -> list[dict]:
         data = self._load()
@@ -177,8 +189,6 @@ class BehaviorStats:
         )
 
     def _behavior_reward(self, predicted_action: str, actual_action: str | None, fallback_reward: float) -> float:
-        if actual_action:
-            return 1.0 if actual_action == predicted_action else -1.0
         return max(-1.0, min(1.0, float(fallback_reward)))
 
     def _normalize_reward(self, reward: float) -> float:

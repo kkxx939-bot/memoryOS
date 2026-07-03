@@ -49,6 +49,8 @@ class BehaviorPatternStore:
         spontaneity: str = "unknown",
         intervention: str = "",
         intervention_result: str = "",
+        feedback_event_id: str = "",
+        reward_breakdown: dict | None = None,
     ) -> dict:
         created_at = created_at or utc_now()
         domain = self._domain(context_tags, retrieval_query)
@@ -83,6 +85,8 @@ class BehaviorPatternStore:
             "intervention": intervention,
             "intervention_result": intervention_result,
             "reward": reward,
+            "feedback_event_id": feedback_event_id,
+            "reward_breakdown": reward_breakdown or {},
             "signatures": signatures,
         }
         self._append_evidence(pattern, evidence)
@@ -245,6 +249,9 @@ class BehaviorPatternStore:
 
     def _append_evidence(self, pattern: dict, evidence: dict) -> None:
         episodes = pattern.setdefault("episodes", [])
+        feedback_event_id = str(evidence.get("feedback_event_id", ""))
+        if feedback_event_id and any(item.get("feedback_event_id") == feedback_event_id for item in episodes):
+            return
         if any(item.get("episode_id") == evidence["episode_id"] for item in episodes):
             return
         episodes.append(evidence)

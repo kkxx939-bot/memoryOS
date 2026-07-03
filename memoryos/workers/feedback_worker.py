@@ -18,19 +18,31 @@ class FeedbackWorker:
         self.learning = LearningProcessor(store)
         self.episode_files = EpisodeFileStore(store)
 
-    def process_pending(self, user_id: str | None = None, limit: int | None = None, max_retries: int = 3) -> dict:
-        pending = self.events.pending_outbox_events(user_id=user_id, limit=limit, max_retries=max_retries)
+    def process_pending(
+        self,
+        user_id: str | None = None,
+        limit: int | None = None,
+        max_retries: int = 3,
+        worker_id: str = "",
+        lease_seconds: int = 60,
+    ) -> dict:
+        pending = self.events.claim_pending_outbox_events(
+            user_id=user_id,
+            limit=limit,
+            max_retries=max_retries,
+            worker_id=worker_id,
+            lease_seconds=lease_seconds,
+        )
         results = []
         failures = []
         for outbox_event in pending:
-            processing_event = self.events.mark_outbox_processing(outbox_event)
-            event = dict(processing_event.get("payload", {}))
+            event = dict(outbox_event.get("payload", {}))
             episode_user_id = str(event.get("user_id") or outbox_event.get("user_id", ""))
             episode_id = str(event.get("episode_id") or outbox_event.get("episode_id", ""))
             try:
                 episode_result = self._read_episode_result(episode_user_id, episode_id)
                 learning_result = self.learning.apply_feedback_event(event, episode_result)
-                applied_outbox = self.events.mark_outbox_applied(processing_event)
+                applied_outbox = self.events.mark_outbox_applied(outbox_event)
                 self._append_episode_jsonl(
                     episode_user_id,
                     episode_id,
@@ -64,7 +76,7 @@ class FeedbackWorker:
                     }
                 )
             except Exception as exc:
-                failed_outbox = self.events.mark_outbox_failed(processing_event, str(exc), max_retries=max_retries)
+                failed_outbox = self.events.mark_outbox_failed(outbox_event, str(exc), max_retries=max_retries)
                 failure = {
                     "outbox_id": outbox_event.get("outbox_id"),
                     "episode_id": episode_id,

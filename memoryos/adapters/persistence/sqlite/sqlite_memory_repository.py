@@ -10,6 +10,9 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from memoryos.adapters.persistence.filesystem.markdown_store import MarkdownStore
+from memoryos.adapters.persistence.sqlite.sqlite_memory_lifecycle_repository import SqliteMemoryLifecycleRepository
+from memoryos.adapters.persistence.sqlite.sqlite_memory_metadata_repository import SqliteMemoryMetadataRepository
+from memoryos.adapters.persistence.sqlite.sqlite_memory_search_repository import SqliteMemorySearchRepository
 from memoryos.domain.memory.memory_item import MEMORY_TYPES, TYPE_DIR, MemoryItem, summarize_text, utc_now
 from memoryos.ports.providers.embedding_provider import (
     EmbeddingProvider,
@@ -37,6 +40,9 @@ class MemoryStore:
         self.embedding_provider = embedding_provider or HashingEmbeddingProvider()
         self.rerank_provider = rerank_provider
         self.markdown_store = MarkdownStore()
+        self.metadata_repository = SqliteMemoryMetadataRepository(self)
+        self.search_repository = SqliteMemorySearchRepository(self)
+        self.lifecycle_repository = SqliteMemoryLifecycleRepository(self)
 
     def init(self, user_id: str) -> None:
         validate_identifier(user_id, "user_id")

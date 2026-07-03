@@ -26,6 +26,8 @@ class BehaviorCaseRecorder:
         spontaneity: str,
         intervention: str,
         intervention_result: str,
+        feedback_event_id: str = "",
+        reward_breakdown: dict | None = None,
     ) -> dict:
         return self.patterns.record(
             user_id=user_id,
@@ -42,4 +44,6 @@ class BehaviorCaseRecorder:
             spontaneity=spontaneity,
             intervention=intervention,
             intervention_result=intervention_result,
+            feedback_event_id=feedback_event_id,
+            reward_breakdown=reward_breakdown or {},
         )

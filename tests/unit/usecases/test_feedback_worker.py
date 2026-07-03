@@ -15,6 +15,24 @@ class FailingLearningProcessor:
 
 
 class FeedbackWorkerTest(unittest.TestCase):
+    def test_outbox_claim_is_exclusive_until_failure_or_lease_expiry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            events = FeedbackEventStore(Path(tmp))
+            feedback_event = events.append_feedback_event(
+                "gulf",
+                "ep_claim",
+                {"user_id": "gulf", "episode_id": "ep_claim", "feedback": "ok", "reward": 1},
+            )
+            events.append_outbox_event("gulf", feedback_event)
+
+            first = events.claim_pending_outbox_events("gulf", worker_id="worker-a", lease_seconds=60)
+            second = events.claim_pending_outbox_events("gulf", worker_id="worker-b", lease_seconds=60)
+
+            self.assertEqual(len(first), 1)
+            self.assertEqual(first[0]["status"], "processing")
+            self.assertEqual(first[0]["locked_by"], "worker-a")
+            self.assertEqual(second, [])
+
     def test_failed_feedback_event_retries_then_dead_letters(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = MemoryStore(Path(tmp))
