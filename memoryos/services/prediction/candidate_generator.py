@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from memoryos.domain.actions.action_schema import action_need, canonical_action
+from memoryos.domain.actions.action_schema import action_need, action_spec, canonical_action
 
 
 @dataclass
@@ -17,6 +17,27 @@ class Candidate:
     memory_evidence: list[dict] = field(default_factory=list)
     reason: str = ""
     used_memories: list[str] = field(default_factory=list)
+    action_type: str = ""
+    risk_level: str = ""
+    predictable: bool = True
+    intervenable: bool = False
+    executable: bool = False
+    requires_confirmation: bool = True
+    is_private: bool = False
+
+    def __post_init__(self) -> None:
+        canonical = canonical_action(self.action)
+        spec = action_spec(canonical)
+        self.action = canonical
+        if not self.need or self.need == "unknown":
+            self.need = spec.need
+        self.action_type = spec.action_type
+        self.risk_level = spec.risk_level
+        self.predictable = spec.predictable
+        self.intervenable = spec.intervenable
+        self.executable = spec.executable
+        self.requires_confirmation = spec.requires_confirmation
+        self.is_private = spec.risk_level == "private" or spec.action_type == "private_behavior"
 
     def to_dict(self) -> dict:
         return {
@@ -30,6 +51,13 @@ class Candidate:
             "memory_evidence": self.memory_evidence,
             "reason": self.reason,
             "used_memories": self.used_memories,
+            "action_type": self.action_type,
+            "risk_level": self.risk_level,
+            "predictable": self.predictable,
+            "intervenable": self.intervenable,
+            "executable": self.executable,
+            "requires_confirmation": self.requires_confirmation,
+            "is_private": self.is_private,
         }
 
 

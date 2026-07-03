@@ -994,7 +994,7 @@ class MemoryStoreTest(unittest.TestCase):
                 behavior_patterns=distribution,
             )
             candidate_actions = {candidate.action for candidate in candidates}
-            self.assertIn("open_ac", candidate_actions)
+            self.assertIn("turn_on_ac", candidate_actions)
             self.assertIn("turn_on_fan", candidate_actions)
 
     def test_ranker_uses_behavior_param_distribution(self) -> None:
@@ -1280,7 +1280,7 @@ class MemoryStoreTest(unittest.TestCase):
                 memory_write_timing="deferred",
             )
 
-            self.assertEqual(current["ranked_candidates"][0]["action"], "open_ac")
+            self.assertEqual(current["ranked_candidates"][0]["action"], "turn_on_ac")
             self.assertIn("behavior_pattern", current["ranked_candidates"][0]["sources"])
             self.assertGreaterEqual(current["behavior_patterns"][0]["distinct_days"], 3)
             self.assertIn("evidence_confidence", current["behavior_patterns"][0])
@@ -1530,7 +1530,7 @@ class MemoryStoreTest(unittest.TestCase):
             self.assertIn("retrieval_query", current)
             self.assertIn("hot_environment", current["context_tags"])
             self.assertEqual(current["observation"]["computed_duration_minutes"], 40)
-            self.assertEqual(current["ranked_candidates"][0]["action"], "open_ac")
+            self.assertEqual(current["ranked_candidates"][0]["action"], "turn_on_ac")
             self.assertIn("behavior_pattern", current["ranked_candidates"][0]["sources"])
 
     def test_action_schema_and_reward_split_normalize_aliases(self) -> None:
@@ -1724,7 +1724,7 @@ class MemoryStoreTest(unittest.TestCase):
             )
             self.assertEqual(feedback["learning_status"], "queued")
 
-            processed = handle("POST /feedback/process", store, {"user_id": "gulf"})
+            processed = handle("POST /workers/feedback", store, {"user_id": "gulf"})
             self.assertEqual(processed["processed"], 1)
             replay = ReplayWorker(store).replay_feedback("gulf")
             self.assertEqual(replay["replayed"], 1)

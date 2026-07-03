@@ -28,6 +28,9 @@ class FeedbackEventStore:
 
     def append_outbox_event(self, user_id: str, event: dict) -> dict:
         validate_identifier(user_id, "user_id")
+        existing = self.latest_outbox_event(user_id, str(event["event_id"]))
+        if existing:
+            return existing
         outbox = {
             "outbox_id": event["event_id"],
             "event_type": event["event_type"],
@@ -40,6 +43,14 @@ class FeedbackEventStore:
         self._append(self._outbox_path(user_id), outbox)
         return outbox
 
+    def latest_outbox_event(self, user_id: str, outbox_id: str) -> dict | None:
+        validate_identifier(user_id, "user_id")
+        latest = None
+        for event in self._read_jsonl(self._outbox_path(user_id)):
+            if str(event.get("outbox_id", "")) == outbox_id:
+                latest = event
+        return latest
+
     def mark_outbox_applied(self, outbox_event: dict) -> dict:
         updated = dict(outbox_event)
         updated["status"] = "applied"
@@ -49,10 +60,36 @@ class FeedbackEventStore:
             self._append(self._outbox_path(user_id), updated)
         return updated
 
-    def pending_outbox_events(self, user_id: str | None = None, limit: int | None = None) -> list[dict]:
+    def mark_outbox_processing(self, outbox_event: dict) -> dict:
+        updated = dict(outbox_event)
+        updated["status"] = "processing"
+        updated["processing_started_at"] = utc_now()
+        updated["retry_count"] = int(updated.get("retry_count", 0))
+        user_id = str(updated.get("user_id", ""))
+        if user_id:
+            self._append(self._outbox_path(user_id), updated)
+        return updated
+
+    def mark_outbox_failed(self, outbox_event: dict, error: str, max_retries: int = 3) -> dict:
+        updated = dict(outbox_event)
+        retry_count = int(updated.get("retry_count", 0)) + 1
+        updated["retry_count"] = retry_count
+        updated["last_error"] = str(error)[:1000]
+        updated["failed_at"] = utc_now()
+        updated["status"] = "dead_letter" if retry_count >= max_retries else "failed"
+        user_id = str(updated.get("user_id", ""))
+        if user_id:
+            self._append(self._outbox_path(user_id), updated)
+        return updated
+
+    def pending_outbox_events(
+        self,
+        user_id: str | None = None,
+        limit: int | None = None,
+        max_retries: int = 3,
+    ) -> list[dict]:
         user_ids = [user_id] if user_id else self._user_ids()
-        pending: dict[str, dict] = {}
-        applied: set[str] = set()
+        latest: dict[str, dict] = {}
         for current_user_id in user_ids:
             if not current_user_id:
                 continue
@@ -60,13 +97,13 @@ class FeedbackEventStore:
                 outbox_id = str(event.get("outbox_id", ""))
                 if not outbox_id:
                     continue
-                if event.get("status") == "applied":
-                    applied.add(outbox_id)
-                    pending.pop(outbox_id, None)
-                    continue
-                if event.get("status") == "pending" and outbox_id not in applied:
-                    pending.setdefault(outbox_id, event)
-        rows = list(pending.values())
+                latest[outbox_id] = event
+        rows = [
+            event
+            for event in latest.values()
+            if event.get("status") in {"pending", "failed"}
+            and int(event.get("retry_count", 0)) < max_retries
+        ]
         rows.sort(key=lambda item: str(item.get("created_at", "")))
         return rows[:limit] if limit is not None else rows
 

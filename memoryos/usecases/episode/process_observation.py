@@ -20,6 +20,7 @@ from memoryos.services.policy.policy_gate import POLICY_VERSION
 from memoryos.services.prediction.candidate_generator import Candidate
 from memoryos.services.prediction.prediction_service import Prediction, RuleBasedPredictor
 from memoryos.services.retrieval.retrieval_service import RetrievalOrchestrator
+from memoryos.usecases.episode.episode_files import EpisodeFileStore
 from memoryos.usecases.episode.episode_state_machine import (
     CREATED,
     EPISODE_STATE_VERSION,
@@ -45,6 +46,7 @@ class EpisodeProcessor:
         self.predictor = predictor or RuleBasedPredictor()
         self.intervention_selector = InterventionSelector()
         self.memory_updates = MemoryUpdateService(store)
+        self.episode_files = EpisodeFileStore(store)
 
     def process(
         self,
@@ -518,26 +520,16 @@ class EpisodeProcessor:
         return history
 
     def _episode_dir(self, user_id: str, episode_id: str) -> Path:
-        validate_identifier(user_id, "user_id")
-        validate_identifier(episode_id, "episode_id")
-        path = self.store.root / "user" / user_id / "episodes" / episode_id
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+        return self.episode_files.episode_dir(user_id, episode_id)
 
     def _write_episode_file(self, user_id: str, episode_id: str, filename: str, payload: dict) -> None:
-        path = self._episode_dir(user_id, episode_id) / filename
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.episode_files.write_json(user_id, episode_id, filename, payload)
 
     def _append_episode_jsonl(self, user_id: str, episode_id: str, filename: str, payload: dict) -> None:
-        path = self._episode_dir(user_id, episode_id) / filename
-        with path.open("a", encoding="utf-8") as fp:
-            fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        self.episode_files.append_jsonl(user_id, episode_id, filename, payload)
 
     def _read_episode_result(self, user_id: str, episode_id: str) -> dict:
-        path = self._episode_dir(user_id, episode_id) / "episode_result.json"
-        if not path.exists():
-            return {}
-        return json.loads(path.read_text(encoding="utf-8"))
+        return self.episode_files.read_json(user_id, episode_id, "episode_result.json")
 
     def _policy_stats_path(self, user_id: str) -> Path:
         return self.store.root / "user" / user_id / "policy_stats.json"

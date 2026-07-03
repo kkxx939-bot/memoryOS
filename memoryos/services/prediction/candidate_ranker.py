@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from memoryos.domain.actions.action_schema import canonical_action
 from memoryos.services.prediction.candidate_generator import Candidate, CandidateGenerator
 
 
@@ -18,7 +19,7 @@ class CandidateRanker:
         candidates = candidates or self.generator.generate(scene, memories)
         rl_action_scores = rl_action_scores or {}
         behavior_scores = {
-            str(item["action"]): self._behavior_score(item)
+            canonical_action(str(item["action"])): self._behavior_score(item)
             for item in (behavior_distribution or [])
         }
         ranked = []
@@ -55,7 +56,7 @@ class CandidateRanker:
             "candidate_prior": candidate.prior,
             "structured_action_match": 1.0 if memory_evidence or "behavior_pattern" in candidate.sources else 0.0,
             "memory_support": memory_support,
-            "behavior_reward": behavior_scores.get(candidate.action, 0.5),
+            "behavior_reward": behavior_scores.get(canonical_action(candidate.action), 0.5),
             "memory_hotness": memory_hotness,
             "rl_policy_score": rl_action_scores.get(candidate.action, 0.5),
         }
@@ -115,12 +116,15 @@ class CandidateRanker:
         return 0.0
 
     def _explicit_action_match(self, action: str, memory: dict) -> bool:
+        canonical = canonical_action(action)
         for tag in [str(tag) for tag in memory.get("tags", [])]:
-            if tag == f"action:{action}" or tag == f"actual_action:{action}":
+            if tag.startswith("action:") and canonical_action(tag.split(":", 1)[1]) == canonical:
+                return True
+            if tag.startswith("actual_action:") and canonical_action(tag.split(":", 1)[1]) == canonical:
                 return True
         for line in str(memory.get("content", "")).splitlines():
             lowered = line.lower().strip()
-            if lowered.startswith("actual action:") and line.split(":", 1)[1].strip() == action:
+            if lowered.startswith("actual action:") and canonical_action(line.split(":", 1)[1].strip()) == canonical:
                 return True
         return False
 

@@ -5,8 +5,8 @@ from pathlib import Path
 
 from memoryos.domain.memory.memory_item import MemoryItem, utc_now
 from memoryos.ports.repositories.memory_repository import MemoryRepository
+from memoryos.services.learning.behavior_case_recorder import BehaviorCaseRecorder
 from memoryos.services.learning.behavior_feedback import BehaviorStats
-from memoryos.services.learning.behavior_patterns import BehaviorPatternStore
 from memoryos.services.learning.intervention_policy_stats import PolicyStats
 from memoryos.services.learning.rl_calibrator import ReinforcementPolicyLedger
 
@@ -53,7 +53,7 @@ class LearningProcessor:
         )
         pattern_update = None
         if actual_action:
-            pattern_update = BehaviorPatternStore(self.store.root).record(
+            pattern_update = BehaviorCaseRecorder(self.store.root).record_case(
                 user_id=user_id,
                 episode_id=episode_id,
                 retrieval_query=str(episode_result.get("retrieval_query") or episode_result.get("scene", "")),

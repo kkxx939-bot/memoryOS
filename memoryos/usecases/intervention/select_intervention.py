@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from memoryos.domain.actions.action_policy import (
+    INTERVENTION_ACTION_POLICY_VERSION,
+    is_safe_intervention,
+    preferred_interventions_for,
+)
 from memoryos.domain.actions.action_schema import canonical_action
 from memoryos.services.policy.policy_gate import POLICY_VERSION, PermissionPolicyEngine
 from memoryos.services.prediction.candidate_generator import Candidate
@@ -67,11 +72,14 @@ class InterventionSelector:
                 features={
                     "policy_allowed": 0.0,
                     "policy_version": POLICY_VERSION,
+                    "intervention_action_policy_version": INTERVENTION_ACTION_POLICY_VERSION,
                     "policy_mode": predicted_policy.mode,
+                    "candidate_risk_level": candidate.risk_level,
+                    "candidate_intervenable": candidate.intervenable,
                 },
                 alternatives=[],
             )
-        preferred = self._preferred_interventions(candidate.action)
+        preferred = preferred_interventions_for(candidate.action)
         available_preferred = [
             action
             for action in preferred
@@ -101,7 +109,10 @@ class InterventionSelector:
                         "interruption_cost": interruption_cost,
                         "policy_allowed": 1.0,
                         "policy_version": POLICY_VERSION,
+                        "intervention_action_policy_version": INTERVENTION_ACTION_POLICY_VERSION,
                         "policy_mode": predicted_policy.mode,
+                        "candidate_risk_level": candidate.risk_level,
+                        "candidate_intervenable": candidate.intervenable,
                     },
                 }
             )
@@ -118,18 +129,6 @@ class InterventionSelector:
             features=top_features if isinstance(top_features, dict) else {},
             alternatives=options[1:],
         )
-
-    def _preferred_interventions(self, action: str) -> list[str]:
-        canonical = canonical_action(action)
-        if canonical == "turn_on_ac":
-            return ["turn_on_ac", "ask_before_turning_on_ac", "ask_user", "do_nothing"]
-        if canonical == "smoke":
-            return ["remind_no_smoking", "ask_user", "do_nothing"]
-        if canonical == "take_break":
-            return ["suggest_break", "ask_user", "do_nothing"]
-        if canonical in {"continue_working", "continue_current_activity"}:
-            return ["do_nothing", "ask_user"]
-        return ["ask_user", "do_nothing"]
 
     def _pick_available(self, available_actions: list[str], preferred: list[str]) -> str:
         for action in preferred:
@@ -156,7 +155,7 @@ class InterventionSelector:
         return max(0.0, min(1.0, (average + 1.0) / 2.0))
 
     def _permission_allows(self, predicted_action: str, intervention: str, policy_stats: dict) -> bool:
-        if intervention in {"do_nothing", "ask_user", "ask_before_turning_on_ac", "remind_no_smoking", "suggest_break"}:
+        if is_safe_intervention(intervention):
             return True
         decision = self.policy_engine.authorize(predicted_action, policy_stats=policy_stats)
         return decision.mode == "execute" and canonical_action(intervention) == canonical_action(predicted_action)

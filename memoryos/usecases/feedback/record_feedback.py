@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from memoryos.adapters.events.jsonl_outbox import FeedbackEventStore
@@ -9,6 +8,7 @@ from memoryos.domain.memory.memory_item import utc_now
 from memoryos.observability.audit_log import AuditLogger
 from memoryos.ports.repositories.memory_repository import MemoryRepository
 from memoryos.security.path_safety import validate_identifier
+from memoryos.usecases.episode.episode_files import EpisodeFileStore
 from memoryos.usecases.episode.episode_state_machine import FEEDBACK_RECEIVED, LEARNING_QUEUED
 
 
@@ -16,6 +16,7 @@ class FeedbackService:
     def __init__(self, store: MemoryRepository) -> None:
         self.store = store
         self.events = FeedbackEventStore(store.root)
+        self.episode_files = EpisodeFileStore(store)
 
     def record_feedback(
         self,
@@ -146,21 +147,13 @@ class FeedbackService:
         return history
 
     def _episode_dir(self, user_id: str, episode_id: str) -> Path:
-        path = self.store.root / "user" / user_id / "episodes" / episode_id
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+        return self.episode_files.episode_dir(user_id, episode_id)
 
     def _write_episode_file(self, user_id: str, episode_id: str, filename: str, payload: dict) -> None:
-        path = self._episode_dir(user_id, episode_id) / filename
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.episode_files.write_json(user_id, episode_id, filename, payload)
 
     def _append_episode_jsonl(self, user_id: str, episode_id: str, filename: str, payload: dict) -> None:
-        path = self._episode_dir(user_id, episode_id) / filename
-        with path.open("a", encoding="utf-8") as fp:
-            fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        self.episode_files.append_jsonl(user_id, episode_id, filename, payload)
 
     def _read_episode_result(self, user_id: str, episode_id: str) -> dict:
-        path = self._episode_dir(user_id, episode_id) / "episode_result.json"
-        if not path.exists():
-            return {}
-        return json.loads(path.read_text(encoding="utf-8"))
+        return self.episode_files.read_json(user_id, episode_id, "episode_result.json")

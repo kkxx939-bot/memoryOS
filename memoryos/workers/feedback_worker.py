@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from memoryos.adapters.events.jsonl_outbox import FeedbackEventStore
@@ -8,6 +7,7 @@ from memoryos.domain.memory.memory_item import utc_now
 from memoryos.observability.audit_log import AuditLogger
 from memoryos.ports.repositories.memory_repository import MemoryRepository
 from memoryos.services.learning.learning_service import LearningProcessor
+from memoryos.usecases.episode.episode_files import EpisodeFileStore
 from memoryos.usecases.episode.episode_state_machine import CLOSED, LEARNING_APPLIED
 
 
@@ -16,50 +16,85 @@ class FeedbackWorker:
         self.store = store
         self.events = FeedbackEventStore(store.root)
         self.learning = LearningProcessor(store)
+        self.episode_files = EpisodeFileStore(store)
 
-    def process_pending(self, user_id: str | None = None, limit: int | None = None) -> dict:
-        pending = self.events.pending_outbox_events(user_id=user_id, limit=limit)
+    def process_pending(self, user_id: str | None = None, limit: int | None = None, max_retries: int = 3) -> dict:
+        pending = self.events.pending_outbox_events(user_id=user_id, limit=limit, max_retries=max_retries)
         results = []
+        failures = []
         for outbox_event in pending:
-            event = dict(outbox_event.get("payload", {}))
+            processing_event = self.events.mark_outbox_processing(outbox_event)
+            event = dict(processing_event.get("payload", {}))
             episode_user_id = str(event.get("user_id") or outbox_event.get("user_id", ""))
             episode_id = str(event.get("episode_id") or outbox_event.get("episode_id", ""))
-            episode_result = self._read_episode_result(episode_user_id, episode_id)
-            learning_result = self.learning.apply_feedback_event(event, episode_result)
-            applied_outbox = self.events.mark_outbox_applied(outbox_event)
-            self._append_episode_jsonl(
-                episode_user_id,
-                episode_id,
-                "feedback.jsonl",
-                {
-                    **learning_result,
-                    "outbox_event": applied_outbox,
-                    "learning_status": "applied_by_worker",
-                },
-            )
-            self._close_episode_result(episode_user_id, episode_id, episode_result, learning_result)
-            AuditLogger(self.store.root).record(
-                episode_user_id,
-                "feedback_learning_applied",
-                {
-                    "episode_id": episode_id,
+            try:
+                episode_result = self._read_episode_result(episode_user_id, episode_id)
+                learning_result = self.learning.apply_feedback_event(event, episode_result)
+                applied_outbox = self.events.mark_outbox_applied(processing_event)
+                self._append_episode_jsonl(
+                    episode_user_id,
+                    episode_id,
+                    "feedback.jsonl",
+                    {
+                        **learning_result,
+                        "outbox_event": applied_outbox,
+                        "learning_status": "applied_by_worker",
+                    },
+                )
+                self._close_episode_result(episode_user_id, episode_id, episode_result, learning_result)
+                AuditLogger(self.store.root).record(
+                    episode_user_id,
+                    "feedback_learning_applied",
+                    {
+                        "episode_id": episode_id,
+                        "outbox_id": outbox_event.get("outbox_id"),
+                        "event_id": learning_result.get("event_id"),
+                        "idempotent": learning_result.get("idempotent", False),
+                        "actual_action": learning_result.get("actual_action"),
+                        "behavior_reward": learning_result.get("reward_breakdown", {}).get("behavior_reward"),
+                        "intervention_reward": learning_result.get("reward_breakdown", {}).get("intervention_reward"),
+                    },
+                )
+                results.append(
+                    {
+                        "outbox_id": outbox_event.get("outbox_id"),
+                        "episode_id": episode_id,
+                        "learning_result": learning_result,
+                        "outbox_event": applied_outbox,
+                    }
+                )
+            except Exception as exc:
+                failed_outbox = self.events.mark_outbox_failed(processing_event, str(exc), max_retries=max_retries)
+                failure = {
                     "outbox_id": outbox_event.get("outbox_id"),
-                    "event_id": learning_result.get("event_id"),
-                    "idempotent": learning_result.get("idempotent", False),
-                    "actual_action": learning_result.get("actual_action"),
-                    "behavior_reward": learning_result.get("reward_breakdown", {}).get("behavior_reward"),
-                    "intervention_reward": learning_result.get("reward_breakdown", {}).get("intervention_reward"),
-                },
-            )
-            results.append(
-                {
-                    "outbox_id": outbox_event.get("outbox_id"),
                     "episode_id": episode_id,
-                    "learning_result": learning_result,
-                    "outbox_event": applied_outbox,
+                    "status": failed_outbox.get("status"),
+                    "retry_count": failed_outbox.get("retry_count"),
+                    "error": str(exc),
                 }
-            )
-        return {"processed": len(results), "results": results}
+                failures.append(failure)
+                self._append_episode_jsonl(
+                    episode_user_id,
+                    episode_id,
+                    "feedback.jsonl",
+                    {
+                        "outbox_event": failed_outbox,
+                        "learning_status": failed_outbox.get("status"),
+                        "error": str(exc),
+                    },
+                )
+                AuditLogger(self.store.root).record(
+                    episode_user_id,
+                    "feedback_learning_failed",
+                    {
+                        "episode_id": episode_id,
+                        "outbox_id": outbox_event.get("outbox_id"),
+                        "status": failed_outbox.get("status"),
+                        "retry_count": failed_outbox.get("retry_count"),
+                        "error": str(exc),
+                    },
+                )
+        return {"processed": len(results), "failed": len(failures), "results": results, "failures": failures}
 
     def _close_episode_result(
         self,
@@ -100,21 +135,13 @@ class FeedbackWorker:
         return history
 
     def _episode_dir(self, user_id: str, episode_id: str) -> Path:
-        path = self.store.root / "user" / user_id / "episodes" / episode_id
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+        return self.episode_files.episode_dir(user_id, episode_id)
 
     def _read_episode_result(self, user_id: str, episode_id: str) -> dict:
-        path = self._episode_dir(user_id, episode_id) / "episode_result.json"
-        if not path.exists():
-            return {}
-        return json.loads(path.read_text(encoding="utf-8"))
+        return self.episode_files.read_json(user_id, episode_id, "episode_result.json")
 
     def _write_episode_file(self, user_id: str, episode_id: str, filename: str, payload: dict) -> None:
-        path = self._episode_dir(user_id, episode_id) / filename
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.episode_files.write_json(user_id, episode_id, filename, payload)
 
     def _append_episode_jsonl(self, user_id: str, episode_id: str, filename: str, payload: dict) -> None:
-        path = self._episode_dir(user_id, episode_id) / filename
-        with path.open("a", encoding="utf-8") as fp:
-            fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        self.episode_files.append_jsonl(user_id, episode_id, filename, payload)

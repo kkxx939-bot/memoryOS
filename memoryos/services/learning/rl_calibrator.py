@@ -134,11 +134,16 @@ class ReinforcementPolicyLedger:
         state_value = StateValue.from_dict(payload.get("states", {}).get(state.key, {}))
         scores = {}
         for action in sorted({str(action) for action in actions if action}):
-            value = state_value.actions.get(action)
+            canonical = canonical_action(action)
+            spec = action_spec(canonical)
+            if not spec.intervenable or spec.risk_level in {"private", "high", "unknown"}:
+                scores[canonical] = 0.5
+                continue
+            value = state_value.actions.get(canonical)
             if value is None or value.trials == 0:
-                scores[action] = 0.5 + self.exploration_bonus
+                scores[canonical] = 0.5 + self.exploration_bonus
             else:
-                scores[action] = value.ucb_score
+                scores[canonical] = value.ucb_score
         return {action: round(max(0.0, min(1.0, score)), 6) for action, score in scores.items()}
 
     def record_prediction(
@@ -167,6 +172,9 @@ class ReinforcementPolicyLedger:
                     "score": candidate.score,
                     "prior": candidate.prior,
                     "sources": candidate.sources,
+                    "risk_level": candidate.risk_level,
+                    "intervenable": candidate.intervenable,
+                    "executable": candidate.executable,
                 }
                 for candidate in candidates
             ],
@@ -202,6 +210,28 @@ class ReinforcementPolicyLedger:
         state_value.visits += 1
         actual = canonical_action(str(actual_action or "").strip())
         predicted = canonical_action(str(predicted_action or prediction.get("selected_action") or "unknown"))
+        predicted_spec = action_spec(predicted)
+        if not predicted_spec.intervenable or predicted_spec.risk_level in {"private", "high", "unknown"}:
+            feedback_record = {
+                "episode_id": episode_id,
+                "created_at": utc_now(),
+                "state_key": state_key,
+                "predicted_action": predicted,
+                "actual_action": actual,
+                "reward": reward,
+                "updated": False,
+                "reason": "predicted action is not safe for RL intervention calibration",
+            }
+            payload.setdefault("feedback", []).append(feedback_record)
+            self._save(payload)
+            self._append_event("feedback_events.jsonl", feedback_record)
+            return {
+                "updated": False,
+                "reason": "predicted action is not safe for RL intervention calibration",
+                "state_key": state_key,
+                "predicted_action": predicted,
+                "actual_action": actual,
+            }
         predicted_success = bool(actual and predicted == actual)
         predicted_reward = reward if predicted_success else min(float(reward), -0.5)
         next_best_q = self._next_best_q(payload, next_state)

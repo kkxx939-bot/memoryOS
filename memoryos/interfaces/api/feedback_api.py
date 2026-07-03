@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from memoryos.ports.repositories.memory_repository import MemoryRepository
 from memoryos.usecases.feedback.record_feedback import FeedbackService
-from memoryos.workers.feedback_worker import FeedbackWorker
 
 
 def record_feedback(store: MemoryRepository, payload: dict) -> dict:
@@ -17,13 +16,4 @@ def record_feedback(store: MemoryRepository, payload: dict) -> dict:
         intervention_result=str(payload.get("intervention_result", "")),
         correction=payload.get("correction"),
         corrects_memory=bool(payload.get("corrects_memory", False)),
-    )
-
-
-def process_feedback_outbox(store: MemoryRepository, payload: dict | None = None) -> dict:
-    payload = payload or {}
-    limit = payload.get("limit")
-    return FeedbackWorker(store).process_pending(
-        user_id=payload.get("user_id"),
-        limit=int(limit) if limit is not None else None,
     )
