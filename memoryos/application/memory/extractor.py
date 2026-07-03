@@ -1,12 +1,11 @@
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
-import json
 from typing import Protocol
 
 from memoryos.domain.memory.memory_item import MEMORY_TYPES
-
 
 MEMORY_ACTIONS = {"add", "update", "delete", "ignore"}
 
@@ -14,6 +13,7 @@ MEMORY_ACTIONS = {"add", "update", "delete", "ignore"}
 class TextGenerationProvider(Protocol):
     def complete(self, prompt: str) -> str:
         """Return a model response for the supplied prompt."""
+        ...
 
 
 @dataclass

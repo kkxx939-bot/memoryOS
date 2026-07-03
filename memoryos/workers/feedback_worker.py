@@ -8,6 +8,7 @@ from memoryos.application.feedback.feedback_event_store import FeedbackEventStor
 from memoryos.application.learning.learning_service import LearningProcessor
 from memoryos.domain.memory.memory_item import utc_now
 from memoryos.infrastructure.repositories.memory_repository import MemoryStore
+from memoryos.observability.audit_log import AuditLogger
 
 
 class FeedbackWorker:
@@ -37,6 +38,19 @@ class FeedbackWorker:
                 },
             )
             self._close_episode_result(episode_user_id, episode_id, episode_result, learning_result)
+            AuditLogger(self.store.root).record(
+                episode_user_id,
+                "feedback_learning_applied",
+                {
+                    "episode_id": episode_id,
+                    "outbox_id": outbox_event.get("outbox_id"),
+                    "event_id": learning_result.get("event_id"),
+                    "idempotent": learning_result.get("idempotent", False),
+                    "actual_action": learning_result.get("actual_action"),
+                    "behavior_reward": learning_result.get("reward_breakdown", {}).get("behavior_reward"),
+                    "intervention_reward": learning_result.get("reward_breakdown", {}).get("intervention_reward"),
+                },
+            )
             results.append(
                 {
                     "outbox_id": outbox_event.get("outbox_id"),

@@ -70,6 +70,12 @@ class FeedbackEventStore:
         rows.sort(key=lambda item: str(item.get("created_at", "")))
         return rows[:limit] if limit is not None else rows
 
+    def feedback_events(self, user_id: str, limit: int | None = None) -> list[dict]:
+        validate_identifier(user_id, "user_id")
+        rows = self._read_jsonl(self._feedback_path(user_id))
+        rows.sort(key=lambda item: str(item.get("created_at", "")))
+        return rows[-limit:] if limit is not None else rows
+
     def _feedback_path(self, user_id: str) -> Path:
         return self.root / "user" / user_id / "events" / "feedback_events.jsonl"
 

@@ -33,7 +33,7 @@ class MemoryUpdateService:
 
     def apply(self, operations: list[MemoryOperation], context: MemoryUpdateContext) -> dict:
         self.store.init(context.user_id)
-        diff_operations = {"adds": [], "updates": [], "deletes": [], "ignores": []}
+        diff_operations: dict[str, list[dict]] = {"adds": [], "updates": [], "deletes": [], "ignores": []}
         for operation in operations:
             self._apply_one(operation, context, diff_operations)
         diff = self._diff(context.diff_id, diff_operations)

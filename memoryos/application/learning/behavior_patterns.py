@@ -5,11 +5,17 @@ import math
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
-from memoryos.infrastructure.providers.rerank_provider import RerankProvider, rerank_with_fallback
+from memoryos.domain.behavior.signatures import (
+    MATCH_LEVEL_WEIGHTS,
+    pattern_layered_token_sets,
+    pattern_scene_signatures,
+)
 from memoryos.domain.memory.memory_item import slugify, utc_now
+from memoryos.infrastructure.providers.rerank_provider import RerankProvider, rerank_with_fallback
+
 from .behavior_scoring import BehaviorEvidenceScorer
-from memoryos.domain.behavior.signatures import MATCH_LEVEL_WEIGHTS, pattern_layered_token_sets, pattern_scene_signatures
 
 
 class BehaviorPatternStore:
@@ -181,13 +187,13 @@ class BehaviorPatternStore:
         episodes = []
         for episode in item.get("episodes", [])[:5]:
             episodes.append(
-                (
+                
                     f"episode={episode.get('episode_id', '')}; "
                     f"query={episode.get('retrieval_query', '')}; "
                     f"predicted={episode.get('predicted_action', '')}; "
                     f"actual={episode.get('actual_action', '')}; "
                     f"reward={episode.get('reward', 0.0)}"
-                )
+                
             )
         return "\n".join(
             [
@@ -289,7 +295,7 @@ class BehaviorPatternStore:
         group_path = self._group_path(user_id, domain, group_id)
         patterns = self._group_patterns(user_id, domain, group_id)
         total_samples = sum(int(pattern.get("sample_count", 0)) for pattern in patterns)
-        action_distribution = []
+        action_distribution: list[dict[str, Any]] = []
         for pattern in patterns:
             sample_count = int(pattern.get("sample_count", 0))
             ratio = sample_count / total_samples if total_samples else 0.0
@@ -310,8 +316,8 @@ class BehaviorPatternStore:
                     "spontaneity_distribution": self._field_distribution(pattern, "spontaneity"),
                 }
             )
-        action_distribution.sort(key=lambda item: item["sample_count"], reverse=True)
-        entropy = self._entropy([item["ratio"] for item in action_distribution])
+        action_distribution.sort(key=lambda item: int(item["sample_count"]), reverse=True)
+        entropy = self._entropy([float(item["ratio"]) for item in action_distribution])
         top_ratio = float(action_distribution[0]["ratio"]) if action_distribution else 0.0
         second_ratio = float(action_distribution[1]["ratio"]) if len(action_distribution) > 1 else 0.0
         top_action_margin = round(top_ratio - second_ratio, 6)
@@ -448,11 +454,11 @@ class BehaviorPatternStore:
         lines = [f"# {domain_path.name}", "", f"- pattern_count: {len(patterns)}", "", "## Top patterns"]
         for pattern in patterns[:8]:
             lines.append(
-                (
+                
                     f"- action={pattern.get('action')} confidence={float(pattern.get('evidence_confidence', 0.0)):.3f} "
                     f"samples={pattern.get('sample_count', 0)} days={pattern.get('distinct_days', 0)} "
                     f"ratio={float(pattern.get('action_ratio', 0.0)):.3f}"
-                )
+                
             )
         text = "\n".join(lines).strip() + "\n"
         (domain_path / ".abstract.md").write_text(text, encoding="utf-8")

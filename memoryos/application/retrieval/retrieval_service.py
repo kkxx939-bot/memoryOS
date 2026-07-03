@@ -3,9 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from memoryos.infrastructure.providers.rerank_provider import RerankProvider
 from memoryos.application.retrieval.behavior_context_builder import BehaviorContext, BehaviorContextBuilder
 from memoryos.application.retrieval.memory_context_builder import MemoryContext, MemoryContextBuilder
+from memoryos.infrastructure.providers.rerank_provider import RerankProvider
 from memoryos.infrastructure.repositories.memory_repository import MemoryStore
 
 

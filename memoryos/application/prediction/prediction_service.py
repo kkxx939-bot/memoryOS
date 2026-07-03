@@ -4,9 +4,9 @@ import json
 import re
 from dataclasses import dataclass, field
 
+from memoryos.application.intervention.intervention_selector import InterventionSelector
 from memoryos.application.memory.extractor import TextGenerationProvider
 from memoryos.application.prediction.candidate_generator import CandidateGenerator
-from memoryos.application.intervention.intervention_selector import InterventionSelector
 from memoryos.application.prediction.candidate_ranker import CandidateRanker
 
 

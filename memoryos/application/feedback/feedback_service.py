@@ -9,6 +9,7 @@ from memoryos.domain.feedback.reward_result import compute_rewards
 from memoryos.domain.memory.memory_item import utc_now
 from memoryos.infrastructure.repositories.memory_repository import MemoryStore
 from memoryos.infrastructure.safety.path_safety import validate_identifier
+from memoryos.observability.audit_log import AuditLogger
 
 
 class FeedbackService:
@@ -88,6 +89,18 @@ class FeedbackService:
         }
         self._append_episode_jsonl(user_id, episode_id, "feedback.jsonl", record)
         self._mark_episode_feedback_queued(user_id, episode_id, episode_result, record)
+        AuditLogger(self.store.root).record(
+            user_id,
+            "feedback_queued",
+            {
+                "episode_id": episode_id,
+                "feedback_event_id": feedback_event["event_id"],
+                "outbox_id": outbox_event["outbox_id"],
+                "predicted_action": predicted_action,
+                "actual_action": actual_action,
+                "reward_breakdown": reward_breakdown.to_dict(),
+            },
+        )
         return record
 
     def _feedback_created_at(self, episode_result: dict) -> str:

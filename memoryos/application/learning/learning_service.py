@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from memoryos.application.learning.intervention_policy_stats import PolicyStats
-from memoryos.application.learning.rl_calibrator import ReinforcementPolicyLedger
 from memoryos.application.learning.behavior_feedback import BehaviorStats
 from memoryos.application.learning.behavior_patterns import BehaviorPatternStore
+from memoryos.application.learning.intervention_policy_stats import PolicyStats
+from memoryos.application.learning.rl_calibrator import ReinforcementPolicyLedger
 from memoryos.domain.memory.memory_item import MemoryItem, utc_now
 from memoryos.infrastructure.repositories.memory_repository import MemoryStore
 
@@ -27,7 +27,8 @@ class LearningProcessor:
         feedback = str(payload.get("feedback", ""))
         reward = float(payload.get("reward", 0.0))
         actual_action = payload.get("actual_action")
-        action_params = payload.get("action_params") if isinstance(payload.get("action_params"), dict) else {}
+        raw_action_params = payload.get("action_params")
+        action_params: dict = raw_action_params if isinstance(raw_action_params, dict) else {}
         spontaneity = str(payload.get("spontaneity", "unknown"))
         intervention_result = str(payload.get("intervention_result", ""))
         correction = payload.get("correction")

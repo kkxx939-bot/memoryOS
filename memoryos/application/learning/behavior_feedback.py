@@ -3,7 +3,15 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from memoryos.domain.behavior.signatures import MATCH_LEVEL_WEIGHTS, context_tokens, hash_tokens, is_coarse_token, is_exact_only_token, scene_signatures, text_tokens
+from memoryos.domain.behavior.signatures import (
+    MATCH_LEVEL_WEIGHTS,
+    context_tokens,
+    hash_tokens,
+    is_coarse_token,
+    is_exact_only_token,
+    scene_signatures,
+    text_tokens,
+)
 
 
 class BehaviorStats:
@@ -39,7 +47,7 @@ class BehaviorStats:
     def distribution_for_scene(self, retrieval_query: str, context_tags: list[str]) -> list[dict]:
         data = self._load()
         signatures = self.scene_signatures(retrieval_query, context_tags)
-        by_action = {}
+        by_action: dict[str, dict] = {}
         for level in ("exact", "semantic", "coarse"):
             signature = signatures[level]
             bucket = data.get("signatures", {}).get(level, {}).get(signature)

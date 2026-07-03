@@ -3,9 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from memoryos.infrastructure.providers.rerank_provider import RerankProvider
 from memoryos.application.learning.behavior_feedback import BehaviorStats
 from memoryos.application.learning.behavior_patterns import BehaviorPatternStore
+from memoryos.infrastructure.providers.rerank_provider import RerankProvider
 
 
 @dataclass

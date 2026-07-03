@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 
-
 MATCH_LEVEL_WEIGHTS = {
     "exact": 1.0,
     "semantic": 0.7,
@@ -84,8 +83,8 @@ def is_coarse_token(token: str) -> bool:
 
 def text_tokens(text: str) -> list[str]:
     lowered = text.lower()
-    tokens = []
-    current = []
+    tokens: list[str] = []
+    current: list[str] = []
     for ch in lowered:
         if "\u4e00" <= ch <= "\u9fff":
             if current:

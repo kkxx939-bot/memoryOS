@@ -4,7 +4,6 @@ from dataclasses import dataclass
 
 from memoryos.domain.actions.action_schema import action_spec, canonical_action
 
-
 POLICY_VERSION = "policy_v1"
 
 

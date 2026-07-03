@@ -6,9 +6,9 @@ import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from memoryos.application.prediction.candidate_generator import Candidate
 from memoryos.domain.actions.action_schema import action_spec, canonical_action
 from memoryos.domain.memory.memory_item import utc_now
-from memoryos.application.prediction.candidate_generator import Candidate
 
 
 @dataclass
@@ -48,7 +48,7 @@ class ActionValue:
         self.ucb_score = max(0.0, min(1.0, self.normalized_value + exploration * 0.12))
 
     @classmethod
-    def from_dict(cls, payload: dict) -> "ActionValue":
+    def from_dict(cls, payload: dict) -> ActionValue:
         return cls(
             trials=int(payload.get("trials", 0)),
             total_reward=float(payload.get("total_reward", 0.0)),
@@ -81,7 +81,7 @@ class StateValue:
     actions: dict[str, ActionValue] = field(default_factory=dict)
 
     @classmethod
-    def from_dict(cls, payload: dict) -> "StateValue":
+    def from_dict(cls, payload: dict) -> StateValue:
         return cls(
             visits=int(payload.get("visits", 0)),
             actions={

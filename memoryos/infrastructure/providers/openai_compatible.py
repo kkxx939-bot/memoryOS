@@ -142,7 +142,8 @@ class OpenAICompatibleRerankProvider:
             index = item.get("index")
             if not isinstance(index, int) or index < 0 or index >= len(documents):
                 return None
-            scores[index] = float(item.get("relevance_score", item.get("score", 0.0)))
+            raw_score = item.get("relevance_score", item.get("score", 0.0))
+            scores[index] = float(raw_score if raw_score is not None else 0.0)
         return scores
 
 

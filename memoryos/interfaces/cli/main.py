@@ -4,18 +4,19 @@ import argparse
 import json
 from pathlib import Path
 
-from memoryos.domain.memory.memory_item import MemoryItem
 from memoryos.application.memory.extractor import JsonLLMMemoryExtractor, RuleBasedExtractor
+from memoryos.application.session.session_manager import SessionManager
+from memoryos.domain.memory.memory_item import MemoryItem
+from memoryos.infrastructure.providers.embedding_provider import HashingEmbeddingProvider
 from memoryos.infrastructure.providers.openai_compatible import (
     build_chat_provider_from_env,
     build_embedding_provider_from_env,
     build_rerank_provider_from_env,
 )
-from memoryos.infrastructure.providers.embedding_provider import HashingEmbeddingProvider
-from memoryos.interfaces.hooks.memory_digest_hook import MemoryHook
-from memoryos.application.session.session_manager import SessionManager
 from memoryos.infrastructure.repositories.memory_repository import MemoryStore, validate_memory_type
+from memoryos.interfaces.hooks.memory_digest_hook import MemoryHook
 from memoryos.workers.feedback_worker import FeedbackWorker
+from memoryos.workers.replay_worker import ReplayWorker
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -116,6 +117,10 @@ def build_parser() -> argparse.ArgumentParser:
     add_root_user(process_feedback)
     process_feedback.add_argument("--limit", type=int, default=None)
 
+    replay_feedback = sub.add_parser("replay-feedback")
+    add_root_user(replay_feedback)
+    replay_feedback.add_argument("--limit", type=int, default=None)
+
     return parser
 
 
@@ -150,8 +155,8 @@ def main() -> None:
 
     if args.command == "update-memory":
         store.init(args.user)
-        tags = None if args.tags is None else [tag.strip() for tag in args.tags.split(",") if tag.strip()]
-        result = store.update_memory(args.id, user_id=args.user, title=args.title, text=args.text, tags=tags)
+        update_tags = None if args.tags is None else [tag.strip() for tag in args.tags.split(",") if tag.strip()]
+        result = store.update_memory(args.id, user_id=args.user, title=args.title, text=args.text, tags=update_tags)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
 
@@ -239,6 +244,11 @@ def main() -> None:
 
     if args.command == "process-feedback":
         result = FeedbackWorker(store).process_pending(user_id=args.user, limit=args.limit)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.command == "replay-feedback":
+        result = ReplayWorker(store).replay_feedback(user_id=args.user, limit=args.limit)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
 

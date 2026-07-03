@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-
 EPISODE_STATE_VERSION = "episode_state_v1"
 
 CREATED = "CREATED"

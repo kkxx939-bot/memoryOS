@@ -1,39 +1,45 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
-import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from memoryos.application.memory.weights import score_memory_weight
-from memoryos.domain.actions.action_schema import action_need, canonical_action
+from memoryos.application.episode.episode_service import EpisodeProcessor
 from memoryos.application.episode.episode_state_machine import CLOSED, FEEDBACK_PENDING
-from memoryos.domain.feedback.reward_result import compute_rewards
-from memoryos.application.intervention.policy_gate import PermissionPolicyEngine
-from memoryos.application.prediction.candidate_generator import Candidate
 from memoryos.application.intervention.intervention_selector import InterventionSelector
-from memoryos.application.memory.merge_ops import merge_op_factory
-from memoryos.application.memory.schema import memory_type_spec
-from memoryos.domain.memory.memory_item import MemoryItem
-from memoryos.application.memory.update_service import MemoryUpdateContext, MemoryUpdateService
-from memoryos.application.memory.extractor import JsonLLMMemoryExtractor, MemoryOperation
+from memoryos.application.intervention.policy_gate import PermissionPolicyEngine
 from memoryos.application.learning.behavior_feedback import BehaviorStats
 from memoryos.application.learning.behavior_patterns import BehaviorPatternStore
-from memoryos.application.retrieval.memory_context_builder import MemoryContextBuilder
-from memoryos.interfaces.hooks.memory_digest_hook import MemoryHook
-from memoryos.application.episode.episode_service import EpisodeProcessor
-from memoryos.domain.scene.observation import ObservationContext
-from memoryos.application.session.session_manager import SessionManager
-from memoryos.domain.memory.storage_plan import all_memory_storage_plans, memory_storage_plan
-from memoryos.infrastructure.repositories.memory_repository import MemoryStore
-from memoryos.domain.memory.update_policy import normalize_operation_for_policy, update_policy
 from memoryos.application.learning.rl_calibrator import ReinforcementPolicyLedger
+from memoryos.application.memory.extractor import JsonLLMMemoryExtractor, MemoryOperation
+from memoryos.application.memory.merge_ops import merge_op_factory
+from memoryos.application.memory.schema import memory_type_spec
+from memoryos.application.memory.update_service import MemoryUpdateContext, MemoryUpdateService
+from memoryos.application.memory.weights import score_memory_weight
+from memoryos.application.prediction.candidate_generator import Candidate
+from memoryos.application.prediction.candidate_ranker import CandidateRanker
+from memoryos.application.retrieval.memory_context_builder import MemoryContextBuilder
+from memoryos.application.session.session_manager import SessionManager
+from memoryos.domain.actions.action_schema import action_need, canonical_action
+from memoryos.domain.feedback.reward_result import compute_rewards
+from memoryos.domain.memory.memory_item import MemoryItem
+from memoryos.domain.memory.storage_plan import all_memory_storage_plans, memory_storage_plan
+from memoryos.domain.memory.update_policy import normalize_operation_for_policy, update_policy
+from memoryos.domain.scene.observation import ObservationContext
+from memoryos.infrastructure.repositories.memory_repository import MemoryStore
+from memoryos.infrastructure.stores.markdown_store import MarkdownStore
+from memoryos.interfaces.api.app import handle
+from memoryos.interfaces.hooks.memory_digest_hook import MemoryHook
+from memoryos.observability.audit_log import AuditLogger
 from memoryos.workers.feedback_worker import FeedbackWorker
+from memoryos.workers.reindex_worker import ReindexWorker
+from memoryos.workers.replay_worker import ReplayWorker
 
 
 class FakeProvider:
-    def __init__(self, response: dict) -> None:
+    def __init__(self, response: object) -> None:
         self.response = response
         self.prompt = ""
 
@@ -784,7 +790,7 @@ class MemoryStoreTest(unittest.TestCase):
             self.assertEqual(store.search("rawhot123", user_id="gulf"), [])
             self.assertTrue((Path(tmp) / "user" / "gulf" / "episodes" / "ep-two-stage" / "episode_log.json").exists())
 
-            feedback = episode.record_feedback(
+            episode.record_feedback(
                 user_id="gulf",
                 episode_id="ep-two-stage",
                 feedback="accepted",
@@ -837,7 +843,7 @@ class MemoryStoreTest(unittest.TestCase):
                     },
                     available_actions=["ask_user", "do_nothing"],
                 )
-                feedback = episode.record_feedback(
+                episode.record_feedback(
                     user_id="gulf",
                     episode_id=episode_id,
                     feedback="accepted",
@@ -988,6 +994,42 @@ class MemoryStoreTest(unittest.TestCase):
             candidate_actions = {candidate.action for candidate in candidates}
             self.assertIn("open_ac", candidate_actions)
             self.assertIn("turn_on_fan", candidate_actions)
+
+    def test_ranker_uses_behavior_param_distribution(self) -> None:
+        ranker = CandidateRanker()
+        candidate = Candidate(action="turn_on_ac", need="cool_down", prior=0.5, sources=["behavior_pattern"])
+        with_params = ranker.rank(
+            scene="hot room",
+            memories=[],
+            candidates=[candidate],
+            behavior_distribution=[
+                {
+                    "action": "turn_on_ac",
+                    "probability": 0.7,
+                    "avg_reward": 0.8,
+                    "confidence": 0.8,
+                    "recency_weight": 0.8,
+                    "param_distribution": {"target_temperature": {"25": 0.8, "26": 0.2}},
+                }
+            ],
+        )[0]
+        without_params = ranker.rank(
+            scene="hot room",
+            memories=[],
+            candidates=[Candidate(action="turn_on_ac", need="cool_down", prior=0.5, sources=["behavior_pattern"])],
+            behavior_distribution=[
+                {
+                    "action": "turn_on_ac",
+                    "probability": 0.7,
+                    "avg_reward": 0.8,
+                    "confidence": 0.8,
+                    "recency_weight": 0.8,
+                }
+            ],
+        )[0]
+
+        self.assertGreater(with_params.features["behavior_reward"], without_params.features["behavior_reward"])
+        self.assertGreater(with_params.score, without_params.score)
 
     def test_storage_plan_matches_memory_type_semantics(self) -> None:
         plans = {plan.memory_type: plan for plan in all_memory_storage_plans()}
@@ -1504,7 +1546,23 @@ class MemoryStoreTest(unittest.TestCase):
         self.assertTrue(reward.need_match)
         self.assertFalse(reward.action_match)
         self.assertGreater(reward.behavior_reward, 0)
+        self.assertEqual(reward.param_reward, 0.0)
+        self.assertEqual(reward.memory_update_signal, "similar_need_different_action")
         self.assertGreaterEqual(reward.intervention_reward, 0.3)
+
+        parameter_reward = compute_rewards(
+            predicted_action="open_ac",
+            actual_action="turn_on_ac",
+            user_reward=0.8,
+            intervention_action="ask_user",
+            intervention_result="accepted",
+            predicted_params={"target_temperature": 25},
+            actual_params={"target_temperature": 26},
+        )
+        self.assertTrue(parameter_reward.action_match)
+        self.assertFalse(parameter_reward.param_match)
+        self.assertEqual(parameter_reward.param_reward, 0.4)
+        self.assertEqual(parameter_reward.memory_update_signal, "parameter_correction")
 
     def test_permission_engine_blocks_private_behavior_intervention(self) -> None:
         decision = PermissionPolicyEngine().authorize("take_shower", prediction_confidence=0.9)
@@ -1558,6 +1616,11 @@ class MemoryStoreTest(unittest.TestCase):
             self.assertEqual(closed["episode_state"], CLOSED)
             self.assertIn("reward_model_version", closed["versions"])
             self.assertIn(CLOSED, {item["state"] for item in closed["state_history"]})
+            audit_events = AuditLogger(root).list_events("gulf")
+            audit_types = {event["event_type"] for event in audit_events}
+            self.assertIn("episode_predicted", audit_types)
+            self.assertIn("feedback_queued", audit_types)
+            self.assertIn("feedback_learning_applied", audit_types)
 
             retry = episode.record_feedback(
                 user_id="gulf",
@@ -1571,6 +1634,55 @@ class MemoryStoreTest(unittest.TestCase):
             retry_worker_result = FeedbackWorker(store).process_pending("gulf")
             self.assertEqual(retry_worker_result["processed"], 0)
             self.assertEqual(len(store.list_by_type("gulf", "case")), 1)
+
+    def test_api_facade_worker_replay_reindex_and_markdown_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = MemoryStore(root)
+            health = handle("GET /health", store)
+            self.assertEqual(health["status"], "ok")
+
+            episode = handle(
+                "POST /episodes",
+                store,
+                {
+                    "user_id": "gulf",
+                    "episode_id": "api-flow",
+                    "scene": "用户回到房间，说热并出汗。",
+                    "available_actions": ["ask_user", "do_nothing"],
+                    "memory_write_timing": "deferred",
+                },
+            )
+            self.assertEqual(episode["episode_status"], "predicted")
+
+            feedback = handle(
+                "POST /episodes/feedback",
+                store,
+                {
+                    "user_id": "gulf",
+                    "episode_id": "api-flow",
+                    "feedback": "accepted",
+                    "reward": 1,
+                    "actual_action": "open_ac",
+                    "intervention_result": "accepted",
+                },
+            )
+            self.assertEqual(feedback["learning_status"], "queued")
+
+            processed = handle("POST /feedback/process", store, {"user_id": "gulf"})
+            self.assertEqual(processed["processed"], 1)
+            replay = ReplayWorker(store).replay_feedback("gulf")
+            self.assertEqual(replay["replayed"], 1)
+            self.assertEqual(replay["idempotent"], 1)
+
+            reindexed = ReindexWorker(store).reindex("gulf")
+            self.assertEqual(reindexed["status"], "reindexed")
+            digest = handle("GET /memory/digest", store, {"user_id": "gulf", "query": "hot room"})
+            self.assertIn("<personal-memory", digest["digest"])
+
+            file_path = root / "atomic.md"
+            MarkdownStore().write_text_atomic(file_path, "hello")
+            self.assertEqual(MarkdownStore().read_text(file_path), "hello")
 
 
 if __name__ == "__main__":

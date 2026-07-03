@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from memoryos.domain.actions.action_schema import canonical_action
 from memoryos.application.intervention.policy_gate import POLICY_VERSION, PermissionPolicyEngine
 from memoryos.application.prediction.candidate_generator import Candidate
+from memoryos.domain.actions.action_schema import canonical_action
 
 
 @dataclass
@@ -106,15 +106,16 @@ class InterventionSelector:
                 }
             )
 
-        options.sort(key=lambda item: item["score"], reverse=True)
+        options.sort(key=lambda item: self._to_float(item.get("score", 0.0)), reverse=True)
         top = options[0]
+        top_features = top.get("features", {})
         return InterventionDecision(
             action=str(top["action"]),
             predicted_action=candidate.action,
             predicted_need=candidate.need,
-            score=float(top["score"]),
+            score=self._to_float(top.get("score", 0.0)),
             reason=f"Selected intervention for predicted user behavior: {candidate.action}.",
-            features=top["features"],
+            features=top_features if isinstance(top_features, dict) else {},
             alternatives=options[1:],
         )
 
@@ -169,3 +170,9 @@ class InterventionSelector:
             if action in group:
                 return [action, *sorted(group - {action})]
         return [action]
+
+    def _to_float(self, value: object, default: float = 0.0) -> float:
+        try:
+            return float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return default

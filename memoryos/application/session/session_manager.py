@@ -3,16 +3,22 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from typing import Protocol
 
-from memoryos.domain.memory.memory_item import utc_now
 from memoryos.application.memory.extractor import MemoryOperation, RuleBasedExtractor
+from memoryos.application.memory.update_service import MemoryUpdateContext, MemoryUpdateService
+from memoryos.domain.memory.memory_item import utc_now
 from memoryos.infrastructure.repositories.memory_repository import MemoryStore
 from memoryos.infrastructure.safety.path_safety import validate_identifier
-from memoryos.application.memory.update_service import MemoryUpdateContext, MemoryUpdateService
+
+
+class MemoryExtractor(Protocol):
+    def extract(self, messages: list[dict[str, str]]) -> list[MemoryOperation]:
+        ...
 
 
 class SessionManager:
-    def __init__(self, store: MemoryStore, extractor: RuleBasedExtractor | None = None) -> None:
+    def __init__(self, store: MemoryStore, extractor: MemoryExtractor | None = None) -> None:
         self.store = store
         self.extractor = extractor or RuleBasedExtractor()
         self.memory_updates = MemoryUpdateService(store)

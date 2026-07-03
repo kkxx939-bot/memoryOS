@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import sqlite3
+from collections.abc import Sequence
 from copy import deepcopy
 from datetime import date
 from pathlib import Path, PurePosixPath
@@ -11,12 +11,17 @@ from typing import Any
 
 from memoryos.application.memory.lifecycle import classify_lifecycle, hotness_score
 from memoryos.application.memory.markdown import parse_memory_markdown, render_memory_markdown
+from memoryos.application.memory.schema import MEMORY_TYPE_SPECS, memory_type_spec, render_template, validate_metadata
 from memoryos.application.memory.weights import score_memory_weight
 from memoryos.domain.memory.memory_item import MEMORY_TYPES, TYPE_DIR, MemoryItem, summarize_text, utc_now
-from memoryos.application.memory.schema import MEMORY_TYPE_SPECS, memory_type_spec, render_template, validate_metadata
-from memoryos.infrastructure.providers.embedding_provider import EmbeddingProvider, HashingEmbeddingProvider, cosine_similarity
+from memoryos.infrastructure.providers.embedding_provider import (
+    EmbeddingProvider,
+    HashingEmbeddingProvider,
+    cosine_similarity,
+)
 from memoryos.infrastructure.providers.rerank_provider import RerankProvider, rerank_with_fallback
 from memoryos.infrastructure.safety.path_safety import safe_join, safe_relative_path, validate_identifier
+from memoryos.infrastructure.stores.markdown_store import MarkdownStore
 
 
 class MemoryStore:
@@ -31,6 +36,7 @@ class MemoryStore:
         self.db_path = self.index_dir / "memory.sqlite3"
         self.embedding_provider = embedding_provider or HashingEmbeddingProvider()
         self.rerank_provider = rerank_provider
+        self.markdown_store = MarkdownStore()
 
     def init(self, user_id: str) -> None:
         validate_identifier(user_id, "user_id")
@@ -61,10 +67,7 @@ class MemoryStore:
         return conn
 
     def _write_text_atomic(self, path: Path, content: str) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        tmp_path.write_text(content, encoding="utf-8")
-        os.replace(tmp_path, path)
+        self.markdown_store.write_text_atomic(path, content)
 
     def _ensure_embedding_columns(self, conn: sqlite3.Connection) -> None:
         existing = {
@@ -212,7 +215,7 @@ class MemoryStore:
             source=f"event:{event_type}",
         )
         event_path = self.add_memory(event)
-        log_path = safe_join(self.root, PurePosixPath("user") / user_id / "daily" / day / "events.jsonl")
+        log_path = safe_join(self.root, str(PurePosixPath("user") / user_id / "daily" / day / "events.jsonl"))
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_entry = {
             "created_at": utc_now(),
@@ -505,7 +508,7 @@ class MemoryStore:
             existing.setdefault("keyword_score", 0.0)
             candidates[data["id"]] = existing
 
-        ranked = []
+        ranked: list[dict[str, Any]] = []
         for data in candidates.values():
             final_score = self._hybrid_score(data)
             data["final_score"] = final_score
@@ -525,7 +528,7 @@ class MemoryStore:
         user_id: str,
         memory_type: str | None,
         limit: int,
-    ) -> list[sqlite3.Row | dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         fts_query = self._to_fts_query(query)
         params: list[Any] = [fts_query, user_id]
         where = ["memory_fts MATCH ?", "memory_fts.user_id = ?"]
@@ -545,7 +548,7 @@ class MemoryStore:
             rows = conn.execute(sql, params).fetchall()
         if not rows:
             return self._fallback_like_search(query, user_id, memory_type, limit)
-        ranked = []
+        ranked: list[dict[str, Any]] = []
         total = max(len(rows), 1)
         for index, row in enumerate(rows):
             data = dict(row)
@@ -753,11 +756,11 @@ class MemoryStore:
         strongest_lines = []
         for memory in memories[:12]:
             strongest_lines.append(
-                (
+                
                     f"- {memory.get('title')} | weight={float(memory.get('effective_weight', 0.0)):.3f} "
                     f"hotness={float(memory.get('hotness', 0.0)):.3f} | {memory.get('abstract', '')} "
                     f"({memory.get('path')})"
-                )
+                
             )
         context = {
             "overview_title": spec.overview_title if spec else "Overview",
@@ -1070,7 +1073,7 @@ class MemoryStore:
             return 0.0
         return min(1.0, overlap / max(3, len(left)))
 
-    def _touch_access(self, rows: list[sqlite3.Row | dict[str, Any]]) -> list[sqlite3.Row | dict[str, Any]]:
+    def _touch_access(self, rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
         if not rows:
             return []
         now = utc_now()
@@ -1182,7 +1185,7 @@ class MemoryStore:
         user_id: str,
         memory_type: str | None,
         limit: int,
-    ) -> list[sqlite3.Row]:
+    ) -> list[dict[str, Any]]:
         terms = [part.strip() for part in query.split() if part.strip()] or [query.strip()]
         terms = [term for term in terms if term]
         if not terms:
@@ -1205,7 +1208,7 @@ class MemoryStore:
         """
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
-        ranked = []
+        ranked: list[dict[str, Any]] = []
         total = max(len(rows), 1)
         for index, row in enumerate(rows):
             data = dict(row)

@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from memoryos.domain.actions.action_schema import ACTION_SCHEMA_VERSION
 from memoryos.application.episode.episode_state_machine import (
     CREATED,
     EPISODE_STATE_VERSION,
@@ -13,21 +12,23 @@ from memoryos.application.episode.episode_state_machine import (
     PREDICTED,
     RETRIEVED,
 )
-from memoryos.domain.feedback.reward_result import REWARD_MODEL_VERSION
 from memoryos.application.feedback.feedback_service import FeedbackService
-from memoryos.application.intervention.policy_gate import POLICY_VERSION
-from memoryos.domain.memory.memory_item import utc_now
-from memoryos.application.memory.extractor import MemoryOperation, RuleBasedExtractor
-from memoryos.application.prediction.candidate_generator import Candidate
 from memoryos.application.intervention.intervention_selector import InterventionDecision, InterventionSelector
+from memoryos.application.intervention.policy_gate import POLICY_VERSION
 from memoryos.application.learning.intervention_policy_stats import PolicyStats
-from memoryos.application.prediction.prediction_service import Prediction, RuleBasedPredictor
 from memoryos.application.learning.rl_calibrator import PolicyState, ReinforcementPolicyLedger
+from memoryos.application.memory.extractor import MemoryOperation, RuleBasedExtractor
+from memoryos.application.memory.update_service import MemoryUpdateContext, MemoryUpdateService
+from memoryos.application.prediction.candidate_generator import Candidate
+from memoryos.application.prediction.prediction_service import Prediction, RuleBasedPredictor
 from memoryos.application.retrieval.retrieval_service import RetrievalOrchestrator
+from memoryos.domain.actions.action_schema import ACTION_SCHEMA_VERSION
+from memoryos.domain.feedback.reward_result import REWARD_MODEL_VERSION
+from memoryos.domain.memory.memory_item import utc_now
 from memoryos.domain.scene.observation import ObservationContext
 from memoryos.infrastructure.repositories.memory_repository import MemoryStore
 from memoryos.infrastructure.safety.path_safety import validate_identifier
-from memoryos.application.memory.update_service import MemoryUpdateContext, MemoryUpdateService
+from memoryos.observability.audit_log import AuditLogger
 
 
 class EpisodeProcessor:
@@ -220,6 +221,20 @@ class EpisodeProcessor:
             ],
         }
         self._write_episode_file(user_id, episode_id, "episode_result.json", result)
+        AuditLogger(self.store.root).record(
+            user_id,
+            "episode_predicted",
+            {
+                "episode_id": episode_id,
+                "predicted_action": prediction.predicted_action,
+                "recommended_intervention": prediction.recommended_intervention,
+                "intervention_action": intervention.action,
+                "top_candidate": ranked_candidates[0].to_dict() if ranked_candidates else None,
+                "retrieved_memory_count": len(memories),
+                "behavior_pattern_count": len(retrieval.behavior_patterns),
+                "rl_state_key": rl_state.key,
+            },
+        )
         if pending_memory_operations:
             self._write_episode_file(
                 user_id,

@@ -81,7 +81,7 @@ class CandidateRanker:
                     "support": "positive",
                 }
             )
-        evidence.sort(key=lambda item: item["combined_weight"], reverse=True)
+        evidence.sort(key=lambda item: self._to_float(item.get("combined_weight", 0.0)), reverse=True)
         return evidence
 
     def _retrieval_weight(self, memory: dict) -> float:
@@ -137,7 +137,33 @@ class CandidateRanker:
             reward_score = max(0.0, min(1.0, (avg_reward + 1.0) / 2.0))
             confidence = float(item.get("confidence", item.get("evidence_confidence", 0.0)) or 0.0)
             recency = float(item.get("recency_weight", 0.5) or 0.0)
+            param_confidence = self._param_distribution_confidence(item.get("param_distribution", {}))
             negative_penalty = min(0.35, int(item.get("negative_count", 0)) * 0.08)
-            score = probability * 0.35 + reward_score * 0.25 + confidence * 0.25 + recency * 0.15 - negative_penalty
+            score = (
+                probability * 0.30
+                + reward_score * 0.22
+                + confidence * 0.22
+                + recency * 0.13
+                + param_confidence * 0.13
+                - negative_penalty
+            )
             return round(max(0.0, min(1.0, score)), 6)
         return float(item.get("weighted_behavior_reward", item.get("behavior_reward_score", 0.5)))
+
+    def _to_float(self, value: object, default: float = 0.0) -> float:
+        try:
+            return float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return default
+
+    def _param_distribution_confidence(self, param_distribution: object) -> float:
+        if not isinstance(param_distribution, dict) or not param_distribution:
+            return 0.0
+        strongest_values = []
+        for value_distribution in param_distribution.values():
+            if not isinstance(value_distribution, dict) or not value_distribution:
+                continue
+            strongest_values.append(max(float(value or 0.0) for value in value_distribution.values()))
+        if not strongest_values:
+            return 0.0
+        return round(max(0.0, min(1.0, sum(strongest_values) / len(strongest_values))), 6)

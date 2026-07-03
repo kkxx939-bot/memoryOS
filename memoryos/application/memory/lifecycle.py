@@ -26,9 +26,10 @@ def hotness_score(
     active_count: int,
     updated_at: str | None,
     now: datetime | None = None,
-    config: LifecycleConfig = LifecycleConfig(),
+    config: LifecycleConfig | None = None,
 ) -> float:
     now = now or datetime.now(timezone.utc)
+    config = config or LifecycleConfig()
     updated = parse_datetime(updated_at)
     age_days = max((now - updated).total_seconds() / 86400, 0.0)
     usage_signal = 0.2 + 0.8 * (1.0 - math.exp(-max(active_count, 0) / 3.0))
@@ -36,7 +37,8 @@ def hotness_score(
     return round(max(0.0, min(1.0, usage_signal * decay)), 6)
 
 
-def classify_lifecycle(score: float, config: LifecycleConfig = LifecycleConfig()) -> str:
+def classify_lifecycle(score: float, config: LifecycleConfig | None = None) -> str:
+    config = config or LifecycleConfig()
     if score >= config.hot_threshold:
         return "hot"
     if score <= config.cold_threshold:

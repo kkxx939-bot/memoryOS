@@ -6,7 +6,6 @@ from datetime import datetime, timezone
 
 from memoryos.application.memory.lifecycle import parse_datetime
 
-
 TEMPORAL_SCOPES = {"stable", "rolling_7d", "rolling_30d", "episodic", "seasonal"}
 
 DEFAULT_BASE_WEIGHTS = {

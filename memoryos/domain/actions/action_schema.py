@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-
 ACTION_SCHEMA_VERSION = "action_schema_v1"
 
 
