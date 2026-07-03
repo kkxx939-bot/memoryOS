@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import sqlite3
 from collections.abc import Sequence
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import date
 from pathlib import Path, PurePosixPath
@@ -56,7 +58,23 @@ class MemoryStore:
         (user_root / "episodes").mkdir(parents=True, exist_ok=True)
         (user_root / "daily").mkdir(parents=True, exist_ok=True)
         (user_root / "archive").mkdir(parents=True, exist_ok=True)
+        (user_root / "locks").mkdir(parents=True, exist_ok=True)
         self._init_db()
+        self.recover_user_operations(user_id)
+
+    @contextmanager
+    def _memory_write_lock(self, user_id: str, key: str):
+        validate_identifier(user_id, "user_id")
+        lock_dir = self.root / "user" / user_id / "locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        safe_key = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+        lock_path = lock_dir / f"{safe_key}.lock"
+        with lock_path.open("a+", encoding="utf-8") as fp:
+            fcntl.flock(fp.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fp.fileno(), fcntl.LOCK_UN)
 
     def _ensure_layer_files(self, directory: Path, label: str) -> None:
         abstract = directory / ".abstract.md"
@@ -91,6 +109,24 @@ class MemoryStore:
             if name not in existing:
                 conn.execute(f"ALTER TABLE memory_embeddings ADD COLUMN {name} {ddl}")
 
+    def _ensure_memory_columns(self, conn: sqlite3.Connection) -> None:
+        existing = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(memories)").fetchall()
+        }
+        columns = {
+            "status": "TEXT NOT NULL DEFAULT 'active'",
+            "supersedes": "TEXT NOT NULL DEFAULT '[]'",
+            "superseded_by": "TEXT",
+            "valid_from": "TEXT NOT NULL DEFAULT ''",
+            "valid_until": "TEXT",
+            "last_confirmed_at": "TEXT",
+            "source_episode_id": "TEXT",
+        }
+        for name, ddl in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE memories ADD COLUMN {name} {ddl}")
+
     def _init_db(self) -> None:
         with self._connect() as conn:
             conn.execute(
@@ -117,10 +153,18 @@ class MemoryStore:
                     evidence_count INTEGER NOT NULL,
                     positive_count INTEGER NOT NULL,
                     negative_count INTEGER NOT NULL,
-                    effective_weight REAL NOT NULL
+                    effective_weight REAL NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    supersedes TEXT NOT NULL DEFAULT '[]',
+                    superseded_by TEXT,
+                    valid_from TEXT NOT NULL DEFAULT '',
+                    valid_until TEXT,
+                    last_confirmed_at TEXT,
+                    source_episode_id TEXT
                 )
                 """
             )
+            self._ensure_memory_columns(conn)
             conn.execute(
                 """
                 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts
@@ -163,6 +207,10 @@ class MemoryStore:
     def add_memory(self, item: MemoryItem) -> Path:
         validate_identifier(item.user_id, "user_id")
         self._init_db()
+        with self._memory_write_lock(item.user_id, item.path or item.memory_id):
+            return self._add_memory_locked(item)
+
+    def _add_memory_locked(self, item: MemoryItem) -> Path:
         path = safe_join(self.root, item.path or "")
         item.path = safe_relative_path(self.root, path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -288,6 +336,18 @@ class MemoryStore:
         metadata_patch: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         validate_identifier(user_id, "user_id")
+        with self._memory_write_lock(user_id, identifier):
+            return self._update_memory_locked(identifier, user_id, title, text, tags, metadata_patch)
+
+    def _update_memory_locked(
+        self,
+        identifier: str,
+        user_id: str,
+        title: str | None = None,
+        text: str | None = None,
+        tags: list[str] | None = None,
+        metadata_patch: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         current = self.resolve_memory(identifier, user_id)
         metadata, body = self.read_memory(current["path"])
         before = {"metadata": deepcopy(metadata), "content": body}
@@ -324,6 +384,10 @@ class MemoryStore:
 
     def delete_memory(self, identifier: str, user_id: str) -> dict[str, Any]:
         validate_identifier(user_id, "user_id")
+        with self._memory_write_lock(user_id, identifier):
+            return self._delete_memory_locked(identifier, user_id)
+
+    def _delete_memory_locked(self, identifier: str, user_id: str) -> dict[str, Any]:
         current = self.resolve_memory(identifier, user_id)
         path = safe_join(self.root, current["path"])
         metadata, body = self.read_memory(current["path"])
@@ -396,6 +460,20 @@ class MemoryStore:
         source: str,
         mode: str,
     ) -> dict[str, Any]:
+        with self._memory_write_lock(user_id, rel_path):
+            return self._upsert_fixed_memory_locked(user_id, rel_path, memory_type, title, text, tags, source, mode)
+
+    def _upsert_fixed_memory_locked(
+        self,
+        user_id: str,
+        rel_path: str,
+        memory_type: str,
+        title: str,
+        text: str,
+        tags: list[str],
+        source: str,
+        mode: str,
+    ) -> dict[str, Any]:
         if mode not in {"append", "replace"}:
             raise ValueError("mode must be 'append' or 'replace'")
         path = safe_join(self.root, rel_path)
@@ -434,7 +512,7 @@ class MemoryStore:
             source=source,
             path=rel_path,
         )
-        self.add_memory(item)
+        self._add_memory_locked(item)
         return {
             "uri": rel_path,
             "operation": "create",
@@ -474,6 +552,13 @@ class MemoryStore:
                 int(metadata["positive_count"]),
                 int(metadata["negative_count"]),
                 float(metadata["effective_weight"]),
+                metadata.get("status", "active"),
+                json.dumps(metadata.get("supersedes", []), ensure_ascii=False),
+                metadata.get("superseded_by"),
+                metadata.get("valid_from", metadata.get("created_at", utc_now())),
+                metadata.get("valid_until"),
+                metadata.get("last_confirmed_at"),
+                metadata.get("source_episode_id"),
             )
             conn.execute(
                 """
@@ -483,9 +568,11 @@ class MemoryStore:
                     source, confidence, created_at, updated_at,
                     last_accessed_at, active_count, hotness, lifecycle_state,
                     temporal_scope, base_weight, evidence_count, positive_count,
-                    negative_count, effective_weight
+                    negative_count, effective_weight, status, supersedes,
+                    superseded_by, valid_from, valid_until, last_confirmed_at,
+                    source_episode_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 row,
             )
@@ -588,7 +675,7 @@ class MemoryStore:
     ) -> list[dict[str, Any]]:
         fts_query = self._to_fts_query(query)
         params: list[Any] = [fts_query, user_id]
-        where = ["memory_fts MATCH ?", "memory_fts.user_id = ?"]
+        where = ["memory_fts MATCH ?", "memory_fts.user_id = ?", "memories.status = 'active'"]
         if memory_type:
             where.append("memory_fts.type = ?")
             params.append(memory_type)
@@ -620,7 +707,7 @@ class MemoryStore:
             rows = conn.execute(
                 """
                 SELECT * FROM memories
-                WHERE user_id = ?
+                WHERE user_id = ? AND status = 'active'
                 ORDER BY updated_at DESC
                 LIMIT ?
                 """,
@@ -635,7 +722,7 @@ class MemoryStore:
             rows = conn.execute(
                 """
                 SELECT * FROM memories
-                WHERE user_id = ? AND type = ?
+                WHERE user_id = ? AND type = ? AND status = 'active'
                 ORDER BY effective_weight DESC, hotness DESC, updated_at DESC
                 LIMIT ?
                 """,
@@ -654,7 +741,7 @@ class MemoryStore:
             rows = conn.execute(
                 """
                 SELECT * FROM memories
-                WHERE user_id = ?
+                WHERE user_id = ? AND status = 'active'
                 ORDER BY
                     CASE lifecycle_state
                         WHEN 'cold' THEN 0
@@ -688,6 +775,7 @@ class MemoryStore:
                 SELECT * FROM memories
                 WHERE user_id = ?
                   AND hotness <= ?
+                  AND status = 'active'
                   AND type IN ({placeholders})
                 ORDER BY hotness ASC, updated_at ASC
                 LIMIT ?
@@ -1034,6 +1122,14 @@ class MemoryStore:
     def _normalize_metadata(self, metadata: dict[str, Any], body: str) -> dict[str, Any]:
         metadata = dict(metadata)
         metadata["abstract"] = summarize_text(body)
+        now = utc_now()
+        metadata["status"] = str(metadata.get("status") or "active")
+        metadata["supersedes"] = metadata.get("supersedes") if isinstance(metadata.get("supersedes"), list) else []
+        metadata["superseded_by"] = metadata.get("superseded_by")
+        metadata["valid_from"] = metadata.get("valid_from") or metadata.get("created_at") or now
+        metadata["valid_until"] = metadata.get("valid_until")
+        metadata["last_confirmed_at"] = metadata.get("last_confirmed_at")
+        metadata["source_episode_id"] = metadata.get("source_episode_id")
         metadata["confidence"] = float(metadata["confidence"])
         metadata["active_count"] = max(0, int(metadata["active_count"]))
         metadata["hotness"] = hotness_score(metadata["active_count"], metadata["updated_at"])
@@ -1061,8 +1157,13 @@ class MemoryStore:
         )
 
     def _embedding_metadata(self, text: str, embedding: list[float]) -> dict[str, Any]:
-        provider = type(self.embedding_provider).__name__
+        provider = str(getattr(self.embedding_provider, "provider_name", type(self.embedding_provider).__name__))
         model = str(getattr(self.embedding_provider, "model", getattr(self.embedding_provider, "model_name", provider)))
+        expected_dimension = int(getattr(self.embedding_provider, "dimension", 0) or 0)
+        if expected_dimension and expected_dimension != len(embedding):
+            raise ValueError(
+                f"Embedding dimension mismatch for {provider}:{model}: expected {expected_dimension}, got {len(embedding)}"
+            )
         return {
             "provider": provider,
             "model": model,
@@ -1075,10 +1176,13 @@ class MemoryStore:
         provider = str(row.get("provider", ""))
         model = str(row.get("model", ""))
         dimension = int(row.get("dimension", 0) or 0)
-        current_provider = type(self.embedding_provider).__name__
+        current_provider = str(getattr(self.embedding_provider, "provider_name", type(self.embedding_provider).__name__))
         current_model = str(getattr(self.embedding_provider, "model", getattr(self.embedding_provider, "model_name", current_provider)))
+        current_dimension = int(getattr(self.embedding_provider, "dimension", 0) or 0)
         if not provider and not model and dimension == 0:
             return True
+        if current_dimension:
+            return provider == current_provider and model == current_model and dimension == current_dimension
         return provider == current_provider and model == current_model and dimension > 0
 
     def _embedding_search_rows(
@@ -1089,7 +1193,7 @@ class MemoryStore:
         limit: int,
     ) -> list[dict[str, Any]]:
         query_embedding = self.embedding_provider.embed(query)
-        where = ["memories.user_id = ?"]
+        where = ["memories.user_id = ?", "memories.status = 'active'"]
         params: list[Any] = [user_id]
         if memory_type:
             where.append("memories.type = ?")
@@ -1143,16 +1247,19 @@ class MemoryStore:
     def _search_tokens(self, text: str) -> set[str]:
         lowered = text.lower()
         tokens = set()
-        current = []
+        current: list[str] = []
         for ch in lowered:
-            if ch.isalnum():
+            if "\u4e00" <= ch <= "\u9fff":
+                if current:
+                    tokens.add("".join(current))
+                    current = []
+                tokens.add(ch)
+            elif ch.isalnum():
                 current.append(ch)
             else:
                 if current:
                     tokens.add("".join(current))
                     current = []
-                if "\u4e00" <= ch <= "\u9fff":
-                    tokens.add(ch)
         if current:
             tokens.add("".join(current))
         return {token for token in tokens if token}
@@ -1256,6 +1363,10 @@ class MemoryStore:
             data["tags"] = json.loads(data["tags"])
         except json.JSONDecodeError:
             data["tags"] = []
+        try:
+            data["supersedes"] = json.loads(data.get("supersedes", "[]") or "[]")
+        except json.JSONDecodeError:
+            data["supersedes"] = []
         data["active_count"] = int(data.get("active_count") or 0)
         data["hotness"] = float(data.get("hotness") or 0.0)
         data["base_weight"] = float(data.get("base_weight") or 0.0)
@@ -1266,7 +1377,7 @@ class MemoryStore:
         return data
 
     def _to_fts_query(self, query: str) -> str:
-        terms = [part.strip().replace('"', "") for part in query.split() if part.strip()]
+        terms = [part.replace('"', "") for part in self._search_terms(query)]
         if not terms:
             return '""'
         return " OR ".join(f'"{term}"' for term in terms)
@@ -1278,11 +1389,11 @@ class MemoryStore:
         memory_type: str | None,
         limit: int,
     ) -> list[dict[str, Any]]:
-        terms = [part.strip() for part in query.split() if part.strip()] or [query.strip()]
+        terms = self._search_terms(query) or [query.strip()]
         terms = [term for term in terms if term]
         if not terms:
             return []
-        where = ["user_id = ?"]
+        where = ["user_id = ?", "status = 'active'"]
         params: list[Any] = [user_id]
         if memory_type:
             where.append("type = ?")
@@ -1307,6 +1418,21 @@ class MemoryStore:
             data["keyword_score"] = 0.65 - (index / total * 0.2)
             ranked.append(data)
         return ranked
+
+    def _search_terms(self, query: str) -> list[str]:
+        raw_terms = [part.strip() for part in query.split() if part.strip()]
+        cjk_chars = [ch for ch in query if "\u4e00" <= ch <= "\u9fff"]
+        cjk_bigrams = ["".join(cjk_chars[index:index + 2]) for index in range(max(0, len(cjk_chars) - 1))]
+        cjk_fallback = cjk_chars if len(cjk_chars) <= 1 else []
+        terms = []
+        seen = set()
+        for term in [*raw_terms, *cjk_bigrams, *cjk_fallback]:
+            term = term.strip()
+            if not term or term in seen:
+                continue
+            seen.add(term)
+            terms.append(term)
+        return terms[:24]
 
     def _operation_id(self, operation: str, payload: dict[str, Any]) -> str:
         material = json.dumps(
@@ -1337,6 +1463,45 @@ class MemoryStore:
         with path.open("a", encoding="utf-8") as fp:
             fp.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
         return str(PurePosixPath(path.relative_to(self.root).as_posix()))
+
+    def recover_user_operations(self, user_id: str) -> dict[str, Any]:
+        validate_identifier(user_id, "user_id")
+        log_path = self.root / "user" / user_id / "events" / "memory_operations.jsonl"
+        if not log_path.exists():
+            return {"user_id": user_id, "recovered": False, "reason": "no_operation_log"}
+        latest: dict[str, dict[str, Any]] = {}
+        for line in log_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            operation_id = str(record.get("operation_id", ""))
+            if operation_id:
+                latest[operation_id] = record
+        unresolved = [
+            record
+            for record in latest.values()
+            if record.get("status") in {"pending", "failed"}
+        ]
+        if not unresolved:
+            return {"user_id": user_id, "recovered": False, "reason": "no_unresolved_operations"}
+        with self._memory_write_lock(user_id, "redo-recovery"):
+            report_before = self.verify_index(user_id)
+            if not report_before.get("healthy", False):
+                self.reindex(user_id)
+            self._append_operation_log(
+                user_id,
+                self._operation_id("redo_recovery", {"unresolved": unresolved}),
+                "committed",
+                "redo_recovery",
+                {
+                    "unresolved_count": len(unresolved),
+                    "index_was_healthy": report_before.get("healthy", False),
+                },
+            )
+        return {"user_id": user_id, "recovered": True, "unresolved_count": len(unresolved)}
 
     def _append_tombstone(self, user_id: str, metadata: dict[str, Any], body: str, reason: str) -> str:
         path = self.root / "user" / user_id / "archive" / "deleted_memories.jsonl"

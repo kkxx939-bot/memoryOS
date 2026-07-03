@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from typing import Any
 
 from memoryos.domain.memory.memory_item import MEMORY_TYPES
 from memoryos.ports.providers.chat_provider import ChatProvider, ModelResponse
@@ -38,6 +39,41 @@ class MemoryOperation:
 
 
 ExtractedMemory = MemoryOperation
+
+
+@dataclass
+class MemoryExtractionResult:
+    accepted: list[MemoryOperation] = field(default_factory=list)
+    rejected: list[dict[str, Any]] = field(default_factory=list)
+    pending: list[dict[str, Any]] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    raw_model_output: str = ""
+    extractor_version: str = "json_llm_extractor_v2"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "accepted": [operation_to_dict(operation) for operation in self.accepted],
+            "rejected": self.rejected,
+            "pending": self.pending,
+            "errors": self.errors,
+            "raw_model_output": self.raw_model_output,
+            "extractor_version": self.extractor_version,
+        }
+
+
+def operation_to_dict(operation: MemoryOperation) -> dict[str, Any]:
+    return {
+        "action": operation.action,
+        "memory_type": operation.memory_type,
+        "title": operation.title,
+        "text": operation.text,
+        "tags": operation.tags,
+        "confidence": operation.confidence,
+        "target": operation.target,
+        "rationale": operation.rationale,
+        "page_id": operation.page_id,
+        "links": operation.links,
+    }
 
 
 class RuleBasedExtractor:
@@ -100,6 +136,7 @@ class JsonLLMMemoryExtractor:
 
     def __init__(self, provider: ChatProvider) -> None:
         self.provider = provider
+        self.last_result = MemoryExtractionResult()
 
     def extract(self, messages: list[dict[str, str]]) -> list[MemoryOperation]:
         clean_messages = [
@@ -109,7 +146,9 @@ class JsonLLMMemoryExtractor:
         prompt = self.build_prompt(clean_messages)
         response = self.provider.complete(prompt)
         text = response.text if isinstance(response, ModelResponse) else str(response)
-        return self.parse_response(text)
+        result = self.parse_response_detailed(text)
+        self.last_result = result
+        return result.accepted
 
     def build_prompt(self, messages: list[dict[str, str]]) -> str:
         transcript = "\n".join(
@@ -156,7 +195,15 @@ Transcript:
 """
 
     def parse_response(self, response: str) -> list[MemoryOperation]:
-        payload = self._load_json(response)
+        return self.parse_response_detailed(response).accepted
+
+    def parse_response_detailed(self, response: str) -> MemoryExtractionResult:
+        result = MemoryExtractionResult(raw_model_output=response)
+        try:
+            payload = self._load_json(response)
+        except ValueError as exc:
+            result.errors.append(str(exc))
+            return result
         if isinstance(payload, dict):
             raw_operations = payload.get("operations", [])
         elif isinstance(payload, list):
@@ -164,41 +211,68 @@ Transcript:
         else:
             raw_operations = []
         if not isinstance(raw_operations, list):
-            raise ValueError("LLM memory response must contain an operations list")
-        operations = []
-        for raw in raw_operations:
+            result.errors.append("LLM memory response must contain an operations list")
+            return result
+        for index, raw in enumerate(raw_operations):
             if not isinstance(raw, dict):
-                raise ValueError("Each memory operation must be an object")
-            action = str(raw.get("action", "ignore")).strip()
-            memory_type = str(raw.get("memory_type", "event")).strip()
-            title = str(raw.get("title", "")).strip()
-            text = str(raw.get("text", "")).strip()
-            tags = raw.get("tags", [])
-            confidence = float(raw.get("confidence", 0.5))
-            if action == "ignore":
-                title = title or "ignored"
-                text = text or raw.get("rationale", "ignored")
-                tags = tags or ["ignore"]
-            if action == "delete":
-                title = title or "delete memory"
-                text = text or raw.get("rationale", "delete requested")
-            if not title or not text:
-                raise ValueError("Memory add/update operations require title and text")
-            operations.append(
-                MemoryOperation(
-                    action=action,
-                    memory_type=memory_type,
-                    title=title,
-                    text=text,
-                    tags=tags,
-                    confidence=confidence,
-                    target=raw.get("target"),
-                    rationale=str(raw.get("rationale", "")),
-                    page_id=int(raw["page_id"]) if raw.get("page_id") is not None else None,
-                    links=raw.get("links", []) if isinstance(raw.get("links", []), list) else [],
+                result.rejected.append({"index": index, "raw": raw, "error": "operation must be an object"})
+                continue
+            try:
+                operation = self._operation_from_raw(raw)
+            except Exception as exc:
+                result.rejected.append({"index": index, "raw": raw, "error": str(exc)})
+                continue
+            if operation.action != "ignore" and operation.confidence < 0.45:
+                result.pending.append(
+                    {
+                        "index": index,
+                        "operation": operation_to_dict(operation),
+                        "reason": "low_confidence",
+                    }
                 )
-            )
-        return operations
+                continue
+            result.accepted.append(operation)
+        return result
+
+    def _operation_from_raw(self, raw: dict[str, Any]) -> MemoryOperation:
+        action = str(raw.get("action", "ignore")).strip()
+        memory_type = str(raw.get("memory_type", "event")).strip()
+        title = str(raw.get("title", "")).strip()
+        text = str(raw.get("text", "")).strip()
+        tags = raw.get("tags", [])
+        if not isinstance(tags, list):
+            raise ValueError("tags must be a list")
+        try:
+            confidence = float(raw.get("confidence", 0.5))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("confidence must be numeric") from exc
+        if action == "ignore":
+            title = title or "ignored"
+            text = text or str(raw.get("rationale", "ignored"))
+            tags = tags or ["ignore"]
+        if action == "delete":
+            title = title or "delete memory"
+            text = text or str(raw.get("rationale", "delete requested"))
+        if not title or not text:
+            raise ValueError("Memory add/update operations require title and text")
+        page_id = None
+        if raw.get("page_id") is not None:
+            try:
+                page_id = int(raw["page_id"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError("page_id must be an integer") from exc
+        return MemoryOperation(
+            action=action,
+            memory_type=memory_type,
+            title=title,
+            text=text,
+            tags=tags,
+            confidence=confidence,
+            target=raw.get("target"),
+            rationale=str(raw.get("rationale", "")),
+            page_id=page_id,
+            links=raw.get("links", []) if isinstance(raw.get("links", []), list) else [],
+        )
 
     def strip_injected_context(self, text: str) -> str:
         return self.injected_context_pattern.sub("", text)

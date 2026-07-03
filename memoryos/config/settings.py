@@ -25,6 +25,8 @@ class Settings:
     provider_timeout_seconds: float = 60.0
     provider_retries: int = 2
     provider_backoff_seconds: float = 0.5
+    provider_circuit_breaker_failures: int = 5
+    provider_circuit_breaker_cooldown_seconds: float = 30.0
     worker_internal_token: str = ""
 
 
@@ -48,5 +50,7 @@ def load_settings() -> Settings:
         provider_timeout_seconds=float(os.environ.get("MEMORYOS_PROVIDER_TIMEOUT_SECONDS", "60")),
         provider_retries=int(os.environ.get("MEMORYOS_PROVIDER_RETRIES", "2")),
         provider_backoff_seconds=float(os.environ.get("MEMORYOS_PROVIDER_BACKOFF_SECONDS", "0.5")),
+        provider_circuit_breaker_failures=int(os.environ.get("MEMORYOS_PROVIDER_CIRCUIT_BREAKER_FAILURES", "5")),
+        provider_circuit_breaker_cooldown_seconds=float(os.environ.get("MEMORYOS_PROVIDER_CIRCUIT_BREAKER_COOLDOWN_SECONDS", "30")),
         worker_internal_token=os.environ.get("MEMORYOS_WORKER_INTERNAL_TOKEN", ""),
     )

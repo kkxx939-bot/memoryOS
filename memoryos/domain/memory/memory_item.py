@@ -65,6 +65,13 @@ class MemoryItem:
     evidence_count: int = 1
     positive_count: int = 1
     negative_count: int = 0
+    status: str = "active"
+    supersedes: list[str] = field(default_factory=list)
+    superseded_by: str | None = None
+    valid_from: str | None = None
+    valid_until: str | None = None
+    last_confirmed_at: str | None = None
+    source_episode_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.memory_type not in MEMORY_TYPES:
@@ -119,4 +126,11 @@ class MemoryItem:
             "negative_count": self.negative_count,
             "effective_weight": weight.effective_weight,
             "abstract": self.abstract,
+            "status": self.status,
+            "supersedes": self.supersedes,
+            "superseded_by": self.superseded_by,
+            "valid_from": self.valid_from or self.created_at,
+            "valid_until": self.valid_until,
+            "last_confirmed_at": self.last_confirmed_at,
+            "source_episode_id": self.source_episode_id,
         }

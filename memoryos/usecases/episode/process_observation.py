@@ -116,8 +116,14 @@ class EpisodeProcessor:
             },
         )
 
+        isolated_current_episode_memory = False
         if memory_commit_timing == "before_prediction":
-            memory_diff = self._apply_memory_operations(user_id, episode_id, memory_operations, observation_context)
+            isolated_current_episode_memory = len(draft_memory_operations) > 0
+            memory_diff = (
+                self._apply_memory_operations(user_id, episode_id, explicit_memory_operations, observation_context)
+                if explicit_memory_operations
+                else self._empty_memory_diff(episode_id)
+            )
         elif memory_commit_timing in {"after_feedback", "explicit_or_after_feedback"} and explicit_memory_operations:
             memory_diff = self._apply_memory_operations(user_id, episode_id, explicit_memory_operations, observation_context)
         else:
@@ -180,7 +186,7 @@ class EpisodeProcessor:
             pending_source_operations = memory_operations
         else:
             pending_source_operations = draft_memory_operations
-        if memory_commit_timing in {"after_feedback", "explicit_or_after_feedback", "deferred"}:
+        if memory_commit_timing in {"after_feedback", "explicit_or_after_feedback", "before_prediction", "deferred"}:
             pending_memory_operations = [
                 self.memory_updates.operation_record(operation)
                 for operation in pending_source_operations
@@ -201,6 +207,8 @@ class EpisodeProcessor:
             "context_tags": context_tags,
             "episode_log_timing": episode_log_timing,
             "memory_commit_timing": memory_commit_timing,
+            "exclude_current_episode_memory": True,
+            "isolated_current_episode_inferred_memory": isolated_current_episode_memory,
             "memory_write_timing": memory_write_timing,
             "memory_diff": memory_diff,
             "pending_memory_operations": pending_memory_operations,

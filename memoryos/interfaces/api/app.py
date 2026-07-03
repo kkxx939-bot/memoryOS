@@ -43,9 +43,9 @@ def handle(
     if route == "GET /health":
         return health()
     if route == "POST /episodes":
-        return process_episode(store, payload)
+        return process_episode(store, payload, context=context)
     if route == "POST /episodes/feedback":
-        return record_feedback(store, payload)
+        return record_feedback(store, payload, context=context)
     if route == "POST /workers/feedback":
         return process_feedback_outbox(store, payload, context=context)
     if route == "POST /workers/reindex":
@@ -55,11 +55,11 @@ def handle(
     if route == "POST /workers/memory-consolidation":
         return run_memory_consolidation(store, payload, context=context)
     if route == "GET /memory/digest":
-        return build_digest(store, payload)
+        return build_digest(store, payload, context=context)
     if route == "GET /memory/search":
-        return search_memory(store, payload)
+        return search_memory(store, payload, context=context)
     if route == "POST /memory/delete":
-        return delete_memory(store, payload)
+        return delete_memory(store, payload, context=context)
     if route == "GET /behavior/patterns":
-        return behavior_patterns(store, payload)
+        return behavior_patterns(store, payload, context=context)
     raise KeyError(f"Unknown API route: {route}")

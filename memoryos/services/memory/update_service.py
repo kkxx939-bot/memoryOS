@@ -35,7 +35,7 @@ class MemoryUpdateService:
 
     def apply(self, operations: list[MemoryOperation], context: MemoryUpdateContext) -> dict:
         self.store.init(context.user_id)
-        diff_operations: dict[str, list[dict]] = {"adds": [], "updates": [], "deletes": [], "ignores": []}
+        diff_operations: dict[str, list[dict]] = {"adds": [], "updates": [], "deletes": [], "pending": [], "ignores": []}
         for operation in operations:
             self._apply_one(operation, context, diff_operations)
         diff = self._diff(context.diff_id, diff_operations)
@@ -45,7 +45,7 @@ class MemoryUpdateService:
         return diff
 
     def empty_diff(self, diff_id: str) -> dict:
-        return self._diff(diff_id, {"adds": [], "updates": [], "deletes": [], "ignores": []}, committed_at=None)
+        return self._diff(diff_id, {"adds": [], "updates": [], "deletes": [], "pending": [], "ignores": []}, committed_at=None)
 
     def operation_record(self, operation: MemoryOperation) -> dict:
         return {
@@ -71,7 +71,8 @@ class MemoryUpdateService:
             record = self.operation_record(operation)
             record["validation"] = validation.to_dict()
             record["reason"] = validation.policy_decision
-            diff_operations["ignores"].append(record)
+            bucket = "pending" if validation.needs_user_confirmation else "ignores"
+            diff_operations[bucket].append(record)
             return
 
         action, reason = normalize_operation_for_policy(
@@ -118,12 +119,17 @@ class MemoryUpdateService:
         self._apply_add(operation, context, diff_operations)
 
     def _apply_update(self, operation: MemoryOperation, context: MemoryUpdateContext, diff_operations: dict[str, list]) -> None:
-        if not operation.target:
-            record = self.operation_record(operation)
-            record["reason"] = "update operation missing target"
-            diff_operations["ignores"].append(record)
-            return
         resolved = self.resolver.resolve(operation, context.user_id)
+        if not resolved.target or not resolved.current or resolved.needs_confirmation:
+            record = self.operation_record(operation)
+            record["reason"] = "update target unresolved"
+            record["candidate_targets"] = resolved.candidate_targets
+            record["resolution_confidence"] = resolved.resolution_confidence
+            diff_operations["pending"].append(record)
+            return
+        if operation.memory_type == "preference" and self._is_conflicting_preference_update(resolved.current, operation):
+            self._supersede_preference(resolved.current, operation, context, diff_operations)
+            return
         update = self.updater.apply_upsert(
             resolved,
             user_id=context.user_id,
@@ -140,12 +146,15 @@ class MemoryUpdateService:
         )
 
     def _apply_delete(self, operation: MemoryOperation, context: MemoryUpdateContext, diff_operations: dict[str, list]) -> None:
-        if not operation.target:
+        resolved = self.resolver.resolve(operation, context.user_id)
+        if not resolved.target or not resolved.current or resolved.needs_confirmation:
             record = self.operation_record(operation)
-            record["reason"] = "delete operation missing target"
-            diff_operations["ignores"].append(record)
+            record["reason"] = "delete target unresolved"
+            record["candidate_targets"] = resolved.candidate_targets
+            record["resolution_confidence"] = resolved.resolution_confidence
+            diff_operations["pending"].append(record)
             return
-        deletion = self.store.delete_memory(operation.target, user_id=context.user_id)
+        deletion = self.store.delete_memory(resolved.target, user_id=context.user_id)
         diff_operations["deletes"].append(
             {
                 "uri": deletion["uri"],
@@ -188,6 +197,9 @@ class MemoryUpdateService:
     def _apply_preference(self, operation: MemoryOperation, context: MemoryUpdateContext, diff_operations: dict[str, list]) -> None:
         existing = self._existing_topic_memory(context.user_id, operation, memory_type="preference")
         if existing:
+            if self._is_conflicting_preference_update(existing, operation):
+                self._supersede_preference(existing, operation, context, diff_operations)
+                return
             merged_text = self._merge_topic_text(existing, operation)
             patch_operation = MemoryOperation(
                 action="update",
@@ -493,6 +505,87 @@ class MemoryUpdateService:
             return body
         return body + f"\n\n## Update {utc_now()}\n\n{operation.text.strip()}\n"
 
+    def _supersede_preference(
+        self,
+        existing: dict[str, Any],
+        operation: MemoryOperation,
+        context: MemoryUpdateContext,
+        diff_operations: dict[str, list],
+    ) -> None:
+        created = self.updater.apply_upsert(
+            ResolvedMemoryOperation(
+                operation=operation,
+                target=None,
+                fields={
+                    "title": operation.title,
+                    "content": operation.text,
+                    "tags": operation.tags,
+                    "confidence": operation.confidence,
+                },
+            ),
+            user_id=context.user_id,
+            source=context.source,
+            metadata_patch={
+                "status": "active",
+                "supersedes": [existing["path"]],
+                "source": context.source,
+            },
+        )
+        obsolete = self.store.update_memory(
+            existing["path"],
+            user_id=context.user_id,
+            metadata_patch={
+                "status": "obsolete",
+                "superseded_by": created["uri"],
+                "valid_until": utc_now(),
+                "negative_count": int(existing.get("negative_count", 0)) + 1,
+                "source": context.source,
+            },
+        )
+        diff_operations["adds"].append(
+            {
+                "uri": created["uri"],
+                "memory_type": "preference",
+                "after": operation.text,
+                "rationale": operation.rationale or "Created superseding preference.",
+                "supersedes": [existing["path"]],
+            }
+        )
+        diff_operations["updates"].append(
+            {
+                "uri": obsolete["uri"],
+                "memory_type": "preference",
+                "before": obsolete["before"],
+                "after": obsolete["after"],
+                "rationale": "Marked conflicting previous preference obsolete.",
+                "superseded_by": created["uri"],
+            }
+        )
+
+    def _is_conflicting_preference_update(self, existing: dict[str, Any], operation: MemoryOperation) -> bool:
+        text = f"{operation.title} {operation.text} {' '.join(operation.tags)}".lower()
+        conflict_markers = {
+            "不喜欢",
+            "不再",
+            "不要",
+            "改成",
+            "改喝",
+            "改用",
+            "现在",
+            "instead",
+            "no longer",
+            "not anymore",
+            "prefer tea",
+            "changed",
+        }
+        if any(marker in text for marker in conflict_markers):
+            return True
+        existing_tokens = self._topic_tokens_from_text(
+            f"{existing.get('title', '')} {existing.get('content', '')}"
+        )
+        operation_tokens = self._topic_tokens(operation)
+        return bool(existing_tokens & operation_tokens and {"不", "no", "not"} & operation_tokens)
+
     def _compact_profile_text(self, current_body: str, new_text: str) -> str:
         current_lines = [line.strip() for line in current_body.splitlines() if line.strip() and not line.startswith("#")]
         new_lines = [line.strip() for line in new_text.splitlines() if line.strip() and not line.startswith("#")]
@@ -554,16 +647,19 @@ class MemoryUpdateService:
     def _topic_tokens_from_text(self, text: str) -> set[str]:
         normalized = text.lower()
         tokens = set()
-        current = []
+        current: list[str] = []
         for ch in normalized:
-            if ch.isalnum():
+            if "\u4e00" <= ch <= "\u9fff":
+                if current:
+                    tokens.add("".join(current))
+                    current = []
+                tokens.add(ch)
+            elif ch.isalnum():
                 current.append(ch)
             else:
                 if current:
                     tokens.add("".join(current))
                     current = []
-                if "\u4e00" <= ch <= "\u9fff":
-                    tokens.add(ch)
         if current:
             tokens.add("".join(current))
         stopwords = {
@@ -605,6 +701,7 @@ class MemoryUpdateService:
                 "total_adds": len(operations["adds"]),
                 "total_updates": len(operations["updates"]),
                 "total_deletes": len(operations["deletes"]),
+                "total_pending": len(operations.get("pending", [])),
                 "total_ignores": len(operations["ignores"]),
             },
         }

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from memoryos.interfaces.api.request_context import APIRequestContext, user_id_from_context_or_payload
 from memoryos.ports.repositories.memory_repository import MemoryRepository
 from memoryos.usecases.episode.process_observation import EpisodeProcessor
 
 
-def process_episode(store: MemoryRepository, payload: dict) -> dict:
+def process_episode(store: MemoryRepository, payload: dict, context: APIRequestContext | None = None) -> dict:
     return EpisodeProcessor(store).process(
-        user_id=str(payload["user_id"]),
+        user_id=user_id_from_context_or_payload(context, payload),
         episode_id=str(payload["episode_id"]),
         scene=payload.get("scene"),
         observation=payload.get("observation"),

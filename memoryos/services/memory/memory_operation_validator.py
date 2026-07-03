@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from memoryos.services.memory.extractor import MEMORY_ACTIONS, MemoryOperation
@@ -33,8 +34,6 @@ class MemoryOperationValidator:
         errors = []
         if operation.action not in MEMORY_ACTIONS:
             errors.append(f"unknown action: {operation.action}")
-        if operation.action in {"update", "delete"} and not operation.target:
-            errors.append(f"{operation.action} requires target")
         if operation.action in {"add", "update"} and not operation.text.strip():
             errors.append("text is required")
         if operation.memory_type == "policy" and not (explicit_user_intent or self._has_explicit_intent(operation)):
@@ -78,10 +77,20 @@ class SensitiveMemoryClassifier:
         "病历",
         "medical",
     }
+    SENSITIVE_PATTERNS = (
+        re.compile(r"\b1[3-9]\d{9}\b"),
+        re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE),
+        re.compile(r"\b\d{15}(\d{2}[0-9Xx])?\b"),
+        re.compile(r"\b(?:\d[ -]*?){13,19}\b"),
+        re.compile(r"\b(?:sk|pk|rk|api)[-_][A-Za-z0-9]{16,}\b"),
+        re.compile(r"\b(?:eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b"),
+    )
 
     def is_sensitive(self, text: str, tags: list[str] | None = None) -> bool:
         lowered = str(text).lower()
         if any(term.lower() in lowered for term in self.SENSITIVE_TERMS):
+            return True
+        if any(pattern.search(str(text)) for pattern in self.SENSITIVE_PATTERNS):
             return True
         tag_set = {str(tag).lower() for tag in (tags or [])}
         return bool(tag_set & {"sensitive", "secret", "credential", "medical"})

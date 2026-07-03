@@ -29,6 +29,13 @@ REQUIRED_METADATA_KEYS = {
     "negative_count",
     "effective_weight",
     "abstract",
+    "status",
+    "supersedes",
+    "superseded_by",
+    "valid_from",
+    "valid_until",
+    "last_confirmed_at",
+    "source_episode_id",
 }
 
 MEMORY_TYPE_DESCRIPTIONS = {
@@ -120,6 +127,13 @@ def validate_metadata(metadata: dict[str, Any]) -> None:
         raise ValueError("Memory metadata field 'lifecycle_state' must be hot, warm, or cold")
     if metadata.get("temporal_scope") not in {"stable", "rolling_7d", "rolling_30d", "episodic", "seasonal"}:
         raise ValueError("Memory metadata field 'temporal_scope' is invalid")
+    if metadata.get("status") not in {"active", "obsolete", "deleted", "pending"}:
+        raise ValueError("Memory metadata field 'status' must be active, obsolete, deleted, or pending")
+    if not isinstance(metadata.get("supersedes"), list):
+        raise ValueError("Memory metadata field 'supersedes' must be a list")
+    superseded_by = metadata.get("superseded_by")
+    if superseded_by is not None and not isinstance(superseded_by, str):
+        raise ValueError("Memory metadata field 'superseded_by' must be a string or null")
     for key in ("base_weight", "effective_weight"):
         value = metadata.get(key)
         if not isinstance(value, int | float) or not 0 <= value <= 1:
