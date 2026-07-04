@@ -12,13 +12,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
-      - name: Install tooling
-        run: python -m pip install --upgrade pip ruff mypy pyright
+      - name: Install dependencies and tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install ruff mypy pyright
       - name: Compile
         run: python -m compileall -q memoryos tests
       - name: Lint
         run: ruff check memoryos tests
       - name: Type check
-        run: mypy memoryos
+        run: |
+          mypy memoryos tests
+          pyright memoryos tests
       - name: Tests
-        run: python -m unittest discover -s tests
+        run: python -m pytest

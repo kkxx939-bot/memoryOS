@@ -18,3 +18,9 @@ pythonVersion = "3.10"
 typeCheckingMode = "basic"
 include = ["memoryos", "tests"]
 reportUnsupportedDunderAll = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["*Test", "Test*"]
+python_functions = ["test_*"]
