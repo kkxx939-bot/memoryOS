@@ -10,7 +10,7 @@ ContextDB + Memory + Behavior + ActionPolicy + PredictionEngine + Operation Plan
 
 The production entrypoint is `MemoryOSClient.process_observation()`. It predicts likely actions from similar behavior and durable action policies, retrieves only the execution context needed for the top candidates, gates every action through PolicyGate, archives the session, and commits durable updates through ContextOperation.
 
-`MemoryOSClient.predict()` is a low-level prediction API. Use `process_observation()` for production flows because it connects PredictionEngine, SessionArchive, SessionCommit, OperationCommitter, Diff, Redo, SourceStore, IndexStore, and RelationStore.
+`MemoryOSClient.predict()` is a low-level prediction API. Use `process_observation()` for production flows because it connects PredictionEngine, ContextDB, SessionArchive, SessionCommit, OperationCommitter, Diff, Redo, SourceStore, IndexStore, and RelationStore.
 
 ## Architecture
 
@@ -28,6 +28,7 @@ ContextDB is the shared substrate for all durable context:
 - Diff, Redo, Audit, and recovery
 
 SourceStore is the source of truth. IndexStore is derived and can be rebuilt from SourceStore.
+Application code should enter through the `ContextDB` facade exposed as `MemoryOSClient.context_db`; the underlying stores remain available for low-level tests and adapters.
 
 ### Memory
 
@@ -144,6 +145,7 @@ ActionContextBuilder is relation-first:
 - `uses_session` -> recent Session
 
 It prefers L1/L0 content and avoids loading L2 by default. Search is a fallback when relations are incomplete.
+Packed contexts include a `load_plan` for selected items and `dropped_contexts` for items excluded by token budget.
 
 ## PolicyGate
 
@@ -170,6 +172,8 @@ suppress
 blocked
 ```
 
+`execute` decisions pass through `ActionExecutor`, which requires resource and skill context and records an `ActionResult`. Successful and failed action results become feedback for async ActionPolicy updates.
+
 ## Quick Start
 
 ```python
@@ -187,7 +191,7 @@ pattern_uri = "memoryos://user/u1/behavior/patterns/hot_room"
 resource_uri = "memoryos://resources/devices/ac-living-room"
 skill_uri = "memoryos://skills/smart_home/ac-control"
 
-client.source_store.write_object(
+client.context_db.write_object(
     ContextObject(
         uri=anchor_uri,
         context_type=ContextType.MEMORY,
@@ -197,7 +201,7 @@ client.source_store.write_object(
     ),
     content="Hot room comfort behavior.",
 )
-client.source_store.write_object(
+client.context_db.write_object(
     ContextObject(
         uri=pattern_uri,
         context_type=ContextType.BEHAVIOR_PATTERN,
@@ -207,8 +211,8 @@ client.source_store.write_object(
     ),
     content="The user often cools the room when temperature is high.",
 )
-client.source_store.write_object(ContextObject(uri=resource_uri, context_type=ContextType.RESOURCE, title="Living room AC"), content="available")
-client.source_store.write_object(ContextObject(uri=skill_uri, context_type=ContextType.SKILL, title="AC control"), content="executable")
+client.context_db.write_object(ContextObject(uri=resource_uri, context_type=ContextType.RESOURCE, title="Living room AC"), content="available")
+client.context_db.write_object(ContextObject(uri=skill_uri, context_type=ContextType.SKILL, title="AC control", metadata={"executable": True}), content="executable")
 
 policy = ActionPolicy(
     user_id="u1",
@@ -223,12 +227,11 @@ policy = ActionPolicy(
     supported_behavior_pattern_uris=[pattern_uri],
 )
 
-client.source_store.write_object(policy.to_context_object(), content="turn on ac policy")
-client.index_store.upsert_index(policy.to_context_object(), content="hot room turn on ac")
-client.relation_store.add_relation(ContextRelation(source_uri=policy.uri, relation_type="anchored_by", target_uri=anchor_uri, metadata={"owner_user_id": "u1"}))
-client.relation_store.add_relation(ContextRelation(source_uri=policy.uri, relation_type="supported_by", target_uri=pattern_uri, metadata={"owner_user_id": "u1"}))
-client.relation_store.add_relation(ContextRelation(source_uri=policy.uri, relation_type="requires_resource", target_uri=resource_uri, metadata={"owner_user_id": "u1"}))
-client.relation_store.add_relation(ContextRelation(source_uri=policy.uri, relation_type="requires_skill", target_uri=skill_uri, metadata={"owner_user_id": "u1"}))
+client.context_db.write_object(policy.to_context_object(), content="hot room turn on ac")
+client.context_db.add_relation(ContextRelation(source_uri=policy.uri, relation_type="anchored_by", target_uri=anchor_uri, metadata={"owner_user_id": "u1"}))
+client.context_db.add_relation(ContextRelation(source_uri=policy.uri, relation_type="supported_by", target_uri=pattern_uri, metadata={"owner_user_id": "u1"}))
+client.context_db.add_relation(ContextRelation(source_uri=policy.uri, relation_type="requires_resource", target_uri=resource_uri, metadata={"owner_user_id": "u1"}))
+client.context_db.add_relation(ContextRelation(source_uri=policy.uri, relation_type="requires_skill", target_uri=skill_uri, metadata={"owner_user_id": "u1"}))
 
 request = PredictionRequest(
     user_id="u1",

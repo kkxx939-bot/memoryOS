@@ -7,6 +7,7 @@ from memoryos.behavior.model.behavior_pattern import BehaviorCluster, BehaviorPa
 from memoryos.behavior.update.behavior_case_writer import BehaviorCaseWriter
 from memoryos.behavior.update.behavior_cluster_updater import BehaviorClusterUpdater
 from memoryos.behavior.update.behavior_pattern_updater import BehaviorPatternUpdater
+from memoryos.behavior.update.behavior_window import BehaviorWindowEvaluator
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.contextdb.store.source_store import IndexStore, SourceStore
@@ -24,6 +25,7 @@ class BehaviorCommitPlanner:
         self.cluster_updater = BehaviorClusterUpdater()
         self.pattern_updater = BehaviorPatternUpdater()
         self.memory_updater = MemoryUpdater()
+        self.window_evaluator = BehaviorWindowEvaluator()
 
     def plan(self, archive: SessionArchive) -> list[ContextOperation]:
         operations: list[ContextOperation] = []
@@ -53,18 +55,19 @@ class BehaviorCommitPlanner:
         for scene_key, cases in cases_by_scene.items():
             anchor_uri = f"memoryos://user/{archive.user_id}/memories/anchors/{scene_key}_anchor"
             current_case_refs = [f"memoryos://user/{archive.user_id}/behavior/cases/{case.scene_key}/{case.case_id}" for case in cases]
-            history_refs = self._history_refs(archive.user_id, scene_key)
-            case_refs = [*history_refs, *current_case_refs]
-            if len(case_refs) >= 2:
+            history_records = self._history_records(archive.user_id, scene_key)
+            decision = self.window_evaluator.evaluate(scene_key, cases, history_records)
+            case_refs = decision.similar_refs_30d or [*current_case_refs]
+            if decision.create_cluster:
                 operations.append(self.memory_updater.add_memory(self._anchor(archive.user_id, scene_key, case_refs), evidence=[{"source": "behavior_cluster", "case_refs": case_refs}]))
-                cluster = BehaviorCluster(user_id=archive.user_id, scene_key=scene_key, memory_anchor_uri=anchor_uri, case_refs=case_refs)
+                cluster = BehaviorCluster(user_id=archive.user_id, scene_key=scene_key, memory_anchor_uri=anchor_uri, case_refs=decision.similar_refs_3d)
                 operations.append(self.cluster_updater.add_cluster(cluster))
-            if len(case_refs) >= 3:
+            if decision.create_pattern:
                 actions = Counter(case.selected_action or case.executed_action or case.user_actual_action or "unknown" for case in cases)
                 pattern = BehaviorPattern(
                     user_id=archive.user_id,
                     scene_key=scene_key,
-                    trigger_conditions={"scene_key": scene_key},
+                    trigger_conditions={"scene_key": scene_key, "context_tags": list(decision.similarity_key)},
                     memory_anchor_uri=anchor_uri,
                     case_refs=case_refs,
                     action_distribution=[{"action": action, "count": count} for action, count in actions.items()],
@@ -72,7 +75,7 @@ class BehaviorCommitPlanner:
                     confidence=0.72,
                 )
                 operations.append(self.pattern_updater.add_pattern(pattern))
-            if len(case_refs) == 1 and any(int(item.get("older_than_days", 0) or 0) > 3 for item in archive.observations):
+            if (decision.archive_stale_single or len(case_refs) == 1) and any(int(item.get("older_than_days", 0) or 0) > 3 for item in archive.observations):
                 operations.append(
                     ContextOperation(
                         user_id=archive.user_id,
@@ -86,14 +89,25 @@ class BehaviorCommitPlanner:
                 )
         return operations
 
-    def _history_refs(self, user_id: str, scene_key: str) -> list[str]:
+    def _history_records(self, user_id: str, scene_key: str) -> list[dict]:
         if self.index_store is None:
             return []
-        refs: list[str] = []
-        for context_type in (ContextType.BEHAVIOR_CASE, ContextType.BEHAVIOR_CLUSTER):
+        records: list[dict] = []
+        seen: set[str] = set()
+        for context_type in (ContextType.BEHAVIOR_CASE, ContextType.BEHAVIOR_CLUSTER, ContextType.BEHAVIOR_PATTERN):
             hits = self.index_store.search(scene_key, filters={"owner_user_id": user_id, "context_type": context_type.value}, limit=20)
-            refs.extend(hit.uri for hit in hits)
-        return list(dict.fromkeys(refs))
+            for hit in hits:
+                if hit.uri in seen:
+                    continue
+                seen.add(hit.uri)
+                metadata = dict(hit.metadata)
+                if self.source_store is not None:
+                    try:
+                        metadata = self.source_store.read_object(hit.uri).metadata
+                    except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+                        pass
+                records.append(self.window_evaluator.historical_record(hit.uri, metadata))
+        return records
 
     def _anchor(self, user_id: str, scene_key: str, case_refs: list[str]) -> MemoryAnchor:
         anchor_key = f"{scene_key}_anchor"

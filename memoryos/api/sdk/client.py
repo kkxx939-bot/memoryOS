@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from memoryos.action_policy.model.action_policy import ActionPolicy
+from memoryos.contextdb.context_db import ContextDB
 from memoryos.contextdb.session.planners import BehaviorCommitPlanner
 from memoryos.contextdb.session.session_archive import SessionArchiveStore
 from memoryos.contextdb.session.session_commit import SessionCommitService
@@ -17,7 +18,9 @@ from memoryos.operations.commit.operation_committer import OperationCommitter
 from memoryos.prediction.model.prediction_ledger import PredictionLedger
 from memoryos.prediction.model.prediction_request import PredictionRequest
 from memoryos.prediction.model.prediction_result import PredictionResult
+from memoryos.prediction.pipeline.executor import ActionExecutor
 from memoryos.prediction.pipeline.prediction_engine import PredictionEngine
+from memoryos.skill.tool_registry import ToolRegistry
 
 
 class MemoryOSClient:
@@ -29,6 +32,7 @@ class MemoryOSClient:
         relation_store: RelationStore | None = None,
         queue_store: QueueStore | None = None,
         lock_store: LockStore | None = None,
+        tool_registry: ToolRegistry | None = None,
     ) -> None:
         self.root = root
         root_path = Path(root)
@@ -51,12 +55,20 @@ class MemoryOSClient:
             committer=self.committer,
             behavior_planner=BehaviorCommitPlanner(index_store=self.index_store, source_store=self.source_store),
         )
+        self.context_db = ContextDB(
+            self.source_store,
+            self.index_store,
+            self.relation_store,
+            queue_store=self.queue_store,
+            session_commit_service=self.session_commit_service,
+        )
         self.engine = PredictionEngine(
             self.index_store,
             PredictionLedger(root),
             source_store=self.source_store,
             relation_store=self.relation_store,
         )
+        self.executor = ActionExecutor(tool_registry)
 
     def predict(self, request: PredictionRequest, policies: list[ActionPolicy]) -> PredictionResult:
         return self.engine.process(request, policies=policies)
@@ -70,8 +82,20 @@ class MemoryOSClient:
         async_commit: bool = True,
     ) -> PredictionResult:
         result = self.engine.process(request, policies=policies)
+        action_result = self.executor.execute(result.decision, result.action_context)
         if not archive_session:
             return result
+        policy_uri = result.candidates[0].policy_uri if result.candidates else ""
+        feedback = []
+        if action_result.status in {"success", "failed", "blocked"} and policy_uri:
+            feedback.append(
+                action_result.to_feedback(
+                    user_id=request.user_id,
+                    episode_id=request.episode_id,
+                    policy_uri=policy_uri,
+                    scene_key=result.observation.scene_key,
+                )
+            )
         archive = SessionArchive(
             user_id=request.user_id,
             session_id=request.episode_id,
@@ -84,8 +108,10 @@ class MemoryOSClient:
                     "episode_id": result.episode_id,
                     "decision": result.decision.to_dict(),
                     "selected_action": result.decision.action,
+                    "action_result": action_result.to_dict(),
                 }
             ],
+            feedback=feedback,
             used_contexts=[{"uri": uri} for uri in result.action_context.source_uris],
             used_skills=[
                 {"uri": uri}
@@ -93,7 +119,5 @@ class MemoryOSClient:
                 if uri.startswith("memoryos://skills/")
             ],
         )
-        self.session_commit_service.sync_archive(archive)
-        if async_commit:
-            self.session_commit_service.async_commit(archive)
+        self.context_db.commit_session(archive, async_commit=async_commit)
         return result

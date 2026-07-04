@@ -32,6 +32,6 @@ def test_legacy_paths_and_imports_do_not_return() -> None:
             assert not any(token in text for token in forbidden), path
 
     readme = (root / "README.md").read_text(encoding="utf-8")
-    assert "Personal Memory OS" not in readme
+    assert " ".join(["Personal", "Memory", "OS"]) not in readme
     assert "第一阶段只解决记忆" not in readme
     assert "".join(["Episode", "Processor"]) not in readme

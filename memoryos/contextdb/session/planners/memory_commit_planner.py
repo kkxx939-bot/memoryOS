@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from memoryos.behavior.update.behavior_window import BehaviorWindowEvaluator
 from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.core.ids import stable_hash
 from memoryos.memory.model.memory import Memory, MemoryAnchor, MemoryCandidate, MemoryKind
@@ -10,6 +11,7 @@ from memoryos.operations.model.context_operation import ContextOperation
 class MemoryCommitPlanner:
     def __init__(self) -> None:
         self.updater = MemoryUpdater()
+        self.window_evaluator = BehaviorWindowEvaluator()
 
     def plan(self, archive: SessionArchive) -> list[ContextOperation]:
         operations: list[ContextOperation] = []
@@ -24,7 +26,7 @@ class MemoryCommitPlanner:
                 operations.append(self.updater.policy_rule(self._memory(archive.user_id, text, MemoryKind.POLICY), evidence=[{"source": "explicit_rule"}]))
 
         scene_groups = self._scene_groups(archive)
-        for scene_key, observations in scene_groups.items():
+        for (scene_key, _similarity_key), observations in scene_groups.items():
             if len(observations) >= 2:
                 operations.append(
                     self.updater.add_memory(
@@ -42,11 +44,12 @@ class MemoryCommitPlanner:
                 )
         return operations
 
-    def _scene_groups(self, archive: SessionArchive) -> dict[str, list[dict]]:
-        groups: dict[str, list[dict]] = {}
+    def _scene_groups(self, archive: SessionArchive) -> dict[tuple[str, tuple[str, ...]], list[dict]]:
+        groups: dict[tuple[str, tuple[str, ...]], list[dict]] = {}
         for observation in archive.observations:
             scene_key = str(observation.get("scene_key", observation.get("scene", "default")))
-            groups.setdefault(scene_key, []).append(observation)
+            similarity_key = self.window_evaluator._similarity_key(observation)
+            groups.setdefault((scene_key, similarity_key), []).append(observation)
         return groups
 
     def _memory(self, user_id: str, content: str, kind: MemoryKind) -> Memory:

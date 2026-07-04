@@ -63,6 +63,7 @@ class ActionContextBuilder:
                     "uri": policy.uri,
                     "content": policy.to_dict(),
                     "token_estimate": 120,
+                    "layer": "metadata",
                 }
             )
             relation_sections = self._relation_sections(policy.uri, user_id=user_id, token_budget_remaining=token_budget, candidate_score=candidate.score)
@@ -120,6 +121,7 @@ class ActionContextBuilder:
                     "uri": relation.target_uri,
                     "content": relation.metadata.get("summary", relation.relation_type),
                     "token_estimate": int(relation.metadata.get("token_estimate", 80)),
+                    "layer": "fallback",
                 }
             item["relation_type"] = relation.relation_type
             sections.setdefault(section, []).append(item)
@@ -144,7 +146,7 @@ class ActionContextBuilder:
         )
         if item is not None:
             return item
-        return {"uri": hit.uri, "content": hit.title, "token_estimate": 80, "score": hit.score}
+        return {"uri": hit.uri, "content": hit.title, "token_estimate": 80, "score": hit.score, "layer": "fallback"}
 
     def _object_context(
         self,
@@ -164,35 +166,39 @@ class ActionContextBuilder:
             return None
         if obj.owner_user_id not in {None, user_id} and not obj.uri.startswith(("memoryos://resources/", "memoryos://skills/")):
             return None
-        layer_content = self._read_best_layer(obj, section, token_budget_remaining, candidate_score=candidate_score)
+        layer_content, layer = self._read_best_layer(obj, section, token_budget_remaining, candidate_score=candidate_score)
         return {
             "uri": obj.uri,
             "title": obj.title,
             "context_type": obj.context_type.value,
             "content": layer_content,
+            "layer": layer,
             "metadata": obj.metadata,
             "token_estimate": max(40, min(300, len(str(layer_content).split()) + 40)),
         }
 
     def _read_best_layer(self, obj, section: str, token_budget_remaining: int = 1000, candidate_score: float = 0.0):
         if section == "action_policy":
-            return obj.metadata
+            return obj.metadata, "metadata"
         if token_budget_remaining <= 120:
-            preferred = [obj.layers.l0_uri, obj.layers.l1_uri]
+            preferred = [(obj.layers.l0_uri, "l0"), (obj.layers.l1_uri, "l1")]
         else:
-            preferred = [obj.layers.l1_uri, obj.layers.l0_uri]
+            preferred = [(obj.layers.l1_uri, "l1"), (obj.layers.l0_uri, "l0")]
         if section == "recent_session":
-            preferred = [obj.layers.l0_uri, obj.layers.l1_uri]
+            preferred = [(obj.layers.l0_uri, "l0"), (obj.layers.l1_uri, "l1")]
         elif token_budget_remaining >= 1200 and candidate_score >= 0.85:
-            preferred = [obj.layers.l2_uri, *preferred]
-        for layer_uri in preferred:
+            preferred = [(obj.layers.l2_uri, "l2"), *preferred]
+        for layer_uri, layer in preferred:
             if not layer_uri:
                 continue
             try:
-                return self.source_store.read_content(layer_uri) if self.source_store is not None else obj.title
+                content = self.source_store.read_content(layer_uri) if self.source_store is not None else obj.title
+                return content, layer
             except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
                 continue
-        return obj.metadata.get("summary") or obj.title
+        if obj.metadata.get("summary"):
+            return obj.metadata["summary"], "metadata"
+        return obj.title, "fallback"
 
     def _section_for_type(self, context_type: str) -> str:
         if context_type == ContextType.BEHAVIOR_PATTERN.value:

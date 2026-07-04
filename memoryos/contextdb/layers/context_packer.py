@@ -21,31 +21,57 @@ class ContextPacker:
 
     def pack(self, sections: dict[str, list[dict]]) -> dict:
         slices = {}
+        load_plan = []
+        dropped_contexts: list[dict] = []
         fallback_budget = self._fallback_budget(sections)
         remaining_total = self.total_budget
         for name, items in sections.items():
             budget = min(int(self.allocations.get(name, fallback_budget)), remaining_total)
             selected: list[dict] = []
             used = 0
-            for item in items:
+            for index, item in enumerate(items):
                 if remaining_total <= 0:
+                    dropped_contexts.extend(
+                        self._drop_payload(later, name, "total_budget_exhausted")
+                        for later in items[index:]
+                    )
                     break
                 estimate = int(item.get("token_estimate", self._estimate_tokens(str(item.get("content", "")))))
                 if estimate > remaining_total:
+                    dropped_contexts.append(self._drop_payload(item, name, "total_budget_exceeded", estimate))
                     continue
                 if selected and used + estimate > budget:
+                    dropped_contexts.append(self._drop_payload(item, name, "section_budget_exceeded", estimate))
                     continue
-                if estimate > budget and selected:
+                if estimate > budget:
+                    dropped_contexts.append(self._drop_payload(item, name, "section_budget_exceeded", estimate))
                     continue
-                selected.append({**item, "token_estimate": estimate})
+                selected_item = {**item, "token_estimate": estimate}
+                selected.append(selected_item)
+                load_plan.append(
+                    {
+                        "uri": item.get("uri", ""),
+                        "section": name,
+                        "layer": item.get("layer", "fallback"),
+                        "token_estimate": estimate,
+                        "reason": "selected_within_budget",
+                    }
+                )
                 used += estimate
                 remaining_total -= estimate
                 if used >= budget:
+                    dropped_contexts.extend(
+                        self._drop_payload(later, name, "section_budget_exhausted")
+                        for later in items[index + 1 :]
+                    )
                     break
             slices[name] = BudgetSlice(name=name, budget=budget, used=used, items=selected)
+            if not items and budget == 0:
+                continue
         return {
             "total_budget": self.total_budget,
             "used": sum(item.used for item in slices.values()),
+            "remaining": max(0, remaining_total),
             "slices": {
                 name: {
                     "budget": item.budget,
@@ -55,6 +81,8 @@ class ContextPacker:
                 }
                 for name, item in slices.items()
             },
+            "load_plan": load_plan,
+            "dropped_contexts": dropped_contexts,
         }
 
     def _fallback_budget(self, sections: dict[str, list[dict]]) -> int:
@@ -62,3 +90,13 @@ class ContextPacker:
 
     def _estimate_tokens(self, text: str) -> int:
         return max(1, len(text) // 4)
+
+    def _drop_payload(self, item: dict, section: str, reason: str, estimate: int | None = None) -> dict:
+        token_estimate = int(item.get("token_estimate", estimate or self._estimate_tokens(str(item.get("content", "")))))
+        return {
+            "uri": item.get("uri", ""),
+            "section": section,
+            "layer": item.get("layer", "fallback"),
+            "token_estimate": token_estimate,
+            "reason": reason,
+        }
