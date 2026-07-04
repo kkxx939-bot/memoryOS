@@ -5,11 +5,18 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from memoryos.action_policy.model.action_policy import ActionPolicy
 from memoryos.contextdb.model.context_uri import ContextURI
 from memoryos.contextdb.session.session_archive import SessionArchiveStore
 from memoryos.contextdb.session.session_commit import SessionCommitService
 from memoryos.contextdb.session.session_model import SessionArchive
-from memoryos.contextdb.store.local_stores import InMemoryQueueStore
+from memoryos.contextdb.store.local_stores import (
+    FileSystemSourceStore,
+    InMemoryIndexStore,
+    InMemoryQueueStore,
+    InMemoryRelationStore,
+)
+from memoryos.operations.commit.operation_committer import OperationCommitter
 
 
 class SessionCommitGeneratesDiffsTest(unittest.TestCase):
@@ -18,13 +25,25 @@ class SessionCommitGeneratesDiffsTest(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.store = SessionArchiveStore(self.root)
         self.queue = InMemoryQueueStore()
-        self.service = SessionCommitService(self.store, self.queue)
+        self.source = FileSystemSourceStore(self.root)
+        self.index = InMemoryIndexStore()
+        self.relations = InMemoryRelationStore()
+        self.committer = OperationCommitter(self.source, self.index, str(self.root), relation_store=self.relations)
+        self.service = SessionCommitService(self.store, self.queue, committer=self.committer)
         self.archive_uri = "memoryos://user/u1/sessions/history/archive_001"
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
     def test_async_commit_generates_real_diffs(self) -> None:
+        policy = ActionPolicy(
+            user_id="u1",
+            scene_key="hot_room",
+            action="turn_on_ac",
+            memory_anchor_uri="memoryos://user/u1/memories/anchors/hot_room_anchor",
+        )
+        self.source.write_object(policy.to_context_object(), content=json.dumps(policy.to_dict()))
+        self.index.upsert_index(policy.to_context_object(), content="hot_room turn_on_ac")
         archive = SessionArchive(
             user_id="u1",
             session_id="s1",
@@ -59,7 +78,9 @@ class SessionCommitGeneratesDiffsTest(unittest.TestCase):
         memory_diff = json.loads((directory / "memory_diff.json").read_text(encoding="utf-8"))
         behavior_diff = json.loads((directory / "behavior_diff.json").read_text(encoding="utf-8"))
         action_policy_diff = json.loads((directory / "action_policy_diff.json").read_text(encoding="utf-8"))
-        self.assertIn(memory_diff["status"], {"planned", "committed"})
+        self.assertEqual(memory_diff["status"], "committed")
+        self.assertEqual(behavior_diff["status"], "committed")
+        self.assertEqual(action_policy_diff["status"], "committed")
         self.assertTrue(any(op["context_type"] == "memory" and op["action"] == "add" for op in memory_diff["operations"]))
         self.assertTrue(any(op["context_type"] == "behavior_case" and op["action"] == "add" for op in behavior_diff["operations"]))
         self.assertTrue(any(op["context_type"] == "behavior_cluster" and op["action"] == "add" for op in behavior_diff["operations"]))

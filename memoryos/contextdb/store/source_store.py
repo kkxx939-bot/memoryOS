@@ -25,6 +25,9 @@ class QueueJob:
     target_uri: str
     payload: dict = field(default_factory=dict)
     status: str = "pending"
+    leased_until: str | None = None
+    retry_count: int = 0
+    last_error: str = ""
 
 
 @dataclass(frozen=True)
@@ -38,6 +41,8 @@ class SourceStore(Protocol):
 
     def write_object(self, obj: ContextObject, content: str | bytes = "") -> None: ...
 
+    def list_objects(self) -> list[ContextObject]: ...
+
     def read_content(self, uri: str) -> str: ...
 
     def write_content(self, uri: str, content: str | bytes) -> None: ...
@@ -50,13 +55,23 @@ class IndexStore(Protocol):
 
     def delete_index(self, uri: str) -> None: ...
 
+    def indexed_uris(self) -> list[str]: ...
+
+    def clear(self) -> None: ...
+
     def search(self, query: str, filters: dict | None = None, limit: int = 10) -> list[IndexHit]: ...
 
 
 class RelationStore(Protocol):
     def add_relation(self, relation: ContextRelation) -> None: ...
 
-    def relations_of(self, uri: str) -> list[ContextRelation]: ...
+    def relations_of(
+        self,
+        uri: str,
+        *,
+        tenant_id: str | None = None,
+        owner_user_id: str | None = None,
+    ) -> list[ContextRelation]: ...
 
     def delete_relation(self, source_uri: str, relation_type: str, target_uri: str) -> None: ...
 
@@ -67,6 +82,8 @@ class QueueStore(Protocol):
     def lease(self, queue_name: str, limit: int = 10) -> list[QueueJob]: ...
 
     def ack(self, job_id: str) -> None: ...
+
+    def fail(self, job_id: str, error: str) -> None: ...
 
 
 class LockStore(Protocol):

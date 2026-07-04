@@ -3,6 +3,7 @@ from __future__ import annotations
 from memoryos.action_policy.model.action_policy import ActionCandidate, ActionPolicy
 from memoryos.contextdb.layers.context_packer import ContextPacker
 from memoryos.contextdb.model.context_type import ContextType
+from memoryos.contextdb.model.lifecycle import LifecycleState
 from memoryos.contextdb.store.source_store import IndexHit, IndexStore, RelationStore, SourceStore
 from memoryos.prediction.model.action_context import ActionContext
 
@@ -93,13 +94,13 @@ class ActionContextBuilder:
         if self.relation_store is None:
             return {}
         sections: dict[str, list[dict]] = {}
-        for relation in self.relation_store.relations_of(policy_uri):
+        for relation in self.relation_store.relations_of(policy_uri, owner_user_id=user_id):
             if relation.source_uri != policy_uri:
                 continue
             section = self.relation_types.get(relation.relation_type)
             if not section:
                 continue
-            item = self._object_context(relation.target_uri, user_id=user_id)
+            item = self._object_context(relation.target_uri, user_id=user_id, section=section)
             if item is None:
                 if self.source_store is not None:
                     continue
@@ -122,25 +123,23 @@ class ActionContextBuilder:
         return items
 
     def _hit_context(self, hit: IndexHit, user_id: str) -> dict | None:
-        item = self._object_context(hit.uri, user_id=user_id)
+        item = self._object_context(hit.uri, user_id=user_id, section=self._section_for_type(hit.context_type))
         if item is not None:
             return item
         return {"uri": hit.uri, "content": hit.title, "token_estimate": 80, "score": hit.score}
 
-    def _object_context(self, uri: str, user_id: str) -> dict | None:
+    def _object_context(self, uri: str, user_id: str, section: str) -> dict | None:
         if self.source_store is None:
             return None
         try:
             obj = self.source_store.read_object(uri)
         except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
             return None
+        if obj.lifecycle_state in {LifecycleState.DELETED, LifecycleState.OBSOLETE}:
+            return None
         if obj.owner_user_id not in {None, user_id} and not obj.uri.startswith(("memoryos://resources/", "memoryos://skills/")):
             return None
-        try:
-            content = self.source_store.read_content(uri)
-        except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
-            content = obj.metadata.get("summary") or obj.title
-        layer_content = content or obj.metadata.get("summary") or obj.title
+        layer_content = self._read_best_layer(obj, section)
         return {
             "uri": obj.uri,
             "title": obj.title,
@@ -149,3 +148,31 @@ class ActionContextBuilder:
             "metadata": obj.metadata,
             "token_estimate": max(40, min(300, len(str(layer_content).split()) + 40)),
         }
+
+    def _read_best_layer(self, obj, section: str, token_budget_remaining: int = 1000):
+        if section == "action_policy":
+            return obj.metadata
+        preferred = [obj.layers.l1_uri, obj.layers.l0_uri]
+        if section == "recent_session":
+            preferred = [obj.layers.l0_uri, obj.layers.l1_uri]
+        if token_budget_remaining > 1200:
+            preferred.append(obj.layers.l2_uri)
+        for layer_uri in preferred:
+            if not layer_uri:
+                continue
+            try:
+                return self.source_store.read_content(layer_uri) if self.source_store is not None else obj.title
+            except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+                continue
+        return obj.metadata.get("summary") or obj.title
+
+    def _section_for_type(self, context_type: str) -> str:
+        if context_type == ContextType.BEHAVIOR_PATTERN.value:
+            return "behavior_pattern"
+        if context_type == ContextType.RESOURCE.value:
+            return "resource"
+        if context_type == ContextType.SKILL.value:
+            return "skill"
+        if context_type == ContextType.ACTION_POLICY.value:
+            return "action_policy"
+        return "memory_rules"

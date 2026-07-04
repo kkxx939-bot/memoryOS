@@ -14,6 +14,18 @@ class RedoEntry:
     operation: ContextOperation
     phase: str
 
+    @property
+    def operation_id(self) -> str:
+        return self.operation.operation_id
+
+    @property
+    def target_uri(self) -> str | None:
+        return self.operation.target_uri
+
+    @property
+    def user_id(self) -> str:
+        return self.operation.user_id
+
 
 class RedoLog:
     def __init__(self, root: str | Path) -> None:

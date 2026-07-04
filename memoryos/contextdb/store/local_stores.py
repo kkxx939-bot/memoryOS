@@ -87,6 +87,12 @@ class InMemoryIndexStore:
     def delete_index(self, uri: str) -> None:
         self.rows.pop(uri, None)
 
+    def indexed_uris(self) -> list[str]:
+        return list(self.rows)
+
+    def clear(self) -> None:
+        self.rows.clear()
+
     def search(self, query: str, filters: dict | None = None, limit: int = 10) -> list[IndexHit]:
         filters = filters or {}
         terms = [term.lower() for term in str(query).split() if term.strip()]
@@ -114,8 +120,24 @@ class InMemoryRelationStore:
         if relation not in self.relations:
             self.relations.append(relation)
 
-    def relations_of(self, uri: str) -> list[ContextRelation]:
-        return [relation for relation in self.relations if relation.source_uri == uri or relation.target_uri == uri]
+    def relations_of(
+        self,
+        uri: str,
+        *,
+        tenant_id: str | None = None,
+        owner_user_id: str | None = None,
+    ) -> list[ContextRelation]:
+        rows = [relation for relation in self.relations if relation.source_uri == uri or relation.target_uri == uri]
+        if tenant_id is not None:
+            rows = [relation for relation in rows if relation.metadata.get("tenant_id", "default") == tenant_id]
+        if owner_user_id is not None:
+            rows = [
+                relation
+                for relation in rows
+                if relation.metadata.get("owner_user_id") in {None, "", owner_user_id}
+                or relation.target_uri.startswith(("memoryos://resources/", "memoryos://skills/"))
+            ]
+        return rows
 
     def delete_relation(self, source_uri: str, relation_type: str, target_uri: str) -> None:
         self.relations = [
@@ -150,6 +172,11 @@ class InMemoryQueueStore:
     def ack(self, job_id: str) -> None:
         if job_id in self.jobs:
             self.jobs[job_id] = QueueJob(**{**self.jobs[job_id].__dict__, "status": "done"})
+
+    def fail(self, job_id: str, error: str) -> None:
+        if job_id in self.jobs:
+            job = self.jobs[job_id]
+            self.jobs[job_id] = QueueJob(**{**job.__dict__, "status": "failed", "retry_count": job.retry_count + 1, "last_error": error})
 
 
 class InMemoryLockStore:

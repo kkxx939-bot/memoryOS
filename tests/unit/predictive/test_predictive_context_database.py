@@ -170,7 +170,7 @@ class PredictiveContextDatabaseTest(unittest.TestCase):
                 observations=[{"raw_text": "temperature 30"}],
             )
             queue = InMemoryQueueStore()
-            service = SessionCommitService(SessionArchiveStore(tmp), queue)
+            service = SessionCommitService(SessionArchiveStore(tmp), queue, allow_plan_only=True)
             queued = service.sync_archive(archive)
             self.assertEqual(queued.status, "queued")
             done = service.async_commit(archive)

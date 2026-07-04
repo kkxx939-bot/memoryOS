@@ -50,6 +50,12 @@ class TargetResolverTest(unittest.TestCase):
             def delete_index(self, uri: str) -> None:
                 return None
 
+            def indexed_uris(self) -> list[str]:
+                return []
+
+            def clear(self) -> None:
+                return None
+
         resolver = TargetResolver(LowConfidenceIndex())
         op = ContextOperation(user_id="u1", context_type=ContextType.MEMORY, action=OperationAction.UPDATE, payload={"query": "name"})
         result = resolver.resolve(op, user_id="u1")

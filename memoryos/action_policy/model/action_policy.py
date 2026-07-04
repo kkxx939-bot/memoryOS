@@ -42,6 +42,11 @@ class ActionPolicy:
     cooldown_until: str | None = None
     evidence_refs: list[str] = field(default_factory=list)
     required_context_types: list[str] = field(default_factory=lambda: ["memory", "behavior_pattern", "resource", "skill"])
+    required_resource_uris: list[str] = field(default_factory=list)
+    required_skill_uris: list[str] = field(default_factory=list)
+    supported_behavior_pattern_uris: list[str] = field(default_factory=list)
+    constrained_by_memory_uris: list[str] = field(default_factory=list)
+    applied_operation_ids: list[str] = field(default_factory=list)
     last_opportunity_at: str | None = None
     last_activated_at: str | None = None
     last_rewarded_at: str | None = None
@@ -57,6 +62,7 @@ class ActionPolicy:
             self.status = ActionPolicyStatus(self.status)
         self.q_value = max(0.0, min(1.0, float(self.q_value)))
         self.confidence = max(0.0, min(1.0, float(self.confidence)))
+        self.applied_operation_ids = list(dict.fromkeys(self.applied_operation_ids))[-500:]
 
     @property
     def uri(self) -> str:
@@ -97,6 +103,11 @@ class ActionPolicy:
             "memory_anchor_uri": self.memory_anchor_uri,
             "evidence_refs": self.evidence_refs,
             "required_context_types": self.required_context_types,
+            "required_resource_uris": self.required_resource_uris,
+            "required_skill_uris": self.required_skill_uris,
+            "supported_behavior_pattern_uris": self.supported_behavior_pattern_uris,
+            "constrained_by_memory_uris": self.constrained_by_memory_uris,
+            "applied_operation_ids": self.applied_operation_ids[-500:],
             "last_opportunity_at": self.last_opportunity_at,
             "last_activated_at": self.last_activated_at,
             "last_rewarded_at": self.last_rewarded_at,

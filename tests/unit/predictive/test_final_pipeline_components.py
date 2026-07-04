@@ -110,7 +110,7 @@ class FinalPipelineComponentsTest(unittest.TestCase):
             vector = InMemoryVectorStore()
             self.assertEqual(EmbeddingWorker(source, queue, vector).process_pending()["processed"], ["embedding1"])
             archive = SessionArchive(user_id="gulf", session_id="s1", archive_uri="memoryos://user/gulf/sessions/history/s1")
-            service = SessionCommitService(SessionArchiveStore(tmp), queue)
+            service = SessionCommitService(SessionArchiveStore(tmp), queue, allow_plan_only=True)
             self.assertTrue(SessionCommitWorker(service).process_archive(archive)["done"])
 
             index = InMemoryIndexStore()

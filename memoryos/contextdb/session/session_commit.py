@@ -26,6 +26,7 @@ class SessionCommitService:
         behavior_planner: BehaviorCommitPlanner | None = None,
         action_policy_planner: ActionPolicyCommitPlanner | None = None,
         context_planner: ContextCommitPlanner | None = None,
+        allow_plan_only: bool = False,
     ) -> None:
         self.archive_store = archive_store
         self.queue_store = queue_store
@@ -34,6 +35,7 @@ class SessionCommitService:
         self.behavior_planner = behavior_planner or BehaviorCommitPlanner()
         self.action_policy_planner = action_policy_planner or ActionPolicyCommitPlanner()
         self.context_planner = context_planner or ContextCommitPlanner()
+        self.allow_plan_only = allow_plan_only
 
     def sync_archive(self, archive: SessionArchive) -> SessionCommitResult:
         self.archive_store.write_sync_archive(archive)
@@ -70,6 +72,8 @@ class SessionCommitService:
         behavior_ops = self.behavior_planner.plan(archive)
         action_policy_ops = self.action_policy_planner.plan(archive)
         context_ops = self.context_planner.plan(archive)
+        if self.committer is None and not self.allow_plan_only:
+            raise RuntimeError("SessionCommitService requires OperationCommitter unless allow_plan_only=True")
         memory_diff = self._commit_or_describe(archive.user_id, memory_ops)
         behavior_diff = self._commit_or_describe(archive.user_id, behavior_ops)
         action_policy_diff = self._commit_or_describe(archive.user_id, action_policy_ops)
@@ -99,6 +103,8 @@ class SessionCommitService:
         if self.committer is not None and operations:
             diff = self.committer.commit(user_id, operations)
             return self._diff_payload(diff, status="committed")
+        if self.committer is not None:
+            return {"status": "committed", "operations": [], "operation_count": 0}
         return {
             "status": "planned",
             "operations": [operation.to_dict() for operation in operations],

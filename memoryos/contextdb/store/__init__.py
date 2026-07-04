@@ -17,6 +17,8 @@ from memoryos.contextdb.store.source_store import (
     SourceStore,
 )
 from memoryos.contextdb.store.sqlite_index_store import SQLiteIndexStore, SqliteIndexStore
+from memoryos.contextdb.store.sqlite_lock_store import SQLiteLockStore, SqliteLockStore
+from memoryos.contextdb.store.sqlite_queue_store import SQLiteQueueStore, SqliteQueueStore
 from memoryos.contextdb.store.sqlite_relation_store import SQLiteRelationStore, SqliteRelationStore
 
 __all__ = [
@@ -36,7 +38,11 @@ __all__ = [
     "RelationStore",
     "SourceStore",
     "SQLiteIndexStore",
+    "SQLiteLockStore",
+    "SQLiteQueueStore",
     "SQLiteRelationStore",
     "SqliteIndexStore",
+    "SqliteLockStore",
+    "SqliteQueueStore",
     "SqliteRelationStore",
 ]

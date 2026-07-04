@@ -14,12 +14,16 @@ class SQLiteRelationStore:
         self._init_db()
 
     def add_relation(self, relation: ContextRelation) -> None:
+        tenant_id = str(relation.metadata.get("tenant_id", "default"))
+        owner_user_id = str(relation.metadata.get("owner_user_id", ""))
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO relations(source_uri, relation_type, target_uri, weight, metadata_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO relations(source_uri, relation_type, target_uri, tenant_id, owner_user_id, weight, metadata_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source_uri, relation_type, target_uri) DO UPDATE SET
+                  tenant_id=excluded.tenant_id,
+                  owner_user_id=excluded.owner_user_id,
                   weight=excluded.weight,
                   metadata_json=excluded.metadata_json
                 """,
@@ -27,18 +31,31 @@ class SQLiteRelationStore:
                     relation.source_uri,
                     relation.relation_type,
                     relation.target_uri,
+                    tenant_id,
+                    owner_user_id,
                     relation.weight,
                     json.dumps(relation.metadata, ensure_ascii=False),
                     relation.created_at,
                 ),
             )
 
-    def relations_of(self, uri: str) -> list[ContextRelation]:
+    def relations_of(
+        self,
+        uri: str,
+        *,
+        tenant_id: str | None = None,
+        owner_user_id: str | None = None,
+    ) -> list[ContextRelation]:
+        sql = "SELECT * FROM relations WHERE (source_uri = ? OR target_uri = ?)"
+        params: list[str] = [uri, uri]
+        if tenant_id is not None:
+            sql += " AND tenant_id = ?"
+            params.append(tenant_id)
+        if owner_user_id is not None:
+            sql += " AND (owner_user_id = ? OR owner_user_id = '' OR target_uri LIKE 'memoryos://resources/%' OR target_uri LIKE 'memoryos://skills/%')"
+            params.append(owner_user_id)
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM relations WHERE source_uri = ? OR target_uri = ?",
-                (uri, uri),
-            ).fetchall()
+            rows = conn.execute(sql, params).fetchall()
         return [
             ContextRelation(
                 source_uri=row["source_uri"],
@@ -71,6 +88,8 @@ class SQLiteRelationStore:
                   source_uri TEXT NOT NULL,
                   relation_type TEXT NOT NULL,
                   target_uri TEXT NOT NULL,
+                  tenant_id TEXT NOT NULL DEFAULT 'default',
+                  owner_user_id TEXT NOT NULL DEFAULT '',
                   weight REAL NOT NULL,
                   metadata_json TEXT NOT NULL,
                   created_at TEXT NOT NULL,
@@ -78,6 +97,11 @@ class SQLiteRelationStore:
                 )
                 """
             )
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(relations)").fetchall()}
+            if "tenant_id" not in columns:
+                conn.execute("ALTER TABLE relations ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'")
+            if "owner_user_id" not in columns:
+                conn.execute("ALTER TABLE relations ADD COLUMN owner_user_id TEXT NOT NULL DEFAULT ''")
 
 
 SqliteRelationStore = SQLiteRelationStore
