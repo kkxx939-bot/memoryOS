@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+# This test covers legacy EpisodeProcessor compatibility only.
+# Production predictive context flow is covered by tests/e2e/test_predictive_context_hot_room_flow.py.
+
 import json
 import tempfile
 import unittest
@@ -16,8 +19,8 @@ from memoryos.contextdb.model.context_uri import ContextURI
 from memoryos.prediction.model.prediction_request import PredictionRequest
 
 
-class LegacyPredictiveHotRoomAcFlowTest(unittest.TestCase):
-    def test_legacy_hot_room_ac_flow_uses_predictive_pipeline(self) -> None:
+class LegacyHotRoomAcFlowTest(unittest.TestCase):
+    def test_legacy_episode_processor_hot_room_flow(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             client = MemoryOSClient(str(root))
@@ -32,8 +35,7 @@ class LegacyPredictiveHotRoomAcFlowTest(unittest.TestCase):
             scene_key = observation.scene_key
             anchor_uri = "memoryos://user/u1/memories/anchors/home_comfort"
             anchor = ContextObject(uri=anchor_uri, context_type=ContextType.MEMORY, title="home comfort anchor", owner_user_id="u1")
-            client.source_store.write_object(anchor, content="User comfort anchor for hot home environment.")
-            client.index_store.upsert_index(anchor, content="hot home comfort anchor")
+            client.context_db.seed_object(anchor, content="User comfort anchor for hot home environment.")
             pattern = BehaviorPattern(
                 user_id="u1",
                 scene_key=scene_key,
@@ -45,8 +47,7 @@ class LegacyPredictiveHotRoomAcFlowTest(unittest.TestCase):
                 hotness=0.9,
             )
             pattern_obj = pattern.to_context_object()
-            client.source_store.write_object(pattern_obj, content="hot room behavior pattern")
-            client.index_store.upsert_index(pattern_obj, content="hot room user present turn_on_ac behavior pattern")
+            client.context_db.seed_object(pattern_obj, content="hot room user present turn_on_ac behavior pattern")
             policy = ActionPolicy(
                 user_id="u1",
                 scene_key=scene_key,
@@ -69,22 +70,28 @@ class LegacyPredictiveHotRoomAcFlowTest(unittest.TestCase):
                 confidence=0.5,
             )
             for item in (policy, fan_policy):
-                obj = item.to_context_object()
-                client.source_store.write_object(obj, content=json.dumps(item.to_dict()))
-                client.index_store.upsert_index(obj, content=f"{item.scene_key} {item.action}")
-            resource = ContextObject(uri="memoryos://resources/devices/ac-living-room", context_type=ContextType.RESOURCE, title="living room AC", owner_user_id=None)
-            skill = ContextObject(uri="memoryos://skills/smart_home/ac-control", context_type=ContextType.SKILL, title="AC control skill", owner_user_id=None)
-            client.source_store.write_object(resource, content="device available")
-            client.source_store.write_object(skill, content="skill available")
-            client.index_store.upsert_index(resource, content="device available")
-            client.index_store.upsert_index(skill, content="skill available")
+                client.context_db.seed_object(item.to_context_object(), content=json.dumps(item.to_dict()))
+            resource = ContextObject(
+                uri="memoryos://resources/devices/ac-living-room",
+                context_type=ContextType.RESOURCE,
+                title="living room AC",
+                owner_user_id=None,
+            )
+            skill = ContextObject(
+                uri="memoryos://skills/smart_home/ac-control",
+                context_type=ContextType.SKILL,
+                title="AC control skill",
+                owner_user_id=None,
+            )
+            client.context_db.seed_object(resource, content="device available")
+            client.context_db.seed_object(skill, content="skill available")
             for relation_type, target in (
                 ("anchored_by", anchor_uri),
                 ("supported_by", pattern_obj.uri),
                 ("requires_resource", resource.uri),
                 ("requires_skill", skill.uri),
             ):
-                client.relation_store.add_relation(ContextRelation(source_uri=policy.uri, relation_type=relation_type, target_uri=target, metadata={"owner_user_id": "u1", "tenant_id": "default"}))
+                client.context_db.add_relation(ContextRelation(source_uri=policy.uri, relation_type=relation_type, target_uri=target, metadata={"owner_user_id": "u1", "tenant_id": "default"}))
             request = PredictionRequest(
                 user_id="u1",
                 episode_id="ep-hot-room",
@@ -92,7 +99,7 @@ class LegacyPredictiveHotRoomAcFlowTest(unittest.TestCase):
                 available_actions=["turn_on_ac", "turn_on_fan", "ask_user", "do_nothing"],
                 token_budget=2000,
             )
-            result = client.process_observation(request, [policy, fan_policy], archive_session=True, async_commit=True)
+            result = client.process_observation(request, archive_session=True, async_commit=True)
             self.assertIn(result.candidates[0].action, {"turn_on_ac", "turn_on_air_conditioner"})
             slices = result.action_context.packed_context["slices"]
             self.assertTrue(slices["memory_anchor"]["items"])
