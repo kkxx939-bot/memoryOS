@@ -18,9 +18,10 @@ class RecoveryService:
         self.committer = committer
 
     def recover(self, user_id: str) -> RecoveryResult:
-        pending = self.redo_log.pending()
-        if not pending:
+        entries = self.redo_log.pending_entries()
+        if not entries:
             return RecoveryResult(recovered_count=0, operation_ids=[])
+        pending = [entry.operation for entry in entries if entry.phase != "committed"]
         diff = self.committer.commit(user_id, pending)
         return RecoveryResult(
             recovered_count=len(diff.operations),

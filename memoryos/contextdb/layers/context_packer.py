@@ -22,18 +22,24 @@ class ContextPacker:
     def pack(self, sections: dict[str, list[dict]]) -> dict:
         slices = {}
         fallback_budget = self._fallback_budget(sections)
+        remaining_total = self.total_budget
         for name, items in sections.items():
-            budget = int(self.allocations.get(name, fallback_budget))
+            budget = min(int(self.allocations.get(name, fallback_budget)), remaining_total)
             selected: list[dict] = []
             used = 0
             for item in items:
+                if remaining_total <= 0:
+                    break
                 estimate = int(item.get("token_estimate", self._estimate_tokens(str(item.get("content", "")))))
+                if estimate > remaining_total:
+                    continue
                 if selected and used + estimate > budget:
                     continue
                 if estimate > budget and selected:
                     continue
                 selected.append({**item, "token_estimate": estimate})
                 used += estimate
+                remaining_total -= estimate
                 if used >= budget:
                     break
             slices[name] = BudgetSlice(name=name, budget=budget, used=used, items=selected)

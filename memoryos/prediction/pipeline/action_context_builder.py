@@ -3,13 +3,33 @@ from __future__ import annotations
 from memoryos.action_policy.model.action_policy import ActionCandidate, ActionPolicy
 from memoryos.contextdb.layers.context_packer import ContextPacker
 from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.store.source_store import IndexStore
+from memoryos.contextdb.store.source_store import IndexHit, IndexStore, RelationStore, SourceStore
 from memoryos.prediction.model.action_context import ActionContext
 
 
 class ActionContextBuilder:
-    def __init__(self, index_store: IndexStore) -> None:
+    relation_types = {
+        "anchored_by": "memory_anchor",
+        "constrained_by": "memory_rules",
+        "supported_by": "behavior_pattern",
+        "updated_by": "behavior_pattern",
+        "requires_resource": "resource",
+        "requires_skill": "skill",
+        "uses_session": "recent_session",
+        "evidence_for": "behavior_pattern",
+    }
+
+    def __init__(
+        self,
+        index_store: IndexStore,
+        source_store: SourceStore | None = None,
+        relation_store: RelationStore | None = None,
+        context_packer: ContextPacker | None = None,
+    ) -> None:
         self.index_store = index_store
+        self.source_store = source_store
+        self.relation_store = relation_store
+        self.context_packer = context_packer
 
     def build(
         self,
@@ -44,10 +64,17 @@ class ActionContextBuilder:
                     "token_estimate": 120,
                 }
             )
-            sections["memory_anchor"].extend(self._hits(user_id, policy.memory_anchor_uri, ContextType.MEMORY))
-            sections["memory_rules"].extend(self._hits(user_id, candidate.action, ContextType.MEMORY))
-            sections["behavior_pattern"].extend(self._hits(user_id, policy.scene_key, ContextType.BEHAVIOR_PATTERN))
-        packed = ContextPacker(
+            relation_sections = self._relation_sections(policy.uri, user_id=user_id)
+            for section, items in relation_sections.items():
+                sections[section].extend(items)
+                source_uris.extend(item["uri"] for item in items)
+            if not relation_sections.get("memory_anchor"):
+                sections["memory_anchor"].extend(self._hits(user_id, policy.memory_anchor_uri, ContextType.MEMORY))
+            if not relation_sections.get("memory_rules"):
+                sections["memory_rules"].extend(self._hits(user_id, candidate.action, ContextType.MEMORY))
+            if not relation_sections.get("behavior_pattern"):
+                sections["behavior_pattern"].extend(self._hits(user_id, policy.scene_key, ContextType.BEHAVIOR_PATTERN))
+        packer = self.context_packer or ContextPacker(
             token_budget,
             allocations={
                 "memory_rules": 350,
@@ -58,15 +85,67 @@ class ActionContextBuilder:
                 "skill": 250,
                 "recent_session": 100,
             },
-        ).pack(sections)
+        )
+        packed = packer.pack(sections)
         return ActionContext(user_id=user_id, candidate_actions=actions, packed_context=packed, source_uris=source_uris)
 
+    def _relation_sections(self, policy_uri: str, user_id: str) -> dict[str, list[dict]]:
+        if self.relation_store is None:
+            return {}
+        sections: dict[str, list[dict]] = {}
+        for relation in self.relation_store.relations_of(policy_uri):
+            if relation.source_uri != policy_uri:
+                continue
+            section = self.relation_types.get(relation.relation_type)
+            if not section:
+                continue
+            item = self._object_context(relation.target_uri, user_id=user_id)
+            if item is None:
+                if self.source_store is not None:
+                    continue
+                item = {
+                    "uri": relation.target_uri,
+                    "content": relation.metadata.get("summary", relation.relation_type),
+                    "token_estimate": int(relation.metadata.get("token_estimate", 80)),
+                }
+            item["relation_type"] = relation.relation_type
+            sections.setdefault(section, []).append(item)
+        return sections
+
     def _hits(self, user_id: str, query: str, context_type: ContextType) -> list[dict]:
-        return [
-            {"uri": hit.uri, "content": hit.title, "token_estimate": 80}
-            for hit in self.index_store.search(
-                query,
-                filters={"owner_user_id": user_id, "context_type": context_type.value},
-                limit=4,
-            )
-        ]
+        hits = self.index_store.search(query, filters={"owner_user_id": user_id, "context_type": context_type.value}, limit=4)
+        items = []
+        for hit in hits:
+            item = self._hit_context(hit, user_id)
+            if item is not None:
+                items.append(item)
+        return items
+
+    def _hit_context(self, hit: IndexHit, user_id: str) -> dict | None:
+        item = self._object_context(hit.uri, user_id=user_id)
+        if item is not None:
+            return item
+        return {"uri": hit.uri, "content": hit.title, "token_estimate": 80, "score": hit.score}
+
+    def _object_context(self, uri: str, user_id: str) -> dict | None:
+        if self.source_store is None:
+            return None
+        try:
+            obj = self.source_store.read_object(uri)
+        except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+            return None
+        if obj.owner_user_id not in {None, user_id} and not obj.uri.startswith(("memoryos://resources/", "memoryos://skills/")):
+            return None
+        try:
+            content = self.source_store.read_content(uri)
+        except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+            content = obj.metadata.get("summary") or obj.title
+        layer_content = content or obj.metadata.get("summary") or obj.title
+        return {
+            "uri": obj.uri,
+            "title": obj.title,
+            "context_type": obj.context_type.value,
+            "content": layer_content,
+            "metadata": obj.metadata,
+            "token_estimate": max(40, min(300, len(str(layer_content).split()) + 40)),
+        }

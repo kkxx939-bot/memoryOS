@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from memoryos.action_policy.model.action_policy import ActionCandidate, ActionPolicy
-from memoryos.domain.actions.action_schema import action_spec
+from memoryos.security.action_risk import action_spec
 
 
 class ActionPolicyRanker:

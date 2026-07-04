@@ -11,7 +11,7 @@ from memoryos.memory.model.memory import Memory, MemoryKind
 from memoryos.operations.model.context_operation import ContextOperation
 from memoryos.operations.model.operation_action import OperationAction
 from memoryos.operations.model.operation_status import OperationStatus
-from memoryos.ports.providers.chat_provider import ChatProvider, ModelResponse
+from memoryos.providers.llm.base import ChatProvider, ModelResponse
 
 
 class LLMMemoryExtractor(MemoryExtractor):

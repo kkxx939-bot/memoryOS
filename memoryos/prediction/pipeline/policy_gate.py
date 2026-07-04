@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from memoryos.action_policy.model.action_policy import ActionCandidate, ActionPolicy, ActionPolicyStatus
-from memoryos.domain.actions.action_schema import action_spec
 from memoryos.prediction.model.action_context import ActionContext
 from memoryos.prediction.model.prediction_result import PolicyDecision
+from memoryos.security.action_risk import action_spec
 
 
 class PolicyGate:

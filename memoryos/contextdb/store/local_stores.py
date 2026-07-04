@@ -117,6 +117,17 @@ class InMemoryRelationStore:
     def relations_of(self, uri: str) -> list[ContextRelation]:
         return [relation for relation in self.relations if relation.source_uri == uri or relation.target_uri == uri]
 
+    def delete_relation(self, source_uri: str, relation_type: str, target_uri: str) -> None:
+        self.relations = [
+            relation
+            for relation in self.relations
+            if not (
+                relation.source_uri == source_uri
+                and relation.relation_type == relation_type
+                and relation.target_uri == target_uri
+            )
+        ]
+
 
 class InMemoryQueueStore:
     def __init__(self) -> None:

@@ -3,9 +3,16 @@ from __future__ import annotations
 import json
 import os
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 from memoryos.operations.model.context_operation import ContextOperation
+
+
+@dataclass(frozen=True)
+class RedoEntry:
+    operation: ContextOperation
+    phase: str
 
 
 class RedoLog:
@@ -13,13 +20,17 @@ class RedoLog:
         self.root = Path(root)
         self.redo_dir = self.root / "system" / "redo"
 
-    def begin(self, operation: ContextOperation) -> Path:
+    def begin(self, operation: ContextOperation, phase: str = "begin") -> Path:
         self.redo_dir.mkdir(parents=True, exist_ok=True)
         path = self.redo_dir / f"{operation.operation_id}.json"
         tmp = path.with_suffix(path.suffix + f".{uuid.uuid4().hex}.tmp")
-        tmp.write_text(json.dumps(operation.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+        payload = {**operation.to_dict(), "redo_phase": phase}
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp, path)
         return path
+
+    def advance(self, operation: ContextOperation, phase: str) -> Path:
+        return self.begin(operation, phase=phase)
 
     def commit(self, operation_id: str) -> None:
         path = self.redo_dir / f"{operation_id}.json"
@@ -27,9 +38,13 @@ class RedoLog:
             path.unlink()
 
     def pending(self) -> list[ContextOperation]:
+        return [entry.operation for entry in self.pending_entries()]
+
+    def pending_entries(self) -> list[RedoEntry]:
         if not self.redo_dir.exists():
             return []
-        return [
-            ContextOperation.from_dict(json.loads(path.read_text(encoding="utf-8")))
-            for path in sorted(self.redo_dir.glob("*.json"))
-        ]
+        entries: list[RedoEntry] = []
+        for path in sorted(self.redo_dir.glob("*.json")):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            entries.append(RedoEntry(operation=ContextOperation.from_dict(payload), phase=str(payload.get("redo_phase", "started"))))
+        return entries

@@ -3,7 +3,7 @@ from __future__ import annotations
 from memoryos.action_policy.model.action_policy import ActionPolicy
 from memoryos.action_policy.ranking.action_policy_ranker import ActionPolicyRanker
 from memoryos.behavior.retrieval.similar_behavior_retriever import SimilarBehaviorRetriever
-from memoryos.contextdb.store.source_store import IndexStore
+from memoryos.contextdb.store.source_store import IndexStore, RelationStore, SourceStore
 from memoryos.prediction.model.prediction_ledger import PredictionLedger
 from memoryos.prediction.model.prediction_request import PredictionRequest
 from memoryos.prediction.model.prediction_result import PredictionResult
@@ -13,13 +13,21 @@ from memoryos.prediction.pipeline.policy_gate import PolicyGate
 
 
 class PredictionEngine:
-    def __init__(self, index_store: IndexStore, ledger: PredictionLedger) -> None:
+    def __init__(
+        self,
+        index_store: IndexStore,
+        ledger: PredictionLedger,
+        source_store: SourceStore | None = None,
+        relation_store: RelationStore | None = None,
+    ) -> None:
         self.index_store = index_store
         self.ledger = ledger
+        self.source_store = source_store
+        self.relation_store = relation_store
         self.observation_normalizer = ObservationNormalizer()
         self.similar_behavior_retriever = SimilarBehaviorRetriever(index_store)
         self.action_policy_ranker = ActionPolicyRanker()
-        self.action_context_builder = ActionContextBuilder(index_store)
+        self.action_context_builder = ActionContextBuilder(index_store, source_store=source_store, relation_store=relation_store)
         self.policy_gate = PolicyGate()
 
     def process(self, request: PredictionRequest, policies: list[ActionPolicy]) -> PredictionResult:
