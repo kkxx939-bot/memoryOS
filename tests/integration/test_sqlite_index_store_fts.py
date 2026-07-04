@@ -30,9 +30,17 @@ def test_sqlite_index_store_fts_or_fallback_search_and_filters(tmp_path) -> None
         owner_user_id="u1",
         lifecycle_state=LifecycleState.DELETED,
     )
+    archived = ContextObject(
+        uri="memoryos://user/u1/memories/profile/archived",
+        context_type=ContextType.MEMORY,
+        title="archived temperature",
+        owner_user_id="u1",
+        lifecycle_state=LifecycleState.ARCHIVED,
+    )
     store.upsert_index(u1, content="hot room air conditioner 温度")
     store.upsert_index(u2, content="hot room")
     store.upsert_index(deleted, content="hot room")
+    store.upsert_index(archived, content="hot room")
 
     chinese_hits = store.search("温度", filters={"owner_user_id": "u1", "context_type": ContextType.MEMORY.value})
     assert [hit.uri for hit in chinese_hits] == [u1.uri]
@@ -42,7 +50,7 @@ def test_sqlite_index_store_fts_or_fallback_search_and_filters(tmp_path) -> None
 
     default_hits = store.search("hot", filters={"owner_user_id": "u1"}, limit=10)
     assert deleted.uri not in {hit.uri for hit in default_hits}
+    assert archived.uri not in {hit.uri for hit in default_hits}
 
     store.delete_index(u1.uri)
     assert not store.search("温度", filters={"owner_user_id": "u1"})
-

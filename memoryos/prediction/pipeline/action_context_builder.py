@@ -65,16 +65,16 @@ class ActionContextBuilder:
                     "token_estimate": 120,
                 }
             )
-            relation_sections = self._relation_sections(policy.uri, user_id=user_id)
+            relation_sections = self._relation_sections(policy.uri, user_id=user_id, token_budget_remaining=token_budget, candidate_score=candidate.score)
             for section, items in relation_sections.items():
                 sections[section].extend(items)
                 source_uris.extend(item["uri"] for item in items)
             if not relation_sections.get("memory_anchor"):
-                sections["memory_anchor"].extend(self._hits(user_id, policy.memory_anchor_uri, ContextType.MEMORY))
+                sections["memory_anchor"].extend(self._hits(user_id, policy.memory_anchor_uri, ContextType.MEMORY, token_budget_remaining=token_budget))
             if not relation_sections.get("memory_rules"):
-                sections["memory_rules"].extend(self._hits(user_id, candidate.action, ContextType.MEMORY))
+                sections["memory_rules"].extend(self._hits(user_id, candidate.action, ContextType.MEMORY, token_budget_remaining=token_budget))
             if not relation_sections.get("behavior_pattern"):
-                sections["behavior_pattern"].extend(self._hits(user_id, policy.scene_key, ContextType.BEHAVIOR_PATTERN))
+                sections["behavior_pattern"].extend(self._hits(user_id, policy.scene_key, ContextType.BEHAVIOR_PATTERN, token_budget_remaining=token_budget))
         packer = self.context_packer or ContextPacker(
             token_budget,
             allocations={
@@ -90,7 +90,13 @@ class ActionContextBuilder:
         packed = packer.pack(sections)
         return ActionContext(user_id=user_id, candidate_actions=actions, packed_context=packed, source_uris=source_uris)
 
-    def _relation_sections(self, policy_uri: str, user_id: str) -> dict[str, list[dict]]:
+    def _relation_sections(
+        self,
+        policy_uri: str,
+        user_id: str,
+        token_budget_remaining: int,
+        candidate_score: float,
+    ) -> dict[str, list[dict]]:
         if self.relation_store is None:
             return {}
         sections: dict[str, list[dict]] = {}
@@ -100,7 +106,13 @@ class ActionContextBuilder:
             section = self.relation_types.get(relation.relation_type)
             if not section:
                 continue
-            item = self._object_context(relation.target_uri, user_id=user_id, section=section)
+            item = self._object_context(
+                relation.target_uri,
+                user_id=user_id,
+                section=section,
+                token_budget_remaining=token_budget_remaining,
+                candidate_score=candidate_score,
+            )
             if item is None:
                 if self.source_store is not None:
                     continue
@@ -113,22 +125,35 @@ class ActionContextBuilder:
             sections.setdefault(section, []).append(item)
         return sections
 
-    def _hits(self, user_id: str, query: str, context_type: ContextType) -> list[dict]:
+    def _hits(self, user_id: str, query: str, context_type: ContextType, token_budget_remaining: int) -> list[dict]:
         hits = self.index_store.search(query, filters={"owner_user_id": user_id, "context_type": context_type.value}, limit=4)
         items = []
         for hit in hits:
-            item = self._hit_context(hit, user_id)
+            item = self._hit_context(hit, user_id, token_budget_remaining=token_budget_remaining)
             if item is not None:
                 items.append(item)
         return items
 
-    def _hit_context(self, hit: IndexHit, user_id: str) -> dict | None:
-        item = self._object_context(hit.uri, user_id=user_id, section=self._section_for_type(hit.context_type))
+    def _hit_context(self, hit: IndexHit, user_id: str, token_budget_remaining: int) -> dict | None:
+        item = self._object_context(
+            hit.uri,
+            user_id=user_id,
+            section=self._section_for_type(hit.context_type),
+            token_budget_remaining=token_budget_remaining,
+            candidate_score=hit.score,
+        )
         if item is not None:
             return item
         return {"uri": hit.uri, "content": hit.title, "token_estimate": 80, "score": hit.score}
 
-    def _object_context(self, uri: str, user_id: str, section: str) -> dict | None:
+    def _object_context(
+        self,
+        uri: str,
+        user_id: str,
+        section: str,
+        token_budget_remaining: int = 1000,
+        candidate_score: float = 0.0,
+    ) -> dict | None:
         if self.source_store is None:
             return None
         try:
@@ -139,7 +164,7 @@ class ActionContextBuilder:
             return None
         if obj.owner_user_id not in {None, user_id} and not obj.uri.startswith(("memoryos://resources/", "memoryos://skills/")):
             return None
-        layer_content = self._read_best_layer(obj, section)
+        layer_content = self._read_best_layer(obj, section, token_budget_remaining, candidate_score=candidate_score)
         return {
             "uri": obj.uri,
             "title": obj.title,
@@ -149,14 +174,17 @@ class ActionContextBuilder:
             "token_estimate": max(40, min(300, len(str(layer_content).split()) + 40)),
         }
 
-    def _read_best_layer(self, obj, section: str, token_budget_remaining: int = 1000):
+    def _read_best_layer(self, obj, section: str, token_budget_remaining: int = 1000, candidate_score: float = 0.0):
         if section == "action_policy":
             return obj.metadata
-        preferred = [obj.layers.l1_uri, obj.layers.l0_uri]
+        if token_budget_remaining <= 120:
+            preferred = [obj.layers.l0_uri, obj.layers.l1_uri]
+        else:
+            preferred = [obj.layers.l1_uri, obj.layers.l0_uri]
         if section == "recent_session":
             preferred = [obj.layers.l0_uri, obj.layers.l1_uri]
-        if token_budget_remaining > 1200:
-            preferred.append(obj.layers.l2_uri)
+        elif token_budget_remaining >= 1200 and candidate_score >= 0.85:
+            preferred = [obj.layers.l2_uri, *preferred]
         for layer_uri in preferred:
             if not layer_uri:
                 continue
