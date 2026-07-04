@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from memoryos.action_policy.model.action_policy import ActionPolicy, ActionPolicyStatus
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.model.lifecycle import LifecycleState
+from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
 from memoryos.contextdb.store.source_store import IndexStore, SourceStore
 
 
 class ActionPolicyRetriever:
-    def __init__(self, index_store: IndexStore, source_store: SourceStore) -> None:
+    def __init__(self, index_store: IndexStore, source_store: SourceStore, hybrid_search: HybridSearch | None = None) -> None:
         self.index_store = index_store
         self.source_store = source_store
+        self.hybrid_search = hybrid_search
 
     def retrieve(
         self,
@@ -30,11 +33,21 @@ class ActionPolicyRetriever:
         seen: set[str] = set()
         policies: list[ActionPolicy] = []
         for query in queries or [""]:
-            hits = self.index_store.search(
-                query,
-                filters={"owner_user_id": user_id, "context_type": ContextType.ACTION_POLICY.value},
-                limit=max(limit * 3, 20),
-            )
+            hits: list[Any]
+            if self.hybrid_search is not None:
+                hits = self.hybrid_search.search(
+                    query,
+                    filters={"owner_user_id": user_id},
+                    namespace=f"memoryos://user/{user_id}/",
+                    context_type=ContextType.ACTION_POLICY,
+                    limit=max(limit * 3, 20),
+                )
+            else:
+                hits = self.index_store.search(
+                    query,
+                    filters={"owner_user_id": user_id, "context_type": ContextType.ACTION_POLICY.value},
+                    limit=max(limit * 3, 20),
+                )
             for hit in hits:
                 if hit.uri in seen:
                     continue

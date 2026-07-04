@@ -19,6 +19,12 @@ class OpportunityDecayResult:
     hotness_delta: float
     q_value_delta: float
     reason: str
+    recent_opportunity_count: int = 0
+    recent_activation_count: int = 0
+    recent_missed_count: int = 0
+    recent_negative_count: int = 0
+    window_start: str | None = None
+    window_end: str | None = None
     generated_operations: list | None = None
 
     def __post_init__(self) -> None:

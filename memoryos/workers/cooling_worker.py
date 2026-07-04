@@ -56,6 +56,10 @@ class CoolingWorker:
                     "pattern_uri": pattern.uri,
                     "opportunity_state": state,
                     "reason": decay_result.reason,
+                    "recent_opportunity_count": decay_result.recent_opportunity_count,
+                    "recent_activation_count": decay_result.recent_activation_count,
+                    "recent_missed_count": decay_result.recent_missed_count,
+                    "recent_negative_count": decay_result.recent_negative_count,
                     "operation_ids": [operation.operation_id for operation in pattern_ops],
                 }
             )
@@ -115,11 +119,11 @@ class CoolingWorker:
             return [
                 self._policy_operation(
                     user_id,
-                    OperationAction.COOLDOWN,
+                    OperationAction.PENALIZE,
                     target_policy_uris,
                     pattern,
                     action,
-                    {"reason": "negative_feedback", "cooldown_until": None},
+                    {"penalty": max(0.2, abs(q_value_delta) or 0.25), "signal_type": "negative_feedback"},
                 )
             ]
         return []

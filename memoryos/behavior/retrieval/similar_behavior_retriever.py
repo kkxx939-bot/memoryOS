@@ -3,6 +3,7 @@ from __future__ import annotations
 from memoryos.behavior.model.observation import Observation
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.model.lifecycle import LifecycleState
+from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
 from memoryos.contextdb.store.source_store import IndexHit, IndexStore, RelationStore, SourceStore
 
 
@@ -22,17 +23,20 @@ class SimilarBehaviorRetriever:
         index_store: IndexStore,
         source_store: SourceStore | None = None,
         relation_store: RelationStore | None = None,
+        hybrid_search: HybridSearch | None = None,
     ) -> None:
         self.index_store = index_store
         self.source_store = source_store
         self.relation_store = relation_store
+        self.hybrid_search = hybrid_search
 
     def retrieve(self, user_id: str, observation: Observation, limit: int = 8) -> dict:
         query = " ".join([observation.raw_text, observation.location, observation.activity, *observation.signals])
         search_query = query or observation.scene_key
+        namespace = f"memoryos://user/{user_id}/"
         trace: dict[str, dict] = {}
-        patterns = self._fallback_hits(user_id, search_query, ContextType.BEHAVIOR_PATTERN, limit, trace, weight=1.0)
-        clusters = self._fallback_hits(user_id, search_query, ContextType.BEHAVIOR_CLUSTER, limit, trace, weight=0.75)
+        patterns = self._fallback_hits(user_id, search_query, ContextType.BEHAVIOR_PATTERN, limit, trace, weight=1.0, namespace=namespace)
+        clusters = self._fallback_hits(user_id, search_query, ContextType.BEHAVIOR_CLUSTER, limit, trace, weight=0.75, namespace=namespace)
         memory_anchors: list[dict] = []
         policy_refs: list[dict] = []
         relation_cases: list[dict] = []
@@ -43,10 +47,10 @@ class SimilarBehaviorRetriever:
             policy_refs.extend(related["policy_refs"])
             relation_cases.extend(related["cases"])
         if not memory_anchors:
-            memory_anchors = self._fallback_hits(user_id, observation.scene_key or search_query, ContextType.MEMORY, limit, trace, weight=0.65)
-        case_hits = relation_cases + self._fallback_hits(user_id, search_query, ContextType.BEHAVIOR_CASE, limit, trace, weight=0.45)
+            memory_anchors = self._fallback_hits(user_id, observation.scene_key or search_query, ContextType.MEMORY, limit, trace, weight=0.65, namespace=namespace)
+        case_hits = relation_cases + self._fallback_hits(user_id, search_query, ContextType.BEHAVIOR_CASE, limit, trace, weight=0.45, namespace=namespace)
         representative_cases = self._representative_cases(case_hits)
-        indexed_policy_refs = self._fallback_hits(user_id, observation.scene_key or search_query, ContextType.ACTION_POLICY, limit, trace, weight=0.55)
+        indexed_policy_refs = self._fallback_hits(user_id, observation.scene_key or search_query, ContextType.ACTION_POLICY, limit, trace, weight=0.55, namespace=namespace)
         policy_refs = self._dedupe([*policy_refs, *indexed_policy_refs])
         patterns = self._dedupe(patterns)
         clusters = self._dedupe(clusters)
@@ -82,15 +86,36 @@ class SimilarBehaviorRetriever:
         limit: int,
         trace: dict[str, dict],
         weight: float,
+        namespace: str,
     ) -> list[dict]:
-        hits = self.index_store.search(
-            query,
-            filters={"owner_user_id": user_id, "context_type": context_type.value},
-            limit=limit,
-        )
-        items = [self._hit_item(hit, source="index_fallback", weight=weight) for hit in hits]
+        if self.hybrid_search is not None:
+            hybrid_hits = self.hybrid_search.search(
+                query,
+                filters={"owner_user_id": user_id},
+                namespace=namespace,
+                context_type=context_type,
+                limit=limit,
+            )
+            items = [
+                {
+                    "uri": hit.uri,
+                    "title": hit.title,
+                    "context_type": hit.context_type,
+                    "score": min(1.0, float(hit.score) * weight),
+                    "source": hit.source,
+                    "metadata": dict(hit.metadata),
+                }
+                for hit in hybrid_hits
+            ]
+        else:
+            index_hits = self.index_store.search(
+                query,
+                filters={"owner_user_id": user_id, "context_type": context_type.value},
+                limit=limit,
+            )
+            items = [self._hit_item(hit, source="index_fallback", weight=weight) for hit in index_hits]
         for item in items:
-            trace.setdefault(item["uri"], {"source": "index_fallback", "context_type": context_type.value})
+            trace.setdefault(str(item["uri"]), {"source": item.get("source", "index_fallback"), "context_type": context_type.value})
         return items
 
     def _relation_results(self, uri: str, user_id: str, trace: dict[str, dict]) -> dict[str, list[dict]]:

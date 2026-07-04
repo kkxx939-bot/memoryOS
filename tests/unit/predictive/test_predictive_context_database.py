@@ -67,7 +67,7 @@ class PredictiveContextDatabaseTest(unittest.TestCase):
         )
         no_opportunity = OpportunityAwareDecay().evaluate(pattern, [])
         self.assertEqual(no_opportunity.opportunity_state, "no_opportunity")
-        hot_obs = Observation(user_id="gulf", location="home", environment={"temperature": 30})
+        hot_obs = Observation(user_id="gulf", location="home", signals=["action_executed"], environment={"temperature": 30})
         activated = OpportunityAwareDecay().evaluate(pattern, [hot_obs])
         self.assertEqual(activated.opportunity_state, "opportunity_activated")
 

@@ -1,0 +1,104 @@
+from __future__ import annotations
+
+import json
+from datetime import datetime, timedelta, timezone
+
+from memoryos.api.sdk.client import MemoryOSClient
+from memoryos.behavior.model.behavior_case import BehaviorCase
+from memoryos.behavior.model.observation import Observation
+from memoryos.behavior.update.behavior_case_writer import BehaviorCaseWriter
+from memoryos.contextdb.model.context_object import ContextObject
+from memoryos.contextdb.model.context_type import ContextType
+from memoryos.contextdb.model.context_uri import ContextURI
+from memoryos.contextdb.session.session_model import SessionArchive
+from memoryos.prediction.model.prediction_request import PredictionRequest
+
+NOW = datetime(2026, 7, 4, tzinfo=timezone.utc)
+
+
+def _observation() -> Observation:
+    return Observation(user_id="u1", raw_text="hot room", location="home", activity="resting", signals=["user_present"], environment={"temperature": 30})
+
+
+def _seed_case(client: MemoryOSClient, case_id: str, days_ago: int) -> None:
+    obs = _observation()
+    case = BehaviorCase(
+        user_id="u1",
+        scene_key=obs.scene_key,
+        observation=obs.__dict__,
+        selected_action="turn_on_ac",
+        case_id=case_id,
+        created_at=(NOW - timedelta(days=days_ago)).isoformat(),
+    )
+    client.committer.commit("u1", [BehaviorCaseWriter().add_case(case)])
+
+
+def test_behavior_to_action_policy_auto_flow(tmp_path) -> None:
+    client = MemoryOSClient(str(tmp_path))
+    obs = _observation()
+    resource_uri = "memoryos://resources/devices/living-room-ac"
+    skill_uri = "memoryos://skills/smart-home/ac-control"
+    client.context_db.seed_object(
+        ContextObject(uri=resource_uri, context_type=ContextType.RESOURCE, title="Living room AC", metadata={"available": True}),
+        content="living room AC available",
+    )
+    client.context_db.seed_object(
+        ContextObject(uri=skill_uri, context_type=ContextType.SKILL, title="AC control skill", metadata={"executable": True, "risk_level": "low"}),
+        content="turn_on_ac skill available",
+    )
+    _seed_case(client, "h1", 2)
+    _seed_case(client, "h2", 6)
+
+    archive = SessionArchive(
+        user_id="u1",
+        session_id="auto-flow",
+        archive_uri="memoryos://user/u1/sessions/history/auto-flow",
+        observations=[{"scene_key": obs.scene_key, **obs.__dict__}],
+        predictions=[
+            {
+                "observation": {"scene_key": obs.scene_key},
+                "decision": {"action": "turn_on_ac"},
+                "candidates": [{"action": "turn_on_ac", "score": 0.9}],
+            }
+        ],
+        feedback=[{"scene_key": obs.scene_key, "action": "turn_on_ac", "reward": 1.0, "feedback_type": "implicit_positive"}],
+        used_contexts=[{"uri": resource_uri}],
+        used_skills=[{"uri": skill_uri}],
+    )
+
+    result = client.context_db.commit_session(archive, async_commit=True)
+    assert result.done
+
+    policy_uri = f"memoryos://user/u1/action_policies/{obs.scene_key}/turn_on_ac"
+    policy = client.context_db.read_object(policy_uri)
+    assert policy.metadata["memory_anchor_uri"]
+    assert policy.metadata["supported_behavior_pattern_uris"]
+    assert policy.metadata["required_resource_uris"] == [resource_uri]
+    assert policy.metadata["required_skill_uris"] == [skill_uri]
+    assert client.context_db.search(obs.scene_key, owner_user_id="u1", context_type=ContextType.BEHAVIOR_CLUSTER)
+    assert client.context_db.search(obs.scene_key, owner_user_id="u1", context_type=ContextType.BEHAVIOR_PATTERN)
+    assert client.context_db.read_object(policy.metadata["memory_anchor_uri"]).context_type == ContextType.MEMORY
+
+    prediction = client.predict(
+        PredictionRequest(
+            user_id="u1",
+            episode_id="after-auto-flow",
+            observation=obs,
+            available_actions=["turn_on_ac", "ask_user", "do_nothing"],
+            token_budget=2000,
+        )
+    )
+    assert prediction.candidates[0].policy_uri == policy_uri
+    assert prediction.decision.mode in {"execute", "ask_user"}
+    assert prediction.memory_operations == []
+    source_uris = set(prediction.action_context.source_uris)
+    assert policy.metadata["memory_anchor_uri"] in source_uris
+    assert policy.metadata["supported_behavior_pattern_uris"][0] in source_uris
+    assert resource_uri in source_uris
+    assert skill_uri in source_uris
+
+    archive_dir = ContextURI.parse(archive.archive_uri).to_source_path(tmp_path)
+    for filename in ("memory_diff.json", "behavior_diff.json", "action_policy_diff.json", "context_diff.json"):
+        payload = json.loads((archive_dir / filename).read_text(encoding="utf-8"))
+        assert payload["status"] == "committed"
+        assert "operations" in payload

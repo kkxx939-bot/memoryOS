@@ -4,7 +4,8 @@ from pathlib import Path
 
 from memoryos.action_policy.model.action_policy import ActionPolicy
 from memoryos.contextdb.context_db import ContextDB
-from memoryos.contextdb.session.planners import BehaviorCommitPlanner
+from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
+from memoryos.contextdb.session.planners import ActionPolicyCommitPlanner, BehaviorCommitPlanner
 from memoryos.contextdb.session.session_archive import SessionArchiveStore
 from memoryos.contextdb.session.session_commit import SessionCommitService
 from memoryos.contextdb.session.session_model import SessionArchive
@@ -14,12 +15,14 @@ from memoryos.contextdb.store.sqlite_index_store import SQLiteIndexStore
 from memoryos.contextdb.store.sqlite_lock_store import SQLiteLockStore
 from memoryos.contextdb.store.sqlite_queue_store import SQLiteQueueStore
 from memoryos.contextdb.store.sqlite_relation_store import SQLiteRelationStore
+from memoryos.contextdb.store.vector_store import VectorStore
 from memoryos.operations.commit.operation_committer import OperationCommitter
 from memoryos.prediction.model.prediction_ledger import PredictionLedger
 from memoryos.prediction.model.prediction_request import PredictionRequest
 from memoryos.prediction.model.prediction_result import PredictionResult
 from memoryos.prediction.pipeline.executor import ActionExecutor
 from memoryos.prediction.pipeline.prediction_engine import PredictionEngine
+from memoryos.providers.embedding import EmbeddingProvider
 from memoryos.skill.tool_registry import ToolRegistry
 
 
@@ -33,6 +36,9 @@ class MemoryOSClient:
         queue_store: QueueStore | None = None,
         lock_store: LockStore | None = None,
         tool_registry: ToolRegistry | None = None,
+        vector_store: VectorStore | None = None,
+        embedding_provider: EmbeddingProvider | None = None,
+        hybrid_search: HybridSearch | None = None,
     ) -> None:
         self.root = root
         root_path = Path(root)
@@ -41,6 +47,13 @@ class MemoryOSClient:
         self.relation_store = relation_store or SQLiteRelationStore(root_path / "indexes" / "relations.sqlite3")
         self.queue_store = queue_store or SQLiteQueueStore(root_path / "queues" / "jobs.sqlite3")
         self.lock_store = lock_store or SQLiteLockStore(root_path / "system" / "locks.sqlite3")
+        self.vector_store = vector_store
+        self.embedding_provider = embedding_provider
+        self.hybrid_search = hybrid_search or (
+            HybridSearch(self.index_store, vector_store=vector_store, embedding_provider=embedding_provider, source_store=self.source_store)
+            if vector_store is not None and embedding_provider is not None
+            else None
+        )
         self.committer = OperationCommitter(
             self.source_store,
             self.index_store,
@@ -54,6 +67,7 @@ class MemoryOSClient:
             self.queue_store,
             committer=self.committer,
             behavior_planner=BehaviorCommitPlanner(index_store=self.index_store, source_store=self.source_store),
+            action_policy_planner=ActionPolicyCommitPlanner(index_store=self.index_store, source_store=self.source_store),
         )
         self.context_db = ContextDB(
             self.source_store,
@@ -68,6 +82,9 @@ class MemoryOSClient:
             PredictionLedger(root),
             source_store=self.source_store,
             relation_store=self.relation_store,
+            vector_store=self.vector_store,
+            embedding_provider=self.embedding_provider,
+            hybrid_search=self.hybrid_search,
         )
         self.executor = ActionExecutor(tool_registry)
 

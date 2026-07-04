@@ -12,3 +12,6 @@ __all__ = [
     "QueryPlan",
     "TokenBudgetController",
 ]
+from memoryos.contextdb.retrieval.hybrid_search import HybridHit, HybridSearch
+
+__all__ = ["HybridHit", "HybridSearch"]

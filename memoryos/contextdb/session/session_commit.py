@@ -70,13 +70,13 @@ class SessionCommitService:
         )
         memory_ops = self.memory_planner.plan(archive)
         behavior_ops = self.behavior_planner.plan(archive)
-        action_policy_ops = self.action_policy_planner.plan(archive)
-        context_ops = self.context_planner.plan(archive)
         if self.committer is None and not self.allow_plan_only:
             raise RuntimeError("SessionCommitService requires OperationCommitter unless allow_plan_only=True")
         memory_diff = self._commit_or_describe(archive.user_id, memory_ops)
         behavior_diff = self._commit_or_describe(archive.user_id, behavior_ops)
+        action_policy_ops = self.action_policy_planner.plan(archive)
         action_policy_diff = self._commit_or_describe(archive.user_id, action_policy_ops)
+        context_ops = self.context_planner.plan(archive)
         context_diff = self._commit_or_describe(archive.user_id, context_ops)
         self.archive_store.write_async_outputs(
             archive.archive_uri,

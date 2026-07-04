@@ -57,7 +57,9 @@ def test_cooling_worker_activated_opportunity_refreshes_pattern(tmp_path) -> Non
     policy = ActionPolicy(user_id="u1", scene_key="hot_room", action="turn_on_ac", memory_anchor_uri="memoryos://user/u1/memories/anchors/hot")
     pattern = _seed_policy_and_pattern(source, index, policy, OpportunityStats(activation_count=2, missed_opportunity_count=1))
 
-    result = CoolingWorker(source, index, committer).process_behavior_patterns("u1", [Observation(user_id="u1", raw_text="hot room", location="home", environment={"temperature": 30})])
+    result = CoolingWorker(source, index, committer).process_behavior_patterns(
+        "u1", [Observation(user_id="u1", raw_text="hot room", location="home", signals=["action_executed"], environment={"temperature": 30})]
+    )
 
     assert result["operations"][0]["action"] == "refresh_layers"
     assert source.read_object(pattern.uri).uri == pattern.uri
@@ -76,15 +78,15 @@ def test_cooling_worker_missed_opportunity_penalizes_policy_once(tmp_path) -> No
     assert updated["penalty_score"] > 0
 
 
-def test_cooling_worker_negative_feedback_cooldown_or_disable(tmp_path) -> None:
+def test_cooling_worker_negative_feedback_penalizes_or_disables(tmp_path) -> None:
     source, index, committer = _stores(tmp_path)
     policy = ActionPolicy(user_id="u1", scene_key="hot_room", action="turn_on_ac", memory_anchor_uri="memoryos://user/u1/memories/anchors/hot", auto_execute_allowed=True)
     _seed_policy_and_pattern(source, index, policy, OpportunityStats())
 
     result = CoolingWorker(source, index, committer).process_behavior_patterns("u1", [Observation(user_id="u1", raw_text="hot room", location="home", signals=["negative_feedback"], environment={"temperature": 30})])
 
-    assert result["operations"][0]["action"] == "cooldown"
-    assert source.read_object(policy.uri).metadata["status"] == ActionPolicyStatus.COOLDOWN.value
+    assert result["operations"][0]["action"] == "penalize"
+    assert source.read_object(policy.uri).metadata["failure_count"] == 1
 
     result = CoolingWorker(source, index, committer).process_behavior_patterns("u1", [Observation(user_id="u1", raw_text="hot room", location="home", signals=["explicit_negative_rule"], environment={"temperature": 30})])
     assert result["operations"][0]["action"] == "disable"
