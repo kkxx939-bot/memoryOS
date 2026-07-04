@@ -1,11 +1,6 @@
 from __future__ import annotations
 
-
-def main() -> None:
-    print(
-        "MemoryOS uses MemoryOSClient.process_observation() as the production entrypoint. "
-        "Import memoryos.api.sdk.client.MemoryOSClient from your application code."
-    )
+from memoryos.api.cli.main import main
 
 
 if __name__ == "__main__":

@@ -61,6 +61,7 @@ class MemoryOSClient:
             self.relation_store,
             queue_store=self.queue_store,
             session_commit_service=self.session_commit_service,
+            committer=self.committer,
         )
         self.engine = PredictionEngine(
             self.index_store,
@@ -70,13 +71,13 @@ class MemoryOSClient:
         )
         self.executor = ActionExecutor(tool_registry)
 
-    def predict(self, request: PredictionRequest, policies: list[ActionPolicy]) -> PredictionResult:
+    def predict(self, request: PredictionRequest, policies: list[ActionPolicy] | None = None) -> PredictionResult:
         return self.engine.process(request, policies=policies)
 
     def process_observation(
         self,
         request: PredictionRequest,
-        policies: list[ActionPolicy],
+        policies: list[ActionPolicy] | None = None,
         *,
         archive_session: bool = True,
         async_commit: bool = True,

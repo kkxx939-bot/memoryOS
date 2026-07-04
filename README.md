@@ -29,6 +29,7 @@ ContextDB is the shared substrate for all durable context:
 
 SourceStore is the source of truth. IndexStore is derived and can be rebuilt from SourceStore.
 Application code should enter through the `ContextDB` facade exposed as `MemoryOSClient.context_db`; the underlying stores remain available for low-level tests and adapters.
+`seed_object()` / `import_object()` are only for tests, bootstrap imports, and fixture data. Production long-term writes use `ContextOperation` through `ContextDB.commit_operation()`, `ContextDB.commit_operations()`, `SessionCommitService`, and `OperationCommitter`.
 
 ### Memory
 
@@ -191,7 +192,7 @@ pattern_uri = "memoryos://user/u1/behavior/patterns/hot_room"
 resource_uri = "memoryos://resources/devices/ac-living-room"
 skill_uri = "memoryos://skills/smart_home/ac-control"
 
-client.context_db.write_object(
+client.context_db.seed_object(
     ContextObject(
         uri=anchor_uri,
         context_type=ContextType.MEMORY,
@@ -201,7 +202,7 @@ client.context_db.write_object(
     ),
     content="Hot room comfort behavior.",
 )
-client.context_db.write_object(
+client.context_db.seed_object(
     ContextObject(
         uri=pattern_uri,
         context_type=ContextType.BEHAVIOR_PATTERN,
@@ -211,8 +212,34 @@ client.context_db.write_object(
     ),
     content="The user often cools the room when temperature is high.",
 )
-client.context_db.write_object(ContextObject(uri=resource_uri, context_type=ContextType.RESOURCE, title="Living room AC"), content="available")
-client.context_db.write_object(ContextObject(uri=skill_uri, context_type=ContextType.SKILL, title="AC control", metadata={"executable": True}), content="executable")
+client.context_db.seed_object(
+    ContextObject(
+        uri=resource_uri,
+        context_type=ContextType.RESOURCE,
+        title="Living room AC",
+        metadata={"available": True, "device_id": "living-room-ac", "temperature": 24},
+    ),
+    content="available",
+)
+client.context_db.seed_object(
+    ContextObject(
+        uri=skill_uri,
+        context_type=ContextType.SKILL,
+        title="AC control",
+        metadata={
+            "executable": True,
+            "tool_name": "ac.turn_on",
+            "input_schema": {
+                "type": "object",
+                "required": ["device_id", "temperature"],
+                "properties": {"device_id": {"type": "string"}, "temperature": {"type": "number"}},
+            },
+            "risk_level": "low",
+            "dry_run_supported": True,
+        },
+    ),
+    content="executable",
+)
 
 policy = ActionPolicy(
     user_id="u1",
@@ -227,7 +254,7 @@ policy = ActionPolicy(
     supported_behavior_pattern_uris=[pattern_uri],
 )
 
-client.context_db.write_object(policy.to_context_object(), content="hot room turn on ac")
+client.context_db.seed_object(policy.to_context_object(), content="hot room turn on ac")
 client.context_db.add_relation(ContextRelation(source_uri=policy.uri, relation_type="anchored_by", target_uri=anchor_uri, metadata={"owner_user_id": "u1"}))
 client.context_db.add_relation(ContextRelation(source_uri=policy.uri, relation_type="supported_by", target_uri=pattern_uri, metadata={"owner_user_id": "u1"}))
 client.context_db.add_relation(ContextRelation(source_uri=policy.uri, relation_type="requires_resource", target_uri=resource_uri, metadata={"owner_user_id": "u1"}))
@@ -245,7 +272,7 @@ request = PredictionRequest(
     available_actions=["turn_on_ac", "turn_on_fan", "ask_user", "do_nothing"],
 )
 
-result = client.process_observation(request, [policy], archive_session=True, async_commit=True)
+result = client.process_observation(request, archive_session=True, async_commit=True)
 print(result.candidates[0].action)
 print(result.decision.mode)
 print(result.memory_operations)  # always []

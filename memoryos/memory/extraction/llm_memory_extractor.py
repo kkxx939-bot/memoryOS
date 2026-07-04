@@ -42,9 +42,13 @@ class LLMMemoryExtractor(MemoryExtractor):
             if not isinstance(raw, dict):
                 result.rejected.append({"index": index, "error": "operation must be an object", "raw": raw})
                 continue
-            operation = self._operation(raw, user_id=user_id, session_id=session_id)
-            if isinstance(operation, dict):
-                result.rejected.append({"index": index, **operation})
+            try:
+                operation = self._operation(raw, user_id=user_id, session_id=session_id)
+                if isinstance(operation, dict):
+                    result.rejected.append({"index": index, **operation})
+                    continue
+            except (TypeError, ValueError, KeyError) as exc:
+                result.rejected.append({"index": index, "error": str(exc), "raw": raw})
                 continue
             if operation.status == OperationStatus.PENDING:
                 result.pending.append(operation)
@@ -66,9 +70,11 @@ class LLMMemoryExtractor(MemoryExtractor):
         if action is None:
             return {"error": f"unknown action: {action_text}", "raw": raw}
         try:
-            confidence = max(0.0, min(1.0, float(raw.get("confidence", 0.5))))
+            confidence = float(raw.get("confidence", 0.5))
         except (TypeError, ValueError):
             return {"error": "confidence must be numeric", "raw": raw}
+        if confidence < 0.0 or confidence > 1.0:
+            return {"error": "confidence must be between 0 and 1", "raw": raw}
         target_uri = raw.get("target_uri") or raw.get("target")
         status = OperationStatus.CANDIDATE
         if action in {OperationAction.UPDATE, OperationAction.DELETE} and not target_uri:
@@ -77,7 +83,10 @@ class LLMMemoryExtractor(MemoryExtractor):
             status = OperationStatus.PENDING
         content = str(raw.get("text", raw.get("content", ""))).strip()
         title = str(raw.get("title", content[:32] or "memory")).strip()
-        kind = MemoryKind(str(raw.get("memory_kind", raw.get("kind", MemoryKind.EXPLICIT.value))))
+        try:
+            kind = MemoryKind(str(raw.get("memory_kind", raw.get("kind", MemoryKind.EXPLICIT.value))))
+        except ValueError:
+            return {"error": "unknown memory kind", "raw": raw}
         uri = str(target_uri or f"memoryos://user/{user_id}/memories/{kind.value}/{stable_hash([title, content], 16)}")
         memory = Memory(uri=uri, user_id=user_id, title=title, content=content, kind=kind, confidence=confidence)
         return ContextOperation(
@@ -99,7 +108,7 @@ class LLMMemoryExtractor(MemoryExtractor):
     def _is_sensitive(self, raw: dict[str, Any]) -> bool:
         tags = [str(tag).lower() for tag in raw.get("tags", []) if isinstance(tag, str)]
         text = json.dumps(raw, ensure_ascii=False).lower()
-        return "sensitive" in tags or "password" in text or "api_key" in text
+        return "sensitive" in tags or "unsafe" in tags or "password" in text or "api_key" in text or "unsafe" in text
 
     def _load_json(self, response: str) -> dict | list:
         text = response.strip()

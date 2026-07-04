@@ -8,7 +8,14 @@ from memoryos.memory.update.memory_updater import MemoryUpdater
 from memoryos.operations.model.context_operation import ContextOperation
 
 
-class MemoryCommitPlanner:
+class RuleMemoryCommitPlanner:
+    """Fallback rule planner.
+
+    Production LLM memory extraction must emit accepted, pending, and rejected
+    operation groups before operations enter the commit plane. This planner is a
+    deterministic fallback for local/session signals and tests.
+    """
+
     def __init__(self) -> None:
         self.updater = MemoryUpdater()
         self.window_evaluator = BehaviorWindowEvaluator()
@@ -82,3 +89,6 @@ class MemoryCommitPlanner:
             kind=MemoryKind.CANDIDATE,
             confidence=0.6,
         )
+
+
+MemoryCommitPlanner = RuleMemoryCommitPlanner

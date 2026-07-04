@@ -84,6 +84,43 @@ class OperationCommitter:
             self.redo.commit(operation.operation_id)
         return diff
 
+    def resume(self, user_id: str, operation: ContextOperation, phase: str) -> bool:
+        if phase in {"committed"}:
+            self.redo.commit(operation.operation_id)
+            return False
+        if phase in {"started", "begin"}:
+            diff = self.commit(user_id, [operation])
+            return any(op.operation_id == operation.operation_id for op in diff.operations)
+        if phase == "source_written":
+            self._apply_index(operation)
+            self.redo.advance(operation, phase="index_written")
+            self.audit.record(user_id, "context_operation_committed", operation.to_dict())
+            self.redo.advance(operation, phase="audit_written")
+            self._write_recovery_diff(user_id, operation)
+            self.redo.advance(operation, phase="diff_written")
+            self.redo.commit(operation.operation_id)
+            return True
+        if phase == "index_written":
+            self.audit.record(user_id, "context_operation_committed", operation.to_dict())
+            self.redo.advance(operation, phase="audit_written")
+            self._write_recovery_diff(user_id, operation)
+            self.redo.advance(operation, phase="diff_written")
+            self.redo.commit(operation.operation_id)
+            return True
+        if phase == "audit_written":
+            self._write_recovery_diff(user_id, operation)
+            self.redo.advance(operation, phase="diff_written")
+            self.redo.commit(operation.operation_id)
+            return True
+        if phase == "diff_written":
+            self.redo.commit(operation.operation_id)
+            return True
+        return False
+
+    def _write_recovery_diff(self, user_id: str, operation: ContextOperation) -> None:
+        operation.status = OperationStatus.COMMITTED
+        self.diff_writer.write(ContextDiff(user_id=user_id, operations=[operation], diff_id=f"diff_{operation.operation_id}"))
+
     def _coalesce_non_policy_operations(self, operations: list[ContextOperation]) -> list[ContextOperation]:
         policy_actions = {
             OperationAction.REWARD,

@@ -16,8 +16,8 @@ from memoryos.contextdb.model.context_uri import ContextURI
 from memoryos.prediction.model.prediction_request import PredictionRequest
 
 
-class PredictiveHotRoomAcFlowTest(unittest.TestCase):
-    def test_hot_room_ac_flow_uses_predictive_pipeline(self) -> None:
+class LegacyPredictiveHotRoomAcFlowTest(unittest.TestCase):
+    def test_legacy_hot_room_ac_flow_uses_predictive_pipeline(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             client = MemoryOSClient(str(root))

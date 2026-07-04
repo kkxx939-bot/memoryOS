@@ -1,0 +1,79 @@
+from __future__ import annotations
+
+import json
+
+from memoryos.action_policy.model.action_policy import ActionPolicy, ActionPolicyStatus
+from memoryos.api.sdk.client import MemoryOSClient
+from memoryos.contextdb.model.context_object import ContextObject
+from memoryos.contextdb.model.context_relation import ContextRelation
+from memoryos.contextdb.model.context_type import ContextType
+from memoryos.contextdb.model.lifecycle import LifecycleState
+from memoryos.prediction.model.prediction_request import PredictionRequest
+
+
+def _seed_policy(client: MemoryOSClient, policy: ActionPolicy, lifecycle: LifecycleState = LifecycleState.ACTIVE) -> None:
+    anchor = ContextObject(uri=policy.memory_anchor_uri, context_type=ContextType.MEMORY, title="anchor", owner_user_id=policy.user_id)
+    obj = policy.to_context_object()
+    obj.lifecycle_state = lifecycle
+    client.context_db.seed_object(anchor, content="anchor")
+    client.context_db.seed_object(obj, content=json.dumps(policy.to_dict()))
+    client.context_db.add_relation(ContextRelation(source_uri=policy.uri, relation_type="anchored_by", target_uri=policy.memory_anchor_uri, metadata={"owner_user_id": policy.user_id}))
+
+
+def _request(actions: list[str]) -> PredictionRequest:
+    return PredictionRequest(
+        user_id="u1",
+        episode_id="ep",
+        observation={"scene_key": "hot", "raw_text": "hot room", "location": "home"},
+        available_actions=actions,
+    )
+
+
+def test_prediction_loads_policy_from_contextdb_without_manual_policies(tmp_path) -> None:
+    client = MemoryOSClient(str(tmp_path))
+    policy = ActionPolicy(user_id="u1", scene_key="hot", action="turn_on_ac", memory_anchor_uri="memoryos://user/u1/memories/anchors/hot", q_value=0.95, confidence=0.95)
+    _seed_policy(client, policy)
+
+    result = client.predict(_request(["turn_on_ac", "ask_user", "do_nothing"]))
+
+    assert result.candidates[0].action == "turn_on_ac"
+    assert result.memory_operations == []
+
+
+def test_available_actions_and_deleted_obsolete_filtering(tmp_path) -> None:
+    client = MemoryOSClient(str(tmp_path))
+    _seed_policy(client, ActionPolicy(user_id="u1", scene_key="hot", action="turn_on_ac", memory_anchor_uri="memoryos://user/u1/memories/anchors/hot"))
+    _seed_policy(client, ActionPolicy(user_id="u1", scene_key="hot", action="turn_on_fan", memory_anchor_uri="memoryos://user/u1/memories/anchors/hot"), lifecycle=LifecycleState.DELETED)
+    _seed_policy(client, ActionPolicy(user_id="u1", scene_key="hot", action="smoke", memory_anchor_uri="memoryos://user/u1/memories/anchors/hot"), lifecycle=LifecycleState.OBSOLETE)
+
+    result = client.predict(_request(["turn_on_fan", "smoke", "ask_user", "do_nothing"]))
+
+    assert result.candidates == []
+    assert result.decision.mode in {"ask_user", "do_nothing"}
+
+
+def test_disabled_auto_execute_policy_ranks_but_gate_asks_user(tmp_path) -> None:
+    client = MemoryOSClient(str(tmp_path))
+    policy = ActionPolicy(
+        user_id="u1",
+        scene_key="hot",
+        action="turn_on_ac",
+        memory_anchor_uri="memoryos://user/u1/memories/anchors/hot",
+        q_value=0.95,
+        confidence=0.95,
+        auto_execute_allowed=True,
+        status=ActionPolicyStatus.DISABLED_AUTO_EXECUTE,
+    )
+    _seed_policy(client, policy)
+
+    result = client.predict(_request(["turn_on_ac", "ask_user", "do_nothing"]))
+
+    assert result.candidates[0].action == "turn_on_ac"
+    assert result.decision.mode == "ask_user"
+
+
+def test_no_policy_does_not_crash(tmp_path) -> None:
+    result = MemoryOSClient(str(tmp_path)).predict(_request(["turn_on_ac", "ask_user", "do_nothing"]))
+
+    assert result.candidates == []
+    assert result.decision.mode in {"ask_user", "do_nothing"}

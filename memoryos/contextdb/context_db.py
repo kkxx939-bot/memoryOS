@@ -6,6 +6,11 @@ from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.session.session_model import SessionArchive, SessionCommitResult
 from memoryos.contextdb.store.index_consistency import IndexConsistencyService
 from memoryos.contextdb.store.source_store import IndexHit, IndexStore, QueueStore, RelationStore, SourceStore
+from memoryos.operations.commit.operation_committer import OperationCommitter
+from memoryos.operations.model.context_diff import ContextDiff
+from memoryos.operations.model.context_operation import ContextOperation
+
+CommitResult = ContextDiff
 
 
 class ContextDB:
@@ -16,19 +21,45 @@ class ContextDB:
         relation_store: RelationStore,
         queue_store: QueueStore | None = None,
         session_commit_service=None,
+        committer: OperationCommitter | None = None,
     ) -> None:
         self.source_store = source_store
         self.index_store = index_store
         self.relation_store = relation_store
         self.queue_store = queue_store
         self.session_commit_service = session_commit_service
+        self.committer = committer
 
     def read_object(self, uri: str) -> ContextObject:
         return self.source_store.read_object(uri)
 
     def write_object(self, obj: ContextObject, content: str | bytes = "") -> None:
+        """Seed/import helper only; not for production long-term writes.
+
+        Production updates must use ContextOperation through commit_operation(),
+        commit_operations(), or SessionCommit/OperationCommitter.
+        """
+        self.seed_object(obj, content=content)
+
+    def seed_object(self, obj: ContextObject, content: str | bytes = "") -> None:
+        """Write SourceStore and IndexStore directly for tests, imports, and seed data."""
         self.source_store.write_object(obj, content=content)
         self.index_store.upsert_index(obj, content=self._index_content(obj, content))
+
+    import_object = seed_object
+
+    def commit_operation(self, operation: ContextOperation) -> CommitResult:
+        if self.committer is None:
+            raise RuntimeError("ContextDB.commit_operation requires OperationCommitter")
+        return self.committer.commit(operation.user_id, [operation])
+
+    def commit_operations(self, operations: list[ContextOperation]) -> list[CommitResult]:
+        if self.committer is None:
+            raise RuntimeError("ContextDB.commit_operations requires OperationCommitter")
+        results: list[CommitResult] = []
+        for operation in operations:
+            results.append(self.committer.commit(operation.user_id, [operation]))
+        return results
 
     def add_relation(self, relation: ContextRelation) -> None:
         self.relation_store.add_relation(relation)

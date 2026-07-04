@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from memoryos.action_policy.model.action_policy import ActionPolicy
 from memoryos.action_policy.ranking.action_policy_ranker import ActionPolicyRanker
+from memoryos.action_policy.retrieval import ActionPolicyRetriever
 from memoryos.behavior.retrieval.similar_behavior_retriever import SimilarBehaviorRetriever
 from memoryos.contextdb.store.source_store import IndexStore, RelationStore, SourceStore
 from memoryos.prediction.model.prediction_ledger import PredictionLedger
@@ -25,14 +26,25 @@ class PredictionEngine:
         self.source_store = source_store
         self.relation_store = relation_store
         self.observation_normalizer = ObservationNormalizer()
-        self.similar_behavior_retriever = SimilarBehaviorRetriever(index_store)
+        self.similar_behavior_retriever = SimilarBehaviorRetriever(index_store, source_store=source_store, relation_store=relation_store)
+        self.action_policy_retriever = ActionPolicyRetriever(index_store, source_store) if source_store is not None else None
         self.action_policy_ranker = ActionPolicyRanker()
         self.action_context_builder = ActionContextBuilder(index_store, source_store=source_store, relation_store=relation_store)
         self.policy_gate = PolicyGate()
 
-    def process(self, request: PredictionRequest, policies: list[ActionPolicy]) -> PredictionResult:
+    def process(self, request: PredictionRequest, policies: list[ActionPolicy] | None = None) -> PredictionResult:
         observation = self.observation_normalizer.normalize(request.user_id, request.observation)
         similar = self.similar_behavior_retriever.retrieve(request.user_id, observation)
+        if policies is None:
+            policies = (
+                self.action_policy_retriever.retrieve(
+                    request.user_id,
+                    request.available_actions,
+                    scene_key=observation.scene_key,
+                )
+                if self.action_policy_retriever is not None
+                else []
+            )
         available = {action for action in request.available_actions}
         scoped_policies = [policy for policy in policies if policy.action in available]
         candidates = self.action_policy_ranker.rank(
