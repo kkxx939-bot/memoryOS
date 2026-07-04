@@ -52,7 +52,7 @@ class SQLiteRelationStore:
             sql += " AND tenant_id = ?"
             params.append(tenant_id)
         if owner_user_id is not None:
-            sql += " AND (owner_user_id = ? OR owner_user_id = '' OR target_uri LIKE 'memoryos://resources/%' OR target_uri LIKE 'memoryos://skills/%')"
+            sql += " AND (owner_user_id = ? OR owner_user_id = '')"
             params.append(owner_user_id)
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()

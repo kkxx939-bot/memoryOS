@@ -46,6 +46,7 @@ class ActionPolicy:
     required_skill_uris: list[str] = field(default_factory=list)
     supported_behavior_pattern_uris: list[str] = field(default_factory=list)
     constrained_by_memory_uris: list[str] = field(default_factory=list)
+    cross_scene_fallback: bool = False
     applied_operation_ids: list[str] = field(default_factory=list)
     last_opportunity_at: str | None = None
     last_activated_at: str | None = None

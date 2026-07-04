@@ -28,8 +28,6 @@ def test_legacy_paths_and_imports_do_not_return() -> None:
         for path in base.rglob("*.py"):
             if path.name == "test_no_legacy_paths.py":
                 continue
-            if root / "tests" / "e2e" / "legacy" in path.parents:
-                continue
             text = path.read_text(encoding="utf-8")
             assert not any(token in text for token in forbidden), path
 

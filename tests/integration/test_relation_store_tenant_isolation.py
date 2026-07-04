@@ -20,5 +20,4 @@ def test_sqlite_relation_store_filters_tenant_and_user_but_allows_global_targets
     assert {relation.target_uri for relation in user_a} == {memory_a, resource}
 
     user_b = store.relations_of(policy_a, tenant_id="default", owner_user_id="u2")
-    assert [relation.target_uri for relation in user_b] == [resource]
-
+    assert user_b == []

@@ -58,6 +58,6 @@ def test_memory_structured_l0_l1_and_empty_fallback() -> None:
     assert generate_l1_for_object(object(), "")
 
 
-def test_legacy_layer_functions_still_callable() -> None:
+def test_existing_layer_functions_still_callable() -> None:
     assert l0_abstract("a " * 200, max_chars=10)
     assert l1_overview("Title", ["one"]).startswith("# Title")

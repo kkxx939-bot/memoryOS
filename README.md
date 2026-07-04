@@ -177,6 +177,8 @@ blocked
 
 ## Quick Start
 
+The following uses `seed_object()` to bootstrap local demo context. Treat it as fixture/import code only: production long-term writes must go through `ContextDB.commit_operation()`, `ContextDB.commit_operations()`, or SessionCommit so SourceStore, IndexStore, relations, audit, diff, redo, and recovery stay consistent.
+
 ```python
 from memoryos.action_policy.model.action_policy import ActionPolicy
 from memoryos.api.sdk.client import MemoryOSClient
@@ -279,6 +281,34 @@ print(result.memory_operations)  # always []
 ```
 
 After the call, the session archive contains committed `memory_diff.json`, `behavior_diff.json`, `action_policy_diff.json`, and `context_diff.json`.
+
+Production write example:
+
+```python
+from memoryos.contextdb.model.context_type import ContextType
+from memoryos.memory.model.memory import MemoryAnchor
+from memoryos.operations.model.context_operation import ContextOperation
+from memoryos.operations.model.operation_action import OperationAction
+
+anchor = MemoryAnchor(
+    uri="memoryos://user/u1/memories/anchors/home_comfort",
+    user_id="u1",
+    title="Home comfort anchor",
+    content="Hot room comfort behavior.",
+    anchor_key="home_comfort",
+)
+
+client.context_db.commit_operation(
+    ContextOperation(
+        user_id="u1",
+        context_type=ContextType.MEMORY,
+        action=OperationAction.ADD,
+        target_uri=anchor.uri,
+        payload={"context_object": anchor.to_context_object().to_dict(), "content": anchor.content},
+        evidence=[{"source": "bootstrap_import"}],
+    )
+)
+```
 
 ## Invariants
 

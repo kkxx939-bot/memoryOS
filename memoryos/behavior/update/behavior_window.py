@@ -58,7 +58,7 @@ class BehaviorWindowEvaluator:
             "uri": uri,
             "scene_key": str(metadata.get("scene_key", observation.get("scene_key", ""))),
             "similarity_key": self._similarity_key(observation),
-            "created_at": str(metadata.get("created_at", observation.get("observed_at", ""))),
+            "created_at": str(metadata.get("observed_at") or observation.get("observed_at") or metadata.get("created_at", "")),
         }
 
     def _record_from_case(self, case: BehaviorCase, current: bool) -> dict:
@@ -66,7 +66,7 @@ class BehaviorWindowEvaluator:
             "uri": f"memoryos://user/{case.user_id}/behavior/cases/{case.scene_key}/{case.case_id}",
             "scene_key": case.scene_key,
             "similarity_key": self._similarity_key(case.observation),
-            "created_at": case.created_at,
+            "created_at": str(case.observation.get("observed_at") or case.created_at),
             "current": current,
         }
 

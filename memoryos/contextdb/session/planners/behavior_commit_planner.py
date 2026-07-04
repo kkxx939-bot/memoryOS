@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from datetime import datetime, timezone
 
 from memoryos.behavior.model.behavior_case import BehaviorCase
 from memoryos.behavior.model.behavior_pattern import BehaviorCluster, BehaviorPattern
@@ -75,7 +76,7 @@ class BehaviorCommitPlanner:
                     confidence=0.72,
                 )
                 operations.append(self.pattern_updater.add_pattern(pattern))
-            if (decision.archive_stale_single or len(case_refs) == 1) and any(int(item.get("older_than_days", 0) or 0) > 3 for item in archive.observations):
+            if (decision.archive_stale_single or len(case_refs) == 1) and any(self._observation_age_days(item) > 3 for item in archive.observations):
                 operations.append(
                     ContextOperation(
                         user_id=archive.user_id,
@@ -136,3 +137,16 @@ class BehaviorCommitPlanner:
         if candidates and isinstance(candidates[0], dict):
             return str(candidates[0].get("action", ""))
         return None
+
+    def _observation_age_days(self, observation: dict) -> int:
+        value = str(observation.get("observed_at") or observation.get("created_at") or "")
+        if value:
+            try:
+                observed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                observed = None
+            if observed is not None:
+                if observed.tzinfo is None:
+                    observed = observed.replace(tzinfo=timezone.utc)
+                return max(0, (datetime.now(timezone.utc) - observed).days)
+        return int(observation.get("older_than_days", 0) or 0)

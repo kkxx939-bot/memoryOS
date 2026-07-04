@@ -24,6 +24,18 @@ class RecoveryService:
         recovered: list[str] = []
         for entry in entries:
             operation = entry.operation
-            if self.committer.resume(user_id, operation, entry.phase):
-                recovered.append(operation.operation_id)
+            try:
+                if self.committer.resume(user_id, operation, entry.phase):
+                    recovered.append(operation.operation_id)
+            except (FileNotFoundError, IsADirectoryError, NotADirectoryError) as exc:
+                self.committer.audit.record(
+                    user_id,
+                    "recovery_failed",
+                    {
+                        "operation_id": operation.operation_id,
+                        "target_uri": operation.target_uri,
+                        "redo_phase": entry.phase,
+                        "error": str(exc),
+                    },
+                )
         return RecoveryResult(recovered_count=len(recovered), operation_ids=recovered)

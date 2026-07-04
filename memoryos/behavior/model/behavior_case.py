@@ -23,11 +23,13 @@ class BehaviorCase:
     created_at: str = field(default_factory=utc_now)
 
     def to_dict(self) -> dict:
+        observed_at = str(self.observation.get("observed_at") or self.created_at)
         return {
             "case_id": self.case_id,
             "user_id": self.user_id,
             "scene_key": self.scene_key,
             "observation": self.observation,
+            "observed_at": observed_at,
             "predicted_candidates": self.predicted_candidates,
             "selected_action": self.selected_action,
             "executed_action": self.executed_action,

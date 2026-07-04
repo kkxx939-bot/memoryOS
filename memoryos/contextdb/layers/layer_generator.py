@@ -141,7 +141,7 @@ def generate_l1_for_object(obj: Any, content: str = "") -> str:
                 f"- constrains policy: {metadata.get('constrains_policy_uris', [])}",
             ]
             return "\n".join(lines).strip() + "\n"
-        if context_type in {ContextType.BEHAVIOR_CASE, ContextType.BEHAVIOR_CLUSTER, ContextType.SESSION, ContextType.RESOURCE, ContextType.SKILL}:
+        if context_type is not None and context_type in {ContextType.BEHAVIOR_CASE, ContextType.BEHAVIOR_CLUSTER, ContextType.SESSION, ContextType.RESOURCE, ContextType.SKILL}:
             return l1_overview(
                 f"{context_type.value}: {title}",
                 [

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from pathlib import Path
 
@@ -74,10 +75,17 @@ class SQLiteIndexStore:
 
     def search(self, query: str, filters: dict | None = None, limit: int = 10) -> list[IndexHit]:
         filters = filters or {}
+        exact_hits = self._search_metadata_exact(query, filters, limit)
+        if len(exact_hits) >= limit:
+            return exact_hits[:limit]
         hits = self._search_fts(query, filters, limit) if self.fts_enabled and str(query).strip() else []
-        if hits:
-            return hits[:limit]
-        return self._search_contains(query, filters, limit)
+        if not hits:
+            hits = self._search_contains(query, filters, limit)
+        merged: dict[str, IndexHit] = {hit.uri: hit for hit in exact_hits}
+        for hit in hits:
+            if hit.uri not in merged:
+                merged[hit.uri] = hit
+        return list(merged.values())[:limit]
 
     def _base_filter_sql(self, filters: dict) -> tuple[str, list[str]]:
         sql = ""
@@ -94,6 +102,8 @@ class SQLiteIndexStore:
     def _search_fts(self, query: str, filters: dict, limit: int) -> list[IndexHit]:
         filter_sql, params = self._base_filter_sql(filters)
         match_query = self._match_query(query)
+        if not match_query:
+            return []
         sql = f"""
             SELECT c.*, contexts_fts.title AS fts_title, contexts_fts.content_text AS fts_content, contexts_fts.metadata_text, bm25(contexts_fts) AS rank
             FROM contexts_fts
@@ -108,6 +118,24 @@ class SQLiteIndexStore:
             except sqlite3.OperationalError:
                 return []
         return [self._hit_from_row(row, lexical=max(0.0, -float(row["rank"]))) for row in rows]
+
+    def _search_metadata_exact(self, query: str, filters: dict, limit: int) -> list[IndexHit]:
+        value = str(query).strip()
+        if not value:
+            return []
+        filter_sql, params = self._base_filter_sql(filters)
+        sql = f"SELECT c.*, f.title AS fts_title, f.content_text AS fts_content, f.metadata_text FROM contexts c JOIN contexts_fts f ON c.uri = f.uri WHERE 1=1 {filter_sql} AND (c.metadata_json LIKE ? OR f.metadata_text LIKE ?)"
+        like = f"%{value}%"
+        hits: list[IndexHit] = []
+        with self._connect() as conn:
+            rows = conn.execute(sql, [*params, like, like]).fetchall()
+        exact_fields = {"scene_key", "action", "memory_anchor_uri"}
+        for row in rows:
+            metadata = json.loads(row["metadata_json"] or "{}")
+            if any(str(metadata.get(field, "")) == value for field in exact_fields):
+                hits.append(self._hit_from_row(row, lexical=10.0))
+        hits.sort(key=lambda hit: hit.score, reverse=True)
+        return hits[:limit]
 
     def _search_contains(self, query: str, filters: dict, limit: int) -> list[IndexHit]:
         terms = [term.lower() for term in str(query).split() if term.strip()]
@@ -140,8 +168,9 @@ class SQLiteIndexStore:
         return lexical + float(row["hotness"]) + float(row["semantic_hotness"]) + float(row["behavior_support_hotness"])
 
     def _match_query(self, query: str) -> str:
-        terms = [term.replace('"', "") for term in str(query).split() if term.strip()]
-        return " OR ".join(terms) if terms else str(query).replace('"', "")
+        terms = re.findall(r"[\w\u4e00-\u9fff]+", str(query), flags=re.UNICODE)
+        escaped = [f'"{term.replace(chr(34), chr(34) + chr(34))}"' for term in terms if term.strip()]
+        return " OR ".join(escaped)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)
