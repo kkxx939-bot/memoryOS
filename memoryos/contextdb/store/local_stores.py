@@ -98,6 +98,14 @@ class InMemoryIndexStore:
         terms = [term.lower() for term in str(query).split() if term.strip()]
         hits = []
         for obj, content in self.rows.values():
+            if filters.get("lifecycle_state") is None and obj.lifecycle_state in {
+                LifecycleState.DELETED,
+                LifecycleState.ARCHIVED,
+                LifecycleState.OBSOLETE,
+            }:
+                continue
+            if filters.get("lifecycle_state") and obj.lifecycle_state.value != filters["lifecycle_state"]:
+                continue
             if filters.get("owner_user_id") and obj.owner_user_id != filters["owner_user_id"]:
                 continue
             if filters.get("context_type") and obj.context_type.value != filters["context_type"]:

@@ -87,7 +87,12 @@ def test_execute_success_writes_action_result_and_rewards_policy(tmp_path) -> No
     assert result.decision.mode == "execute"
     archive_dir = ContextURI.parse("memoryos://user/u1/sessions/history/ep-execute").to_source_path(tmp_path)
     action_result = json.loads((archive_dir / "action_results.jsonl").read_text(encoding="utf-8").splitlines()[0])["action_result"]
+    observation = json.loads((archive_dir / "observations.jsonl").read_text(encoding="utf-8").splitlines()[0])
     assert action_result["status"] == "success"
+    assert observation["episode_id"] == request.episode_id
+    behavior_cases = [obj for obj in client.source_store.list_objects() if obj.context_type == ContextType.BEHAVIOR_CASE]
+    assert behavior_cases[0].metadata["feedback_type"] == "execution_success"
+    assert behavior_cases[0].metadata["reward"] == 1.0
     assert client.source_store.read_object(policy.uri).metadata["success_count"] == 1
 
 
@@ -102,6 +107,10 @@ def test_execute_failure_writes_failed_action_result_and_penalizes_policy(tmp_pa
     archive_dir = ContextURI.parse("memoryos://user/u1/sessions/history/ep-execute").to_source_path(tmp_path)
     action_result = json.loads((archive_dir / "action_results.jsonl").read_text(encoding="utf-8").splitlines()[0])["action_result"]
     assert action_result["status"] == "failed"
+    behavior_cases = [obj for obj in client.source_store.list_objects() if obj.context_type == ContextType.BEHAVIOR_CASE]
+    assert behavior_cases[0].metadata["feedback_type"] == "execution_failure"
+    assert behavior_cases[0].metadata["reward"] == -1.0
+    assert behavior_cases[0].metadata["observation"]["episode_id"] == request.episode_id
     assert client.source_store.read_object(policy.uri).metadata["failure_count"] == 1
 
 

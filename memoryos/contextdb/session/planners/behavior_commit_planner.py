@@ -31,13 +31,12 @@ class BehaviorCommitPlanner:
     def plan(self, archive: SessionArchive) -> list[ContextOperation]:
         operations: list[ContextOperation] = []
         cases_by_scene: dict[str, list[BehaviorCase]] = {}
-        feedback_by_episode = {str(item.get("episode_id", item.get("request_id", ""))): item for item in archive.feedback}
         for observation in archive.observations:
             scene_key = str(observation.get("scene_key", observation.get("scene", "default")))
             prediction = self._prediction_for_scene(archive, scene_key)
             candidates = list(prediction.get("candidates", [])) if isinstance(prediction, dict) else []
             selected_action = self._selected_action(prediction)
-            feedback = feedback_by_episode.get(str(observation.get("episode_id", "")), {})
+            feedback = self._feedback_for_observation(archive.feedback, observation, scene_key)
             case = BehaviorCase(
                 user_id=archive.user_id,
                 scene_key=scene_key,
@@ -89,6 +88,22 @@ class BehaviorCommitPlanner:
                     )
                 )
         return operations
+
+    def _feedback_for_observation(self, feedback_items: list[dict], observation: dict, scene_key: str) -> dict:
+        if not feedback_items:
+            return {}
+        for key in ("episode_id", "request_id"):
+            value = observation.get(key)
+            if value:
+                for item in feedback_items:
+                    if str(item.get(key, "")) == str(value):
+                        return item
+        for item in feedback_items:
+            if str(item.get("scene_key", "")) == scene_key:
+                return item
+        if len(feedback_items) == 1:
+            return feedback_items[0]
+        return {}
 
     def _history_records(self, user_id: str, scene_key: str) -> list[dict]:
         if self.index_store is None:

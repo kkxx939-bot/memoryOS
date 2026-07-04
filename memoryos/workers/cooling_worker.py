@@ -46,7 +46,8 @@ class CoolingWorker:
         results = []
         for hit in hits:
             pattern = self._read_pattern(hit.uri)
-            state_override = self._explicit_feedback_state(recent_observations)
+            matching_observations = self._matching_observations(pattern, recent_observations)
+            state_override = self._explicit_feedback_state(pattern, matching_observations)
             decay_result = self.decay.evaluate(pattern, recent_observations)
             state = state_override or decay_result.opportunity_state
             pattern_ops = self._operations_for_state(user_id, pattern, state, decay_result.q_value_delta)
@@ -169,13 +170,19 @@ class CoolingWorker:
             updated_at=obj.updated_at,
         )
 
-    def _explicit_feedback_state(self, observations: list[Observation]) -> str | None:
+    def _explicit_feedback_state(self, pattern: BehaviorPattern, observations: list[Observation]) -> str | None:
         signals = {signal for observation in observations for signal in observation.signals}
         if "explicit_negative_rule" in signals:
             return "explicit_negative_rule"
         if "negative_feedback" in signals or "user_rejected" in signals:
             return "negative_feedback"
         return None
+
+    def _matching_observations(self, pattern: BehaviorPattern, observations: list[Observation]) -> list[Observation]:
+        expected = set(str(tag) for tag in pattern.trigger_conditions.get("context_tags", []) if tag)
+        if not expected:
+            return observations
+        return [observation for observation in observations if expected.issubset(set(observation.context_tags()))]
 
     def _top_action(self, pattern: BehaviorPattern) -> str:
         if not pattern.action_distribution:

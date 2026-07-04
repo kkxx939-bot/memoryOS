@@ -91,7 +91,7 @@ class BehaviorWindowEvaluator:
         refs = []
         for record in records:
             created = self._parse_time(str(record.get("created_at", "")))
-            if created is None or (now - created).days <= days:
+            if created is not None and (now - created).days <= days:
                 refs.append(str(record["uri"]))
         return refs
 

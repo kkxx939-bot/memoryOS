@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import defaultdict
+
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_relation import ContextRelation
 from memoryos.contextdb.model.context_type import ContextType
@@ -57,8 +59,11 @@ class ContextDB:
         if self.committer is None:
             raise RuntimeError("ContextDB.commit_operations requires OperationCommitter")
         results: list[CommitResult] = []
+        operations_by_user: dict[str, list[ContextOperation]] = defaultdict(list)
         for operation in operations:
-            results.append(self.committer.commit(operation.user_id, [operation]))
+            operations_by_user[operation.user_id].append(operation)
+        for user_id, user_operations in operations_by_user.items():
+            results.append(self.committer.commit(user_id, user_operations))
         return results
 
     def add_relation(self, relation: ContextRelation) -> None:

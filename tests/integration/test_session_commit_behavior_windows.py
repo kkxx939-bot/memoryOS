@@ -82,6 +82,69 @@ def test_three_similar_cases_within_seven_days_generate_pattern(tmp_path) -> Non
     assert payload["memory_anchor_uri"]
 
 
+def test_missing_created_at_history_can_archive_but_not_upgrade_to_cluster_or_pattern(tmp_path) -> None:
+    source = FileSystemSourceStore(tmp_path)
+    index = InMemoryIndexStore()
+    case = BehaviorCase(
+        user_id="u1",
+        scene_key="hot_room",
+        observation={"scene_key": "hot_room", "raw_text": "hot room", "location": "home", "environment": {"temperature": 30}},
+        case_id="missing_time",
+        selected_action="turn_on_ac",
+        created_at="",
+    )
+    op = BehaviorCaseWriter().add_case(case)
+    metadata = op.payload["context_object"]["metadata"]
+    metadata["created_at"] = ""
+    metadata["observed_at"] = ""
+    op.payload["content"] = metadata
+    OperationCommitter(source, index, str(tmp_path)).commit("u1", [op])
+
+    operations = BehaviorCommitPlanner(index, source).plan(_archive())
+
+    assert all(operation.context_type.value != "behavior_cluster" for operation in operations)
+    assert all(operation.context_type.value != "behavior_pattern" for operation in operations)
+
+
+def test_behavior_planner_matches_feedback_by_request_scene_and_single_fallback() -> None:
+    request_archive = SessionArchive(
+        user_id="u1",
+        session_id="s-request",
+        archive_uri="memoryos://user/u1/sessions/history/s-request",
+        observations=[{"scene_key": "hot_room", "request_id": "req-1", "location": "home"}],
+        predictions=[{"observation": {"scene_key": "hot_room"}, "decision": {"action": "turn_on_ac"}, "candidates": [{"action": "turn_on_ac"}]}],
+        feedback=[{"request_id": "req-1", "feedback_type": "execution_success", "reward": 1.0, "executed_action": "turn_on_ac"}],
+    )
+    scene_archive = SessionArchive(
+        user_id="u1",
+        session_id="s-scene",
+        archive_uri="memoryos://user/u1/sessions/history/s-scene",
+        observations=[{"scene_key": "hot_room", "location": "home"}],
+        predictions=[{"observation": {"scene_key": "hot_room"}, "decision": {"action": "turn_on_ac"}, "candidates": [{"action": "turn_on_ac"}]}],
+        feedback=[{"scene_key": "hot_room", "feedback_type": "execution_failure", "reward": -1.0, "executed_action": "turn_on_ac"}],
+    )
+    single_archive = SessionArchive(
+        user_id="u1",
+        session_id="s-single",
+        archive_uri="memoryos://user/u1/sessions/history/s-single",
+        observations=[{"scene_key": "hot_room", "location": "home"}],
+        predictions=[{"observation": {"scene_key": "hot_room"}, "decision": {"action": "turn_on_ac"}, "candidates": [{"action": "turn_on_ac"}]}],
+        feedback=[{"feedback_type": "implicit_positive", "reward": 0.5, "executed_action": "turn_on_ac"}],
+    )
+
+    planner = BehaviorCommitPlanner()
+    request_case = planner.plan(request_archive)[0].payload["context_object"]["metadata"]
+    scene_case = planner.plan(scene_archive)[0].payload["context_object"]["metadata"]
+    single_case = planner.plan(single_archive)[0].payload["context_object"]["metadata"]
+
+    assert request_case["feedback_type"] == "execution_success"
+    assert request_case["reward"] == 1.0
+    assert scene_case["feedback_type"] == "execution_failure"
+    assert scene_case["reward"] == -1.0
+    assert single_case["feedback_type"] == "implicit_positive"
+    assert single_case["reward"] == 0.5
+
+
 def test_same_scene_different_context_tags_do_not_generate_pattern(tmp_path) -> None:
     source = FileSystemSourceStore(tmp_path)
     index = InMemoryIndexStore()

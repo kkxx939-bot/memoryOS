@@ -134,7 +134,10 @@ class OperationCommitter:
         return [*self.coalescer.coalesce(other_ops), *policy_ops]
 
     def _apply_source(self, operation: ContextOperation) -> None:
-        if operation.action in {OperationAction.ADD, OperationAction.UPDATE, OperationAction.SUPERSEDE}:
+        if operation.action == OperationAction.SUPERSEDE:
+            self._apply_supersede_source(operation)
+            return
+        if operation.action in {OperationAction.ADD, OperationAction.UPDATE}:
             object_payload = operation.payload.get("context_object")
             if isinstance(object_payload, dict):
                 obj = ContextObject.from_dict(object_payload)
@@ -181,7 +184,10 @@ class OperationCommitter:
             return
 
     def _apply_index(self, operation: ContextOperation) -> None:
-        if operation.action in {OperationAction.ADD, OperationAction.UPDATE, OperationAction.SUPERSEDE}:
+        if operation.action == OperationAction.SUPERSEDE:
+            self._apply_supersede_index(operation)
+            return
+        if operation.action in {OperationAction.ADD, OperationAction.UPDATE}:
             object_payload = operation.payload.get("context_object")
             if isinstance(object_payload, dict):
                 obj = ContextObject.from_dict(object_payload)
@@ -219,6 +225,57 @@ class OperationCommitter:
         if operation.action == OperationAction.DISABLE:
             return self.action_policy_updater.disable_auto_execute(policy, operation_id=operation.operation_id)
         return policy
+
+    def _apply_supersede_source(self, operation: ContextOperation) -> None:
+        if not operation.target_uri:
+            return
+        object_payload = operation.payload.get("context_object")
+        if not isinstance(object_payload, dict):
+            return
+        old_obj = self.source_store.read_object(operation.target_uri)
+        old_content = self._read_content_or_empty(operation.target_uri)
+        new_obj = ContextObject.from_dict(object_payload)
+        new_obj.lifecycle_state = LifecycleState.ACTIVE
+        superseded_at = utc_now()
+        reason = str(operation.payload.get("reason") or operation.payload.get("supersede_reason") or "")
+        old_obj.lifecycle_state = LifecycleState.OBSOLETE
+        old_obj.metadata = {
+            **old_obj.metadata,
+            "superseded_at": superseded_at,
+            "superseded_by": new_obj.uri,
+            "supersede_reason": reason,
+        }
+        new_obj.metadata = {
+            **new_obj.metadata,
+            "supersedes": old_obj.uri,
+            "superseded_at": superseded_at,
+            "supersede_reason": reason,
+        }
+        self.source_store.write_object(old_obj, content=old_content)
+        self.source_store.write_object(new_obj, content=str(operation.payload.get("content", "")))
+        self._apply_relations(new_obj, operation)
+        self._add_supersede_relations(old_obj, new_obj)
+
+    def _apply_supersede_index(self, operation: ContextOperation) -> None:
+        if not operation.target_uri:
+            return
+        old_obj = self.source_store.read_object(operation.target_uri)
+        self.index_store.upsert_index(old_obj, content=self._read_content_or_empty(operation.target_uri))
+        object_payload = operation.payload.get("context_object")
+        if isinstance(object_payload, dict):
+            new_uri = object_payload.get("uri")
+            if not new_uri:
+                return
+            new_obj = self.source_store.read_object(str(new_uri))
+            self.index_store.upsert_index(new_obj, content=str(operation.payload.get("content", "")))
+
+    def _add_supersede_relations(self, old_obj: ContextObject, new_obj: ContextObject) -> None:
+        metadata = {
+            "tenant_id": new_obj.tenant_id or old_obj.tenant_id or "default",
+            "owner_user_id": new_obj.owner_user_id or old_obj.owner_user_id,
+        }
+        self._add_relation(new_obj.uri, "supersedes", old_obj.uri, metadata)
+        self._add_relation(old_obj.uri, "superseded_by", new_obj.uri, metadata)
 
     def _read_action_policy(self, uri: str) -> ActionPolicy:
         obj = self.source_store.read_object(uri)

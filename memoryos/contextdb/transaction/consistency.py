@@ -29,12 +29,13 @@ class ConsistencyVerifier:
         source_uris = {obj.uri for obj in objects}
         missing_index = []
         deleted_in_default_search = []
+        inactive_states = {LifecycleState.DELETED, LifecycleState.ARCHIVED, LifecycleState.OBSOLETE}
         for obj in objects:
             hits = self.index_store.search(obj.title or obj.uri, filters={"context_type": obj.context_type.value, "owner_user_id": obj.owner_user_id}, limit=20)
             hit_uris = {hit.uri for hit in hits}
-            if obj.lifecycle_state != LifecycleState.DELETED and obj.uri not in hit_uris:
+            if obj.lifecycle_state not in inactive_states and obj.uri not in hit_uris:
                 missing_index.append(obj.uri)
-            if obj.lifecycle_state == LifecycleState.DELETED and obj.uri in hit_uris:
+            if obj.lifecycle_state in inactive_states and obj.uri in hit_uris:
                 deleted_in_default_search.append(obj.uri)
         indexed_uris = set(getattr(self.index_store, "indexed_uris", lambda: [])())
         orphan_index = sorted(uri for uri in indexed_uris if uri not in source_uris)

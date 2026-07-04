@@ -114,11 +114,17 @@ class MemoryOSClient:
                     scene_key=result.observation.scene_key,
                 )
             )
+        observation_payload = {
+            **result.observation.__dict__,
+            "episode_id": request.episode_id,
+            "request_id": request.request_id or result.request_id,
+            "scene_key": result.observation.scene_key,
+        }
         archive = SessionArchive(
             user_id=request.user_id,
             session_id=request.episode_id,
             archive_uri=request.session_uri or f"memoryos://user/{request.user_id}/sessions/history/{request.episode_id}",
-            observations=[result.observation.__dict__],
+            observations=[observation_payload],
             predictions=[result.to_dict()],
             action_results=[
                 {

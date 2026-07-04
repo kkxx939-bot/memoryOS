@@ -43,13 +43,13 @@ class IndexConsistencyService:
         missing = sorted(
             obj.uri
             for obj in objects
-            if obj.lifecycle_state not in {LifecycleState.DELETED, LifecycleState.ARCHIVED}
+            if obj.lifecycle_state not in {LifecycleState.DELETED, LifecycleState.ARCHIVED, LifecycleState.OBSOLETE}
             and obj.uri not in indexed_uris
         )
         orphan = sorted(uri for uri in indexed_uris if uri not in source_uris)
         hot_in_default = []
         for obj in objects:
-            if obj.lifecycle_state not in {LifecycleState.DELETED, LifecycleState.ARCHIVED}:
+            if obj.lifecycle_state not in {LifecycleState.DELETED, LifecycleState.ARCHIVED, LifecycleState.OBSOLETE}:
                 continue
             hits = self.index_store.search(
                 obj.title or obj.uri,
@@ -70,7 +70,7 @@ class IndexConsistencyService:
     def rebuild(self) -> IndexConsistencyResult:
         self.index_store.clear()
         for obj in self.source_store.list_objects():
-            if obj.lifecycle_state in {LifecycleState.DELETED, LifecycleState.ARCHIVED}:
+            if obj.lifecycle_state in {LifecycleState.DELETED, LifecycleState.ARCHIVED, LifecycleState.OBSOLETE}:
                 self.index_store.delete_index(obj.uri)
                 continue
             try:

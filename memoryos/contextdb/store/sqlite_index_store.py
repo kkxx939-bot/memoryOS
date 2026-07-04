@@ -95,8 +95,8 @@ class SQLiteIndexStore:
                 sql += f" AND c.{field} = ?"
                 params.append(str(filters[field]))
         if filters.get("lifecycle_state") is None:
-            sql += " AND c.lifecycle_state NOT IN (?, ?)"
-            params.extend(["deleted", "archived"])
+            sql += " AND c.lifecycle_state NOT IN (?, ?, ?)"
+            params.extend(["deleted", "archived", "obsolete"])
         return sql, params
 
     def _search_fts(self, query: str, filters: dict, limit: int) -> list[IndexHit]:

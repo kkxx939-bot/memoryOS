@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 from memoryos.behavior.model.behavior_case import BehaviorCase
 from memoryos.behavior.model.behavior_pattern import BehaviorCluster, BehaviorPattern
+from memoryos.behavior.update.behavior_window import BehaviorWindowEvaluator
 from memoryos.memory.model.memory import MemoryAnchor
 
 
@@ -18,29 +19,24 @@ class BehaviorLifecycleResult:
 
 
 class BehaviorLifecycleService:
+    """Deprecated compatibility wrapper around BehaviorWindowEvaluator."""
+
     def evaluate(self, user_id: str, scene_key: str, cases: list[BehaviorCase]) -> BehaviorLifecycleResult:
         relevant = [case for case in cases if case.user_id == user_id and case.scene_key == scene_key]
-        if len(relevant) < 2:
+        decision = BehaviorWindowEvaluator().evaluate(scene_key, relevant, [])
+        if not decision.create_cluster:
             return BehaviorLifecycleResult(temporary_cases=relevant)
         anchor = self._anchor(user_id, scene_key, relevant)
-        cluster = BehaviorCluster(
-            user_id=user_id,
-            scene_key=scene_key,
-            memory_anchor_uri=anchor.uri,
-            case_refs=[case.case_id for case in relevant],
-            confidence=min(0.85, 0.35 + len(relevant) * 0.12),
-        )
-        if len(relevant) < 3:
+        cluster = self._cluster(user_id, scene_key, anchor.uri, decision.similar_refs_3d)
+        if not decision.create_pattern:
             return BehaviorLifecycleResult(temporary_cases=[], cluster=cluster, memory_anchor=anchor)
-        pattern = BehaviorPattern(
-            user_id=user_id,
-            scene_key=scene_key,
-            trigger_conditions={"scene_key": scene_key},
-            memory_anchor_uri=anchor.uri,
-            case_refs=[case.case_id for case in relevant],
-            action_distribution=self._action_distribution(relevant),
-            hotness=min(1.0, len(relevant) * 0.12),
-            confidence=min(0.95, 0.45 + len(relevant) * 0.10),
+        pattern = self._pattern(
+            user_id,
+            scene_key,
+            anchor.uri,
+            decision.similar_refs_30d,
+            decision.similarity_key,
+            relevant,
         )
         return BehaviorLifecycleResult(
             temporary_cases=[],
@@ -48,6 +44,35 @@ class BehaviorLifecycleService:
             pattern=pattern,
             memory_anchor=anchor,
             memory_candidate_required=True,
+        )
+
+    def _cluster(self, user_id: str, scene_key: str, anchor_uri: str, case_refs: list[str]) -> BehaviorCluster:
+        return BehaviorCluster(
+            user_id=user_id,
+            scene_key=scene_key,
+            memory_anchor_uri=anchor_uri,
+            case_refs=case_refs,
+            confidence=min(0.85, 0.35 + len(case_refs) * 0.12),
+        )
+
+    def _pattern(
+        self,
+        user_id: str,
+        scene_key: str,
+        anchor_uri: str,
+        case_refs: list[str],
+        similarity_key: tuple[str, ...],
+        cases: list[BehaviorCase],
+    ) -> BehaviorPattern:
+        return BehaviorPattern(
+            user_id=user_id,
+            scene_key=scene_key,
+            trigger_conditions={"scene_key": scene_key, "context_tags": list(similarity_key)},
+            memory_anchor_uri=anchor_uri,
+            case_refs=case_refs,
+            action_distribution=self._action_distribution(cases),
+            hotness=min(1.0, len(case_refs) * 0.12),
+            confidence=min(0.95, 0.45 + len(case_refs) * 0.10),
         )
 
     def _anchor(self, user_id: str, scene_key: str, cases: list[BehaviorCase]) -> MemoryAnchor:
