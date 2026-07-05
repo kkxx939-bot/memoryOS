@@ -9,7 +9,7 @@ from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.contextdb.store.source_store import IndexStore, SourceStore
 from memoryos.core.ids import stable_hash
 from memoryos.memory.model.memory import Memory, MemoryAnchor, MemoryKind
-from memoryos.memory.update.memory_updater import MemoryUpdater
+from memoryos.memory.service.memory_updater import MemoryUpdater
 from memoryos.operations.model.context_operation import ContextOperation
 from memoryos.operations.model.operation_action import OperationAction
 from memoryos.security.action_risk import canonical_action

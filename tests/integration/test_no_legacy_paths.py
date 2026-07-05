@@ -13,7 +13,7 @@ def test_legacy_paths_and_imports_do_not_return() -> None:
         root / "memoryos" / "usecases" / "session",
         root / "memoryos" / "interfaces",
         root / "memoryos" / "ports",
-        root / "docs",
+        root / "architecture",
     ]
     assert all(not path.exists() for path in forbidden_dirs)
 

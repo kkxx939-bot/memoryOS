@@ -4,7 +4,7 @@ from memoryos.action_policy.model.action_policy import ActionPolicy
 from memoryos.action_policy.model.reward_signal import PenaltySignal
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.memory.model.memory import Memory, MemoryKind
-from memoryos.memory.update.memory_updater import MemoryUpdater
+from memoryos.memory.service.memory_updater import MemoryUpdater
 from memoryos.operations.model.context_operation import ContextOperation
 from memoryos.operations.model.operation_action import OperationAction
 

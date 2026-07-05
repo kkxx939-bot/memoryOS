@@ -4,7 +4,7 @@ from memoryos.behavior.update.behavior_window import BehaviorWindowEvaluator
 from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.core.ids import stable_hash
 from memoryos.memory.model.memory import Memory, MemoryAnchor, MemoryCandidate, MemoryKind
-from memoryos.memory.update.memory_updater import MemoryUpdater
+from memoryos.memory.service.memory_updater import MemoryUpdater
 from memoryos.operations.model.context_operation import ContextOperation
 
 

@@ -617,20 +617,27 @@ memoryos/
   action_policy/        Action policy model, retrieval, ranking and updates
   behavior/             Observation, behavior cases, windows, patterns and cooling
   contextdb/            ContextDB facade, stores, layers, sessions and transactions
-  memory/               Memory model, extraction, update and cooling logic
+  memory/               Memory model, extraction, lifecycle, service and store boundaries
   operations/           Operation model, committer, coalescer, conflict resolver, redo
   prediction/           Prediction request/result, engine, gate and executor
   providers/            Provider interfaces
+  runtime/              Runtime config and dependency wiring
   security/             Action risk and safety helpers
   skill/                Tool registry and skill helpers
   workers/              Background-style maintenance workers
+
+examples/
+  Public API usage examples.
+
+benchmark/
+  Lightweight benchmark skeleton and smoke checks.
 
 tests/
   unit/
   integration/
   e2e/
 
-architecture/
+docs/architecture/
   Design notes for ContextDB, operation plane, prediction pipeline and closure.
 ```
 
