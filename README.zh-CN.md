@@ -6,17 +6,17 @@
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![Status](https://img.shields.io/badge/status-production--oriented-green)
 
-MemoryOS is a **Predictive Context Database for AI Agents**.
+MemoryOS 是一个面向 AI Agent 的 **Predictive Context Database**。
 
-It is not a chat-history wrapper, a memory-only SDK, or a vector database abstraction. MemoryOS is a local-first context substrate for long-running agents: it stores durable user facts, learns behavior patterns, maintains action policies, predicts useful actions, gates automatic execution, and commits execution feedback back into long-term context.
+它不是普通聊天历史库，也不是向量数据库包装层。MemoryOS 的目标是给长期运行的 Agent 提供一个 local-first 的上下文底座：保存用户事实，沉淀行为证据，维护动作策略，预测下一步可能动作，在自动执行前做安全门禁，并把执行反馈继续写回长期上下文。
 
-Production entrypoint:
+生产入口是：
 
 ```text
 MemoryOSClient.process_observation(request, ...)
 ```
 
-Core loop:
+核心闭环是：
 
 ```text
 observation
@@ -29,54 +29,54 @@ observation
 -> durable memory / behavior / action-policy updates
 ```
 
-## Why MemoryOS
+## 为什么是 MemoryOS
 
-Most memory SDKs answer "what did the user say before?" MemoryOS focuses on production agent questions:
+普通 memory SDK 通常回答“用户说过什么”。MemoryOS 关注的是 Agent 在生产运行中真正需要的上下文问题：
 
-| Question | MemoryOS answer |
+| 问题 | MemoryOS 中的答案 |
 | --- | --- |
-| What does the user usually do in this scene? | `BehaviorCase`, `BehaviorCluster`, `BehaviorPattern` |
-| Which action is most useful now? | `ActionPolicyRetriever` + `ActionPolicyRanker` |
-| Can this action run automatically? | `PolicyGate` + `ActionExecutor` |
-| Which context is required for this action? | `ActionContextBuilder` + relation-first packing |
-| How does feedback become long-term learning? | `SessionArchive` + planners + `OperationCommitter` |
-| What happens if a write is interrupted? | `RedoLog`, `ContextDiff`, audit, source/index consistency |
+| 用户在这个场景下通常会怎么做？ | `BehaviorCase`、`BehaviorCluster`、`BehaviorPattern` |
+| 当前候选动作是什么？ | `ActionPolicyRetriever` + `ActionPolicyRanker` |
+| 这个动作是否能自动执行？ | `PolicyGate` + `ActionExecutor` |
+| 执行需要哪些上下文？ | `ActionContextBuilder` + relation-first packing |
+| 本轮反馈如何变成长期学习？ | `SessionArchive` + planners + `OperationCommitter` |
+| 写入失败或中断怎么办？ | `RedoLog`、`ContextDiff`、audit、source/index consistency |
 
-The central invariant is:
+MemoryOS 坚持一个边界：
 
 ```text
 Prediction is runtime logic.
 Durable update is operation-plane logic.
 ```
 
-`PredictionResult` never writes durable memory. Long-term updates are produced only through session commit, planners, `ContextOperation`, and `OperationCommitter`.
+`PredictionResult` 不写长期记忆。长期更新只通过 session commit、planner、`ContextOperation` 和 `OperationCommitter` 完成。
 
-## Features
+## 核心能力
 
-- **Predictive Context Database**: one `ContextDB` for memory, behavior, action policy, resource, skill, and session context.
-- **Local-first source of truth**: `FileSystemSourceStore` stores durable facts; SQLite-backed index, relation, queue, and lock stores are the default local production implementation.
-- **Relation-first context packing**: loads context through `anchored_by`, `constrained_by`, `supported_by`, `requires_resource`, `requires_skill`, and related edges before falling back to search.
-- **Safe execution boundary**: `PolicyGate` decides whether a candidate may execute; `ActionExecutor` validates resources, skills, registered tools, and arguments.
-- **Operation plane**: production writes flow through `ContextOperation`, target resolution, coalescing, conflict resolution, path locking, redo, audit, and diff writing.
-- **Behavior lifecycle**: `BehaviorWindowEvaluator` is the production logic for behavior cluster and pattern upgrades.
-- **Supersede semantics**: `SUPERSEDE` marks the old object `obsolete`, writes a new active object, stores supersede metadata, and creates `supersedes` / `superseded_by` relations.
-- **Feedback learning**: action success, failure, and blocked outcomes become feedback for action-policy reward and penalty updates.
-- **Recovery and consistency**: SourceStore is the source of truth; indexes are derived and rebuildable; redo prevents repeated reward/penalty application after interruption.
+- **Predictive Context Database**: 用统一的 `ContextDB` 管理 memory、behavior、action policy、resource、skill、session。
+- **Local-first source of truth**: `FileSystemSourceStore` 保存事实源，SQLite index/relation/queue/lock 作为本地生产默认实现。
+- **Relation-first context packing**: 优先使用 `anchored_by`、`constrained_by`、`supported_by`、`requires_resource`、`requires_skill` 等关系加载上下文。
+- **Safe auto-execution boundary**: `PolicyGate` 决定是否 `execute`，`ActionExecutor` 负责 resource、skill、tool、args 校验。
+- **Operation plane**: 所有生产长期写入通过 `ContextOperation`，支持 target resolve、coalesce、conflict resolve、path lock、redo、audit、diff。
+- **Behavior lifecycle**: 由 `BehaviorWindowEvaluator` 统一判断 cluster/pattern 生成窗口。
+- **Supersede semantics**: `SUPERSEDE` 会将旧对象标记为 `obsolete`，写入新 active 对象，并维护 `supersedes` / `superseded_by` 关系。
+- **Feedback learning**: action success/failure/blocked 会转成 feedback，驱动 action policy reward/penalty 更新。
+- **Recovery and consistency**: source 是事实源，index 可重建；redo log 避免 reward/penalty 重放。
 
-## What MemoryOS Is Not
+## MemoryOS 不是什么
 
-MemoryOS is not:
+MemoryOS 不是：
 
-- an LLM provider,
-- a hosted vector database,
-- a general autonomous-agent framework,
-- a distributed database,
-- a business authorization system,
-- a replacement for application-level device or tool permissions.
+- LLM provider。
+- 通用 autonomous agent framework。
+- 托管向量数据库。
+- 分布式数据库。
+- 业务权限系统或设备权限系统。
+- 替代应用层安全策略的执行框架。
 
-Bring your own LLM, embedding provider, vector store, external APIs, authentication, authorization, secrets, worker supervision, and deployment observability.
+真实 LLM、embedding、vector database、外部 API、设备控制、用户认证、业务授权、worker 编排和 secret 管理都应由应用层接入。
 
-## Architecture
+## 架构
 
 ```mermaid
 flowchart TD
@@ -119,9 +119,9 @@ flowchart TD
     Committer --> Diff[DiffWriter]
 ```
 
-## Runtime Flow
+## 运行时链路
 
-`process_observation(...)` is the production runtime path. It predicts, optionally executes, archives the session, and commits durable updates.
+`process_observation(...)` 是生产运行链路。它会预测、执行、归档并提交长期上下文更新。
 
 ```mermaid
 sequenceDiagram
@@ -154,9 +154,9 @@ sequenceDiagram
     Client-->>App: PredictionResult
 ```
 
-Important: in the default SDK path, `async_commit=True` immediately runs the async commit phase after writing the archive. Queue records are still written for deployment-level workers and refresh flows, but the local SDK path remains deterministic.
+Important: `async_commit=True` means MemoryOS immediately runs the async commit phase after writing the archive. The queue records jobs for deployment-level workers and refresh flows; the default SDK path is local and deterministic.
 
-## Context Model
+## 上下文模型
 
 All durable context is represented as a `ContextObject`.
 
@@ -192,15 +192,15 @@ resource
 skill
 ```
 
-The semantic separation is intentional:
+Semantic separation is intentional:
 
 - `Memory` stores durable facts, preferences, policy memories, and memory anchors.
 - `Behavior` stores cases, clusters, patterns, and opportunity evidence.
-- `ActionPolicy` stores durable action value, safety status, resource/skill requirements, rewards, penalties, cooldown, and suppression state.
+- `ActionPolicy` stores durable action value, safety status, resource/skill requirements, rewards, penalties, cooldown and suppression state.
 
 Behavior evidence can support memory and policy decisions, but it must not silently overwrite explicit memory.
 
-## Storage Layout
+## 存储布局
 
 Default local stores:
 
@@ -238,7 +238,7 @@ memoryos-data/
 
 SourceStore is the source of truth. IndexStore is derived and can be rebuilt.
 
-## Operation Plane
+## 操作提交平面
 
 Production long-term writes should use `ContextOperation`.
 
@@ -282,13 +282,13 @@ Production guarantees:
 - Same-batch operations can be coalesced and conflict-resolved together.
 - `update + delete` on the same target resolves to delete.
 - `reward + penalty` on the same policy is merged or resolved by `ConflictResolver`.
-- `SUPERSEDE` marks the old object `obsolete`, writes the replacement as `active`, stores supersede metadata, and updates relations.
+- `SUPERSEDE` marks the old object `obsolete`, writes the replacement `active`, stores supersede metadata, and updates relations.
 - Default active retrieval excludes `deleted`, `archived`, and `obsolete` objects.
-- Redo phases prevent interrupted writes from applying reward or penalty twice.
+- Redo phases prevent interrupted writes from reapplying reward or penalty twice.
 
-## Behavior Lifecycle
+## 行为生命周期
 
-Production behavior lifecycle logic is centralized in `BehaviorWindowEvaluator`.
+Behavior lifecycle production logic is centralized in `BehaviorWindowEvaluator`.
 
 ```mermaid
 flowchart TD
@@ -310,12 +310,12 @@ Rules:
 - 2 similar cases within 3 days can create a cluster.
 - 3 similar cases within 7 days can create a pattern.
 - 4 similar cases within 30 days can create a pattern.
-- Missing or invalid `created_at` evidence can be archived but cannot trigger cluster or pattern upgrades.
+- Missing or invalid `created_at` evidence can be archived but cannot trigger cluster/pattern upgrades.
 - `BehaviorLifecycleService` is kept only as a compatibility wrapper and delegates to `BehaviorWindowEvaluator`.
 
-## Action Context Packing
+## 动作上下文打包
 
-`ActionContextBuilder` builds the minimum context required by top candidate actions.
+`ActionContextBuilder` builds the minimal context needed by top candidate actions.
 
 Sections:
 
@@ -342,12 +342,12 @@ Relation mapping:
 
 When relations are incomplete, MemoryOS can fall back to index search.
 
-## Safety Model
+## 安全模型
 
 Automatic execution requires two gates:
 
 1. `PolicyGate` must return `mode="execute"`.
-2. `ActionExecutor` must validate resource context, skill context, tool registration, and tool arguments.
+2. `ActionExecutor` must validate resource, skill, tool registration, and tool args.
 
 Decision modes:
 
@@ -387,7 +387,7 @@ Execution also requires:
 - Tool name is registered in `ToolRegistry`.
 - Tool args pass schema-like validation.
 
-## Quick Start
+## 快速开始
 
 MemoryOS currently runs from source.
 
@@ -434,9 +434,9 @@ print(result.decision.reason)
 
 If no behavior, action policy, resource, skill, or registered tool exists yet, the safe result may be `do_nothing`, `ask_user`, `suggest`, or `blocked`. That is expected.
 
-## Executable Example
+## 可执行示例
 
-This example seeds the minimum context required for a low-risk executable action.
+This example seeds the minimum context needed for an executable low-risk action.
 
 ```python
 import json
@@ -541,9 +541,9 @@ result = client.process_observation(request, archive_session=True, async_commit=
 print(result.decision.mode)
 ```
 
-`seed_object(...)` is for bootstrap, imports, and tests. Production long-term updates should use `ContextOperation`, `ContextDB.commit_operation(...)`, `ContextDB.commit_operations(...)`, or session commit.
+`seed_object(...)` is intended for bootstrap, import, and tests. Production long-term updates should use `ContextOperation`, `ContextDB.commit_operation(...)`, `ContextDB.commit_operations(...)`, or session commit.
 
-## Production Integration
+## 生产接入
 
 Recommended integration shape:
 
@@ -570,15 +570,15 @@ Production checklist:
 
 - Use `process_observation(...)` for runtime flows.
 - Treat `predict(...)` as a lower-level read-only prediction API.
-- Seed or commit durable memory, behavior, resource, skill, and action-policy context before expecting execution.
+- Seed or commit durable memory, behavior, resource, skill, and action policy context before expecting execution.
 - Register only safe tool handlers in `ToolRegistry`.
 - Keep application-level user authorization outside MemoryOS.
 - Monitor `system/audit`, `system/diffs`, `system/redo`, and queue status.
-- Verify or rebuild indexes after store migration or recovery.
+- Verify or rebuild index after store migration or recovery.
 - Do not bypass `OperationCommitter` for production long-term writes.
 - Keep Memory, Behavior, and ActionPolicy semantically separate.
 
-## CLI and Thin Adapters
+## CLI 和轻量适配器
 
 The package includes lightweight local adapters:
 
@@ -589,7 +589,7 @@ python -m memoryos.api.cli.main inspect-architecture
 
 HTTP and MCP modules are thin predict adapters around the SDK. They are not a full hosted service; production deployment should wrap the SDK with your own auth, rate limits, secrets, observability, and worker supervision.
 
-## Development
+## 开发
 
 Install dependencies:
 
@@ -609,7 +609,7 @@ python -m pytest
 
 The CI workflow targets Python 3.10 and runs compile, lint, type checks, and tests.
 
-## Repository Map
+## 仓库结构
 
 ```text
 memoryos/
@@ -634,42 +634,42 @@ architecture/
   Design notes for ContextDB, operation plane, prediction pipeline and closure.
 ```
 
-## Current Boundaries
+## 当前边界
 
 MemoryOS is production-oriented, but intentionally local-first and embeddable.
 
 Out of scope for the default implementation:
 
-- hosted control plane,
-- distributed database guarantees,
-- managed vector database,
-- built-in LLM provider,
-- built-in device authorization,
-- full tenant IAM,
-- secret management,
-- worker process supervision,
-- dashboards and alerting.
+- Hosted control plane.
+- Distributed database guarantees.
+- Managed vector database.
+- Built-in LLM provider.
+- Built-in device authorization.
+- Full tenant IAM.
+- Secret management.
+- Worker process supervision.
+- Dashboards and alerting.
 
-These remain application and deployment responsibilities.
+These are application and deployment responsibilities.
 
-## Invariants
+## 运行不变量
 
 1. `process_observation(...)` is the production runtime entrypoint.
 2. `PredictionResult` never carries durable memory operations.
 3. Long-term updates are generated by session commit planners.
 4. Production writes go through `ContextOperation`.
-5. `OperationCommitter` coordinates source, index, relation, audit, diff, redo, and lock.
+5. `OperationCommitter` coordinates source, index, relation, audit, diff, redo and lock.
 6. `SourceStore` is the source of truth.
 7. `IndexStore` is derived and rebuildable.
 8. `Memory`, `Behavior`, and `ActionPolicy` are separate semantic layers.
 9. Behavior evidence must not overwrite explicit memory.
-10. Action policy updates must be expressed as reward, penalty, cooldown, suppress, disable, or related operations.
+10. Action policy updates must be expressed as reward, penalty, cooldown, suppress, disable or related operations.
 11. Automatic execution must pass `PolicyGate`.
 12. Tool execution must pass through `ActionExecutor`.
 13. External business authorization remains the application layer's responsibility.
 
-## Project Status
+## 项目状态
 
 Version: `0.1.0`
 
-MemoryOS currently provides a production-oriented local architecture, a deterministic operation plane, and test-covered e2e flows. The default implementation is suitable for local-first agent systems, embedded agent runtimes, prototypes that need production-grade write semantics, and applications that bring their own LLM, vector store, tools, and deployment layer.
+MemoryOS currently provides a production-oriented local architecture, deterministic operation plane, and test-covered e2e flows. The default implementation is suitable for local-first agent systems, embedded agent runtimes, prototypes that need production-grade write semantics, and applications that want to bring their own LLM, vector store, tools and deployment layer.
