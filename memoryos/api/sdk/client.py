@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+from typing import Any
+
 from memoryos.action_policy.model.action_policy import ActionPolicy
+from memoryos.connect import ConnectMetadata, PipelineMode
+from memoryos.contextdb.model.context_type import ContextType
+from memoryos.contextdb.retrieval.context_assembler import ContextAssembler
 from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
 from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.contextdb.store import IndexStore, RelationStore, SourceStore
@@ -56,6 +61,16 @@ class MemoryOSClient:
         self.executor = container.executor
 
     def predict(self, request: PredictionRequest, policies: list[ActionPolicy] | None = None) -> PredictionResult:
+        if request.connect_metadata:
+            metadata = self._parse_connect_metadata(request.connect_metadata)
+            if (
+                metadata.run_mode != PipelineMode.ACTION_CAPABLE
+                or not metadata.capabilities.can_predict_behavior
+            ):
+                raise ValueError(
+                    "predict() requires action_capable connect metadata with can_predict_behavior=True; "
+                    "use assemble_context() for context_reduction agents."
+                )
         return self.engine.process(request, policies=policies)
 
     def process_observation(
@@ -66,6 +81,19 @@ class MemoryOSClient:
         archive_session: bool = True,
         async_commit: bool = True,
     ) -> PredictionResult:
+        connect_metadata: dict[str, Any] = {}
+        if request.connect_metadata:
+            metadata = self._parse_connect_metadata(request.connect_metadata)
+            connect_metadata = metadata.to_dict()
+            if (
+                metadata.run_mode != PipelineMode.ACTION_CAPABLE
+                or not metadata.capabilities.can_predict_behavior
+                or not metadata.capabilities.can_execute_action
+            ):
+                raise PermissionError(
+                    "process_observation() requires action_capable connect metadata "
+                    "with can_predict_behavior=True and can_execute_action=True."
+                )
         result = self.engine.process(request, policies=policies)
         action_result = self.executor.execute(result.decision, result.action_context)
         if not archive_session:
@@ -109,6 +137,78 @@ class MemoryOSClient:
                 for uri in result.action_context.source_uris
                 if uri.startswith("memoryos://skills/")
             ],
+            metadata={"connect": connect_metadata} if connect_metadata else {},
         )
         self.context_db.commit_session(archive, async_commit=async_commit)
         return result
+
+    def search_context(
+        self,
+        query: str,
+        *,
+        user_id: str | None = None,
+        context_type: object | None = None,
+        limit: int = 10,
+        connect_metadata: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        self._parse_connect_metadata(connect_metadata)
+        return ContextAssembler(self.context_db).search(
+            query,
+            user_id=user_id,
+            context_type=context_type,
+            limit=limit,
+        )
+
+    def assemble_context(
+        self,
+        query: str,
+        *,
+        user_id: str | None = None,
+        token_budget: int = 2000,
+        context_types: list[object] | None = None,
+        limit: int = 20,
+        connect_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        metadata = self._parse_connect_metadata(connect_metadata)
+        parsed_types: list[object] | None = (
+            [self._parse_context_type(item) for item in context_types] if context_types else None
+        )
+        return ContextAssembler(self.context_db).assemble(
+            query,
+            user_id=user_id,
+            token_budget=token_budget,
+            context_types=parsed_types,
+            limit=limit,
+            connect_metadata=metadata.to_dict(),
+        )
+
+    def commit_agent_session(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        messages: list[dict[str, Any]] | None = None,
+        used_contexts: list[dict[str, Any]] | None = None,
+        tool_results: list[dict[str, Any]] | None = None,
+        connect_metadata: dict[str, Any] | None = None,
+        async_commit: bool = True,
+    ) -> None:
+        metadata = self._parse_connect_metadata(connect_metadata)
+        archive = SessionArchive(
+            user_id=user_id,
+            session_id=session_id,
+            archive_uri=f"memoryos://user/{user_id}/sessions/history/{session_id}",
+            messages=messages or [],
+            used_contexts=used_contexts or [],
+            tool_results=tool_results or [],
+            metadata={"connect": metadata.to_dict()},
+        )
+        self.context_db.commit_session(archive, async_commit=async_commit)
+
+    def _parse_connect_metadata(self, payload: dict[str, Any] | None) -> ConnectMetadata:
+        return ConnectMetadata.from_dict(payload)
+
+    def _parse_context_type(self, context_type: object) -> ContextType:
+        if isinstance(context_type, ContextType):
+            return context_type
+        return ContextType(str(context_type))

@@ -13,7 +13,7 @@ from memoryos.contextdb.model.context_uri import ContextURI
 from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.prediction.model.prediction_request import PredictionRequest
 
-NOW = datetime(2026, 7, 4, tzinfo=timezone.utc)
+NOW = datetime.now(timezone.utc)
 
 
 def _observation() -> Observation:

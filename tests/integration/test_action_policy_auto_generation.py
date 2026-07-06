@@ -11,7 +11,7 @@ from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.operations.model.operation_action import OperationAction
 from memoryos.prediction.model.prediction_request import PredictionRequest
 
-NOW = datetime(2026, 7, 4, tzinfo=timezone.utc)
+NOW = datetime.now(timezone.utc)
 
 
 def _observation() -> Observation:

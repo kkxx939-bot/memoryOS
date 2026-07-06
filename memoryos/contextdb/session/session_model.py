@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from memoryos.core.ids import new_id
 from memoryos.core.time import utc_now
@@ -19,6 +20,7 @@ class SessionArchive:
     used_contexts: list[dict] = field(default_factory=list)
     used_skills: list[dict] = field(default_factory=list)
     tool_results: list[dict] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
     task_id: str = field(default_factory=lambda: new_id("session_commit"))
     created_at: str = field(default_factory=utc_now)
 
@@ -29,6 +31,7 @@ class SessionArchive:
             "session_id": self.session_id,
             "archive_uri": self.archive_uri,
             "created_at": self.created_at,
+            "metadata": self.metadata,
             "phase": "sync_archive",
             "files": [
                 "messages.jsonl",

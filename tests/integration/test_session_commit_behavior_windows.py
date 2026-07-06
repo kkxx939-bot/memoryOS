@@ -11,7 +11,7 @@ from memoryos.contextdb.store.local_stores import FileSystemSourceStore, InMemor
 from memoryos.operations.commit.operation_committer import OperationCommitter
 from memoryos.operations.model.operation_action import OperationAction
 
-NOW = datetime(2026, 7, 4, tzinfo=timezone.utc)
+NOW = datetime.now(timezone.utc)
 
 
 def _archive(location: str = "home", older_than_days: int = 0) -> SessionArchive:

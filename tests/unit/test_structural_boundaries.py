@@ -67,3 +67,18 @@ def test_example_main_runs_without_import_errors() -> None:
     root = Path(__file__).resolve().parents[2]
 
     subprocess.run([sys.executable, str(root / "examples" / "main.py")], check=True, cwd=root)
+
+
+def test_context_assembly_smoke_benchmark_runs() -> None:
+    root = Path(__file__).resolve().parents[2]
+    script = root / "benchmark" / "smoke" / "context_assembly_smoke.py"
+
+    result = subprocess.run(
+        [sys.executable, str(script)],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout

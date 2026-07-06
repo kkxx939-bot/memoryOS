@@ -8,10 +8,18 @@ class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, Callable[[dict], dict]] = {}
         self._schemas: dict[str, dict] = {}
+        self._metadata: dict[str, dict[str, Any]] = {}
 
-    def register(self, tool_name: str, handler: Callable[[dict], dict], input_schema: dict | None = None) -> None:
+    def register(
+        self,
+        tool_name: str,
+        handler: Callable[[dict], dict],
+        input_schema: dict | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         self._tools[tool_name] = handler
         self._schemas[tool_name] = input_schema or {}
+        self._metadata[tool_name] = dict(metadata or {})
 
     def can_execute(self, tool_name: str) -> bool:
         return tool_name in self._tools
@@ -40,6 +48,11 @@ class ToolRegistry:
         if dry_run:
             return {"dry_run": True, "tool_name": tool_name, "args": args}
         return self._tools[tool_name](args)
+
+    def metadata(self, tool_name: str) -> dict[str, Any]:
+        if tool_name not in self._tools:
+            raise KeyError(f"Tool is not registered: {tool_name}")
+        return dict(self._metadata.get(tool_name, {}))
 
     def _matches_type(self, value: Any, expected: str) -> bool:
         if expected == "string":
