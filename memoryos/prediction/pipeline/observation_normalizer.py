@@ -8,6 +8,7 @@ class ObservationNormalizer:
         if isinstance(observation, Observation):
             return observation
         if isinstance(observation, dict):
+            raw_scene_key = observation.get("scene_key")
             return Observation(
                 user_id=user_id,
                 raw_text=str(observation.get("raw_text", observation.get("scene", ""))),
@@ -16,6 +17,6 @@ class ObservationNormalizer:
                 signals=[str(item) for item in observation.get("signals", [])],
                 environment=dict(observation.get("environment", {})),
                 observed_at=str(observation.get("observed_at", "")),
-                explicit_scene_key=str(observation.get("scene_key", "")),
+                explicit_scene_key=str(raw_scene_key) if raw_scene_key is not None else "",
             )
         return Observation(user_id=user_id, raw_text=str(observation))

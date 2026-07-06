@@ -91,3 +91,17 @@ def test_dict_observation_explicit_scene_key_is_preserved() -> None:
     )
 
     assert observation.scene_key == "hot_room"
+
+
+def test_dict_observation_scene_key_none_is_not_string_none() -> None:
+    observation = ObservationNormalizer().normalize(
+        "u1",
+        {
+            "raw_text": "room is hot",
+            "location": "home",
+            "scene_key": None,
+        },
+    )
+
+    assert observation.explicit_scene_key == ""
+    assert observation.scene_key != "None"
