@@ -214,13 +214,14 @@ class MemoryOSClient:
     def _connect_filters_from_metadata(self, connect_metadata: dict[str, Any] | None) -> dict[str, str]:
         if not connect_metadata:
             return {}
+        allowed = {"connect_type", "adapter_id", "run_mode", "world_domain", "source_kind"}
         metadata = self._parse_connect_metadata(connect_metadata)
+        metadata.validate()
+        metadata_dict = metadata.to_dict()
         return {
-            "connect_type": metadata.connect_type,
-            "adapter_id": metadata.adapter_id,
-            "run_mode": metadata.run_mode,
-            "world_domain": metadata.world_domain,
-            "source_kind": metadata.source_kind,
+            key: str(metadata_dict[key])
+            for key in allowed
+            if key in connect_metadata and metadata_dict.get(key) not in {None, ""}
         }
 
     def _parse_context_type(self, context_type: object) -> ContextType:

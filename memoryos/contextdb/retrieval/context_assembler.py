@@ -113,11 +113,12 @@ class ContextAssembler:
         return ContextType(str(context_type))
 
     def _filter_connect(self, items: list[dict[str, Any]], filters: dict[str, Any] | None) -> list[dict[str, Any]]:
-        filters = {key: value for key, value in dict(filters or {}).items() if value not in {None, ""}}
-        if not filters:
-            return items
         allowed = {"connect_type", "adapter_id", "run_mode", "world_domain", "source_kind"}
-        simple_filters = {key: value for key, value in filters.items() if key in allowed}
+        simple_filters = {
+            key: value
+            for key, value in dict(filters or {}).items()
+            if key in allowed and value is not None and value != ""
+        }
         if not simple_filters:
             return items
         matched = []

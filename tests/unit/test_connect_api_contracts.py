@@ -152,8 +152,37 @@ def test_context_reduction_sdk_does_not_call_prediction_or_executor() -> None:
     archive, async_commit = context_db.committed[0]
     assert async_commit is False
     assert archive.metadata["connect"]["adapter_id"] == "codex"
+    assert archive.predictions == []
+    assert archive.action_results == []
     assert client.engine.called is False
     assert client.executor.called is False
+
+
+def test_connect_filters_from_metadata_only_uses_explicit_simple_fields() -> None:
+    client = _client()
+    full_metadata = ConnectMetadata(
+        adapter_id="codex",
+        run_mode=PipelineMode.ACTION_CAPABLE,
+        world_domain="digital",
+        source_kind="terminal",
+        modality=("text", "tool"),
+        capabilities=CapabilityProfile(can_predict_behavior=True, can_execute_action=True),
+        extra={"workspace": "/repo"},
+    ).to_dict()
+
+    assert client._connect_filters_from_metadata(None) == {}
+    assert client._connect_filters_from_metadata({}) == {}
+    assert client._connect_filters_from_metadata({"adapter_id": "codex"}) == {"adapter_id": "codex"}
+    assert client._connect_filters_from_metadata(full_metadata) == {
+        "connect_type": "agent",
+        "adapter_id": "codex",
+        "run_mode": "action_capable",
+        "world_domain": "digital",
+        "source_kind": "terminal",
+    }
+    assert "capabilities" not in client._connect_filters_from_metadata(full_metadata)
+    assert "modality" not in client._connect_filters_from_metadata(full_metadata)
+    assert "extra" not in client._connect_filters_from_metadata(full_metadata)
 
 
 def test_search_and_assemble_context_apply_connect_filters_without_behavior_or_action() -> None:
@@ -200,6 +229,82 @@ def test_search_and_assemble_context_apply_connect_filters_without_behavior_or_a
     assert client.executor.called is False
 
 
+def test_search_context_adapter_id_filter_does_not_apply_default_fields() -> None:
+    codex_metadata = ConnectMetadata(adapter_id="codex", source_kind="terminal").to_dict()
+    context_db = FakeContextDB(
+        [
+            IndexHit(
+                uri="memoryos://user/u1/memories/anchors/codex",
+                score=1.0,
+                context_type="memory",
+                title="Codex terminal context",
+                metadata={"connect": codex_metadata},
+            )
+        ]
+    )
+    client = _client(context_db)
+
+    codex_results = client.search_context("terminal", connect_metadata={"adapter_id": "codex"})
+    claude_results = client.search_context("terminal", connect_metadata={"adapter_id": "claude_code"})
+    unfiltered_results = client.search_context("terminal")
+
+    assert [item["uri"] for item in codex_results] == ["memoryos://user/u1/memories/anchors/codex"]
+    assert claude_results == []
+    assert [item["uri"] for item in unfiltered_results] == ["memoryos://user/u1/memories/anchors/codex"]
+    assert client.engine.called is False
+    assert client.executor.called is False
+
+
+def test_assemble_context_passes_explicit_connect_filters(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, Any]] = []
+
+    class RecordingAssembler:
+        def __init__(self, context_db: FakeContextDB) -> None:
+            self.context_db = context_db
+
+        def assemble(
+            self,
+            query: str,
+            *,
+            user_id: str | None = None,
+            token_budget: int = 2000,
+            context_types: list[object] | None = None,
+            limit: int = 20,
+            connect_metadata: dict[str, Any] | None = None,
+            connect_filters: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            calls.append(
+                {
+                    "query": query,
+                    "user_id": user_id,
+                    "token_budget": token_budget,
+                    "context_types": context_types,
+                    "limit": limit,
+                    "connect_metadata": connect_metadata,
+                    "connect_filters": connect_filters,
+                }
+            )
+            return {
+                "query": query,
+                "token_budget": token_budget,
+                "contexts": [],
+                "packed_context": "",
+                "source_uris": [],
+                "dropped_contexts": [],
+                "connect_metadata": dict(connect_metadata or {}),
+            }
+
+    monkeypatch.setattr("memoryos.api.sdk.client.ContextAssembler", RecordingAssembler)
+    client = _client()
+
+    assembled = client.assemble_context("terminal", connect_metadata={"adapter_id": "codex"}, token_budget=500)
+
+    assert assembled["connect_metadata"]["adapter_id"] == "codex"
+    assert calls[0]["connect_filters"] == {"adapter_id": "codex"}
+    assert client.engine.called is False
+    assert client.executor.called is False
+
+
 def test_context_assembler_connect_filter_simple_fields() -> None:
     claude_connect = ConnectMetadata(adapter_id="claude_code", source_kind="terminal").to_dict()
     codex_connect = ConnectMetadata(adapter_id="codex", source_kind="terminal").to_dict()
@@ -235,10 +340,18 @@ def test_context_assembler_connect_filter_simple_fields() -> None:
     )
     adapter_miss = assembler.search("context", connect_filters={"adapter_id": "openclaw"})
     domain_miss = assembler.search("context", connect_filters={"world_domain": "physical"})
+    ignored_complex_filters = assembler.search(
+        "context",
+        connect_filters={"capabilities": {"can_predict_behavior": True}, "modality": ["text"], "extra": {"x": "y"}},
+    )
 
     assert [item["uri"] for item in matched] == ["memoryos://user/u1/memories/anchors/claude"]
     assert adapter_miss == []
     assert domain_miss == []
+    assert {item["uri"] for item in ignored_complex_filters} == {
+        "memoryos://user/u1/memories/anchors/claude",
+        "memoryos://user/u1/memories/anchors/codex",
+    }
 
 
 def test_assemble_context_empty_results_are_stable() -> None:
