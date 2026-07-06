@@ -128,3 +128,15 @@ def test_console_script_entrypoints_are_declared() -> None:
     assert 'memoryos = "memoryos.api.cli.main:main"' in pyproject
     assert 'memoryos-mcp-server = "memoryos.api.mcp.stdio:main"' in pyproject
     assert 'memoryos-agent-hook = "memoryos.adapters.agent_hooks.cli:main"' in pyproject
+
+
+def test_console_script_entrypoint_targets_import() -> None:
+    targets = [
+        "memoryos.api.cli.main",
+        "memoryos.api.mcp.stdio",
+        "memoryos.adapters.agent_hooks.cli",
+    ]
+
+    for target in targets:
+        module = import_module(target)
+        assert callable(module.main)

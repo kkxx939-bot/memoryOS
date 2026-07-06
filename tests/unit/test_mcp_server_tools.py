@@ -137,10 +137,12 @@ def test_mcp_connection_schema_and_health() -> None:
     schema = server.call_tool("memoryos_connection_schema", {})
     health = server.call_tool("memoryos_health", {})
 
+    assert server.config.user_id == "u1"
     assert schema["error"] is None
     assert schema["action_tools_enabled"] is False
     assert "codex" in schema["allowed_adapter_ids"]
     assert health["client_ready"] is True
+    assert server.call_tool("memoryos_health", None)["status"] == "ok"
 
 
 def test_action_tools_default_closed_and_coding_agent_rejected() -> None:
@@ -148,9 +150,15 @@ def test_action_tools_default_closed_and_coding_agent_rejected() -> None:
     coding_metadata = {"adapter_id": "codex"}
 
     result = server.call_tool("memoryos_predict", {"request": _request(coding_metadata)})
+    observation_result = server.call_tool(
+        "memoryos_process_observation",
+        {"request": _request(ConnectMetadata.action_capable_embodied("reachy_mini").to_dict())},
+    )
 
     assert result["error"]["code"] == "PERMISSION_DENIED"
+    assert observation_result["error"]["code"] == "PERMISSION_DENIED"
     assert client.predict_calls == 0
+    assert client.process_calls == 0
 
 
 def test_action_tools_enabled_still_requires_embodied_metadata() -> None:
@@ -207,12 +215,37 @@ def test_stdio_initialize_tools_list_and_health_call_include_stable_schemas() ->
 
     assert initialized["result"]["serverInfo"]["name"] == "memoryos"
     tools = listed["result"]["tools"]
+    names = {tool["name"] for tool in tools}
+    assert {"memoryos_health", "memoryos_connection_schema"} <= names
+    assert all(tool["inputSchema"]["type"] == "object" for tool in tools)
     assemble = next(tool for tool in tools if tool["name"] == "memoryos_assemble_context")
     assert assemble["inputSchema"]["type"] == "object"
     assert "query" in assemble["inputSchema"]["required"]
     health_payload = json.loads(called["result"]["content"][0]["text"])
     assert called["result"]["isError"] is False
     assert health_payload["status"] == "ok"
+
+
+def test_stdio_action_tool_disabled_returns_permission_error_payload() -> None:
+    server, _client = _server()
+    response = stdio._handle_jsonrpc(
+        server,
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {
+                    "name": "memoryos_predict",
+                    "arguments": {"request": _request(ConnectMetadata.action_capable_embodied("reachy_mini").to_dict())},
+                },
+            }
+        ),
+    )
+
+    payload = json.loads(response["result"]["content"][0]["text"])
+    assert response["result"]["isError"] is True
+    assert payload["error"]["code"] == "PERMISSION_DENIED"
 
 
 def test_stdio_unknown_tool_returns_tool_error_payload() -> None:
@@ -233,3 +266,12 @@ def test_stdio_unknown_tool_returns_tool_error_payload() -> None:
     payload = json.loads(response["result"]["content"][0]["text"])
     assert response["result"]["isError"] is True
     assert payload["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_stdio_malformed_json_returns_parse_error() -> None:
+    server, _client = _server()
+
+    response = stdio._handle_jsonrpc(server, "{bad json")
+
+    assert response["error"]["code"] == -32700
+    assert response["error"]["message"] == "Invalid JSON"

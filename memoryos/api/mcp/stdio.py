@@ -5,86 +5,11 @@ import sys
 from typing import Any
 
 from memoryos.api.mcp.config import MCPServerConfig
+from memoryos.api.mcp.schemas import tool_definitions
 from memoryos.api.mcp.server import MemoryOSMCPServer
 from memoryos.api.sdk.client import MemoryOSClient
 
-TOOLS = [
-    {
-        "name": "memoryos_search_context",
-        "description": "Search MemoryOS context for a coding agent.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "user_id": {"type": "string"},
-                "limit": {"type": "integer"},
-                "context_type": {"type": "string"},
-                "context_types": {"type": "array", "items": {"type": "string"}},
-                "connect_metadata": {"type": "object"},
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "memoryos_assemble_context",
-        "description": "Assemble token-bounded MemoryOS context for prompt injection.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "user_id": {"type": "string"},
-                "token_budget": {"type": "integer"},
-                "context_types": {"type": "array", "items": {"type": "string"}},
-                "limit": {"type": "integer"},
-                "connect_metadata": {"type": "object"},
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "memoryos_commit_session",
-        "description": "Commit a sanitized agent session archive.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "user_id": {"type": "string"},
-                "session_id": {"type": "string"},
-                "messages": {"type": "array", "items": {"type": "object"}},
-                "used_contexts": {"type": "array", "items": {"type": "object"}},
-                "tool_results": {"type": "array", "items": {"type": "object"}},
-                "connect_metadata": {"type": "object"},
-                "async_commit": {"type": "boolean"},
-            },
-            "required": ["session_id"],
-        },
-    },
-    {"name": "memoryos_health", "description": "Check MemoryOS availability.", "inputSchema": {"type": "object", "properties": {}, "required": []}},
-    {"name": "memoryos_connection_schema", "description": "Describe allowed MemoryOS connection profiles.", "inputSchema": {"type": "object", "properties": {}, "required": []}},
-    {
-        "name": "memoryos_predict",
-        "description": "Action-capable embodied behavior prediction. Disabled by default.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"request": {"type": "object"}, "policies": {"type": "array", "items": {"type": "object"}}, "connect_metadata": {"type": "object"}},
-            "required": ["request"],
-        },
-    },
-    {
-        "name": "memoryos_process_observation",
-        "description": "Action-capable embodied observation processing. Disabled by default.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "request": {"type": "object"},
-                "policies": {"type": "array", "items": {"type": "object"}},
-                "connect_metadata": {"type": "object"},
-                "archive_session": {"type": "boolean"},
-                "async_commit": {"type": "boolean"},
-            },
-            "required": ["request"],
-        },
-    },
-]
+TOOLS = tool_definitions()
 
 
 def main() -> None:

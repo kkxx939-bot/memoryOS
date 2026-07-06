@@ -8,7 +8,8 @@ from memoryos.api.sdk.client import MemoryOSClient
 class MemoryOSMCPServer:
     def __init__(self, client: MemoryOSClient, config: MCPServerConfig | None = None) -> None:
         self.client = client
-        self.router = MCPToolRouter(client, config=config)
+        self.config = config or MCPServerConfig.from_env()
+        self.router = MCPToolRouter(client, config=self.config)
 
-    def call_tool(self, name: str, arguments: dict) -> dict:
-        return self.router.call(name, arguments)
+    def call_tool(self, name: str, arguments: dict | None = None) -> dict:
+        return self.router.call(name, arguments or {})

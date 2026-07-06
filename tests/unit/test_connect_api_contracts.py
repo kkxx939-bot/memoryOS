@@ -421,45 +421,71 @@ def test_assemble_context_empty_results_are_stable() -> None:
     assert assembled["dropped_contexts"] == []
 
 
-def test_predict_rejects_explicit_context_reduction_metadata() -> None:
-    client = _client()
+def test_predict_rejects_context_reduction_metadata_before_engine() -> None:
+    context_db = FakeContextDB()
+    client = _client(context_db)
 
     with pytest.raises(PermissionError):
         client.predict(_request(ConnectMetadata.default_agent("codex").to_dict()))
     assert client.engine.called is False
+    assert context_db.committed == []
 
 
-def test_predict_rejects_missing_behavior_capability() -> None:
+def test_predict_rejects_missing_behavior_capability_before_engine() -> None:
     metadata = ConnectMetadata(
         connect_type="embodied",
         run_mode=PipelineMode.ACTION_CAPABLE,
         capabilities=CapabilityProfile(can_predict_behavior=False),
     ).to_dict()
-    client = _client()
+    context_db = FakeContextDB()
+    client = _client(context_db)
 
     with pytest.raises(PermissionError):
         client.predict(_request(metadata))
     assert client.engine.called is False
+    assert context_db.committed == []
 
 
 def test_predict_rejects_missing_connect_metadata_before_engine() -> None:
-    client = _client()
+    context_db = FakeContextDB()
+    client = _client(context_db)
+
+    request = PredictionRequest(
+        user_id="u1",
+        episode_id="s1",
+        observation="hello",
+        available_actions=["ask_user"],
+        connect_metadata=None,  # type: ignore[arg-type]
+    )
 
     with pytest.raises(PermissionError):
-        client.predict(_request())
+        client.predict(request)
     assert client.engine.called is False
+    assert context_db.committed == []
 
 
-def test_predict_rejects_agent_action_capable_even_with_behavior_capability() -> None:
+def test_predict_rejects_empty_connect_metadata_before_engine() -> None:
+    context_db = FakeContextDB()
+    client = _client(context_db)
+
+    with pytest.raises(PermissionError):
+        client.predict(_request({}))
+    assert client.engine.called is False
+    assert context_db.committed == []
+
+
+def test_predict_rejects_agent_action_capable_metadata_before_engine() -> None:
     metadata = ConnectMetadata(
         run_mode=PipelineMode.ACTION_CAPABLE,
         capabilities=CapabilityProfile(can_predict_behavior=True),
     ).to_dict()
-    client = _client()
+    context_db = FakeContextDB()
+    client = _client(context_db)
 
     with pytest.raises(PermissionError):
         client.predict(_request(metadata))
     assert client.engine.called is False
+    assert context_db.committed == []
 
 
 def test_predict_allows_embodied_action_capable_metadata() -> None:
@@ -471,29 +497,33 @@ def test_predict_allows_embodied_action_capable_metadata() -> None:
 
 
 def test_process_observation_rejects_missing_connect_metadata_before_engine_or_executor() -> None:
-    client = _client()
+    context_db = FakeContextDB()
+    client = _client(context_db)
 
     with pytest.raises(PermissionError):
-        client.process_observation(_request())
+        client.process_observation(_request({}), archive_session=False)
     assert client.engine.called is False
     assert client.executor.called is False
+    assert context_db.committed == []
 
 
-def test_process_observation_rejects_missing_execute_capability_before_executor() -> None:
+def test_process_observation_rejects_missing_execute_capability_before_engine_or_executor() -> None:
     metadata = ConnectMetadata(
         connect_type="embodied",
         run_mode=PipelineMode.ACTION_CAPABLE,
         capabilities=CapabilityProfile(can_predict_behavior=True, can_execute_action=False),
     ).to_dict()
-    client = _client()
+    context_db = FakeContextDB()
+    client = _client(context_db)
 
     with pytest.raises(PermissionError):
         client.process_observation(_request(metadata))
     assert client.engine.called is False
     assert client.executor.called is False
+    assert context_db.committed == []
 
 
-def test_process_observation_allows_full_embodied_execute_metadata_and_archives_connect() -> None:
+def test_process_observation_allows_embodied_action_capable_execute_metadata() -> None:
     context_db = FakeContextDB()
     client = _client(context_db)
     client.engine = ReturningEngine(_prediction_result())

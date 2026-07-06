@@ -10,6 +10,8 @@ from memoryos.adapters.agent_hooks.claude_code import ClaudeCodeHookAdapter
 from memoryos.adapters.agent_hooks.codex import CodexHookAdapter
 from memoryos.adapters.agent_hooks.config import AgentHookConfig
 from memoryos.adapters.agent_hooks.cursor import CursorHookAdapter
+from memoryos.adapters.agent_hooks.events import AgentHookEvent
+from memoryos.adapters.agent_hooks.mcp_client import AgentHookMCPClient
 from memoryos.adapters.agent_hooks.queue import PendingItem, PendingQueue
 from memoryos.adapters.agent_hooks.sanitizer import sanitize_changed_files, sanitize_payload, summarize_tool_result
 
@@ -158,6 +160,16 @@ def test_hooks_only_call_context_or_commit_tools_with_agent_metadata(tmp_path: P
         assert metadata["capabilities"]["can_execute_action"] is False
 
 
+def test_agent_hook_mcp_client_real_initializes_and_calls_health(tmp_path: Path) -> None:
+    client = AgentHookMCPClient(_config(tmp_path))
+
+    result = client.call_tool("memoryos_health", {})
+
+    assert result["error"] is None
+    assert result["status"] == "ok"
+    assert result["metadata"]["adapter_id"] == "codex"
+
+
 def test_stop_and_precompact_commit_session_do_not_trigger_action_tools(tmp_path: Path) -> None:
     fake = FakeHookMCPClient()
     adapter = CodexHookAdapter(_config(tmp_path), mcp_client=fake)
@@ -192,6 +204,26 @@ def test_pending_queue_idempotency_retry_success_and_corrupt_file(tmp_path: Path
     assert failed["failed"] == 1
     assert succeeded["flushed"] == 1
     assert [item.event_id for item in queue.list_items()] == ["e2"]
+
+
+def test_agent_hook_event_id_is_stable_for_retry_payloads(tmp_path: Path) -> None:
+    payload = {"session_id": "s1", "prompt": "same prompt", "cwd": str(tmp_path)}
+
+    first = AgentHookEvent.from_payload(payload, adapter_id="codex", hook_name="UserPromptSubmit")
+    second = AgentHookEvent.from_payload(payload, adapter_id="codex", hook_name="UserPromptSubmit")
+    with_timestamp = AgentHookEvent.from_payload(
+        {**payload, "timestamp": "2026-07-06T00:00:00Z"},
+        adapter_id="codex",
+        hook_name="UserPromptSubmit",
+    )
+    same_timestamp = AgentHookEvent.from_payload(
+        {**payload, "timestamp": "2026-07-06T00:00:00Z"},
+        adapter_id="codex",
+        hook_name="UserPromptSubmit",
+    )
+
+    assert first.event_id == second.event_id
+    assert with_timestamp.event_id == same_timestamp.event_id
 
 
 def test_pending_queue_refuses_action_capable_tools(tmp_path: Path) -> None:

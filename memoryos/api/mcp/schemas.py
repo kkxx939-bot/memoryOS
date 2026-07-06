@@ -21,6 +21,89 @@ ALLOWED_METADATA_FIELDS = {
 
 ACTION_ADAPTERS = {"reachy_mini"}
 
+TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
+    "memoryos_search_context": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "user_id": {"type": "string"},
+            "limit": {"type": "integer"},
+            "context_type": {"type": "string"},
+            "context_types": {"type": "array", "items": {"type": "string"}},
+            "connect_metadata": {"type": "object"},
+        },
+        "required": ["query"],
+    },
+    "memoryos_assemble_context": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "user_id": {"type": "string"},
+            "token_budget": {"type": "integer"},
+            "context_types": {"type": "array", "items": {"type": "string"}},
+            "limit": {"type": "integer"},
+            "connect_metadata": {"type": "object"},
+        },
+        "required": ["query"],
+    },
+    "memoryos_commit_session": {
+        "type": "object",
+        "properties": {
+            "user_id": {"type": "string"},
+            "session_id": {"type": "string"},
+            "messages": {"type": "array", "items": {"type": "object"}},
+            "used_contexts": {"type": "array", "items": {"type": "object"}},
+            "tool_results": {"type": "array", "items": {"type": "object"}},
+            "connect_metadata": {"type": "object"},
+            "async_commit": {"type": "boolean"},
+        },
+        "required": ["session_id"],
+    },
+    "memoryos_health": {"type": "object", "properties": {}, "required": []},
+    "memoryos_connection_schema": {"type": "object", "properties": {}, "required": []},
+    "memoryos_predict": {
+        "type": "object",
+        "properties": {
+            "request": {"type": "object"},
+            "policies": {"type": "array", "items": {"type": "object"}},
+            "connect_metadata": {"type": "object"},
+        },
+        "required": ["request"],
+    },
+    "memoryos_process_observation": {
+        "type": "object",
+        "properties": {
+            "request": {"type": "object"},
+            "policies": {"type": "array", "items": {"type": "object"}},
+            "connect_metadata": {"type": "object"},
+            "archive_session": {"type": "boolean"},
+            "async_commit": {"type": "boolean"},
+        },
+        "required": ["request"],
+    },
+}
+
+TOOL_DESCRIPTIONS: dict[str, str] = {
+    "memoryos_search_context": "Search MemoryOS context for a coding agent.",
+    "memoryos_assemble_context": "Assemble token-bounded MemoryOS context for prompt injection.",
+    "memoryos_commit_session": "Commit a sanitized agent session archive.",
+    "memoryos_health": "Check MemoryOS availability.",
+    "memoryos_connection_schema": "Describe allowed MemoryOS connection profiles.",
+    "memoryos_predict": "Action-capable embodied behavior prediction. Requires action tools enabled and embodied metadata.",
+    "memoryos_process_observation": "Action-capable embodied observation processing. Requires action tools enabled and embodied metadata.",
+}
+
+
+def tool_definitions() -> list[dict[str, Any]]:
+    return [
+        {
+            "name": name,
+            "description": TOOL_DESCRIPTIONS[name],
+            "inputSchema": schema,
+        }
+        for name, schema in TOOL_INPUT_SCHEMAS.items()
+    ]
+
 
 def required_str(payload: dict[str, Any], key: str) -> str:
     value = payload.get(key)
