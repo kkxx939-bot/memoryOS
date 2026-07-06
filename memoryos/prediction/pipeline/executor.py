@@ -151,11 +151,13 @@ class ActionExecutor:
                     matches.append(item)
                 else:
                     generic.append(item)
-        if has_explicit:
-            if not matches:
-                return [], f"No {item_name} supports action {action}"
+        if matches:
             return matches, None
-        return generic, None
+        if generic:
+            return generic, None
+        if has_explicit:
+            return [], f"No {item_name} supports action {action}"
+        return [], None
 
     def _match_action(self, item: dict, action: str) -> tuple[bool, bool]:
         metadata = self._metadata(item)

@@ -148,7 +148,7 @@ def test_context_reduction_sdk_does_not_call_prediction_or_executor() -> None:
     assert results[0]["uri"] == "memoryos://user/u1/memories/anchors/m1"
     assert assembled["source_uris"] == ["memoryos://user/u1/memories/anchors/m1"]
     assert assembled["packed_context"]
-    assert context_db.search_calls[0]["limit"] == 1
+    assert context_db.search_calls[0]["limit"] == 50
     archive, async_commit = context_db.committed[0]
     assert async_commit is False
     assert archive.metadata["connect"]["adapter_id"] == "codex"
@@ -352,6 +352,35 @@ def test_context_assembler_connect_filter_simple_fields() -> None:
         "memoryos://user/u1/memories/anchors/claude",
         "memoryos://user/u1/memories/anchors/codex",
     }
+
+
+def test_context_assembler_connect_filter_overfetches_before_limit_slice() -> None:
+    claude_connect = ConnectMetadata(adapter_id="claude_code", source_kind="terminal").to_dict()
+    codex_connect = ConnectMetadata(adapter_id="codex", source_kind="terminal").to_dict()
+    context_db = FakeContextDB(
+        [
+            IndexHit(
+                uri="memoryos://user/u1/memories/anchors/claude",
+                score=2.0,
+                context_type="memory",
+                title="Claude context",
+                metadata={"connect": claude_connect},
+            ),
+            IndexHit(
+                uri="memoryos://user/u1/memories/anchors/codex",
+                score=1.0,
+                context_type="memory",
+                title="Codex context",
+                metadata={"connect": codex_connect},
+            ),
+        ]
+    )
+    assembler = ContextAssembler(cast(Any, context_db))
+
+    matched = assembler.search("context", limit=1, connect_filters={"adapter_id": "codex"})
+
+    assert [item["uri"] for item in matched] == ["memoryos://user/u1/memories/anchors/codex"]
+    assert context_db.search_calls[0]["limit"] == 50
 
 
 def test_assemble_context_empty_results_are_stable() -> None:

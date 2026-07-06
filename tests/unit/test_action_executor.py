@@ -230,6 +230,61 @@ def test_execute_uses_resource_tool_name_when_skill_has_no_tool_name() -> None:
     assert calls
 
 
+def test_execute_uses_resource_metadata_tool_name_when_skill_has_no_tool_name() -> None:
+    calls: list[dict] = []
+    context = _context_items(
+        resources=[_resource("memoryos://resources/ac", supported_actions=["turn_on_ac"], tool_name="ac_tool", device_id="ac")],
+        skills=[
+            {
+                "uri": "memoryos://skills/ac",
+                "title": "",
+                "metadata": {"supported_actions": ["turn_on_ac"], "executable": True},
+            }
+        ],
+    )
+
+    result = ActionExecutor(_registry(calls)).execute(PolicyDecision(mode="execute", allowed=True, action="turn_on_ac", reason="ok"), context)
+
+    assert result.status == "success"
+    assert result.tool_name == "ac_tool"
+    assert calls
+
+
+def test_execute_falls_back_to_unique_generic_skill_when_no_explicit_skill_matches() -> None:
+    calls: list[dict] = []
+    context = _context_items(
+        resources=[_resource("memoryos://resources/ac", supported_actions=["turn_on_ac"], device_id="ac")],
+        skills=[
+            _skill("memoryos://skills/generic"),
+            _skill("memoryos://skills/fan", supported_actions=["turn_on_fan"]),
+        ],
+    )
+
+    result = ActionExecutor(_registry(calls)).execute(PolicyDecision(mode="execute", allowed=True, action="turn_on_ac", reason="ok"), context)
+
+    assert result.status == "success"
+    assert result.skill_uris == ["memoryos://skills/generic"]
+    assert calls
+
+
+def test_execute_blocks_when_multiple_generic_skills_could_fallback() -> None:
+    calls: list[dict] = []
+    context = _context_items(
+        resources=[_resource("memoryos://resources/ac", supported_actions=["turn_on_ac"], device_id="ac")],
+        skills=[
+            _skill("memoryos://skills/generic-primary"),
+            _skill("memoryos://skills/generic-secondary"),
+            _skill("memoryos://skills/fan", supported_actions=["turn_on_fan"]),
+        ],
+    )
+
+    result = ActionExecutor(_registry(calls)).execute(PolicyDecision(mode="execute", allowed=True, action="turn_on_ac", reason="ok"), context)
+
+    assert result.status == "blocked"
+    assert result.reason == "Ambiguous skills for action turn_on_ac"
+    assert calls == []
+
+
 def test_execute_blocks_ambiguous_resources_for_action() -> None:
     calls: list[dict] = []
     context = _context_items(

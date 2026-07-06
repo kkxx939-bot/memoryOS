@@ -16,5 +16,6 @@ class ObservationNormalizer:
                 signals=[str(item) for item in observation.get("signals", [])],
                 environment=dict(observation.get("environment", {})),
                 observed_at=str(observation.get("observed_at", "")),
+                explicit_scene_key=str(observation.get("scene_key", "")),
             )
         return Observation(user_id=user_id, raw_text=str(observation))

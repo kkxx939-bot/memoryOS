@@ -9,6 +9,7 @@ from memoryos.contextdb.model.context_relation import ContextRelation
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.model.lifecycle import LifecycleState
 from memoryos.prediction.model.prediction_request import PredictionRequest
+from memoryos.prediction.pipeline.observation_normalizer import ObservationNormalizer
 
 
 def _seed_policy(client: MemoryOSClient, policy: ActionPolicy, lifecycle: LifecycleState = LifecycleState.ACTIVE) -> None:
@@ -77,3 +78,16 @@ def test_no_policy_does_not_crash(tmp_path) -> None:
 
     assert result.candidates == []
     assert result.decision.mode in {"ask_user", "do_nothing"}
+
+
+def test_dict_observation_explicit_scene_key_is_preserved() -> None:
+    observation = ObservationNormalizer().normalize(
+        "u1",
+        {
+            "raw_text": "room is hot",
+            "location": "home",
+            "scene_key": "hot_room",
+        },
+    )
+
+    assert observation.scene_key == "hot_room"

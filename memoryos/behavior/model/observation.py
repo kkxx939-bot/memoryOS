@@ -14,9 +14,12 @@ class Observation:
     signals: list[str] = field(default_factory=list)
     environment: dict = field(default_factory=dict)
     observed_at: str = ""
+    explicit_scene_key: str = ""
 
     @property
     def scene_key(self) -> str:
+        if self.explicit_scene_key:
+            return self.explicit_scene_key
         tags = [self.location, self.activity, *sorted(self.signals), *self._environment_buckets()]
         return stable_hash([tag for tag in tags if tag], length=16)
 

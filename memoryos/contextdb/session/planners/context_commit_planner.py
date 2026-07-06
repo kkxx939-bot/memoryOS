@@ -14,6 +14,8 @@ class ContextCommitPlanner:
             uri = str(item.get("uri", ""))
             if not uri or uri in seen:
                 continue
+            if item.get("refresh_layers") is False:
+                continue
             seen.add(uri)
             context_type = ContextType(str(item.get("context_type", self._infer_type(uri))))
             operations.append(

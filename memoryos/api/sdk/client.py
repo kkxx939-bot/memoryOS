@@ -121,6 +121,16 @@ class MemoryOSClient:
             "request_id": request.request_id or result.request_id,
             "scene_key": result.observation.scene_key,
         }
+        used_contexts = self._merge_uri_items(
+            [{"uri": uri} for uri in result.action_context.source_uris],
+            [{"uri": uri, "refresh_layers": False} for uri in action_result.resource_uris],
+        )
+        used_skills = self._uri_items(
+            [
+                *[uri for uri in result.action_context.source_uris if uri.startswith("memoryos://skills/")],
+                *action_result.skill_uris,
+            ]
+        )
         archive = SessionArchive(
             user_id=request.user_id,
             session_id=request.episode_id,
@@ -137,12 +147,8 @@ class MemoryOSClient:
                 }
             ],
             feedback=feedback,
-            used_contexts=[{"uri": uri} for uri in result.action_context.source_uris],
-            used_skills=[
-                {"uri": uri}
-                for uri in result.action_context.source_uris
-                if uri.startswith("memoryos://skills/")
-            ],
+            used_contexts=used_contexts,
+            used_skills=used_skills,
             metadata={"connect": connect_metadata} if connect_metadata else {},
         )
         commit_result = self.context_db.commit_session(archive, async_commit=async_commit)
@@ -239,3 +245,18 @@ class MemoryOSClient:
         if isinstance(context_type, ContextType):
             return context_type
         return ContextType(str(context_type))
+
+    def _uri_items(self, uris: list[str]) -> list[dict[str, str]]:
+        return [{"uri": uri} for uri in dict.fromkeys(str(uri) for uri in uris if uri)]
+
+    def _merge_uri_items(self, *groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        merged: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for group in groups:
+            for item in group:
+                uri = str(item.get("uri", ""))
+                if not uri or uri in seen:
+                    continue
+                seen.add(uri)
+                merged.append(dict(item))
+        return merged

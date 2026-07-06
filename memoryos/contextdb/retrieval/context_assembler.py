@@ -22,9 +22,11 @@ class ContextAssembler:
         connect_filters: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         parsed_type = self._context_type(context_type)
-        hits = self.context_db.search(query, owner_user_id=user_id, context_type=parsed_type, limit=limit)
+        requested_limit = max(0, limit)
+        search_limit = max(requested_limit * 5, 50) if connect_filters and requested_limit else requested_limit
+        hits = self.context_db.search(query, owner_user_id=user_id, context_type=parsed_type, limit=search_limit)
         results = [self._hit_payload(hit) for hit in hits]
-        return self._filter_connect(results, connect_filters)[: max(0, limit)]
+        return self._filter_connect(results, connect_filters)[:requested_limit]
 
     def assemble(
         self,

@@ -27,6 +27,10 @@ class SQLiteQueueStore:
                   action=excluded.action,
                   target_uri=excluded.target_uri,
                   payload_json=excluded.payload_json,
+                  status=excluded.status,
+                  leased_until=excluded.leased_until,
+                  retry_count=excluded.retry_count,
+                  last_error=excluded.last_error,
                   updated_at=excluded.updated_at
                 """,
                 (
