@@ -228,6 +228,7 @@ def test_process_observation_result_to_dict_handles_optional_and_commit_shapes()
         "action_result": None,
         "session_commit_result": None,
         "archive_uri": None,
+        "archive_error": None,
     }
     assert ProcessObservationResult(
         prediction_result=prediction_result,

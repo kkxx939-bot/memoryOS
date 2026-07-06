@@ -13,6 +13,7 @@ class ProcessObservationResult:
     action_result: ActionResult | None = None
     session_commit_result: Any | None = None
     archive_uri: str | None = None
+    archive_error: dict[str, Any] | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -20,6 +21,7 @@ class ProcessObservationResult:
             "action_result": self.action_result.to_dict() if self.action_result is not None else None,
             "session_commit_result": self._session_commit_result_to_dict(),
             "archive_uri": self.archive_uri,
+            "archive_error": self.archive_error,
         }
 
     def _session_commit_result_to_dict(self) -> Any:

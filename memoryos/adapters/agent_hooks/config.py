@@ -13,6 +13,7 @@ class AgentHookConfig:
     agent_name: str
     token_budget: int
     queue_path: str
+    flush_mode: str = "stop"
 
     @classmethod
     def from_env(cls, adapter_id: str = "codex") -> AgentHookConfig:
@@ -25,6 +26,7 @@ class AgentHookConfig:
             agent_name=os.environ.get("MEMORYOS_AGENT_NAME", adapter_id),
             token_budget=_env_int("MEMORYOS_TOKEN_BUDGET", 1200),
             queue_path=queue_path,
+            flush_mode=_flush_mode(),
         )
 
 
@@ -33,3 +35,8 @@ def _env_int(name: str, default: int) -> int:
         return int(os.environ.get(name, default))
     except (TypeError, ValueError):
         return default
+
+
+def _flush_mode() -> str:
+    value = os.environ.get("MEMORYOS_HOOK_FLUSH_MODE", "stop").lower()
+    return value if value in {"never", "stop", "immediate"} else "stop"

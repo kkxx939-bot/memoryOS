@@ -27,6 +27,7 @@ class FakeContextDB:
         self.hits = hits or []
         self.search_calls: list[dict] = []
         self.committed: list[tuple[SessionArchive, bool]] = []
+        self.fail_commit = False
 
     def search(self, query: str, *, owner_user_id=None, context_type=None, limit: int = 10):  # noqa: ANN001
         self.search_calls.append(
@@ -38,6 +39,8 @@ class FakeContextDB:
         raise FileNotFoundError(uri)
 
     def commit_session(self, archive: SessionArchive, *, async_commit: bool = True):  # noqa: ANN201
+        if self.fail_commit:
+            raise RuntimeError("archive down")
         self.committed.append((archive, async_commit))
         return {"status": "done"}
 
@@ -67,6 +70,15 @@ class ReturningExecutor:
     def execute(self, decision, action_context):  # noqa: ANN001, ANN201
         self.called = True
         return ActionResult(action=decision.action, status="skipped", executed=False, reason="test")
+
+
+class RaisingExecutor:
+    def __init__(self) -> None:
+        self.called = False
+
+    def execute(self, decision, action_context):  # noqa: ANN001, ANN201
+        self.called = True
+        raise RuntimeError("motor failed")
 
 
 class ReturningEngine:
@@ -474,6 +486,18 @@ def test_predict_rejects_empty_connect_metadata_before_engine() -> None:
     assert context_db.committed == []
 
 
+def test_predict_rejects_string_false_behavior_capability_before_engine() -> None:
+    metadata = ConnectMetadata.action_capable_embodied("reachy_mini").to_dict()
+    metadata["capabilities"]["can_predict_behavior"] = "false"
+    context_db = FakeContextDB()
+    client = _client(context_db)
+
+    with pytest.raises(ValueError, match="capability field must be boolean"):
+        client.predict(_request(metadata))
+    assert client.engine.called is False
+    assert context_db.committed == []
+
+
 def test_predict_rejects_agent_action_capable_metadata_before_engine() -> None:
     metadata = ConnectMetadata(
         run_mode=PipelineMode.ACTION_CAPABLE,
@@ -523,6 +547,19 @@ def test_process_observation_rejects_missing_execute_capability_before_engine_or
     assert context_db.committed == []
 
 
+def test_process_observation_rejects_string_false_execute_capability_before_engine_or_executor() -> None:
+    metadata = ConnectMetadata.action_capable_embodied("reachy_mini").to_dict()
+    metadata["capabilities"]["can_execute_action"] = "false"
+    context_db = FakeContextDB()
+    client = _client(context_db)
+
+    with pytest.raises(ValueError, match="capability field must be boolean"):
+        client.process_observation(_request(metadata))
+    assert client.engine.called is False
+    assert client.executor.called is False
+    assert context_db.committed == []
+
+
 def test_process_observation_allows_embodied_action_capable_execute_metadata() -> None:
     context_db = FakeContextDB()
     client = _client(context_db)
@@ -539,6 +576,79 @@ def test_process_observation_allows_embodied_action_capable_execute_metadata() -
     assert async_commit is False
     assert archive.metadata["connect"]["connect_type"] == "embodied"
     assert archive.metadata["connect"]["run_mode"] == "action_capable"
+
+
+def test_process_observation_returns_archive_error_when_commit_fails_after_action() -> None:
+    context_db = FakeContextDB()
+    context_db.fail_commit = True
+    client = _client(context_db)
+    client.engine = ReturningEngine(_prediction_result())
+    client.executor = ReturningExecutor()
+    metadata = ConnectMetadata.action_capable_embodied("reachy_mini").to_dict()
+
+    result = client.process_observation(_request(metadata), async_commit=False)
+
+    assert result.action_result is not None
+    assert result.archive_error == {"code": "ARCHIVE_COMMIT_FAILED", "message": "RuntimeError"}
+    assert result.session_commit_result is None
+    assert result.archive_uri == "memoryos://user/u1/sessions/history/s1"
+    assert client.executor.called is True
+
+
+def test_process_observation_archives_failed_action_when_executor_raises() -> None:
+    context_db = FakeContextDB()
+    client = _client(context_db)
+    client.engine = ReturningEngine(_prediction_result())
+    client.executor = RaisingExecutor()
+    metadata = ConnectMetadata.action_capable_embodied("reachy_mini").to_dict()
+
+    result = client.process_observation(_request(metadata), async_commit=False)
+
+    assert result.action_result is not None
+    assert result.action_result.status == "failed"
+    assert result.action_result.executed is False
+    archive, _async_commit = context_db.committed[0]
+    assert archive.action_results[0]["action_result"]["status"] == "failed"
+
+
+def test_commit_agent_session_uses_stable_task_id_for_same_payload() -> None:
+    context_db = FakeContextDB()
+    client = _client(context_db)
+    metadata = ConnectMetadata.default_agent("codex").to_dict()
+
+    first = client.commit_agent_session(
+        user_id="u1",
+        session_id="s1",
+        messages=[{"role": "user", "content": "same"}],
+        tool_results=[{"tool_name": "shell", "tool_output": "ok"}],
+        connect_metadata=metadata,
+        async_commit=False,
+    )
+    second = client.commit_agent_session(
+        user_id="u1",
+        session_id="s1",
+        messages=[{"role": "user", "content": "same"}],
+        tool_results=[{"tool_name": "shell", "tool_output": "ok"}],
+        connect_metadata=metadata,
+        async_commit=False,
+    )
+    client.commit_agent_session(
+        user_id="u1",
+        session_id="s1",
+        messages=[{"role": "user", "content": "different"}],
+        tool_results=[{"tool_name": "shell", "tool_output": "ok"}],
+        connect_metadata=metadata,
+        async_commit=False,
+    )
+
+    first_archive = context_db.committed[0][0]
+    second_archive = context_db.committed[1][0]
+    third_archive = context_db.committed[2][0]
+    assert first == {"status": "done"}
+    assert second == {"status": "done"}
+    assert first_archive.task_id == second_archive.task_id
+    assert third_archive.task_id != first_archive.task_id
+    assert first_archive.archive_uri == second_archive.archive_uri
 
 
 class FakeExternalClient:

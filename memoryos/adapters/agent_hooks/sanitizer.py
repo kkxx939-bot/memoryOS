@@ -5,6 +5,11 @@ from typing import Any
 
 SECRET_KEY_RE = re.compile(r"(?i)(api[_-]?key|token|password|secret|authorization)")
 PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.DOTALL)
+BEARER_RE = re.compile(r"(?i)(authorization\s*:\s*bearer\s+)[^\s]+")
+ENV_SECRET_RE = re.compile(
+    r"(?i)\b([A-Z0-9_]*(?:API[_-]?KEY|TOKEN|PASSWORD|SECRET)[A-Z0-9_]*)(\s*=\s*)([^\s]+)"
+)
+INLINE_SECRET_RE = re.compile(r"(?i)\b(api[_-]?key|token|password|secret)(\s*[:=]\s*)([^\s,;]+)")
 NOISY_PATH_PARTS = {".git", "node_modules", "venv", ".venv", "dist", "build", "__pycache__"}
 MAX_TEXT = 4000
 MAX_LOG_LINES = 80
@@ -35,6 +40,9 @@ def sanitize_text(text: str, *, max_text: int = MAX_TEXT) -> str:
     if "\x00" in text:
         return "<binary>"
     redacted = PRIVATE_KEY_RE.sub("<redacted-private-key>", text)
+    redacted = BEARER_RE.sub(r"\1<redacted>", redacted)
+    redacted = ENV_SECRET_RE.sub(r"\1\2<redacted>", redacted)
+    redacted = INLINE_SECRET_RE.sub(r"\1\2<redacted>", redacted)
     lines = redacted.splitlines()
     if len(lines) > MAX_LOG_LINES:
         head = lines[:40]

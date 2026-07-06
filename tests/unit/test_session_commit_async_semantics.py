@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, cast
 
+from memoryos.api.mcp.config import MCPServerConfig
+from memoryos.api.mcp.server import MemoryOSMCPServer
 from memoryos.api.sdk.client import MemoryOSClient
 from memoryos.connect import ConnectMetadata
 from memoryos.contextdb.context_db import ContextDB
@@ -149,3 +151,20 @@ def test_process_observation_async_false_returns_queued_commit_result_and_worker
     assert result.archive_uri == "memoryos://user/u1/sessions/history/ep1"
     pending = queue.lease("session_commit", 1)
     assert [job.job_id for job in pending] == [result.session_commit_result.task_id]
+
+
+def test_mcp_commit_session_retry_same_payload_enqueues_one_stable_job(tmp_path) -> None:
+    queue = InMemoryQueueStore()
+    client = MemoryOSClient(str(tmp_path), queue_store=queue)
+    server = MemoryOSMCPServer(
+        client,
+        MCPServerConfig(root=str(tmp_path), user_id="u1", adapter_id="codex", agent_name="codex"),
+    )
+    args = {"session_id": "s1", "messages": [{"role": "user", "content": "same"}]}
+
+    first = server.call_tool("memoryos_commit_session", args)
+    second = server.call_tool("memoryos_commit_session", args)
+
+    assert first["result"]["task_id"] == second["result"]["task_id"]
+    assert list(queue.jobs) == [first["result"]["task_id"]]
+    assert queue.jobs[first["result"]["task_id"]].status == "pending"

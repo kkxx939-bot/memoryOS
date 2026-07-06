@@ -8,9 +8,11 @@ from memoryos.action_policy.model.action_policy import ActionPolicy
 from memoryos.api.mcp.config import MCPServerConfig
 from memoryos.api.mcp.errors import MCPErrorCode, ToolPermissionError, exception_payload, ok_payload
 from memoryos.api.mcp.schemas import (
+    agent_search_filter_metadata,
     connection_schema,
     normalize_action_metadata,
     normalize_agent_metadata,
+    optional_bool,
     optional_int,
     optional_list,
     require_process_observation_metadata,
@@ -50,17 +52,31 @@ class MCPToolRouter:
         query = required_str(args, "query")
         limit = optional_int(args, "limit", 10, minimum=0, maximum=100)
         metadata = normalize_agent_metadata(args.get("connect_metadata"), self.config)
+        filter_metadata = agent_search_filter_metadata(args.get("connect_metadata"), self.config)
         context_type = args.get("context_type")
         context_types = optional_list(args, "context_types")
-        if context_type is None and context_types:
-            context_type = context_types[0]
-        contexts = self.client.search_context(
-            query,
-            user_id=args.get("user_id") or self.config.user_id,
-            context_type=context_type,
-            limit=limit,
-            connect_metadata=metadata,
-        )
+        requested_types = [context_type] if context_type is not None else list(context_types or [])
+        if requested_types:
+            contexts = []
+            for requested_type in requested_types:
+                contexts.extend(
+                    self.client.search_context(
+                        query,
+                        user_id=args.get("user_id") or self.config.user_id,
+                        context_type=requested_type,
+                        limit=limit,
+                        connect_metadata=filter_metadata,
+                    )
+                )
+            contexts = _dedupe_contexts(contexts)[:limit]
+        else:
+            contexts = self.client.search_context(
+                query,
+                user_id=args.get("user_id") or self.config.user_id,
+                context_type=None,
+                limit=limit,
+                connect_metadata=filter_metadata,
+            )
         source_uris = [str(item.get("uri", "")) for item in contexts if item.get("uri")]
         return ok_payload({"contexts": contexts, "results": contexts, "source_uris": source_uris, "metadata": {"connect": metadata}})
 
@@ -70,13 +86,14 @@ class MCPToolRouter:
         limit = optional_int(args, "limit", 20, minimum=0, maximum=200)
         context_types = optional_list(args, "context_types")
         metadata = normalize_agent_metadata(args.get("connect_metadata"), self.config)
+        filter_metadata = agent_search_filter_metadata(args.get("connect_metadata"), self.config)
         assembled = self.client.assemble_context(
             query,
             user_id=args.get("user_id") or self.config.user_id,
             token_budget=token_budget,
             context_types=context_types,
             limit=limit,
-            connect_metadata=metadata,
+            connect_metadata=filter_metadata,
         )
         payload = {
             "packed_context": assembled.get("packed_context", ""),
@@ -100,7 +117,7 @@ class MCPToolRouter:
             used_contexts=list(args.get("used_contexts") or []),
             tool_results=list(args.get("tool_results") or []),
             connect_metadata=metadata,
-            async_commit=bool(args.get("async_commit", True)),
+            async_commit=optional_bool(args, "async_commit", False),
         )
         result_payload = _to_payload(result) or {"status": "accepted"}
         return ok_payload({"status": result_payload.get("status", "accepted"), "result": result_payload, "metadata": {"connect": metadata}})
@@ -141,8 +158,8 @@ class MCPToolRouter:
         result = self.client.process_observation(
             PredictionRequest(**request_payload),
             _policies(args.get("policies")),
-            archive_session=bool(args.get("archive_session", True)),
-            async_commit=bool(args.get("async_commit", True)),
+            archive_session=optional_bool(args, "archive_session", True),
+            async_commit=optional_bool(args, "async_commit", True),
         )
         return ok_payload({"result": _to_payload(result)})
 
@@ -168,6 +185,18 @@ def _to_payload(value: Any) -> Any:
     if isinstance(value, dict):
         return dict(value)
     return value
+
+
+def _dedupe_contexts(contexts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for item in sorted(contexts, key=lambda row: float(row.get("score", 0.0)), reverse=True):
+        uri = str(item.get("uri", ""))
+        if uri in seen:
+            continue
+        seen.add(uri)
+        deduped.append(item)
+    return deduped
 
 
 def _policies(value: Any) -> list[ActionPolicy] | None:

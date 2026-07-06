@@ -44,21 +44,32 @@ class AgentHookEvent:
         cwd = _str_or_none(data.get("cwd") or data.get("workspace") or os.getcwd())
         repo_root = _str_or_none(data.get("repo_root")) or _git_value(cwd, ["rev-parse", "--show-toplevel"])
         branch = _str_or_none(data.get("branch")) or _git_value(cwd, ["branch", "--show-current"])
-        session_id = _str_or_none(data.get("session_id") or data.get("conversation_id") or os.environ.get("MEMORYOS_SESSION_ID"))
-        if not session_id:
-            session_id = "agent-" + _stable_hash({"adapter_id": adapter_id, "cwd": cwd, "repo_root": repo_root})[:16]
         prompt = _str_or_none(data.get("prompt") or data.get("user_prompt") or data.get("input"))
         raw_messages = data.get("messages")
         messages: list[Any] = raw_messages if isinstance(raw_messages, list) else []
         raw_changed_files = data.get("changed_files")
         changed_files: list[Any] = raw_changed_files if isinstance(raw_changed_files, list) else []
+        session_id = _str_or_none(data.get("session_id") or data.get("conversation_id") or os.environ.get("MEMORYOS_SESSION_ID"))
+        if not session_id:
+            session_id = "agent-" + _stable_hash(
+                {
+                    "adapter_id": adapter_id,
+                    "cwd": cwd,
+                    "repo_root": repo_root,
+                    "branch": branch,
+                    "task_hint": _task_hint(data, prompt, messages, changed_files),
+                }
+            )[:16]
         event_core = {
             "adapter_id": adapter_id,
             "hook_name": hook_name,
             "session_id": session_id,
-            "timestamp": data.get("timestamp"),
             "prompt": prompt,
             "tool_name": data.get("tool_name") or data.get("name"),
+            "tool_input": data.get("tool_input"),
+            "tool_output": data.get("tool_output", data.get("output")),
+            "changed_files": changed_files,
+            "messages": messages,
         }
         event_id = _str_or_none(data.get("event_id")) or "hook-" + _stable_hash(event_core)[:24]
         known = {
@@ -120,6 +131,16 @@ class AgentHookEvent:
 def _stable_hash(payload: dict[str, Any]) -> str:
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _task_hint(data: dict[str, Any], prompt: str | None, messages: list[Any], changed_files: list[Any]) -> dict[str, Any]:
+    return {
+        "prompt": prompt,
+        "messages": messages,
+        "tool_name": data.get("tool_name") or data.get("name"),
+        "tool_input": data.get("tool_input"),
+        "changed_files": changed_files,
+    }
 
 
 def _str_or_none(value: Any) -> str | None:

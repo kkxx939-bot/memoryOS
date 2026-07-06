@@ -24,8 +24,9 @@ class CursorHookAdapter(BaseAgentHookAdapter):
             return self.assemble_context(event)
         if hook_name == "after_turn":
             committed = self.commit_now(event)
-            flushed = self.flush()
-            committed.flushed = flushed.flushed
+            if self.config.flush_mode in {"stop", "immediate"}:
+                flushed = self.flush()
+                committed.flushed = flushed.flushed
             return committed
         if hook_name == "flush":
             return self.flush()

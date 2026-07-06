@@ -132,11 +132,16 @@ def optional_list(payload: dict[str, Any], key: str) -> list[Any] | None:
     return value
 
 
+def optional_bool(payload: dict[str, Any], key: str, default: bool) -> bool:
+    value = payload.get(key, default)
+    if isinstance(value, bool):
+        return value
+    raise ToolValidationError(f"requires boolean field: {key}")
+
+
 def normalize_agent_metadata(payload: dict[str, Any] | None, config: MCPServerConfig) -> dict[str, Any]:
     raw = _filtered_metadata(payload)
-    adapter_id = str(raw.get("adapter_id") or config.adapter_id)
-    if adapter_id not in config.allowed_adapter_ids:
-        adapter_id = config.adapter_id
+    adapter_id = _allowed_agent_adapter_id(raw.get("adapter_id") or config.adapter_id, config)
     extra: dict[str, Any] = dict(raw.get("extra", {})) if isinstance(raw.get("extra"), dict) else {}
     metadata = ConnectMetadata(
         connect_type=ConnectType.AGENT,
@@ -158,6 +163,17 @@ def normalize_agent_metadata(payload: dict[str, Any] | None, config: MCPServerCo
         extra=extra,
     )
     return metadata.to_dict()
+
+
+def agent_search_filter_metadata(payload: dict[str, Any] | None, config: MCPServerConfig) -> dict[str, Any]:
+    raw = _filtered_metadata(payload)
+    adapter_id = _allowed_agent_adapter_id(raw.get("adapter_id") or config.adapter_id, config)
+    filters: dict[str, Any] = {"adapter_id": adapter_id}
+    for key in ("connect_type", "run_mode", "world_domain", "source_kind"):
+        value = raw.get(key)
+        if isinstance(value, str) and value:
+            filters[key] = value
+    return filters
 
 
 def normalize_action_metadata(payload: dict[str, Any] | None) -> ConnectMetadata:
@@ -198,3 +214,10 @@ def _filtered_metadata(payload: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ToolValidationError("connect_metadata must be an object")
     return {key: value for key, value in payload.items() if key in ALLOWED_METADATA_FIELDS}
+
+
+def _allowed_agent_adapter_id(value: Any, config: MCPServerConfig) -> str:
+    adapter_id = str(value)
+    if adapter_id not in config.allowed_adapter_ids:
+        raise ToolValidationError(f"adapter_id is not allowed: {adapter_id}")
+    return adapter_id

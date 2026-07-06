@@ -48,14 +48,16 @@ class CapabilityProfile:
     def from_dict(cls, payload: dict[str, Any] | None) -> CapabilityProfile:
         if payload is None:
             return cls()
+        if not isinstance(payload, dict):
+            raise ValueError("capabilities must be an object")
         return cls(
-            can_write_memory=bool(payload.get("can_write_memory", True)),
-            can_search_context=bool(payload.get("can_search_context", True)),
-            can_reduce_context=bool(payload.get("can_reduce_context", True)),
-            can_predict_behavior=bool(payload.get("can_predict_behavior", False)),
-            can_generate_action=bool(payload.get("can_generate_action", False)),
-            can_execute_action=bool(payload.get("can_execute_action", False)),
-            can_use_external_tools=bool(payload.get("can_use_external_tools", False)),
+            can_write_memory=_strict_bool(payload, "can_write_memory", True),
+            can_search_context=_strict_bool(payload, "can_search_context", True),
+            can_reduce_context=_strict_bool(payload, "can_reduce_context", True),
+            can_predict_behavior=_strict_bool(payload, "can_predict_behavior", False),
+            can_generate_action=_strict_bool(payload, "can_generate_action", False),
+            can_execute_action=_strict_bool(payload, "can_execute_action", False),
+            can_use_external_tools=_strict_bool(payload, "can_use_external_tools", False),
         )
 
 
@@ -145,3 +147,12 @@ class ConnectMetadata:
                 can_use_external_tools=True,
             ),
         )
+
+
+def _strict_bool(payload: dict[str, Any], key: str, default: bool) -> bool:
+    if key not in payload:
+        return default
+    value = payload[key]
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"capability field must be boolean: {key}")

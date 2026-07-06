@@ -28,13 +28,15 @@ class CodexHookAdapter(BaseAgentHookAdapter):
             return self.assemble_context(event)
         if hook_name == "PostToolUse":
             queued = self.enqueue_commit(event)
-            flushed = self.flush()
-            queued.flushed = flushed.flushed
+            if self.config.flush_mode == "immediate":
+                flushed = self.flush()
+                queued.flushed = flushed.flushed
             return queued
         if hook_name == "Stop":
             committed = self.commit_now(event)
-            flushed = self.flush()
-            committed.flushed = flushed.flushed
+            if self.config.flush_mode in {"stop", "immediate"}:
+                flushed = self.flush()
+                committed.flushed = flushed.flushed
             return committed
         if hook_name == "PreCompact":
             assembled = self.assemble_context(event)
@@ -42,5 +44,8 @@ class CodexHookAdapter(BaseAgentHookAdapter):
             assembled.committed = committed.committed
             assembled.queued = committed.queued
             assembled.error = assembled.error or committed.error
+            if self.config.flush_mode in {"stop", "immediate"}:
+                flushed = self.flush()
+                assembled.flushed = flushed.flushed
             return assembled
         return HookResult(ok=False, session_id=event.session_id, error={"code": "VALIDATION_ERROR", "message": f"unknown Codex hook: {hook_name}"})

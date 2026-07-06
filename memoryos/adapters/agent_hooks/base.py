@@ -79,7 +79,7 @@ class BaseAgentHookAdapter:
             "tool_results": [tool_result] if event.tool_name or event.tool_output is not None else [],
             "used_contexts": sanitize_payload(event.metadata.get("used_contexts", [])),
             "connect_metadata": _agent_hook_metadata(event.adapter_id),
-            "async_commit": True,
+            "async_commit": False,
         }
         queued = self.queue.enqueue(
             PendingItem(
@@ -100,7 +100,7 @@ class BaseAgentHookAdapter:
             "used_contexts": sanitize_payload(event.metadata.get("used_contexts", [])),
             "tool_results": sanitize_payload(event.metadata.get("tool_results", [])),
             "connect_metadata": _agent_hook_metadata(event.adapter_id),
-            "async_commit": True,
+            "async_commit": False,
         }
         try:
             result = self.mcp_client.call_tool("memoryos_commit_session", arguments)

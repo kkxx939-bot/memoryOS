@@ -12,6 +12,7 @@ from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.contextdb.store import IndexStore, RelationStore, SourceStore
 from memoryos.contextdb.store.source_store import LockStore, QueueStore
 from memoryos.contextdb.store.vector_store import VectorStore
+from memoryos.core.ids import stable_hash
 from memoryos.prediction.model.prediction_request import PredictionRequest
 from memoryos.prediction.model.prediction_result import PredictionResult
 from memoryos.providers.embedding import EmbeddingProvider
@@ -76,7 +77,18 @@ class MemoryOSClient:
         metadata = self._require_process_observation_metadata(request.connect_metadata)
         connect_metadata = metadata.to_dict()
         result = self.engine.process(request, policies=policies)
-        action_result = self.executor.execute(result.decision, result.action_context)
+        try:
+            action_result = self.executor.execute(result.decision, result.action_context)
+        except Exception as exc:
+            from memoryos.prediction.model.action_result import ActionResult
+
+            action_result = ActionResult(
+                action=result.decision.action,
+                status="failed",
+                executed=False,
+                reason="ActionExecutor raised",
+                error=exc.__class__.__name__,
+            )
         if not archive_session:
             return ProcessObservationResult(
                 prediction_result=result,
@@ -131,12 +143,18 @@ class MemoryOSClient:
             used_skills=used_skills,
             metadata={"connect": connect_metadata},
         )
-        commit_result = self.context_db.commit_session(archive, async_commit=async_commit)
+        archive_error = None
+        try:
+            commit_result = self.context_db.commit_session(archive, async_commit=async_commit)
+        except Exception as exc:
+            commit_result = None
+            archive_error = {"code": "ARCHIVE_COMMIT_FAILED", "message": exc.__class__.__name__}
         return ProcessObservationResult(
             prediction_result=result,
             action_result=action_result,
             session_commit_result=commit_result,
             archive_uri=archive.archive_uri,
+            archive_error=archive_error,
         )
 
     def search_context(
@@ -194,14 +212,28 @@ class MemoryOSClient:
         async_commit: bool = True,
     ) -> Any:
         metadata = self._parse_connect_metadata(connect_metadata)
+        archive_uri = f"memoryos://user/{user_id}/sessions/history/{session_id}"
+        normalized_metadata = metadata.to_dict()
+        task_id = _stable_session_commit_task_id(
+            {
+                "user_id": user_id,
+                "session_id": session_id,
+                "archive_uri": archive_uri,
+                "messages": messages or [],
+                "used_contexts": used_contexts or [],
+                "tool_results": tool_results or [],
+                "metadata": {"connect": normalized_metadata},
+            }
+        )
         archive = SessionArchive(
             user_id=user_id,
             session_id=session_id,
-            archive_uri=f"memoryos://user/{user_id}/sessions/history/{session_id}",
+            archive_uri=archive_uri,
             messages=messages or [],
             used_contexts=used_contexts or [],
             tool_results=tool_results or [],
-            metadata={"connect": metadata.to_dict()},
+            metadata={"connect": normalized_metadata},
+            task_id=task_id,
         )
         return self.context_db.commit_session(archive, async_commit=async_commit)
 
@@ -267,3 +299,7 @@ class MemoryOSClient:
                 seen.add(uri)
                 merged.append(dict(item))
         return merged
+
+
+def _stable_session_commit_task_id(payload: dict[str, Any]) -> str:
+    return f"session_commit_{stable_hash(payload, length=32)}"

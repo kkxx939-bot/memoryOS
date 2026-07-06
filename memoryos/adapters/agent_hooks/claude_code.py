@@ -24,7 +24,8 @@ class ClaudeCodeHookAdapter(BaseAgentHookAdapter):
             return self.assemble_context(event)
         if hook_name == "after_turn":
             committed = self.commit_now(event)
-            flushed = self.flush()
-            committed.flushed = flushed.flushed
+            if self.config.flush_mode in {"stop", "immediate"}:
+                flushed = self.flush()
+                committed.flushed = flushed.flushed
             return committed
         return HookResult(ok=False, session_id=event.session_id, error={"code": "VALIDATION_ERROR", "message": f"unknown Claude Code hook: {hook_name}"})

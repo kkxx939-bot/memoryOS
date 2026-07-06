@@ -69,6 +69,108 @@ def test_cli_predict_rejects_agent_metadata_before_client(monkeypatch, capsys) -
     assert FakeCLIClient.calls == []
 
 
+def test_cli_predict_rejects_string_false_behavior_capability(monkeypatch, capsys) -> None:  # noqa: ANN001
+    FakeCLIClient.calls = []
+    monkeypatch.setattr(cli_main, "MemoryOSClient", FakeCLIClient)
+    metadata = ConnectMetadata.action_capable_embodied("reachy_mini").to_dict()
+    metadata["capabilities"]["can_predict_behavior"] = "false"
+
+    exit_code = cli_main.main(
+        [
+            "predict",
+            "--user",
+            "u1",
+            "--episode",
+            "s1",
+            "--observation",
+            "hot",
+            "--connect-metadata-json",
+            json.dumps(metadata),
+        ]
+    )
+
+    assert exit_code == 2
+    assert "capability field must be boolean" in capsys.readouterr().err
+    assert FakeCLIClient.calls == []
+
+
+def test_cli_predict_stable_errors_for_bad_metadata_and_policies(tmp_path: Path, monkeypatch, capsys) -> None:  # noqa: ANN001
+    FakeCLIClient.calls = []
+    monkeypatch.setattr(cli_main, "MemoryOSClient", FakeCLIClient)
+    missing = tmp_path / "missing.json"
+    bad_file = tmp_path / "bad.json"
+    bad_file.write_text("{bad json", encoding="utf-8")
+    valid_metadata = json.dumps(ConnectMetadata.action_capable_embodied("reachy_mini").to_dict())
+
+    missing_code = cli_main.main(
+        [
+            "predict",
+            "--user",
+            "u1",
+            "--episode",
+            "s1",
+            "--observation",
+            "hot",
+            "--connect-metadata-file",
+            str(missing),
+        ]
+    )
+    missing_err = capsys.readouterr().err
+    bad_file_code = cli_main.main(
+        [
+            "predict",
+            "--user",
+            "u1",
+            "--episode",
+            "s1",
+            "--observation",
+            "hot",
+            "--connect-metadata-file",
+            str(bad_file),
+        ]
+    )
+    bad_file_err = capsys.readouterr().err
+    bad_json_code = cli_main.main(
+        [
+            "predict",
+            "--user",
+            "u1",
+            "--episode",
+            "s1",
+            "--observation",
+            "hot",
+            "--connect-metadata-json",
+            "{bad json",
+        ]
+    )
+    bad_json_err = capsys.readouterr().err
+    bad_policies_code = cli_main.main(
+        [
+            "predict",
+            "--user",
+            "u1",
+            "--episode",
+            "s1",
+            "--observation",
+            "hot",
+            "--connect-metadata-json",
+            valid_metadata,
+            "--policies-json",
+            "{}",
+        ]
+    )
+    bad_policies_err = capsys.readouterr().err
+
+    assert missing_code == bad_file_code == bad_json_code == bad_policies_code == 2
+    assert "failed to read connect metadata file" in missing_err
+    assert str(missing) not in missing_err
+    assert "valid JSON" in bad_file_err
+    assert "valid JSON" in bad_json_err
+    assert "policies JSON must be an array" in bad_policies_err
+    assert "Traceback" not in missing_err + bad_file_err + bad_json_err + bad_policies_err
+    assert FakeCLIClient.calls == []
+
+
 def test_cli_predict_allows_action_capable_embodied_metadata_json(monkeypatch, capsys) -> None:  # noqa: ANN001
     FakeCLIClient.calls = []
     monkeypatch.setattr(cli_main, "MemoryOSClient", FakeCLIClient)

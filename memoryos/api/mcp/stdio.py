@@ -25,6 +25,7 @@ def main() -> None:
 
 
 def _handle_jsonrpc(server: MemoryOSMCPServer, line: str) -> dict[str, Any]:
+    request_id: Any = None
     try:
         request = json.loads(line)
         request_id = request.get("id")
@@ -48,8 +49,8 @@ def _handle_jsonrpc(server: MemoryOSMCPServer, line: str) -> dict[str, Any]:
         return {"jsonrpc": "2.0", "id": request_id, "result": result}
     except json.JSONDecodeError:
         return {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Invalid JSON"}}
-    except Exception as exc:
-        return {"jsonrpc": "2.0", "id": None, "error": {"code": -32603, "message": str(exc)[:200] or exc.__class__.__name__}}
+    except Exception:
+        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32603, "message": "Internal error"}}
 
 
 if __name__ == "__main__":

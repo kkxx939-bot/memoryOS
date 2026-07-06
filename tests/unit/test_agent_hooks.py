@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -64,7 +65,7 @@ def test_codex_user_prompt_submit_injects_bounded_context(tmp_path: Path) -> Non
     assert "memoryos://ctx/1" in result["injection_text"]
 
 
-def test_codex_post_tool_use_enqueues_and_flushes(tmp_path: Path) -> None:
+def test_codex_post_tool_use_enqueues_without_immediate_flush(tmp_path: Path) -> None:
     fake = FakeHookMCPClient(fail_commit=True)
     adapter = CodexHookAdapter(_config(tmp_path), mcp_client=fake)
 
@@ -74,7 +75,8 @@ def test_codex_post_tool_use_enqueues_and_flushes(tmp_path: Path) -> None:
     ).to_dict()
 
     assert result["queued"] is True
-    assert result["flushed"]["failed"] == 1
+    assert result["flushed"] == {}
+    assert fake.calls == []
     assert len(PendingQueue(_config(tmp_path).queue_path).list_items()) == 1
 
 
@@ -98,6 +100,7 @@ def test_codex_stop_commits_and_flushes_queue(tmp_path: Path) -> None:
     assert result["committed"] is True
     assert result["flushed"]["flushed"] == 1
     assert queue.list_items() == []
+    assert fake.calls[0][1]["async_commit"] is False
 
 
 def test_codex_precompact_assembles_and_commits(tmp_path: Path) -> None:
@@ -206,6 +209,29 @@ def test_pending_queue_idempotency_retry_success_and_corrupt_file(tmp_path: Path
     assert [item.event_id for item in queue.list_items()] == ["e2"]
 
 
+def test_pending_queue_concurrent_enqueue_keeps_all_unique_events(tmp_path: Path) -> None:
+    queue = PendingQueue(str(tmp_path / "queue.jsonl"))
+
+    def enqueue(index: int) -> None:
+        queue.enqueue(
+            PendingItem(
+                event_id=f"e{index}",
+                session_id="s1",
+                adapter_id="codex",
+                hook_name="PostToolUse",
+                payload={"tool_name": "memoryos_commit_session", "arguments": {"session_id": "s1"}},
+            )
+        )
+
+    threads = [threading.Thread(target=enqueue, args=(index,)) for index in range(20)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert {item.event_id for item in queue.list_items()} == {f"e{index}" for index in range(20)}
+
+
 def test_agent_hook_event_id_is_stable_for_retry_payloads(tmp_path: Path) -> None:
     payload = {"session_id": "s1", "prompt": "same prompt", "cwd": str(tmp_path)}
 
@@ -226,6 +252,28 @@ def test_agent_hook_event_id_is_stable_for_retry_payloads(tmp_path: Path) -> Non
     assert with_timestamp.event_id == same_timestamp.event_id
 
 
+def test_agent_hook_event_id_changes_for_different_tool_payloads(tmp_path: Path) -> None:
+    base = {"session_id": "s1", "cwd": str(tmp_path), "tool_name": "shell"}
+
+    first = AgentHookEvent.from_payload({**base, "tool_input": {"cmd": "ls"}, "tool_output": "one"}, adapter_id="codex", hook_name="PostToolUse")
+    same = AgentHookEvent.from_payload({**base, "tool_input": {"cmd": "ls"}, "tool_output": "one"}, adapter_id="codex", hook_name="PostToolUse")
+    different_input = AgentHookEvent.from_payload({**base, "tool_input": {"cmd": "pwd"}, "tool_output": "one"}, adapter_id="codex", hook_name="PostToolUse")
+    different_output = AgentHookEvent.from_payload({**base, "tool_input": {"cmd": "ls"}, "tool_output": "two"}, adapter_id="codex", hook_name="PostToolUse")
+
+    assert first.event_id == same.event_id
+    assert different_input.event_id != first.event_id
+    assert different_output.event_id != first.event_id
+
+
+def test_fallback_session_id_includes_prompt_hint(tmp_path: Path) -> None:
+    first = AgentHookEvent.from_payload({"cwd": str(tmp_path), "prompt": "task one"}, adapter_id="codex", hook_name="UserPromptSubmit")
+    second = AgentHookEvent.from_payload({"cwd": str(tmp_path), "prompt": "task two"}, adapter_id="codex", hook_name="UserPromptSubmit")
+    repeat = AgentHookEvent.from_payload({"cwd": str(tmp_path), "prompt": "task one"}, adapter_id="codex", hook_name="UserPromptSubmit")
+
+    assert first.session_id == repeat.session_id
+    assert first.session_id != second.session_id
+
+
 def test_pending_queue_refuses_action_capable_tools(tmp_path: Path) -> None:
     queue = PendingQueue(str(tmp_path / "queue.jsonl"))
     queue.enqueue(
@@ -242,8 +290,31 @@ def test_pending_queue_refuses_action_capable_tools(tmp_path: Path) -> None:
     result = queue.flush(fake)
 
     assert result["failed"] == 1
+    assert result["dead_lettered"] == 1
     assert fake.calls == []
-    assert queue.list_items()[0].last_error == "RuntimeError"
+    assert queue.list_items() == []
+    assert "DISALLOWED_HOOK_TOOL" in queue.dead_letter_path.read_text(encoding="utf-8")
+
+
+def test_pending_queue_dead_letters_after_retry_limit(tmp_path: Path) -> None:
+    queue = PendingQueue(str(tmp_path / "queue.jsonl"), max_retries=2)
+    queue.enqueue(
+        PendingItem(
+            event_id="e1",
+            session_id="s1",
+            adapter_id="codex",
+            hook_name="Stop",
+            payload={"tool_name": "memoryos_commit_session", "arguments": {"session_id": "s1"}},
+        )
+    )
+
+    first = queue.flush(FakeHookMCPClient(fail_commit=True))
+    second = queue.flush(FakeHookMCPClient(fail_commit=True))
+
+    assert first["remaining"] == 1
+    assert second["remaining"] == 0
+    assert second["dead_lettered"] == 1
+    assert "CLIENT_ERROR" in queue.dead_letter_path.read_text(encoding="utf-8")
 
 
 def test_sanitizer_redacts_secret_truncates_logs_and_filters_paths() -> None:
@@ -255,13 +326,27 @@ def test_sanitizer_redacts_secret_truncates_logs_and_filters_paths() -> None:
         "paths": ["src/app.py", "node_modules/pkg/index.js", ".git/config"],
     }
     sanitized = sanitize_payload(payload, max_text=200)
-    summary = summarize_tool_result("shell", {"password": "pw"}, "x" * 5000, ["dist/out.js", "memoryos/api/mcp/server.py"])
+    output = "\n".join(
+        [
+            "Authorization: Bearer sk-test",
+            "OPENAI_API_KEY=sk-env",
+            "api_key: raw",
+            "password=secret",
+            "ordinary context remains",
+        ]
+    )
+    summary = summarize_tool_result("shell", {"password": "pw"}, output, ["dist/out.js", "memoryos/api/mcp/server.py"])
 
     assert sanitized["api_key"] == "<redacted>"
     assert "<redacted-private-key>" in sanitized["private"]
     assert "omitted" in sanitized["output"]
     assert sanitized["paths"] == ["src/app.py"]
     assert summary["tool_input"]["password"] == "<redacted>"
+    assert "Bearer <redacted>" in summary["tool_output"]
+    assert "OPENAI_API_KEY=<redacted>" in summary["tool_output"]
+    assert "api_key: <redacted>" in summary["tool_output"]
+    assert "password=<redacted>" in summary["tool_output"]
+    assert "ordinary context remains" in summary["tool_output"]
     assert summary["changed_files"] == ["memoryos/api/mcp/server.py"]
     assert sanitize_changed_files([".venv/bin/python", "a.py"]) == ["a.py"]
 

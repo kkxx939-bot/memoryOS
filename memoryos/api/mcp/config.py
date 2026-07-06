@@ -27,15 +27,18 @@ class MCPServerConfig:
         queue_path = os.environ.get("MEMORYOS_HOOK_QUEUE_PATH") or str(
             Path(root) / "queues" / "agent_hooks.jsonl"
         )
+        adapter_id = os.environ.get("MEMORYOS_ADAPTER_ID", "codex")
+        allowed = _allowed_adapter_ids(adapter_id)
         return cls(
             root=root,
             user_id=os.environ.get("MEMORYOS_USER_ID", "default"),
-            adapter_id=os.environ.get("MEMORYOS_ADAPTER_ID", "codex"),
-            agent_name=os.environ.get("MEMORYOS_AGENT_NAME", os.environ.get("MEMORYOS_ADAPTER_ID", "codex")),
+            adapter_id=adapter_id,
+            agent_name=os.environ.get("MEMORYOS_AGENT_NAME", adapter_id),
             token_budget=_env_int("MEMORYOS_TOKEN_BUDGET", 2000),
             enable_action_tools=os.environ.get("MEMORYOS_ENABLE_ACTION_TOOLS", "").lower() in {"1", "true", "yes"},
             hook_queue_path=queue_path,
             log_level=os.environ.get("MEMORYOS_LOG_LEVEL", "WARNING"),
+            allowed_adapter_ids=allowed,
         )
 
     def default_agent_metadata(self) -> ConnectMetadata:
@@ -53,3 +56,13 @@ def _env_int(name: str, default: int) -> int:
         return int(os.environ.get(name, default))
     except (TypeError, ValueError):
         return default
+
+
+def _allowed_adapter_ids(adapter_id: str) -> tuple[str, ...]:
+    configured = [
+        item.strip()
+        for item in os.environ.get("MEMORYOS_ALLOWED_ADAPTER_IDS", "").split(",")
+        if item.strip()
+    ]
+    allowed = [*DEFAULT_AGENT_ADAPTERS, *configured, adapter_id]
+    return tuple(dict.fromkeys(allowed))
