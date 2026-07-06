@@ -37,17 +37,18 @@ class SessionCommitService:
         self.context_planner = context_planner or ContextCommitPlanner()
         self.allow_plan_only = allow_plan_only
 
-    def sync_archive(self, archive: SessionArchive) -> SessionCommitResult:
+    def sync_archive(self, archive: SessionArchive, *, enqueue_commit_job: bool = True) -> SessionCommitResult:
         self.archive_store.write_sync_archive(archive)
-        self.queue_store.enqueue(
-            QueueJob(
-                job_id=archive.task_id,
-                queue_name="session_commit",
-                action="async_session_commit",
-                target_uri=archive.archive_uri,
-                payload={"user_id": archive.user_id, "session_id": archive.session_id},
+        if enqueue_commit_job:
+            self.queue_store.enqueue(
+                QueueJob(
+                    job_id=archive.task_id,
+                    queue_name="session_commit",
+                    action="async_session_commit",
+                    target_uri=archive.archive_uri,
+                    payload={"user_id": archive.user_id, "session_id": archive.session_id},
+                )
             )
-        )
         return SessionCommitResult(task_id=archive.task_id, archive_uri=archive.archive_uri, status="queued")
 
     def async_commit(self, archive: SessionArchive) -> SessionCommitResult:

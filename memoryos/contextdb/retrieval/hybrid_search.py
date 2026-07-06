@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 from memoryos.contextdb.model.context_type import ContextType
@@ -7,6 +8,9 @@ from memoryos.contextdb.model.lifecycle import LifecycleState
 from memoryos.contextdb.store.source_store import IndexStore, SourceStore
 from memoryos.contextdb.store.vector_store import VectorStore
 from memoryos.providers.embedding import EmbeddingProvider
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -79,8 +83,12 @@ class HybridSearch:
                     existing["metadata"] = {**item["metadata"], **dict(existing.get("metadata", {}))}
                     existing["vector_score"] = min(1.0, float(vector_hit.score))
                     existing["source"] = "hybrid" if existing.get("index_score") is not None else "vector"
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "HybridSearch vector branch failed; falling back to lexical search: %s",
+                    exc,
+                    exc_info=True,
+                )
         results = []
         for item in combined.values():
             index_score = item.get("index_score")

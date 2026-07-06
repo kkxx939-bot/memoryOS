@@ -19,6 +19,66 @@ def _context(with_skill: bool = True, with_resource: bool = True) -> ActionConte
     )
 
 
+def _context_items(resources: list[dict], skills: list[dict]) -> ActionContext:
+    return ActionContext(
+        user_id="u1",
+        candidate_actions=["turn_on_ac"],
+        packed_context={"slices": {"resource": {"items": resources}, "skill": {"items": skills}}},
+    )
+
+
+def _skill(
+    uri: str,
+    *,
+    tool_name: str = "ac_tool",
+    action: str | None = None,
+    supported_actions: list[str] | str | None = None,
+    default_args: dict | None = None,
+) -> dict:
+    metadata = {"tool_name": tool_name, "executable": True}
+    if action is not None:
+        metadata["action"] = action
+    if supported_actions is not None:
+        metadata["supported_actions"] = supported_actions
+    if default_args is not None:
+        metadata["default_args"] = default_args
+    return {"uri": uri, "title": tool_name, "metadata": metadata}
+
+
+def _resource(
+    uri: str,
+    *,
+    action: str | None = None,
+    supported_actions: list[str] | str | None = None,
+    tool_name: str | None = None,
+    tool_args: dict | None = None,
+    device_id: str | None = None,
+) -> dict:
+    metadata: dict[str, object] = {"available": True}
+    if action is not None:
+        metadata["action"] = action
+    if supported_actions is not None:
+        metadata["supported_actions"] = supported_actions
+    if tool_name is not None:
+        metadata["tool_name"] = tool_name
+    if tool_args is not None:
+        metadata["tool_args"] = tool_args
+    if device_id is not None:
+        metadata["device_id"] = device_id
+    return {"uri": uri, "metadata": metadata}
+
+
+def _registry(calls: list[dict]) -> ToolRegistry:
+    registry = ToolRegistry()
+
+    def handler(payload: dict) -> dict:
+        calls.append(payload)
+        return {"ok": True, **payload}
+
+    registry.register("ac_tool", handler)
+    return registry
+
+
 def test_execute_calls_registered_fake_skill_successfully() -> None:
     registry = ToolRegistry()
     calls = []
@@ -58,3 +118,120 @@ def test_ask_user_does_not_call_tool() -> None:
 
     assert result.status == "skipped"
     assert calls == []
+
+
+def test_execute_selects_only_resource_supporting_action() -> None:
+    calls: list[dict] = []
+    context = _context_items(
+        resources=[
+            _resource("memoryos://resources/fan", supported_actions=["turn_on_fan"], device_id="fan"),
+            _resource("memoryos://resources/ac", supported_actions=["turn_on_ac"], device_id="ac"),
+        ],
+        skills=[_skill("memoryos://skills/ac")],
+    )
+
+    result = ActionExecutor(_registry(calls)).execute(PolicyDecision(mode="execute", allowed=True, action="turn_on_ac", reason="ok"), context)
+
+    assert result.status == "success"
+    assert result.resource_uris == ["memoryos://resources/ac"]
+    assert calls[0]["device_id"] == "ac"
+
+
+def test_execute_selects_only_skill_supporting_action() -> None:
+    calls: list[dict] = []
+    context = _context_items(
+        resources=[_resource("memoryos://resources/ac", device_id="ac")],
+        skills=[
+            _skill("memoryos://skills/fan", supported_actions=["turn_on_fan"]),
+            _skill("memoryos://skills/ac", supported_actions=["turn_on_ac"]),
+        ],
+    )
+
+    result = ActionExecutor(_registry(calls)).execute(PolicyDecision(mode="execute", allowed=True, action="turn_on_ac", reason="ok"), context)
+
+    assert result.status == "success"
+    assert result.skill_uris == ["memoryos://skills/ac"]
+    assert calls
+
+
+def test_execute_blocks_when_skill_and_resource_tool_names_do_not_match() -> None:
+    calls: list[dict] = []
+    context = _context_items(
+        resources=[_resource("memoryos://resources/ac", supported_actions=["turn_on_ac"], tool_name="fan_tool")],
+        skills=[_skill("memoryos://skills/ac", supported_actions=["turn_on_ac"], tool_name="ac_tool")],
+    )
+
+    result = ActionExecutor(_registry(calls)).execute(PolicyDecision(mode="execute", allowed=True, action="turn_on_ac", reason="ok"), context)
+
+    assert result.status == "blocked"
+    assert result.executed is False
+    assert result.reason == "Skill tool_name does not match resource tool_name"
+    assert calls == []
+
+
+def test_execute_blocks_ambiguous_resources_for_action() -> None:
+    calls: list[dict] = []
+    context = _context_items(
+        resources=[
+            _resource("memoryos://resources/ac-bedroom", supported_actions=["turn_on_ac"], device_id="bedroom"),
+            _resource("memoryos://resources/ac-office", supported_actions=["turn_on_ac"], device_id="office"),
+        ],
+        skills=[_skill("memoryos://skills/ac", supported_actions=["turn_on_ac"])],
+    )
+
+    result = ActionExecutor(_registry(calls)).execute(PolicyDecision(mode="execute", allowed=True, action="turn_on_ac", reason="ok"), context)
+
+    assert result.status == "blocked"
+    assert result.reason == "Ambiguous resources for action turn_on_ac"
+    assert calls == []
+
+
+def test_execute_blocks_when_no_skill_supports_action() -> None:
+    calls: list[dict] = []
+    context = _context_items(
+        resources=[_resource("memoryos://resources/ac", supported_actions=["turn_on_ac"])],
+        skills=[_skill("memoryos://skills/fan", supported_actions=["turn_on_fan"])],
+    )
+
+    result = ActionExecutor(_registry(calls)).execute(PolicyDecision(mode="execute", allowed=True, action="turn_on_ac", reason="ok"), context)
+
+    assert result.status == "blocked"
+    assert result.reason == "No skill supports action turn_on_ac"
+    assert calls == []
+
+
+def test_execute_blocks_when_no_resource_supports_action() -> None:
+    calls: list[dict] = []
+    context = _context_items(
+        resources=[_resource("memoryos://resources/fan", supported_actions=["turn_on_fan"])],
+        skills=[_skill("memoryos://skills/ac", supported_actions=["turn_on_ac"])],
+    )
+
+    result = ActionExecutor(_registry(calls)).execute(PolicyDecision(mode="execute", allowed=True, action="turn_on_ac", reason="ok"), context)
+
+    assert result.status == "blocked"
+    assert result.reason == "No resource supports action turn_on_ac"
+    assert calls == []
+
+
+def test_execute_merges_skill_default_args_with_selected_resource_tool_args() -> None:
+    calls: list[dict] = []
+    context = _context_items(
+        resources=[
+            _resource("memoryos://resources/fan", supported_actions=["turn_on_fan"], tool_args={"device_id": "fan"}),
+            _resource(
+                "memoryos://resources/ac",
+                supported_actions="turn_on_ac",
+                tool_args={"device_id": "ac", "temperature": 22},
+            ),
+        ],
+        skills=[_skill("memoryos://skills/ac", action="turn_on_ac", default_args={"mode": "cool", "temperature": 24})],
+    )
+
+    result = ActionExecutor(_registry(calls)).execute(PolicyDecision(mode="execute", allowed=True, action="turn_on_ac", reason="ok"), context)
+
+    assert result.status == "success"
+    assert result.tool_args["mode"] == "cool"
+    assert result.tool_args["temperature"] == 22
+    assert result.tool_args["device_id"] == "ac"
+    assert calls == [result.tool_args]

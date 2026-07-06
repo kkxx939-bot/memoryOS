@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 from memoryos.action_policy.model.action_policy import ActionPolicy
 from memoryos.action_policy.retrieval import ActionPolicyRetriever
@@ -23,6 +24,11 @@ class BrokenProvider(HashingEmbeddingProvider):
         raise RuntimeError("provider down")
 
 
+class BrokenVectorStore(InMemoryVectorStore):
+    def search_vector(self, embedding: list[float], namespace: str, limit: int = 10):
+        raise RuntimeError("vector db down")
+
+
 def test_hybrid_search_falls_back_to_index_without_vector(tmp_path) -> None:
     source = FileSystemSourceStore(tmp_path)
     index = InMemoryIndexStore()
@@ -33,6 +39,48 @@ def test_hybrid_search_falls_back_to_index_without_vector(tmp_path) -> None:
     hits = HybridSearch(index, source_store=source).search("hot", filters={"owner_user_id": "u1"}, namespace="memoryos://user/u1/", context_type=ContextType.MEMORY)
     assert hits[0].uri == obj.uri
     assert hits[0].source == "index"
+
+
+def test_hybrid_search_logs_embedding_failure_and_returns_index_hits(tmp_path, caplog) -> None:
+    source = FileSystemSourceStore(tmp_path)
+    index = InMemoryIndexStore()
+    vector = InMemoryVectorStore()
+    obj = ContextObject(uri="memoryos://user/u1/memories/m1", context_type=ContextType.MEMORY, title="hot", owner_user_id="u1")
+    source.write_object(obj, content="hot room")
+    index.upsert_index(obj, content="hot room")
+
+    caplog.set_level(logging.WARNING, logger="memoryos.contextdb.retrieval.hybrid_search")
+    hits = HybridSearch(index, vector, BrokenProvider(), source).search(
+        "hot",
+        filters={"owner_user_id": "u1"},
+        namespace="memoryos://user/u1/",
+        context_type=ContextType.MEMORY,
+    )
+
+    assert hits[0].uri == obj.uri
+    assert hits[0].source == "index"
+    assert "HybridSearch vector branch failed; falling back to lexical search: provider down" in caplog.text
+
+
+def test_hybrid_search_logs_vector_store_failure_and_returns_index_hits(tmp_path, caplog) -> None:
+    source = FileSystemSourceStore(tmp_path)
+    index = InMemoryIndexStore()
+    provider = HashingEmbeddingProvider()
+    obj = ContextObject(uri="memoryos://user/u1/memories/m1", context_type=ContextType.MEMORY, title="hot", owner_user_id="u1")
+    source.write_object(obj, content="hot room")
+    index.upsert_index(obj, content="hot room")
+
+    caplog.set_level(logging.WARNING, logger="memoryos.contextdb.retrieval.hybrid_search")
+    hits = HybridSearch(index, BrokenVectorStore(), provider, source).search(
+        "hot",
+        filters={"owner_user_id": "u1"},
+        namespace="memoryos://user/u1/",
+        context_type=ContextType.MEMORY,
+    )
+
+    assert hits[0].uri == obj.uri
+    assert hits[0].source == "index"
+    assert "HybridSearch vector branch failed; falling back to lexical search: vector db down" in caplog.text
 
 
 def test_vector_only_hit_and_namespace_isolation(tmp_path) -> None:

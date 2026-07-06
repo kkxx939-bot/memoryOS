@@ -96,10 +96,10 @@ class ContextDB:
     def commit_session(self, archive: SessionArchive, *, async_commit: bool = True) -> SessionCommitResult:
         if self.session_commit_service is None:
             raise RuntimeError("ContextDB requires SessionCommitService to commit sessions")
-        result = self.session_commit_service.sync_archive(archive)
         if async_commit:
+            self.session_commit_service.sync_archive(archive, enqueue_commit_job=False)
             return self.session_commit_service.async_commit(archive)
-        return result
+        return self.session_commit_service.sync_archive(archive, enqueue_commit_job=True)
 
     def rebuild_index(self, *, owner_user_id: str | None = None) -> dict:
         if owner_user_id is None:

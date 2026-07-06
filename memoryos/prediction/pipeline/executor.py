@@ -21,12 +21,34 @@ class ActionExecutor:
             return ActionResult(action=decision.action, status="blocked", executed=False, reason="Required resource is missing.", started_at=started_at)
         if not skills:
             return ActionResult(action=decision.action, status="blocked", executed=False, reason="Required skill is missing.", started_at=started_at)
-        skill = skills[0]
+        skill, resource, selection_error = self._select_skill_and_resource(decision.action, skills, resources)
+        if selection_error is not None:
+            return ActionResult(
+                action=decision.action,
+                status="blocked",
+                executed=False,
+                reason=selection_error,
+                resource_uris=[str(item.get("uri", "")) for item in resources],
+                skill_uris=[str(item.get("uri", "")) for item in skills],
+                started_at=started_at,
+            )
+        if skill is None or resource is None:
+            return ActionResult(
+                action=decision.action,
+                status="blocked",
+                executed=False,
+                reason=f"No unique skill/resource supports action {decision.action}.",
+                resource_uris=[str(item.get("uri", "")) for item in resources],
+                skill_uris=[str(item.get("uri", "")) for item in skills],
+                started_at=started_at,
+            )
         metadata = skill.get("metadata", {}) if isinstance(skill.get("metadata", {}), dict) else {}
         if metadata.get("executable") is not True:
             return ActionResult(action=decision.action, status="blocked", executed=False, reason="Required skill is not executable.", started_at=started_at)
         tool_name = self._tool_name(skill)
-        tool_args = self._tool_args(decision.action, resources[0], skill)
+        tool_args = self._tool_args(decision.action, resource, skill)
+        resource_uris = [str(resource.get("uri", ""))]
+        skill_uris = [str(skill.get("uri", ""))]
         if self.tool_registry.can_execute(tool_name):
             try:
                 self.tool_registry.validate_args(tool_name, tool_args)
@@ -38,8 +60,8 @@ class ActionExecutor:
                     reason="invalid_args",
                     tool_name=tool_name,
                     tool_args=tool_args,
-                    resource_uris=[str(item.get("uri", "")) for item in resources],
-                    skill_uris=[str(item.get("uri", "")) for item in skills],
+                    resource_uris=resource_uris,
+                    skill_uris=skill_uris,
                     error=str(exc),
                     started_at=started_at,
                 )
@@ -53,8 +75,8 @@ class ActionExecutor:
                     reason=str(exc),
                     tool_name=tool_name,
                     tool_args=tool_args,
-                    resource_uris=[str(item.get("uri", "")) for item in resources],
-                    skill_uris=[str(item.get("uri", "")) for item in skills],
+                    resource_uris=resource_uris,
+                    skill_uris=skill_uris,
                     error=str(exc),
                     started_at=started_at,
                 )
@@ -65,8 +87,8 @@ class ActionExecutor:
                 reason="Tool executed successfully.",
                 tool_name=tool_name,
                 tool_args=tool_args,
-                resource_uris=[str(item.get("uri", "")) for item in resources],
-                skill_uris=[str(item.get("uri", "")) for item in skills],
+                resource_uris=resource_uris,
+                skill_uris=skill_uris,
                 output=output,
                 started_at=started_at,
             )
@@ -77,8 +99,8 @@ class ActionExecutor:
             reason=f"No executable tool registered for {tool_name}.",
             tool_name=tool_name,
             tool_args=tool_args,
-            resource_uris=[str(item.get("uri", "")) for item in resources],
-            skill_uris=[str(item.get("uri", "")) for item in skills],
+            resource_uris=resource_uris,
+            skill_uris=skill_uris,
             error=f"tool_not_registered:{tool_name}",
             started_at=started_at,
         )
@@ -86,13 +108,75 @@ class ActionExecutor:
     def _section_items(self, action_context: ActionContext, section: str) -> list[dict]:
         return list(action_context.packed_context.get("slices", {}).get(section, {}).get("items", []))
 
+    def _select_skill_and_resource(
+        self,
+        action: str,
+        skills: list[dict],
+        resources: list[dict],
+    ) -> tuple[dict | None, dict | None, str | None]:
+        skill_candidates, skill_error = self._matching_items(action, skills, "skill")
+        if skill_error is not None:
+            return None, None, skill_error
+        resource_candidates, resource_error = self._matching_items(action, resources, "resource")
+        if resource_error is not None:
+            return None, None, resource_error
+        if len(skill_candidates) > 1 and len(resource_candidates) > 1:
+            return None, None, f"Ambiguous skills and resources for action {action}"
+        if len(skill_candidates) > 1:
+            return None, None, f"Ambiguous skills for action {action}"
+        if len(resource_candidates) > 1:
+            return None, None, f"Ambiguous resources for action {action}"
+        if not skill_candidates:
+            return None, None, f"No skill supports action {action}"
+        if not resource_candidates:
+            return None, None, f"No resource supports action {action}"
+        skill = skill_candidates[0]
+        resource = resource_candidates[0]
+        skill_tool = self._metadata(skill).get("tool_name")
+        resource_tool = self._metadata(resource).get("tool_name")
+        if skill_tool and resource_tool and str(skill_tool) != str(resource_tool):
+            return None, None, "Skill tool_name does not match resource tool_name"
+        return skill, resource, None
+
+    def _matching_items(self, action: str, items: list[dict], item_name: str) -> tuple[list[dict], str | None]:
+        declared = [item for item in items if self._declares_action_match(item)]
+        if declared:
+            matches = [item for item in declared if self._supports_action(item, action)]
+            if not matches:
+                return [], f"No {item_name} supports action {action}"
+            return matches, None
+        if len(items) == 1:
+            return items, None
+        return list(items), None
+
+    def _declares_action_match(self, item: dict) -> bool:
+        metadata = self._metadata(item)
+        return "supported_actions" in metadata or "action" in metadata
+
+    def _supports_action(self, item: dict, action: str) -> bool:
+        metadata = self._metadata(item)
+        supported = metadata.get("supported_actions")
+        if isinstance(supported, str):
+            supported_actions = {supported}
+        elif isinstance(supported, list):
+            supported_actions = {str(value) for value in supported}
+        else:
+            supported_actions = set()
+        if action in supported_actions:
+            return True
+        return str(metadata.get("action", "")) == action
+
+    def _metadata(self, item: dict) -> dict:
+        metadata = item.get("metadata", {})
+        return metadata if isinstance(metadata, dict) else {}
+
     def _tool_name(self, skill: dict) -> str:
-        metadata = skill.get("metadata", {}) if isinstance(skill.get("metadata", {}), dict) else {}
+        metadata = self._metadata(skill)
         return str(metadata.get("tool_name") or skill.get("title") or skill.get("uri") or "")
 
     def _tool_args(self, action: str, resource: dict, skill: dict) -> dict:
-        resource_metadata = resource.get("metadata", {}) if isinstance(resource.get("metadata", {}), dict) else {}
-        skill_metadata = skill.get("metadata", {}) if isinstance(skill.get("metadata", {}), dict) else {}
+        resource_metadata = self._metadata(resource)
+        skill_metadata = self._metadata(skill)
         args = dict(skill_metadata.get("default_args", {})) if isinstance(skill_metadata.get("default_args", {}), dict) else {}
         args.update(resource_metadata.get("tool_args", {}) if isinstance(resource_metadata.get("tool_args", {}), dict) else {})
         args.setdefault("action", action)
