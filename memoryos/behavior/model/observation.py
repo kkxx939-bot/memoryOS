@@ -29,7 +29,7 @@ class Observation:
     def _environment_buckets(self) -> list[str]:
         buckets = []
         temperature = self.environment.get("temperature")
-        if isinstance(temperature, (int, float)):
+        if isinstance(temperature, int | float):
             if temperature >= 29:
                 buckets.append("hot_environment")
             elif temperature <= 18:

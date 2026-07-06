@@ -4,7 +4,7 @@ from typing import Any
 
 from memoryos.action_policy.model.action_policy import ActionPolicy
 from memoryos.api.sdk.result import ProcessObservationResult
-from memoryos.connect import ConnectMetadata, PipelineMode
+from memoryos.connect import ConnectMetadata, ConnectType, PipelineMode
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.retrieval.context_assembler import ContextAssembler
 from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
@@ -62,16 +62,7 @@ class MemoryOSClient:
         self.executor = container.executor
 
     def predict(self, request: PredictionRequest, policies: list[ActionPolicy] | None = None) -> PredictionResult:
-        if request.connect_metadata:
-            metadata = self._parse_connect_metadata(request.connect_metadata)
-            if (
-                metadata.run_mode != PipelineMode.ACTION_CAPABLE
-                or not metadata.capabilities.can_predict_behavior
-            ):
-                raise ValueError(
-                    "predict() requires action_capable connect metadata with can_predict_behavior=True; "
-                    "use assemble_context() for context_reduction agents."
-                )
+        self._require_predict_metadata(request.connect_metadata)
         return self.engine.process(request, policies=policies)
 
     def process_observation(
@@ -82,19 +73,8 @@ class MemoryOSClient:
         archive_session: bool = True,
         async_commit: bool = True,
     ) -> ProcessObservationResult:
-        connect_metadata: dict[str, Any] = {}
-        if request.connect_metadata:
-            metadata = self._parse_connect_metadata(request.connect_metadata)
-            connect_metadata = metadata.to_dict()
-            if (
-                metadata.run_mode != PipelineMode.ACTION_CAPABLE
-                or not metadata.capabilities.can_predict_behavior
-                or not metadata.capabilities.can_execute_action
-            ):
-                raise PermissionError(
-                    "process_observation() requires action_capable connect metadata "
-                    "with can_predict_behavior=True and can_execute_action=True."
-                )
+        metadata = self._require_process_observation_metadata(request.connect_metadata)
+        connect_metadata = metadata.to_dict()
         result = self.engine.process(request, policies=policies)
         action_result = self.executor.execute(result.decision, result.action_context)
         if not archive_session:
@@ -149,7 +129,7 @@ class MemoryOSClient:
             feedback=feedback,
             used_contexts=used_contexts,
             used_skills=used_skills,
-            metadata={"connect": connect_metadata} if connect_metadata else {},
+            metadata={"connect": connect_metadata},
         )
         commit_result = self.context_db.commit_session(archive, async_commit=async_commit)
         return ProcessObservationResult(
@@ -227,6 +207,33 @@ class MemoryOSClient:
 
     def _parse_connect_metadata(self, payload: dict[str, Any] | None) -> ConnectMetadata:
         return ConnectMetadata.from_dict(payload)
+
+    def _require_predict_metadata(self, payload: dict[str, Any] | None) -> ConnectMetadata:
+        if not payload:
+            raise PermissionError(
+                "predict() requires explicit embodied/action_capable connect metadata "
+                "with can_predict_behavior=True."
+            )
+        metadata = self._parse_connect_metadata(payload)
+        if (
+            metadata.connect_type != ConnectType.EMBODIED
+            or metadata.run_mode != PipelineMode.ACTION_CAPABLE
+            or not metadata.capabilities.can_predict_behavior
+        ):
+            raise PermissionError(
+                "predict() requires embodied/action_capable connect metadata "
+                "with can_predict_behavior=True; use assemble_context() for context_reduction agents."
+            )
+        return metadata
+
+    def _require_process_observation_metadata(self, payload: dict[str, Any] | None) -> ConnectMetadata:
+        metadata = self._require_predict_metadata(payload)
+        if not metadata.capabilities.can_execute_action:
+            raise PermissionError(
+                "process_observation() requires embodied/action_capable connect metadata "
+                "with can_predict_behavior=True and can_execute_action=True."
+            )
+        return metadata
 
     def _connect_filters_from_metadata(self, connect_metadata: dict[str, Any] | None) -> dict[str, str]:
         if not connect_metadata:

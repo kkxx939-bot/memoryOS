@@ -8,13 +8,17 @@ import pytest
 from memoryos.api.http.app import handle
 from memoryos.api.mcp.server import MemoryOSMCPServer
 from memoryos.api.sdk.client import MemoryOSClient
+from memoryos.behavior.model.observation import Observation
 from memoryos.connect import CapabilityProfile, ConnectMetadata, PipelineMode
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.retrieval.context_assembler import ContextAssembler
 from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.contextdb.store.source_store import IndexHit
+from memoryos.prediction.model.action_context import ActionContext
+from memoryos.prediction.model.action_result import ActionResult
 from memoryos.prediction.model.prediction_request import PredictionRequest
+from memoryos.prediction.model.prediction_result import PolicyDecision, PredictionResult
 from memoryos.skill.tool_registry import ToolRegistry
 
 
@@ -56,6 +60,15 @@ class FailingExecutor:
         raise AssertionError("ActionExecutor must not be called")
 
 
+class ReturningExecutor:
+    def __init__(self) -> None:
+        self.called = False
+
+    def execute(self, decision, action_context):  # noqa: ANN001, ANN201
+        self.called = True
+        return ActionResult(action=decision.action, status="skipped", executed=False, reason="test")
+
+
 class ReturningEngine:
     def __init__(self, result) -> None:  # noqa: ANN001
         self.result = result
@@ -81,6 +94,22 @@ def _request(connect_metadata: dict | None = None) -> PredictionRequest:
         observation="hello",
         available_actions=["ask_user"],
         connect_metadata=connect_metadata or {},
+    )
+
+
+def _prediction_result() -> PredictionResult:
+    return PredictionResult(
+        request_id="r1",
+        episode_id="s1",
+        observation=Observation(user_id="u1", raw_text="hello"),
+        candidates=[],
+        action_context=ActionContext(
+            user_id="u1",
+            candidate_actions=["ask_user"],
+            packed_context={},
+            source_uris=["memoryos://user/u1/memories/anchors/m1"],
+        ),
+        decision=PolicyDecision(mode="skip", allowed=False, action="ask_user", reason="test"),
     )
 
 
@@ -395,33 +424,64 @@ def test_assemble_context_empty_results_are_stable() -> None:
 def test_predict_rejects_explicit_context_reduction_metadata() -> None:
     client = _client()
 
-    with pytest.raises(ValueError):
+    with pytest.raises(PermissionError):
         client.predict(_request(ConnectMetadata.default_agent("codex").to_dict()))
     assert client.engine.called is False
 
 
 def test_predict_rejects_missing_behavior_capability() -> None:
     metadata = ConnectMetadata(
+        connect_type="embodied",
         run_mode=PipelineMode.ACTION_CAPABLE,
         capabilities=CapabilityProfile(can_predict_behavior=False),
     ).to_dict()
     client = _client()
 
-    with pytest.raises(ValueError):
+    with pytest.raises(PermissionError):
         client.predict(_request(metadata))
     assert client.engine.called is False
 
 
-def test_predict_without_connect_metadata_keeps_legacy_behavior() -> None:
+def test_predict_rejects_missing_connect_metadata_before_engine() -> None:
+    client = _client()
+
+    with pytest.raises(PermissionError):
+        client.predict(_request())
+    assert client.engine.called is False
+
+
+def test_predict_rejects_agent_action_capable_even_with_behavior_capability() -> None:
+    metadata = ConnectMetadata(
+        run_mode=PipelineMode.ACTION_CAPABLE,
+        capabilities=CapabilityProfile(can_predict_behavior=True),
+    ).to_dict()
+    client = _client()
+
+    with pytest.raises(PermissionError):
+        client.predict(_request(metadata))
+    assert client.engine.called is False
+
+
+def test_predict_allows_embodied_action_capable_metadata() -> None:
     client = _client()
     client.engine = ReturningEngine({"ok": True})
 
-    assert client.predict(_request()) == {"ok": True}
+    assert client.predict(_request(ConnectMetadata.action_capable_embodied("reachy_mini").to_dict())) == {"ok": True}
     assert client.engine.called is True
+
+
+def test_process_observation_rejects_missing_connect_metadata_before_engine_or_executor() -> None:
+    client = _client()
+
+    with pytest.raises(PermissionError):
+        client.process_observation(_request())
+    assert client.engine.called is False
+    assert client.executor.called is False
 
 
 def test_process_observation_rejects_missing_execute_capability_before_executor() -> None:
     metadata = ConnectMetadata(
+        connect_type="embodied",
         run_mode=PipelineMode.ACTION_CAPABLE,
         capabilities=CapabilityProfile(can_predict_behavior=True, can_execute_action=False),
     ).to_dict()
@@ -429,7 +489,26 @@ def test_process_observation_rejects_missing_execute_capability_before_executor(
 
     with pytest.raises(PermissionError):
         client.process_observation(_request(metadata))
+    assert client.engine.called is False
     assert client.executor.called is False
+
+
+def test_process_observation_allows_full_embodied_execute_metadata_and_archives_connect() -> None:
+    context_db = FakeContextDB()
+    client = _client(context_db)
+    client.engine = ReturningEngine(_prediction_result())
+    client.executor = ReturningExecutor()
+    metadata = ConnectMetadata.action_capable_embodied("reachy_mini").to_dict()
+
+    result = client.process_observation(_request(metadata), async_commit=False)
+
+    assert result.archive_uri == "memoryos://user/u1/sessions/history/s1"
+    assert client.engine.called is True
+    assert client.executor.called is True
+    archive, async_commit = context_db.committed[0]
+    assert async_commit is False
+    assert archive.metadata["connect"]["connect_type"] == "embodied"
+    assert archive.metadata["connect"]["run_mode"] == "action_capable"
 
 
 class FakeExternalClient:
@@ -462,14 +541,41 @@ def test_http_routes_and_errors() -> None:
 
     typed_client = cast(MemoryOSClient, client)
 
-    assert handle("POST /predict", typed_client, {"request": _request().__dict__}) == {"episode_id": "s1"}
     assert handle("POST /context/search", typed_client, {"query": "memoryOS"})["results"][0]["uri"] == "memoryos://x"
     assert handle("POST /context/assemble", typed_client, {"query": "memoryOS"})["packed_context"] == "ctx"
     assert handle("POST /sessions/commit", typed_client, {"user_id": "u1", "session_id": "s1"}) == {"status": "accepted"}
-    assert client.predict_called is True
+    assert client.predict_called is False
     assert client.search_called is True
     with pytest.raises(ValueError, match="requires non-empty string field: query"):
         handle("POST /context/search", typed_client, {})
+
+
+def test_http_predict_rejects_missing_and_agent_metadata_before_engine() -> None:
+    client = _client()
+
+    with pytest.raises(PermissionError):
+        handle("POST /predict", client, {"request": _request().__dict__})
+    with pytest.raises(PermissionError):
+        handle(
+            "POST /predict",
+            client,
+            {"request": _request(ConnectMetadata.default_agent("codex").to_dict()).__dict__},
+        )
+    assert client.engine.called is False
+
+
+def test_http_predict_allows_embodied_action_capable_metadata() -> None:
+    client = _client()
+    client.engine = ReturningEngine(_prediction_result())
+
+    result = handle(
+        "POST /predict",
+        client,
+        {"request": _request(ConnectMetadata.action_capable_embodied("reachy_mini").to_dict()).__dict__},
+    )
+
+    assert result["episode_id"] == "s1"
+    assert client.engine.called is True
 
 
 def test_mcp_routes_and_unknown_tool() -> None:

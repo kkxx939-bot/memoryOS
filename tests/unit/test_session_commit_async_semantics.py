@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, cast
 
 from memoryos.api.sdk.client import MemoryOSClient
+from memoryos.connect import ConnectMetadata
 from memoryos.contextdb.context_db import ContextDB
 from memoryos.contextdb.session import SessionArchive, SessionArchiveStore, SessionCommitService
 from memoryos.contextdb.store.local_stores import (
@@ -115,6 +116,7 @@ def test_process_observation_async_true_returns_commit_result_without_session_co
         observation="hot room",
         available_actions=["turn_on_ac", "ask_user", "do_nothing"],
         request_id="req1",
+        connect_metadata=ConnectMetadata.action_capable_embodied("reachy_mini").to_dict(),
     )
 
     result = client.process_observation(request, archive_session=True, async_commit=True)
@@ -135,6 +137,7 @@ def test_process_observation_async_false_returns_queued_commit_result_and_worker
         observation="hot room",
         available_actions=["turn_on_ac", "ask_user", "do_nothing"],
         request_id="req1",
+        connect_metadata=ConnectMetadata.action_capable_embodied("reachy_mini").to_dict(),
     )
 
     result = client.process_observation(request, archive_session=True, async_commit=False)

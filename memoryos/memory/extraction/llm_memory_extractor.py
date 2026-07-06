@@ -119,6 +119,6 @@ class LLMMemoryExtractor(MemoryExtractor):
             payload = json.loads(text)
         except json.JSONDecodeError as exc:
             raise ValueError(f"LLM memory response is not valid JSON: {exc}") from exc
-        if not isinstance(payload, (dict, list)):
+        if not isinstance(payload, dict | list):
             raise ValueError("LLM memory response must be an object or list")
         return payload

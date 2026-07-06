@@ -9,6 +9,7 @@ mcp = ["mcp>=1.0,<2"]
 test = ["pytest>=8.2,<9"]
 
 [project.scripts]
+memoryos = "memoryos.api.cli.main:main"
 memoryos-mcp-server = "memoryos.api.mcp.stdio:main"
 memoryos-agent-hook = "memoryos.adapters.agent_hooks.cli:main"
 

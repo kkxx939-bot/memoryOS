@@ -7,6 +7,13 @@ from typing import Any
 
 from memoryos.core.time import utc_now
 
+HOOK_ALLOWED_TOOLS = {
+    "memoryos_search_context",
+    "memoryos_assemble_context",
+    "memoryos_commit_session",
+    "memoryos_health",
+}
+
 
 @dataclass
 class PendingItem:
@@ -41,6 +48,8 @@ class PendingQueue:
             tool_name = str(item.payload.get("tool_name", "memoryos_commit_session"))
             arguments = item.payload.get("arguments", {})
             try:
+                if tool_name not in HOOK_ALLOWED_TOOLS:
+                    raise RuntimeError("DISALLOWED_HOOK_TOOL")
                 result = client.call_tool(tool_name, arguments)
                 if isinstance(result, dict) and result.get("error"):
                     raise RuntimeError(str(result["error"].get("code", "MCP_ERROR")))

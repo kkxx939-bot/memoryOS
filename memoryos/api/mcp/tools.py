@@ -50,10 +50,14 @@ class MCPToolRouter:
         query = required_str(args, "query")
         limit = optional_int(args, "limit", 10, minimum=0, maximum=100)
         metadata = normalize_agent_metadata(args.get("connect_metadata"), self.config)
+        context_type = args.get("context_type")
+        context_types = optional_list(args, "context_types")
+        if context_type is None and context_types:
+            context_type = context_types[0]
         contexts = self.client.search_context(
             query,
             user_id=args.get("user_id") or self.config.user_id,
-            context_type=args.get("context_type"),
+            context_type=context_type,
             limit=limit,
             connect_metadata=metadata,
         )

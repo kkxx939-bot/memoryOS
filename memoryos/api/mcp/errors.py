@@ -59,6 +59,8 @@ def exception_payload(exc: Exception) -> dict[str, Any]:
         return error_payload(MCPErrorCode.PERMISSION_DENIED, str(exc), retryable=False)
     if isinstance(exc, FileNotFoundError | OSError):
         return error_payload(MCPErrorCode.STORAGE_ERROR, exc.__class__.__name__, retryable=True)
+    if isinstance(exc, RuntimeError):
+        return error_payload(MCPErrorCode.CLIENT_ERROR, str(exc) or exc.__class__.__name__, retryable=True)
     return error_payload(MCPErrorCode.INTERNAL_ERROR, exc.__class__.__name__, retryable=True)
 
 

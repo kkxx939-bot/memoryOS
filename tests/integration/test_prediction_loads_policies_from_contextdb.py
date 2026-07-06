@@ -5,6 +5,7 @@ import json
 from memoryos.action_policy.model.action_policy import ActionPolicy, ActionPolicyStatus
 from memoryos.api.sdk.client import MemoryOSClient
 from memoryos.behavior.model.behavior_pattern import BehaviorPattern
+from memoryos.connect import ConnectMetadata
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_relation import ContextRelation
 from memoryos.contextdb.model.context_type import ContextType
@@ -29,6 +30,7 @@ def _request(actions: list[str]) -> PredictionRequest:
         episode_id="ep",
         observation={"scene_key": "hot", "raw_text": "hot room", "location": "home"},
         available_actions=actions,
+        connect_metadata=ConnectMetadata.action_capable_embodied("reachy_mini").to_dict(),
     )
 
 
@@ -138,6 +140,7 @@ def test_packed_fallback_behavior_hit_enters_source_uris_and_archive_used_contex
             observation={"scene_key": scene_key, "raw_text": "hot room", "location": "home"},
             available_actions=["turn_on_ac", "ask_user", "do_nothing"],
             token_budget=2000,
+            connect_metadata=ConnectMetadata.action_capable_embodied("reachy_mini").to_dict(),
         ),
         policies=[policy],
         async_commit=False,

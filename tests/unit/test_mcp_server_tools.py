@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 from typing import Any, cast
 
+from memoryos.api.mcp import stdio
 from memoryos.api.mcp.config import MCPServerConfig
 from memoryos.api.mcp.server import MemoryOSMCPServer
 from memoryos.api.sdk.client import MemoryOSClient
@@ -125,7 +127,7 @@ def test_mcp_validation_and_client_errors_are_structured() -> None:
 
     client.fail_search = True
     failed = server.call_tool("memoryos_search_context", {"query": "MCP"})
-    assert failed["error"]["code"] == "INTERNAL_ERROR"
+    assert failed["error"]["code"] == "CLIENT_ERROR"
     assert "/Users/gulf" not in failed["error"]["message"]
 
 
@@ -154,8 +156,10 @@ def test_action_tools_default_closed_and_coding_agent_rejected() -> None:
 def test_action_tools_enabled_still_requires_embodied_metadata() -> None:
     server, client = _server(enable_action_tools=True)
 
+    missing = server.call_tool("memoryos_predict", {"request": {"user_id": "u1", "episode_id": "s1", "observation": "hot", "available_actions": ["turn_on_ac"]}})
     result = server.call_tool("memoryos_predict", {"request": _request({"adapter_id": "codex"})})
 
+    assert missing["error"]["code"] == "PERMISSION_DENIED"
     assert result["error"]["code"] == "PERMISSION_DENIED"
     assert client.predict_calls == 0
 
@@ -182,3 +186,50 @@ def test_process_observation_requires_execute_capability() -> None:
     assert denied["error"]["code"] == "PERMISSION_DENIED"
     assert allowed["error"] is None
     assert client.process_calls == 1
+
+
+def test_stdio_initialize_tools_list_and_health_call_include_stable_schemas() -> None:
+    server, _client = _server()
+
+    initialized = stdio._handle_jsonrpc(server, json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}))
+    listed = stdio._handle_jsonrpc(server, json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
+    called = stdio._handle_jsonrpc(
+        server,
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "memoryos_health", "arguments": {}},
+            }
+        ),
+    )
+
+    assert initialized["result"]["serverInfo"]["name"] == "memoryos"
+    tools = listed["result"]["tools"]
+    assemble = next(tool for tool in tools if tool["name"] == "memoryos_assemble_context")
+    assert assemble["inputSchema"]["type"] == "object"
+    assert "query" in assemble["inputSchema"]["required"]
+    health_payload = json.loads(called["result"]["content"][0]["text"])
+    assert called["result"]["isError"] is False
+    assert health_payload["status"] == "ok"
+
+
+def test_stdio_unknown_tool_returns_tool_error_payload() -> None:
+    server, _client = _server()
+
+    response = stdio._handle_jsonrpc(
+        server,
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {"name": "unknown", "arguments": {}},
+            }
+        ),
+    )
+
+    payload = json.loads(response["result"]["content"][0]["text"])
+    assert response["result"]["isError"] is True
+    assert payload["error"]["code"] == "VALIDATION_ERROR"

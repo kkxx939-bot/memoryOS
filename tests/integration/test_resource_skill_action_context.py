@@ -5,6 +5,7 @@ import json
 from memoryos.action_policy.model.action_policy import ActionCandidate, ActionPolicy
 from memoryos.api.sdk.client import MemoryOSClient
 from memoryos.behavior.model.behavior_pattern import BehaviorPattern
+from memoryos.connect import ConnectMetadata
 from memoryos.contextdb.model.context_uri import ContextURI
 from memoryos.contextdb.resource.resource_importer import ResourceImporter
 from memoryos.contextdb.skill.skill_model import Skill
@@ -82,6 +83,7 @@ def test_direct_request_resource_and_skill_are_archived_and_learned_by_action_po
         observation={"raw_text": "room is hot", "location": "home", "scene_key": scene_key},
         available_actions=["turn_on_ac", "ask_user", "do_nothing"],
         request_id="req-direct",
+        connect_metadata=ConnectMetadata.action_capable_embodied("reachy_mini").to_dict(),
         resources=[
             {
                 "uri": resource_uri,
@@ -181,6 +183,7 @@ def test_registered_persistent_skill_is_executable_by_default(tmp_path) -> None:
             episode_id="registered-skill",
             observation={"scene_key": "hot", "raw_text": "room is hot", "location": "home"},
             available_actions=["turn_on_ac", "ask_user", "do_nothing"],
+            connect_metadata=ConnectMetadata.action_capable_embodied("reachy_mini").to_dict(),
         ),
         async_commit=False,
     )

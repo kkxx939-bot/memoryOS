@@ -8,6 +8,7 @@ from memoryos.action_policy.model.action_policy import ActionCandidate
 from memoryos.api.sdk import ProcessObservationResult
 from memoryos.api.sdk.client import MemoryOSClient
 from memoryos.behavior.model.observation import Observation
+from memoryos.connect import ConnectMetadata
 from memoryos.contextdb.session.session_model import SessionArchive, SessionCommitResult
 from memoryos.prediction.model.action_context import ActionContext
 from memoryos.prediction.model.action_result import ActionResult
@@ -94,6 +95,7 @@ def _request(*, session_uri: str = "") -> PredictionRequest:
         available_actions=["turn_on_ac", "ask_user", "do_nothing"],
         request_id="req1",
         session_uri=session_uri,
+        connect_metadata=ConnectMetadata.action_capable_embodied("reachy_mini").to_dict(),
     )
 
 
@@ -189,7 +191,7 @@ def test_process_observation_archive_passes_async_true() -> None:
     assert client.context_db.calls[0][1] is True
 
 
-def test_predict_still_returns_prediction_result_without_action_or_commit() -> None:
+def test_predict_returns_prediction_result_without_action_or_commit_when_action_capable() -> None:
     prediction_result = _prediction_result()
     client = _client(prediction_result=prediction_result)
 

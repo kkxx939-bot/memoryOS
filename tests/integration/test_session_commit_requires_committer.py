@@ -7,6 +7,7 @@ from pathlib import Path
 
 from memoryos.action_policy.model.action_policy import ActionPolicy
 from memoryos.api.sdk.client import MemoryOSClient
+from memoryos.connect import ConnectMetadata
 from memoryos.contextdb.session.session_archive import SessionArchiveStore
 from memoryos.contextdb.session.session_commit import SessionCommitService
 from memoryos.contextdb.session.session_model import SessionArchive
@@ -43,7 +44,13 @@ class SessionCommitRequiresCommitterTest(unittest.TestCase):
             client.source_store.write_object(policy.to_context_object(), content=json.dumps(policy.to_dict()))
             client.index_store.upsert_index(policy.to_context_object(), content="hot turn_on_ac")
             result = client.process_observation(
-                PredictionRequest(user_id="u1", episode_id="s2", observation={"scene": "hot", "signals": ["hot_environment"]}, available_actions=["turn_on_ac"]),
+                PredictionRequest(
+                    user_id="u1",
+                    episode_id="s2",
+                    observation={"scene": "hot", "signals": ["hot_environment"]},
+                    available_actions=["turn_on_ac"],
+                    connect_metadata=ConnectMetadata.action_capable_embodied("reachy_mini").to_dict(),
+                ),
                 [policy],
                 async_commit=True,
             )

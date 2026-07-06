@@ -6,6 +6,7 @@ from memoryos.api.sdk.client import MemoryOSClient
 from memoryos.behavior.model.behavior_case import BehaviorCase
 from memoryos.behavior.model.observation import Observation
 from memoryos.behavior.update.behavior_case_writer import BehaviorCaseWriter
+from memoryos.connect import ConnectMetadata
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.operations.model.operation_action import OperationAction
@@ -81,6 +82,7 @@ def test_behavior_windows_auto_generate_and_update_action_policy(tmp_path) -> No
             episode_id="p1",
             observation=obs,
             available_actions=["turn_on_ac", "ask_user", "do_nothing"],
+            connect_metadata=ConnectMetadata.action_capable_embodied("reachy_mini").to_dict(),
         )
     )
     assert prediction.candidates[0].policy_uri == policy_uri

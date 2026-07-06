@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 def main() -> None:
     from memoryos import MemoryOSClient, PredictionRequest
+    from memoryos.connect import ConnectMetadata
 
     with tempfile.TemporaryDirectory() as root:
         client = MemoryOSClient(root)
@@ -18,6 +19,7 @@ def main() -> None:
                 episode_id="smoke-session",
                 observation="The user says the office is too bright.",
                 available_actions=["ask_user", "do_nothing"],
+                connect_metadata=ConnectMetadata.action_capable_embodied("reachy_mini").to_dict(),
             )
         )
         print(

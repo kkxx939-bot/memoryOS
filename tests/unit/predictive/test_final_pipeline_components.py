@@ -88,6 +88,7 @@ class FinalPipelineComponentsTest(unittest.TestCase):
                 observation=observation,
                 available_actions=["turn_on_ac"],
                 request_id="r1",
+                connect_metadata=ConnectMetadata.action_capable_embodied("reachy_mini").to_dict(),
             )
             result = client.predict(request, [policy])
             self.assertEqual(result.memory_operations, [])

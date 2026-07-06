@@ -80,7 +80,7 @@ class BehaviorWindowEvaluator:
         environment = observation.get("environment", {})
         if isinstance(environment, dict):
             temperature = environment.get("temperature")
-            if isinstance(temperature, (int, float)):
+            if isinstance(temperature, int | float):
                 if temperature >= 29:
                     tags.append("hot_environment")
                 elif temperature <= 18:

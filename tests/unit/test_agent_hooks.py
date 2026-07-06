@@ -130,6 +130,47 @@ def test_cursor_before_prompt_after_turn_and_flush(tmp_path: Path) -> None:
     assert flushed["flushed"]["remaining"] == 0
 
 
+def test_hooks_only_call_context_or_commit_tools_with_agent_metadata(tmp_path: Path) -> None:
+    adapters: list[tuple[Any, str, dict[str, Any]]] = [
+        (CodexHookAdapter(_config(tmp_path, "codex"), mcp_client=FakeHookMCPClient()), "UserPromptSubmit", {"session_id": "s1", "prompt": "hello"}),
+        (ClaudeCodeHookAdapter(_config(tmp_path, "claude_code"), mcp_client=FakeHookMCPClient()), "before_prompt", {"session_id": "s2", "input": "hello"}),
+        (CursorHookAdapter(_config(tmp_path, "cursor"), mcp_client=FakeHookMCPClient()), "before_prompt", {"session_id": "s3", "prompt": "hello"}),
+    ]
+
+    for adapter, hook_name, payload in adapters:
+        result = adapter.handle(hook_name, payload).to_dict()
+        calls = adapter.mcp_client.calls
+        assert result["ok"] is True
+        assert {name for name, _args in calls} <= {
+            "memoryos_assemble_context",
+            "memoryos_search_context",
+            "memoryos_commit_session",
+            "memoryos_health",
+        }
+        assert "memoryos_predict" not in {name for name, _args in calls}
+        assert "memoryos_process_observation" not in {name for name, _args in calls}
+        metadata = calls[0][1]["connect_metadata"]
+        assert metadata["connect_type"] == "agent"
+        assert metadata["run_mode"] == "context_reduction"
+        assert metadata["world_domain"] == "digital"
+        assert metadata["source_kind"] == "coding_agent"
+        assert metadata["capabilities"]["can_predict_behavior"] is False
+        assert metadata["capabilities"]["can_execute_action"] is False
+
+
+def test_stop_and_precompact_commit_session_do_not_trigger_action_tools(tmp_path: Path) -> None:
+    fake = FakeHookMCPClient()
+    adapter = CodexHookAdapter(_config(tmp_path), mcp_client=fake)
+
+    adapter.handle("Stop", {"event_id": "stop", "session_id": "s1", "messages": [{"content": "done"}]})
+    adapter.handle("PreCompact", {"event_id": "compact", "session_id": "s1", "prompt": "compact"})
+
+    tool_names = [name for name, _args in fake.calls]
+    assert "memoryos_predict" not in tool_names
+    assert "memoryos_process_observation" not in tool_names
+    assert "memoryos_commit_session" in tool_names
+
+
 def test_pending_queue_idempotency_retry_success_and_corrupt_file(tmp_path: Path) -> None:
     path = tmp_path / "queue.jsonl"
     queue = PendingQueue(str(path))
@@ -151,6 +192,26 @@ def test_pending_queue_idempotency_retry_success_and_corrupt_file(tmp_path: Path
     assert failed["failed"] == 1
     assert succeeded["flushed"] == 1
     assert [item.event_id for item in queue.list_items()] == ["e2"]
+
+
+def test_pending_queue_refuses_action_capable_tools(tmp_path: Path) -> None:
+    queue = PendingQueue(str(tmp_path / "queue.jsonl"))
+    queue.enqueue(
+        PendingItem(
+            event_id="e1",
+            session_id="s1",
+            adapter_id="codex",
+            hook_name="Stop",
+            payload={"tool_name": "memoryos_predict", "arguments": {"request": {}}},
+        )
+    )
+    fake = FakeHookMCPClient()
+
+    result = queue.flush(fake)
+
+    assert result["failed"] == 1
+    assert fake.calls == []
+    assert queue.list_items()[0].last_error == "RuntimeError"
 
 
 def test_sanitizer_redacts_secret_truncates_logs_and_filters_paths() -> None:

@@ -8,6 +8,7 @@ from memoryos.adapters.agent_hooks.events import AgentHookEvent
 from memoryos.adapters.agent_hooks.mcp_client import AgentHookMCPClient
 from memoryos.adapters.agent_hooks.queue import PendingItem, PendingQueue
 from memoryos.adapters.agent_hooks.sanitizer import sanitize_payload, summarize_tool_result
+from memoryos.connect import ConnectMetadata, ConnectType, PipelineMode
 
 
 @dataclass
@@ -54,7 +55,7 @@ class BaseAgentHookAdapter:
                     "query": event.query() or event.session_id,
                     "user_id": event.user_id or self.config.user_id,
                     "token_budget": token_budget or self.config.token_budget,
-                    "connect_metadata": {"adapter_id": event.adapter_id},
+                    "connect_metadata": _agent_hook_metadata(event.adapter_id),
                 },
             )
             if result.get("error"):
@@ -77,7 +78,7 @@ class BaseAgentHookAdapter:
             "messages": sanitize_payload(messages if messages is not None else event.messages),
             "tool_results": [tool_result] if event.tool_name or event.tool_output is not None else [],
             "used_contexts": sanitize_payload(event.metadata.get("used_contexts", [])),
-            "connect_metadata": {"adapter_id": event.adapter_id},
+            "connect_metadata": _agent_hook_metadata(event.adapter_id),
             "async_commit": True,
         }
         queued = self.queue.enqueue(
@@ -98,7 +99,7 @@ class BaseAgentHookAdapter:
             "messages": sanitize_payload(event.messages),
             "used_contexts": sanitize_payload(event.metadata.get("used_contexts", [])),
             "tool_results": sanitize_payload(event.metadata.get("tool_results", [])),
-            "connect_metadata": {"adapter_id": event.adapter_id},
+            "connect_metadata": _agent_hook_metadata(event.adapter_id),
             "async_commit": True,
         }
         try:
@@ -143,3 +144,13 @@ def format_injection(result: dict[str, Any]) -> str:
     uris = [str(uri) for uri in result.get("source_uris", [])]
     sources = "\n".join(f"- {uri}" for uri in uris[:20])
     return f"<memoryos_context>\n{packed}\n\nSources:\n{sources}\n</memoryos_context>"
+
+
+def _agent_hook_metadata(adapter_id: str) -> dict[str, Any]:
+    return ConnectMetadata(
+        connect_type=ConnectType.AGENT,
+        adapter_id=adapter_id,
+        run_mode=PipelineMode.CONTEXT_REDUCTION,
+        world_domain="digital",
+        source_kind="coding_agent",
+    ).to_dict()

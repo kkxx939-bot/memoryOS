@@ -6,6 +6,7 @@ from memoryos.action_policy.model.action_policy import ActionPolicy
 from memoryos.api.sdk.client import MemoryOSClient
 from memoryos.behavior.model.behavior_pattern import BehaviorPattern
 from memoryos.behavior.model.observation import Observation
+from memoryos.connect import ConnectMetadata
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_relation import ContextRelation
 from memoryos.contextdb.model.context_type import ContextType
@@ -115,6 +116,7 @@ def test_predictive_context_hot_room_flow_uses_production_entrypoint(tmp_path) -
         observation=observation,
         available_actions=["turn_on_ac", "turn_on_fan", "ask_user", "do_nothing"],
         token_budget=2000,
+        connect_metadata=ConnectMetadata.action_capable_embodied("reachy_mini").to_dict(),
     )
     result = client.process_observation(request, archive_session=True, async_commit=True)
     prediction = result.prediction_result
