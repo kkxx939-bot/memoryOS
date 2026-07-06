@@ -1,20 +1,14 @@
 from __future__ import annotations
 
-from memoryos.api.http.app import handle
+from memoryos.api.mcp.config import MCPServerConfig
+from memoryos.api.mcp.tools import MCPToolRouter
 from memoryos.api.sdk.client import MemoryOSClient
 
 
 class MemoryOSMCPServer:
-    def __init__(self, client: MemoryOSClient) -> None:
+    def __init__(self, client: MemoryOSClient, config: MCPServerConfig | None = None) -> None:
         self.client = client
+        self.router = MCPToolRouter(client, config=config)
 
     def call_tool(self, name: str, arguments: dict) -> dict:
-        if name == "memoryos_predict":
-            return handle("POST /predict", self.client, arguments)
-        if name == "memoryos_search_context":
-            return handle("POST /context/search", self.client, arguments)
-        if name == "memoryos_assemble_context":
-            return handle("POST /context/assemble", self.client, arguments)
-        if name == "memoryos_commit_session":
-            return handle("POST /sessions/commit", self.client, arguments)
-        raise KeyError(f"Unknown tool: {name}")
+        return self.router.call(name, arguments)

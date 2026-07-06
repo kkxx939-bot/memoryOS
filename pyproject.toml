@@ -1,3 +1,17 @@
+[project]
+name = "memoryos"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["PyYAML>=6.0.2,<7"]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.0,<2"]
+test = ["pytest>=8.2,<9"]
+
+[project.scripts]
+memoryos-mcp-server = "memoryos.api.mcp.stdio:main"
+memoryos-agent-hook = "memoryos.adapters.agent_hooks.cli:main"
+
 [tool.ruff]
 line-length = 120
 target-version = "py310"

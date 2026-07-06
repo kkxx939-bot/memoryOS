@@ -151,6 +151,7 @@ def test_packed_fallback_behavior_hit_enters_source_uris_and_archive_used_contex
     assert behavior.uri in fallback_uris
     assert behavior.uri in action_context.source_uris
 
+    assert result.archive_uri is not None
     archive_dir = ContextURI.parse(result.archive_uri).to_source_path(tmp_path)
     used_contexts = json.loads((archive_dir / "used_contexts.json").read_text(encoding="utf-8"))
     assert behavior.uri in {item["uri"] for item in used_contexts}

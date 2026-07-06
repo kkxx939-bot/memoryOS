@@ -475,12 +475,11 @@ def test_http_routes_and_errors() -> None:
 def test_mcp_routes_and_unknown_tool() -> None:
     server = MemoryOSMCPServer(cast(MemoryOSClient, FakeExternalClient()))
 
-    assert server.call_tool("memoryos_predict", {"request": _request().__dict__})["episode_id"] == "s1"
+    assert server.call_tool("memoryos_predict", {"request": _request().__dict__})["error"]["code"] == "PERMISSION_DENIED"
     assert server.call_tool("memoryos_search_context", {"query": "memoryOS"})["results"]
     assert server.call_tool("memoryos_assemble_context", {"query": "memoryOS"})["packed_context"] == "ctx"
-    assert server.call_tool("memoryos_commit_session", {"user_id": "u1", "session_id": "s1"}) == {"status": "accepted"}
-    with pytest.raises(KeyError):
-        server.call_tool("unknown", {})
+    assert server.call_tool("memoryos_commit_session", {"user_id": "u1", "session_id": "s1"})["status"] == "accepted"
+    assert server.call_tool("unknown", {})["error"]["code"] == "VALIDATION_ERROR"
 
 
 def test_tool_registry_metadata_and_legacy_behavior() -> None:

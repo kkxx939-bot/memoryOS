@@ -3,8 +3,8 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
-from memoryos.contextdb.store.source_store import QueueJob
 from memoryos.contextdb.store.local_stores import InMemoryQueueStore
+from memoryos.contextdb.store.source_store import QueueJob
 from memoryos.contextdb.store.sqlite_queue_store import SQLiteQueueStore
 
 

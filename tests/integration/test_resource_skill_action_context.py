@@ -46,7 +46,12 @@ def test_resource_and_skill_required_by_action_policy_gate_execution(tmp_path) -
 def test_direct_request_resource_and_skill_are_archived_and_learned_by_action_policy(tmp_path) -> None:
     calls: list[dict] = []
     registry = ToolRegistry()
-    registry.register("ac_tool", lambda args: calls.append(args) or {"ok": True})
+
+    def ac_tool(args: dict) -> dict:
+        calls.append(args)
+        return {"ok": True}
+
+    registry.register("ac_tool", ac_tool)
     client = MemoryOSClient(str(tmp_path), tool_registry=registry)
     scene_key = "hot_room"
     resource_uri = "memoryos://resources/ac"
@@ -112,6 +117,7 @@ def test_direct_request_resource_and_skill_are_archived_and_learned_by_action_po
     assert [item["uri"] for item in action_context["resource"]["items"]] == [resource_uri]
     assert [item["uri"] for item in action_context["skill"]["items"]] == [skill_uri]
 
+    assert result.archive_uri is not None
     archive_dir = ContextURI.parse(result.archive_uri).to_source_path(tmp_path)
     used_contexts = json.loads((archive_dir / "used_contexts.json").read_text(encoding="utf-8"))
     used_skills = json.loads((archive_dir / "used_skills.json").read_text(encoding="utf-8"))
@@ -126,7 +132,12 @@ def test_direct_request_resource_and_skill_are_archived_and_learned_by_action_po
 def test_registered_persistent_skill_is_executable_by_default(tmp_path) -> None:
     calls: list[dict] = []
     registry = ToolRegistry()
-    registry.register("ac_tool", lambda args: calls.append(args) or {"ok": True})
+
+    def ac_tool(args: dict) -> dict:
+        calls.append(args)
+        return {"ok": True}
+
+    registry.register("ac_tool", ac_tool)
     client = MemoryOSClient(str(tmp_path), tool_registry=registry)
     resource_uri = "memoryos://resources/devices/ac-living-room"
     skill_uri = "memoryos://skills/smart_home/ac-control"

@@ -7,9 +7,11 @@ import unittest
 from memoryos.action_policy.model import ActionPolicy
 from memoryos.api.http import handle
 from memoryos.api.mcp import MemoryOSMCPServer
+from memoryos.api.mcp.config import MCPServerConfig
 from memoryos.api.sdk import MemoryOSClient
 from memoryos.behavior.extraction import BehaviorExtractor
 from memoryos.behavior.model import Observation
+from memoryos.connect import ConnectMetadata
 from memoryos.contextdb.session import SessionArchive, SessionArchiveStore, SessionCommitService
 from memoryos.contextdb.store import FileSystemSourceStore, InMemoryIndexStore, InMemoryQueueStore
 from memoryos.contextdb.store.vector_store import InMemoryVectorStore
@@ -92,7 +94,20 @@ class FinalPipelineComponentsTest(unittest.TestCase):
             http_result = handle("POST /predict", client, {"request": request.__dict__, "policies": [policy.to_dict()]})
             self.assertEqual(http_result["memory_operations"], [])
             mcp_result = MemoryOSMCPServer(client).call_tool("memoryos_predict", {"request": request.__dict__, "policies": [policy.to_dict()]})
-            self.assertEqual(mcp_result["episode_id"], "ep")
+            self.assertEqual(mcp_result["error"]["code"], "PERMISSION_DENIED")
+            enabled_mcp = MemoryOSMCPServer(
+                client,
+                MCPServerConfig(
+                    root=tmp,
+                    user_id="gulf",
+                    adapter_id="codex",
+                    agent_name="codex",
+                    enable_action_tools=True,
+                ),
+            )
+            action_request = {**request.__dict__, "connect_metadata": ConnectMetadata.action_capable_embodied("reachy_mini").to_dict()}
+            allowed_mcp_result = enabled_mcp.call_tool("memoryos_predict", {"request": action_request, "policies": [policy.to_dict()]})
+            self.assertEqual(allowed_mcp_result["prediction"]["episode_id"], "ep")
 
     def test_workers_process_semantic_embedding_session_and_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
