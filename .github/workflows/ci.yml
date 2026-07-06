@@ -27,3 +27,5 @@ jobs:
           pyright memoryos tests
       - name: Tests
         run: python -m pytest
+      - name: Benchmark smoke
+        run: python benchmark/smoke/context_assembly_smoke.py

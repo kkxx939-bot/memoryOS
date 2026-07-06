@@ -151,12 +151,13 @@ class MemoryOSClient:
         limit: int = 10,
         connect_metadata: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        self._parse_connect_metadata(connect_metadata)
+        connect_filters = self._connect_filters_from_metadata(connect_metadata)
         return ContextAssembler(self.context_db).search(
             query,
             user_id=user_id,
             context_type=context_type,
             limit=limit,
+            connect_filters=connect_filters,
         )
 
     def assemble_context(
@@ -170,6 +171,7 @@ class MemoryOSClient:
         connect_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         metadata = self._parse_connect_metadata(connect_metadata)
+        connect_filters = self._connect_filters_from_metadata(connect_metadata)
         parsed_types: list[object] | None = (
             [self._parse_context_type(item) for item in context_types] if context_types else None
         )
@@ -180,6 +182,7 @@ class MemoryOSClient:
             context_types=parsed_types,
             limit=limit,
             connect_metadata=metadata.to_dict(),
+            connect_filters=connect_filters,
         )
 
     def commit_agent_session(
@@ -207,6 +210,18 @@ class MemoryOSClient:
 
     def _parse_connect_metadata(self, payload: dict[str, Any] | None) -> ConnectMetadata:
         return ConnectMetadata.from_dict(payload)
+
+    def _connect_filters_from_metadata(self, connect_metadata: dict[str, Any] | None) -> dict[str, str]:
+        if not connect_metadata:
+            return {}
+        metadata = self._parse_connect_metadata(connect_metadata)
+        return {
+            "connect_type": metadata.connect_type,
+            "adapter_id": metadata.adapter_id,
+            "run_mode": metadata.run_mode,
+            "world_domain": metadata.world_domain,
+            "source_kind": metadata.source_kind,
+        }
 
     def _parse_context_type(self, context_type: object) -> ContextType:
         if isinstance(context_type, ContextType):

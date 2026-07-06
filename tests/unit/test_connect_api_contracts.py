@@ -11,6 +11,7 @@ from memoryos.api.sdk.client import MemoryOSClient
 from memoryos.connect import CapabilityProfile, ConnectMetadata, PipelineMode
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_type import ContextType
+from memoryos.contextdb.retrieval.context_assembler import ContextAssembler
 from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.contextdb.store.source_store import IndexHit
 from memoryos.prediction.model.prediction_request import PredictionRequest
@@ -126,7 +127,7 @@ def test_context_reduction_sdk_does_not_call_prediction_or_executor() -> None:
                 score=1.0,
                 context_type="memory",
                 title="MemoryOS MCP server",
-                metadata={"connect": {"adapter_id": "codex"}},
+                metadata={"connect": ConnectMetadata.default_agent("codex").to_dict()},
             )
         ]
     )
@@ -153,6 +154,91 @@ def test_context_reduction_sdk_does_not_call_prediction_or_executor() -> None:
     assert archive.metadata["connect"]["adapter_id"] == "codex"
     assert client.engine.called is False
     assert client.executor.called is False
+
+
+def test_search_and_assemble_context_apply_connect_filters_without_behavior_or_action() -> None:
+    claude_metadata = ConnectMetadata(adapter_id="claude_code", source_kind="terminal").to_dict()
+    codex_metadata = ConnectMetadata(adapter_id="codex", source_kind="terminal").to_dict()
+    context_db = FakeContextDB(
+        [
+            IndexHit(
+                uri="memoryos://user/u1/memories/anchors/claude",
+                score=2.0,
+                context_type="memory",
+                title="Claude terminal context",
+                metadata={"connect": claude_metadata},
+            ),
+            IndexHit(
+                uri="memoryos://user/u1/memories/anchors/codex",
+                score=1.0,
+                context_type="memory",
+                title="Codex terminal context",
+                metadata={"connect": codex_metadata},
+            ),
+        ]
+    )
+    client = _client(context_db)
+
+    assert client._connect_filters_from_metadata(claude_metadata) == {
+        "connect_type": "agent",
+        "adapter_id": "claude_code",
+        "run_mode": "context_reduction",
+        "world_domain": "digital",
+        "source_kind": "terminal",
+    }
+    search_results = client.search_context("terminal", connect_metadata=claude_metadata)
+    assembled = client.assemble_context("terminal", connect_metadata=claude_metadata, token_budget=500)
+    unfiltered_results = client.search_context("terminal")
+
+    assert [item["uri"] for item in search_results] == ["memoryos://user/u1/memories/anchors/claude"]
+    assert assembled["source_uris"] == ["memoryos://user/u1/memories/anchors/claude"]
+    assert {item["uri"] for item in unfiltered_results} == {
+        "memoryos://user/u1/memories/anchors/claude",
+        "memoryos://user/u1/memories/anchors/codex",
+    }
+    assert client.engine.called is False
+    assert client.executor.called is False
+
+
+def test_context_assembler_connect_filter_simple_fields() -> None:
+    claude_connect = ConnectMetadata(adapter_id="claude_code", source_kind="terminal").to_dict()
+    codex_connect = ConnectMetadata(adapter_id="codex", source_kind="terminal").to_dict()
+    context_db = FakeContextDB(
+        [
+            IndexHit(
+                uri="memoryos://user/u1/memories/anchors/claude",
+                score=2.0,
+                context_type="memory",
+                title="Claude context",
+                metadata={"connect": claude_connect},
+            ),
+            IndexHit(
+                uri="memoryos://user/u1/memories/anchors/codex",
+                score=1.0,
+                context_type="memory",
+                title="Codex context",
+                metadata={"connect": codex_connect},
+            ),
+        ]
+    )
+    assembler = ContextAssembler(cast(Any, context_db))
+
+    matched = assembler.search(
+        "context",
+        connect_filters={
+            "connect_type": "agent",
+            "adapter_id": "claude_code",
+            "run_mode": "context_reduction",
+            "world_domain": "digital",
+            "source_kind": "terminal",
+        },
+    )
+    adapter_miss = assembler.search("context", connect_filters={"adapter_id": "openclaw"})
+    domain_miss = assembler.search("context", connect_filters={"world_domain": "physical"})
+
+    assert [item["uri"] for item in matched] == ["memoryos://user/u1/memories/anchors/claude"]
+    assert adapter_miss == []
+    assert domain_miss == []
 
 
 def test_assemble_context_empty_results_are_stable() -> None:
