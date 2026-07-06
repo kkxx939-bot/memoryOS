@@ -186,7 +186,6 @@ class ActionExecutor:
         return str(item.get("tool_name") or metadata.get("tool_name") or "")
 
     def _tool_name(self, skill: dict, resource: dict) -> str:
-        metadata = self._metadata(skill)
         return self._declared_tool_name(skill) or self._declared_tool_name(resource) or str(skill.get("title") or skill.get("uri") or "")
 
     def _tool_args(self, action: str, resource: dict, skill: dict) -> dict:

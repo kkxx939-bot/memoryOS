@@ -101,8 +101,8 @@ def _client(
     prediction_result: PredictionResult | None = None,
     action_result: ActionResult | None = None,
     commit_result: Any | None = None,
-) -> MemoryOSClient:
-    client = object.__new__(MemoryOSClient)
+) -> Any:
+    client: Any = object.__new__(MemoryOSClient)
     client.engine = FakeEngine(prediction_result or _prediction_result())
     client.executor = FakeExecutor(action_result or _action_result())
     client.context_db = FakeContextDB(commit_result)

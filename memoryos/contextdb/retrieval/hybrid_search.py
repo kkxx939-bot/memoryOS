@@ -9,7 +9,6 @@ from memoryos.contextdb.store.source_store import IndexStore, SourceStore
 from memoryos.contextdb.store.vector_store import VectorStore
 from memoryos.providers.embedding import EmbeddingProvider
 
-
 logger = logging.getLogger(__name__)
 
 

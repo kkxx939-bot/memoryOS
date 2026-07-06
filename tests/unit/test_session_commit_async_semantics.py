@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any, cast
+
 from memoryos.api.sdk.client import MemoryOSClient
 from memoryos.contextdb.context_db import ContextDB
 from memoryos.contextdb.session import SessionArchive, SessionArchiveStore, SessionCommitService
@@ -48,8 +50,8 @@ def _context_db(tmp_path, queue: InMemoryQueueStore, committer: RecordingCommitt
     source = FileSystemSourceStore(tmp_path)
     index = InMemoryIndexStore()
     relations = InMemoryRelationStore()
-    service = SessionCommitService(SessionArchiveStore(tmp_path), queue, committer=committer)
-    return ContextDB(source, index, relations, queue_store=queue, session_commit_service=service, committer=committer)
+    service = SessionCommitService(SessionArchiveStore(tmp_path), queue, committer=cast(Any, committer))
+    return ContextDB(source, index, relations, queue_store=queue, session_commit_service=service, committer=cast(Any, committer))
 
 
 def test_commit_session_async_true_does_not_leave_worker_session_commit_job(tmp_path) -> None:
@@ -88,7 +90,7 @@ def test_commit_session_async_false_keeps_sync_archive_pending_job(tmp_path) -> 
 def test_session_commit_worker_processes_real_pending_archive_once(tmp_path) -> None:
     queue = InMemoryQueueStore()
     committer = RecordingCommitter()
-    service = SessionCommitService(SessionArchiveStore(tmp_path), queue, committer=committer)
+    service = SessionCommitService(SessionArchiveStore(tmp_path), queue, committer=cast(Any, committer))
     archive = _archive()
     queued = service.sync_archive(archive)
 
