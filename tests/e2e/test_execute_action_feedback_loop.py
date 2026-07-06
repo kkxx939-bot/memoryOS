@@ -84,7 +84,7 @@ def test_execute_success_writes_action_result_and_rewards_policy(tmp_path) -> No
 
     result = client.process_observation(request, archive_session=True, async_commit=True)
 
-    assert result.decision.mode == "execute"
+    assert result.prediction_result.decision.mode == "execute"
     archive_dir = ContextURI.parse("memoryos://user/u1/sessions/history/ep-execute").to_source_path(tmp_path)
     action_result = json.loads((archive_dir / "action_results.jsonl").read_text(encoding="utf-8").splitlines()[0])["action_result"]
     observation = json.loads((archive_dir / "observations.jsonl").read_text(encoding="utf-8").splitlines()[0])
@@ -120,7 +120,7 @@ def test_missing_required_skill_keeps_policy_gate_from_execute(tmp_path) -> None
 
     result = client.process_observation(request, archive_session=True, async_commit=True)
 
-    assert result.decision.mode == "ask_user"
+    assert result.prediction_result.decision.mode == "ask_user"
     archive_dir = ContextURI.parse("memoryos://user/u1/sessions/history/ep-execute").to_source_path(tmp_path)
     action_result = json.loads((archive_dir / "action_results.jsonl").read_text(encoding="utf-8").splitlines()[0])["action_result"]
     assert action_result["status"] == "skipped"

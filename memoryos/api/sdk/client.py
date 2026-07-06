@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from memoryos.action_policy.model.action_policy import ActionPolicy
+from memoryos.api.sdk.result import ProcessObservationResult
 from memoryos.connect import ConnectMetadata, PipelineMode
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.retrieval.context_assembler import ContextAssembler
@@ -80,7 +81,7 @@ class MemoryOSClient:
         *,
         archive_session: bool = True,
         async_commit: bool = True,
-    ) -> PredictionResult:
+    ) -> ProcessObservationResult:
         connect_metadata: dict[str, Any] = {}
         if request.connect_metadata:
             metadata = self._parse_connect_metadata(request.connect_metadata)
@@ -97,7 +98,12 @@ class MemoryOSClient:
         result = self.engine.process(request, policies=policies)
         action_result = self.executor.execute(result.decision, result.action_context)
         if not archive_session:
-            return result
+            return ProcessObservationResult(
+                prediction_result=result,
+                action_result=action_result,
+                session_commit_result=None,
+                archive_uri=None,
+            )
         policy_uri = result.candidates[0].policy_uri if result.candidates else ""
         feedback = []
         if action_result.status in {"success", "failed", "blocked"} and policy_uri:
@@ -139,8 +145,13 @@ class MemoryOSClient:
             ],
             metadata={"connect": connect_metadata} if connect_metadata else {},
         )
-        self.context_db.commit_session(archive, async_commit=async_commit)
-        return result
+        commit_result = self.context_db.commit_session(archive, async_commit=async_commit)
+        return ProcessObservationResult(
+            prediction_result=result,
+            action_result=action_result,
+            session_commit_result=commit_result,
+            archive_uri=archive.archive_uri,
+        )
 
     def search_context(
         self,
@@ -195,7 +206,7 @@ class MemoryOSClient:
         tool_results: list[dict[str, Any]] | None = None,
         connect_metadata: dict[str, Any] | None = None,
         async_commit: bool = True,
-    ) -> None:
+    ) -> Any:
         metadata = self._parse_connect_metadata(connect_metadata)
         archive = SessionArchive(
             user_id=user_id,
@@ -206,7 +217,7 @@ class MemoryOSClient:
             tool_results=tool_results or [],
             metadata={"connect": metadata.to_dict()},
         )
-        self.context_db.commit_session(archive, async_commit=async_commit)
+        return self.context_db.commit_session(archive, async_commit=async_commit)
 
     def _parse_connect_metadata(self, payload: dict[str, Any] | None) -> ConnectMetadata:
         return ConnectMetadata.from_dict(payload)

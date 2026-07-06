@@ -117,12 +117,13 @@ def test_predictive_context_hot_room_flow_uses_production_entrypoint(tmp_path) -
         token_budget=2000,
     )
     result = client.process_observation(request, archive_session=True, async_commit=True)
+    prediction = result.prediction_result
 
-    assert result.candidates[0].action == "turn_on_ac"
-    assert result.decision.mode == "execute"
-    assert result.memory_operations == []
-    assert result.action_context.packed_context["load_plan"]
-    assert "dropped_contexts" in result.action_context.packed_context
+    assert prediction.candidates[0].action == "turn_on_ac"
+    assert prediction.decision.mode == "execute"
+    assert prediction.memory_operations == []
+    assert prediction.action_context.packed_context["load_plan"]
+    assert "dropped_contexts" in prediction.action_context.packed_context
 
     archive_dir = ContextURI.parse("memoryos://user/u1/sessions/history/ep-hot-room-production").to_source_path(tmp_path)
     assert (archive_dir / "observations.jsonl").exists()

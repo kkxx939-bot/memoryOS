@@ -47,7 +47,7 @@ class SessionCommitRequiresCommitterTest(unittest.TestCase):
                 [policy],
                 async_commit=True,
             )
-            self.assertEqual(result.memory_operations, [])
+            self.assertEqual(result.prediction_result.memory_operations, [])
             diff = json.loads((root / "tenants/default/users/u1/sessions/history/s2/memory_diff.json").read_text(encoding="utf-8"))
             self.assertEqual(diff["status"], "committed")
 
