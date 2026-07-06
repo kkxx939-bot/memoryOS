@@ -52,12 +52,10 @@ class ActionContextBuilder:
             "skill": skills or [],
             "recent_session": [],
         }
-        source_uris = []
         for candidate in top_candidates:
             policy = policy_by_uri.get(candidate.policy_uri)
             if not policy:
                 continue
-            source_uris.append(policy.uri)
             sections["action_policy"].append(
                 {
                     "uri": policy.uri,
@@ -69,7 +67,6 @@ class ActionContextBuilder:
             relation_sections = self._relation_sections(policy.uri, user_id=user_id, token_budget_remaining=token_budget, candidate_score=candidate.score)
             for section, items in relation_sections.items():
                 sections[section].extend(items)
-                source_uris.extend(item["uri"] for item in items)
             if not relation_sections.get("memory_anchor"):
                 sections["memory_anchor"].extend(self._hits(user_id, policy.memory_anchor_uri, ContextType.MEMORY, token_budget_remaining=token_budget))
             if not relation_sections.get("memory_rules"):
@@ -89,6 +86,7 @@ class ActionContextBuilder:
             },
         )
         packed = packer.pack(sections)
+        source_uris = self._packed_source_uris(packed)
         return ActionContext(user_id=user_id, candidate_actions=actions, packed_context=packed, source_uris=source_uris)
 
     def _relation_sections(
@@ -210,3 +208,15 @@ class ActionContextBuilder:
         if context_type == ContextType.ACTION_POLICY.value:
             return "action_policy"
         return "memory_rules"
+
+    def _packed_source_uris(self, packed: dict) -> list[str]:
+        uris: list[str] = []
+        for section, payload in packed.get("slices", {}).items():
+            for item in payload.get("items", []):
+                uri = str(item.get("uri", ""))
+                if not uri:
+                    continue
+                if section in {"resource", "skill"} and not item.get("context_type"):
+                    continue
+                uris.append(uri)
+        return list(dict.fromkeys(uris))

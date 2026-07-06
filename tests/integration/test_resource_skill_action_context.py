@@ -121,3 +121,71 @@ def test_direct_request_resource_and_skill_are_archived_and_learned_by_action_po
     learned_policy = client.context_db.read_object(f"memoryos://user/u1/action_policies/{scene_key}/turn_on_ac")
     assert learned_policy.metadata["required_resource_uris"] == [resource_uri]
     assert learned_policy.metadata["required_skill_uris"] == [skill_uri]
+
+
+def test_registered_persistent_skill_is_executable_by_default(tmp_path) -> None:
+    calls: list[dict] = []
+    registry = ToolRegistry()
+    registry.register("ac_tool", lambda args: calls.append(args) or {"ok": True})
+    client = MemoryOSClient(str(tmp_path), tool_registry=registry)
+    resource_uri = "memoryos://resources/devices/ac-living-room"
+    skill_uri = "memoryos://skills/smart_home/ac-control"
+    ResourceImporter(client.source_store, client.index_store).import_text(
+        resource_uri,
+        "AC",
+        "device",
+        json.dumps({"tool_name": "ac_tool", "supported_actions": ["turn_on_ac"], "device_id": "ac"}),
+    )
+    SkillRegistry(client.source_store, client.index_store).register(
+        Skill(uri=skill_uri, title="AC control", tool_name="ac_tool"),
+        content="turn_on_ac skill available",
+    )
+    policy = ActionPolicy(
+        user_id="u1",
+        scene_key="hot",
+        action="turn_on_ac",
+        memory_anchor_uri="memoryos://user/u1/memories/anchors/hot",
+        auto_execute_allowed=True,
+        q_value=0.95,
+        confidence=0.95,
+        required_resource_uris=[resource_uri],
+        required_skill_uris=[skill_uri],
+    )
+    client.committer.commit(
+        "u1",
+        [
+            ContextOperation(
+                user_id="u1",
+                context_type=policy.to_context_object().context_type,
+                action=OperationAction.ADD,
+                target_uri=policy.uri,
+                payload={"context_object": policy.to_context_object().to_dict(), "content": json.dumps(policy.to_dict())},
+            )
+        ],
+    )
+
+    result = client.process_observation(
+        PredictionRequest(
+            user_id="u1",
+            episode_id="registered-skill",
+            observation={"scene_key": "hot", "raw_text": "room is hot", "location": "home"},
+            available_actions=["turn_on_ac", "ask_user", "do_nothing"],
+        ),
+        async_commit=False,
+    )
+
+    assert result.action_result is not None
+    assert result.action_result.status == "success"
+    assert result.action_result.skill_uris == [skill_uri]
+    assert calls
+
+
+def test_registered_skill_preserves_explicit_non_executable_metadata() -> None:
+    skill = Skill(
+        uri="memoryos://skills/smart_home/ac-control-disabled",
+        title="AC control disabled",
+        tool_name="ac_tool",
+        metadata={"executable": False},
+    )
+
+    assert skill.to_context_object().metadata["executable"] is False

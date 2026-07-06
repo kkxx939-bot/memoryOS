@@ -19,5 +19,5 @@ class Skill:
             uri=self.uri,
             context_type=ContextType.SKILL,
             title=self.title,
-            metadata={"tool_name": self.tool_name, "risk_level": self.risk_level, **self.metadata},
+            metadata={"tool_name": self.tool_name, "risk_level": self.risk_level, "executable": True, **self.metadata},
         )
