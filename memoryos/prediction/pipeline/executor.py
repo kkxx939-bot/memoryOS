@@ -45,7 +45,7 @@ class ActionExecutor:
         metadata = skill.get("metadata", {}) if isinstance(skill.get("metadata", {}), dict) else {}
         if metadata.get("executable") is not True:
             return ActionResult(action=decision.action, status="blocked", executed=False, reason="Required skill is not executable.", started_at=started_at)
-        tool_name = self._tool_name(skill)
+        tool_name = self._tool_name(skill, resource)
         tool_args = self._tool_args(decision.action, resource, skill)
         resource_uris = [str(resource.get("uri", ""))]
         skill_uris = [str(skill.get("uri", ""))]
@@ -132,47 +132,62 @@ class ActionExecutor:
             return None, None, f"No resource supports action {action}"
         skill = skill_candidates[0]
         resource = resource_candidates[0]
-        skill_tool = self._metadata(skill).get("tool_name")
-        resource_tool = self._metadata(resource).get("tool_name")
+        skill_tool = self._declared_tool_name(skill)
+        resource_tool = self._declared_tool_name(resource)
         if skill_tool and resource_tool and str(skill_tool) != str(resource_tool):
-            return None, None, "Skill tool_name does not match resource tool_name"
+            return None, None, "resource/skill tool_name mismatch"
         return skill, resource, None
 
     def _matching_items(self, action: str, items: list[dict], item_name: str) -> tuple[list[dict], str | None]:
-        declared = [item for item in items if self._declares_action_match(item)]
-        if declared:
-            matches = [item for item in declared if self._supports_action(item, action)]
+        matches = []
+        generic = []
+        has_explicit = False
+        for item in items:
+            matched, explicit = self._match_action(item, action)
+            if explicit:
+                has_explicit = True
+            if matched:
+                if explicit:
+                    matches.append(item)
+                else:
+                    generic.append(item)
+        if has_explicit:
             if not matches:
                 return [], f"No {item_name} supports action {action}"
             return matches, None
-        if len(items) == 1:
-            return items, None
-        return list(items), None
+        return generic, None
 
-    def _declares_action_match(self, item: dict) -> bool:
+    def _match_action(self, item: dict, action: str) -> tuple[bool, bool]:
         metadata = self._metadata(item)
-        return "supported_actions" in metadata or "action" in metadata
-
-    def _supports_action(self, item: dict, action: str) -> bool:
-        metadata = self._metadata(item)
+        has_action = "action" in metadata
+        has_supported_actions = "supported_actions" in metadata
+        if has_action and str(metadata.get("action", "")) != action:
+            return False, True
         supported = metadata.get("supported_actions")
-        if isinstance(supported, str):
-            supported_actions = {supported}
-        elif isinstance(supported, list):
-            supported_actions = {str(value) for value in supported}
-        else:
-            supported_actions = set()
-        if action in supported_actions:
-            return True
-        return str(metadata.get("action", "")) == action
+        if has_supported_actions:
+            if isinstance(supported, str):
+                if supported != action:
+                    return False, True
+            elif isinstance(supported, list):
+                if action not in {str(value) for value in supported}:
+                    return False, True
+            else:
+                return False, True
+        if has_action or has_supported_actions:
+            return True, True
+        return True, False
 
     def _metadata(self, item: dict) -> dict:
         metadata = item.get("metadata", {})
         return metadata if isinstance(metadata, dict) else {}
 
-    def _tool_name(self, skill: dict) -> str:
+    def _declared_tool_name(self, item: dict) -> str:
+        metadata = self._metadata(item)
+        return str(item.get("tool_name") or metadata.get("tool_name") or "")
+
+    def _tool_name(self, skill: dict, resource: dict) -> str:
         metadata = self._metadata(skill)
-        return str(metadata.get("tool_name") or skill.get("title") or skill.get("uri") or "")
+        return self._declared_tool_name(skill) or self._declared_tool_name(resource) or str(skill.get("title") or skill.get("uri") or "")
 
     def _tool_args(self, action: str, resource: dict, skill: dict) -> dict:
         resource_metadata = self._metadata(resource)

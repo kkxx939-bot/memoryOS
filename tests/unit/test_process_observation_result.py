@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from memoryos.action_policy.model.action_policy import ActionCandidate
 from memoryos.api.sdk import ProcessObservationResult
 from memoryos.api.sdk.client import MemoryOSClient
@@ -156,6 +158,29 @@ def test_process_observation_archive_commit_result_and_async_flag_are_visible() 
     assert result.archive_uri == archive.archive_uri == "memoryos://archive/s1"
 
 
+def test_process_observation_commit_status_is_visible_for_async_modes() -> None:
+    queued = SessionCommitResult(task_id="task1", archive_uri="memoryos://archive/s1", status="queued")
+    done = SessionCommitResult(task_id="task2", archive_uri="memoryos://archive/s2", status="done", done=True)
+
+    queued_result = _client(commit_result=queued).process_observation(
+        _request(session_uri="memoryos://archive/s1"),
+        archive_session=True,
+        async_commit=False,
+    )
+    done_result = _client(commit_result=done).process_observation(
+        _request(session_uri="memoryos://archive/s2"),
+        archive_session=True,
+        async_commit=True,
+    )
+
+    assert queued_result.prediction_result is not None
+    assert queued_result.session_commit_result.status == "queued"
+    assert queued_result.archive_uri == "memoryos://archive/s1"
+    assert done_result.prediction_result is not None
+    assert done_result.session_commit_result.status == "done"
+    assert done_result.archive_uri == "memoryos://archive/s2"
+
+
 def test_process_observation_archive_passes_async_true() -> None:
     client = _client(commit_result={"status": "done"})
 
@@ -210,3 +235,18 @@ def test_process_observation_result_to_dict_handles_optional_and_commit_shapes()
         prediction_result=prediction_result,
         session_commit_result=DictLikeCommitResult(),
     ).to_dict()["session_commit_result"] == {"status": "done", "source": "to_dict"}
+
+
+def test_prediction_result_still_rejects_memory_operations() -> None:
+    base = _prediction_result()
+
+    with pytest.raises(ValueError, match="durable memory operations"):
+        PredictionResult(
+            request_id=base.request_id,
+            episode_id=base.episode_id,
+            observation=base.observation,
+            candidates=base.candidates,
+            action_context=base.action_context,
+            decision=base.decision,
+            memory_operations=[{"op": "write"}],
+        )

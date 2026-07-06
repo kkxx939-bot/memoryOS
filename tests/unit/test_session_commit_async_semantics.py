@@ -66,6 +66,9 @@ def test_commit_session_async_true_does_not_leave_worker_session_commit_job(tmp_
     committed_once = sum(len(operations) for _, operations in committer.calls)
     assert committed_once > 0
     assert sum(1 for job in queue.jobs.values() if job.queue_name == "session_commit") == 0
+    call_count_after_commit = len(committer.calls)
+    assert queue.lease("session_commit", 1) == []
+    assert len(committer.calls) == call_count_after_commit
 
 
 def test_commit_session_async_false_keeps_sync_archive_pending_job(tmp_path) -> None:
@@ -119,3 +122,25 @@ def test_process_observation_async_true_returns_commit_result_without_session_co
     assert result.session_commit_result.done is True
     assert result.archive_uri == "memoryos://user/u1/sessions/history/ep1"
     assert queue.lease("session_commit", 1) == []
+
+
+def test_process_observation_async_false_returns_queued_commit_result_and_worker_job(tmp_path) -> None:
+    queue = InMemoryQueueStore()
+    client = MemoryOSClient(str(tmp_path), queue_store=queue)
+    request = PredictionRequest(
+        user_id="u1",
+        episode_id="ep1",
+        observation="hot room",
+        available_actions=["turn_on_ac", "ask_user", "do_nothing"],
+        request_id="req1",
+    )
+
+    result = client.process_observation(request, archive_session=True, async_commit=False)
+
+    assert result.prediction_result is not None
+    assert result.session_commit_result is not None
+    assert result.session_commit_result.status == "queued"
+    assert result.session_commit_result.done is False
+    assert result.archive_uri == "memoryos://user/u1/sessions/history/ep1"
+    pending = queue.lease("session_commit", 1)
+    assert [job.job_id for job in pending] == [result.session_commit_result.task_id]
