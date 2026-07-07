@@ -10,6 +10,7 @@ import pytest
 
 import memoryos.adapters.agent_hooks.queue as queue_module
 from memoryos.adapters.agent_hooks import cli
+from memoryos.adapters.agent_hooks.base import format_injection
 from memoryos.adapters.agent_hooks.claude_code import ClaudeCodeHookAdapter
 from memoryos.adapters.agent_hooks.codex import CodexHookAdapter
 from memoryos.adapters.agent_hooks.config import AgentHookConfig
@@ -74,6 +75,17 @@ def test_codex_user_prompt_submit_injects_bounded_context(tmp_path: Path) -> Non
 
     assert "<memoryos_context>" in result["injection_text"]
     assert "memoryos://ctx/1" in result["injection_text"]
+
+
+def test_format_injection_wraps_context_and_sources_inside_boundary() -> None:
+    text = format_injection({"packed_context": "remember the local MCP plan", "source_uris": ["memoryos://ctx/1"]})
+
+    assert text == "<memoryos_context>\nremember the local MCP plan\n\nSources:\n- memoryos://ctx/1\n</memoryos_context>"
+
+
+def test_format_injection_empty_context_returns_empty_string() -> None:
+    assert format_injection({"packed_context": "", "source_uris": ["memoryos://ctx/1"]}) == ""
+    assert format_injection({"source_uris": ["memoryos://ctx/1"]}) == ""
 
 
 def test_codex_post_tool_use_enqueues_without_immediate_flush(tmp_path: Path) -> None:
@@ -348,6 +360,27 @@ def test_pending_queue_uses_msvcrt_fallback_when_fcntl_unavailable(tmp_path: Pat
 
     assert queue.enqueue(PendingItem(event_id="e1", session_id="s1", adapter_id="codex", hook_name="Stop", payload={}))
     assert fake_msvcrt.calls == [(fake_msvcrt.LK_LOCK, 1), (fake_msvcrt.LK_UNLCK, 1)]
+
+
+def test_pending_queue_prefers_fcntl_locking_when_available(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeFcntl:
+        LOCK_EX = 1
+        LOCK_UN = 2
+
+        def __init__(self) -> None:
+            self.calls: list[int] = []
+
+        def flock(self, fd: int, mode: int) -> None:  # noqa: ARG002
+            self.calls.append(mode)
+
+    fake_fcntl = FakeFcntl()
+    queue = PendingQueue(str(tmp_path / "queue.jsonl"))
+
+    monkeypatch.setattr(queue_module, "_fcntl", fake_fcntl)
+    monkeypatch.setattr(queue_module, "_msvcrt", None)
+
+    assert queue.enqueue(PendingItem(event_id="e1", session_id="s1", adapter_id="codex", hook_name="Stop", payload={}))
+    assert fake_fcntl.calls == [fake_fcntl.LOCK_EX, fake_fcntl.LOCK_UN]
 
 
 def test_pending_queue_concurrent_enqueue_keeps_all_unique_events(tmp_path: Path) -> None:
