@@ -329,13 +329,25 @@ def test_pending_queue_mark_failed_redacts_error(tmp_path: Path) -> None:
     assert "<redacted-path>" in item.last_error
 
 
-def test_pending_queue_imports_on_non_posix_but_operations_fail_clearly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_pending_queue_uses_msvcrt_fallback_when_fcntl_unavailable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeMsvcrt:
+        LK_LOCK = 1
+        LK_UNLCK = 2
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[int, int]] = []
+
+        def locking(self, fd: int, mode: int, nbytes: int) -> None:  # noqa: ARG002
+            self.calls.append((mode, nbytes))
+
+    fake_msvcrt = FakeMsvcrt()
     queue = PendingQueue(str(tmp_path / "queue.jsonl"))
 
     monkeypatch.setattr(queue_module, "_fcntl", None)
+    monkeypatch.setattr(queue_module, "_msvcrt", fake_msvcrt)
 
-    with pytest.raises(RuntimeError, match="POSIX fcntl"):
-        queue.enqueue(PendingItem(event_id="e1", session_id="s1", adapter_id="codex", hook_name="Stop", payload={}))
+    assert queue.enqueue(PendingItem(event_id="e1", session_id="s1", adapter_id="codex", hook_name="Stop", payload={}))
+    assert fake_msvcrt.calls == [(fake_msvcrt.LK_LOCK, 1), (fake_msvcrt.LK_UNLCK, 1)]
 
 
 def test_pending_queue_concurrent_enqueue_keeps_all_unique_events(tmp_path: Path) -> None:

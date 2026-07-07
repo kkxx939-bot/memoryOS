@@ -35,6 +35,25 @@ def test_sqlite_queue_store_fail_records_retry(tmp_path) -> None:
     assert (status, retry_count, last_error) == ("failed", 1, "boom")
 
 
+def test_queue_duplicate_enqueue_is_idempotent_for_both_stores(tmp_path) -> None:
+    job = QueueJob(job_id="same", queue_name="session_commit", action="commit", target_uri="memoryos://user/u1/sessions/same")
+    memory_store = InMemoryQueueStore()
+    sqlite_path = tmp_path / "queue.sqlite3"
+    sqlite_store = SQLiteQueueStore(sqlite_path)
+
+    memory_store.enqueue(job)
+    memory_store.enqueue(job)
+    sqlite_store.enqueue(job)
+    sqlite_store.enqueue(job)
+
+    with sqlite3.connect(sqlite_path) as conn:
+        row_count = conn.execute("SELECT COUNT(*) FROM queue_jobs WHERE job_id = 'same'").fetchone()[0]
+    assert list(memory_store.jobs) == ["same"]
+    assert row_count == 1
+    assert [item.job_id for item in memory_store.lease("session_commit", 10)] == ["same"]
+    assert [item.job_id for item in sqlite_store.lease("session_commit", 10)] == ["same"]
+
+
 def test_queue_reenqueue_failed_job_restores_pending_for_both_stores(tmp_path) -> None:
     job = QueueJob(job_id="j3", queue_name="session_commit", action="commit", target_uri="memoryos://user/u1/sessions/s1")
     for store in (InMemoryQueueStore(), SQLiteQueueStore(tmp_path / "queue.sqlite3")):

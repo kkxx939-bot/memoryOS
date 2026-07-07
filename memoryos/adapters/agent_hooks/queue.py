@@ -17,6 +17,12 @@ try:
 except ImportError:  # pragma: no cover - exercised by monkeypatch on POSIX CI.
     _fcntl = None
 
+_msvcrt: Any
+try:
+    import msvcrt as _msvcrt
+except ImportError:  # pragma: no cover - exercised by monkeypatch on POSIX CI.
+    _msvcrt = None
+
 HOOK_ALLOWED_TOOLS = {
     "memoryos_search_context",
     "memoryos_assemble_context",
@@ -181,18 +187,19 @@ class PendingQueue:
         os.replace(tmp_name, self.path)
 
     def _locked_update(self, update) -> int:  # noqa: ANN001
-        if _fcntl is None:
-            raise RuntimeError("PendingQueue requires POSIX fcntl file locking; Windows hooks are not supported yet")
+        lock_backend = _lock_backend()
+        if lock_backend is None:
+            raise RuntimeError("PendingQueue requires fcntl or msvcrt file locking")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.lock_path.open("w", encoding="utf-8") as lock_file:
-            _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_EX)
+            _lock_file(lock_file, lock_backend)
             try:
                 items = self._read_items()
                 updated = update(items)
                 self._write_items(updated)
                 return len(updated)
             finally:
-                _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_UN)
+                _unlock_file(lock_file, lock_backend)
 
     def _append_dead_letter(self, item: PendingItem) -> None:
         self.dead_letter_path.parent.mkdir(parents=True, exist_ok=True)
@@ -202,6 +209,28 @@ class PendingQueue:
 
 def _safe_error(exc: Exception) -> str:
     return sanitize_error_text(str(exc) or exc.__class__.__name__, max_text=300)
+
+
+def _lock_backend() -> str | None:
+    if _fcntl is not None:
+        return "fcntl"
+    if _msvcrt is not None:
+        return "msvcrt"
+    return None
+
+
+def _lock_file(lock_file: Any, backend: str) -> None:
+    if backend == "fcntl":
+        _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_EX)
+        return
+    _msvcrt.locking(lock_file.fileno(), _msvcrt.LK_LOCK, 1)
+
+
+def _unlock_file(lock_file: Any, backend: str) -> None:
+    if backend == "fcntl":
+        _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_UN)
+        return
+    _msvcrt.locking(lock_file.fileno(), _msvcrt.LK_UNLCK, 1)
 
 
 def _now_dt() -> datetime:

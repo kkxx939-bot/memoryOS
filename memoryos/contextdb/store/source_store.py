@@ -77,7 +77,9 @@ class RelationStore(Protocol):
 
 
 class QueueStore(Protocol):
-    def enqueue(self, job: QueueJob) -> None: ...
+    def enqueue(self, job: QueueJob) -> None:
+        """Insert or replace by job_id; repeated enqueue of the same job_id must not duplicate work."""
+        ...
 
     def lease(self, queue_name: str, limit: int = 10) -> list[QueueJob]: ...
 
