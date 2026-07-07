@@ -118,12 +118,12 @@ class ConnectMetadata:
         if not isinstance(extra, dict):
             raise ValueError("extra must be an object")
         metadata = cls(
-            connect_type=str(payload.get("connect_type", ConnectType.AGENT)),
-            adapter_id=str(payload.get("adapter_id", "generic_agent")),
-            agent_instance_id=str(payload.get("agent_instance_id", "")),
-            run_mode=str(payload.get("run_mode", PipelineMode.CONTEXT_REDUCTION)),
-            world_domain=str(payload.get("world_domain", "digital")),
-            source_kind=str(payload.get("source_kind", "chat")),
+            connect_type=_string_field(payload, "connect_type", ConnectType.AGENT),
+            adapter_id=_string_field(payload, "adapter_id", "generic_agent"),
+            agent_instance_id=_string_field(payload, "agent_instance_id", "", allow_empty=True),
+            run_mode=_string_field(payload, "run_mode", PipelineMode.CONTEXT_REDUCTION),
+            world_domain=_string_field(payload, "world_domain", "digital"),
+            source_kind=_string_field(payload, "source_kind", "chat"),
             modality=modality or ("text",),
             capabilities=CapabilityProfile.from_dict(payload.get("capabilities")),
             extra=dict(extra),
@@ -188,3 +188,14 @@ def _parse_modality(value: Any) -> tuple[str, ...]:
 def _require_non_empty_string(value: Any, field_name: str) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a non-empty string")
+
+
+def _string_field(payload: dict[str, Any], key: str, default: str, *, allow_empty: bool = False) -> str:
+    if key not in payload:
+        return default
+    value = payload[key]
+    if not isinstance(value, str):
+        raise ValueError(f"{key} must be a string")
+    if not allow_empty and not value.strip():
+        raise ValueError(f"{key} must be a non-empty string")
+    return value

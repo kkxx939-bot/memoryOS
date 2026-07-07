@@ -72,6 +72,15 @@ class ReturningExecutor:
         return ActionResult(action=decision.action, status="skipped", executed=False, reason="test")
 
 
+class SuccessfulExecutor:
+    def __init__(self) -> None:
+        self.called = False
+
+    def execute(self, decision, action_context):  # noqa: ANN001, ANN201
+        self.called = True
+        return ActionResult(action=decision.action, status="success", executed=True, reason="done")
+
+
 class RaisingExecutor:
     def __init__(self) -> None:
         self.called = False
@@ -498,6 +507,36 @@ def test_predict_rejects_string_false_behavior_capability_before_engine() -> Non
     assert context_db.committed == []
 
 
+def test_connect_metadata_rejects_non_string_identity_fields() -> None:
+    cases: list[tuple[dict[str, Any], str]] = [
+        ({"adapter_id": 123}, "adapter_id must be a string"),
+        ({"source_kind": 123}, "source_kind must be a string"),
+        ({"world_domain": []}, "world_domain must be a string"),
+        ({"connect_type": 123}, "connect_type must be a string"),
+        ({"run_mode": False}, "run_mode must be a string"),
+        ({"agent_instance_id": 123}, "agent_instance_id must be a string"),
+    ]
+    for payload, message in cases:
+        with pytest.raises(ValueError, match=message):
+            ConnectMetadata.from_dict(payload)
+
+
+def test_connect_metadata_accepts_valid_string_identity_fields() -> None:
+    metadata = ConnectMetadata.from_dict(
+        {
+            "adapter_id": "codex",
+            "source_kind": "terminal",
+            "world_domain": "digital",
+            "agent_instance_id": "agent-1",
+        }
+    )
+
+    assert metadata.adapter_id == "codex"
+    assert metadata.source_kind == "terminal"
+    assert metadata.world_domain == "digital"
+    assert metadata.agent_instance_id == "agent-1"
+
+
 def test_predict_rejects_agent_action_capable_metadata_before_engine() -> None:
     metadata = ConnectMetadata(
         run_mode=PipelineMode.ACTION_CAPABLE,
@@ -583,12 +622,14 @@ def test_process_observation_returns_archive_error_when_commit_fails_after_actio
     context_db.fail_commit = True
     client = _client(context_db)
     client.engine = ReturningEngine(_prediction_result())
-    client.executor = ReturningExecutor()
+    client.executor = SuccessfulExecutor()
     metadata = ConnectMetadata.action_capable_embodied("reachy_mini").to_dict()
 
     result = client.process_observation(_request(metadata), async_commit=False)
 
     assert result.action_result is not None
+    assert result.action_result.status == "success"
+    assert result.action_result.executed is True
     assert result.archive_error == {"code": "ARCHIVE_COMMIT_FAILED", "message": "RuntimeError"}
     assert result.session_commit_result is None
     assert result.archive_uri == "memoryos://user/u1/sessions/history/s1"
@@ -609,6 +650,23 @@ def test_process_observation_archives_failed_action_when_executor_raises() -> No
     assert result.action_result.executed is False
     archive, _async_commit = context_db.committed[0]
     assert archive.action_results[0]["action_result"]["status"] == "failed"
+
+
+def test_process_observation_archive_session_false_does_not_commit() -> None:
+    context_db = FakeContextDB()
+    client = _client(context_db)
+    client.engine = ReturningEngine(_prediction_result())
+    client.executor = SuccessfulExecutor()
+    metadata = ConnectMetadata.action_capable_embodied("reachy_mini").to_dict()
+
+    result = client.process_observation(_request(metadata), archive_session=False)
+
+    assert result.archive_uri is None
+    assert result.session_commit_result is None
+    assert result.archive_error is None
+    assert context_db.committed == []
+    assert client.engine.called is True
+    assert client.executor.called is True
 
 
 def test_commit_agent_session_uses_stable_task_id_for_same_payload() -> None:

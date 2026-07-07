@@ -6,6 +6,9 @@ import threading
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+import memoryos.adapters.agent_hooks.queue as queue_module
 from memoryos.adapters.agent_hooks import cli
 from memoryos.adapters.agent_hooks.claude_code import ClaudeCodeHookAdapter
 from memoryos.adapters.agent_hooks.codex import CodexHookAdapter
@@ -34,6 +37,14 @@ class FakeHookMCPClient:
         if name == "memoryos_commit_session" and self.fail_commit:
             return {"error": {"code": "CLIENT_ERROR", "message": "temporary", "retryable": True, "details": {}}}
         return {"status": "done", "error": None}
+
+
+class SecretFailHookMCPClient:
+    def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:  # noqa: ARG002
+        raise RuntimeError(
+            "boom Authorization: Bearer sk-test OPENAI_API_KEY=sk-env "
+            "api_key=raw token=tok password=pw secret=hidden /Users/gulf/project /home/gulf/x /tmp/raw"
+        )
 
 
 def _config(tmp_path: Path, adapter_id: str = "codex") -> AgentHookConfig:
@@ -207,6 +218,124 @@ def test_pending_queue_idempotency_retry_success_and_corrupt_file(tmp_path: Path
     assert failed["failed"] == 1
     assert succeeded["flushed"] == 1
     assert [item.event_id for item in queue.list_items()] == ["e2"]
+
+
+def test_pending_queue_flush_calls_client_outside_locked_update(tmp_path: Path) -> None:
+    class InstrumentedQueue(PendingQueue):
+        in_locked_update = False
+
+        def _locked_update(self, update: Any) -> int:
+            self.in_locked_update = True
+            try:
+                return super()._locked_update(update)
+            finally:
+                self.in_locked_update = False
+
+    queue = InstrumentedQueue(str(tmp_path / "queue.jsonl"))
+    queue.enqueue(
+        PendingItem(
+            event_id="e1",
+            session_id="s1",
+            adapter_id="codex",
+            hook_name="Stop",
+            payload={"tool_name": "memoryos_commit_session", "arguments": {"session_id": "s1"}},
+        )
+    )
+
+    class LockAssertingClient:
+        def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:  # noqa: ARG002
+            assert queue.in_locked_update is False
+            assert queue.enqueue(
+                PendingItem(
+                    event_id="e2",
+                    session_id="s2",
+                    adapter_id="codex",
+                    hook_name="Stop",
+                    payload={"tool_name": "memoryos_commit_session", "arguments": {"session_id": "s2"}},
+                )
+            )
+            return {"status": "done", "error": None}
+
+    result = queue.flush(LockAssertingClient())
+
+    assert result["flushed"] == 1
+    assert [item.event_id for item in queue.list_items()] == ["e2"]
+
+
+def test_pending_queue_flush_failure_error_is_redacted_and_retryable(tmp_path: Path) -> None:
+    queue = PendingQueue(str(tmp_path / "queue.jsonl"), max_retries=2)
+    queue.enqueue(
+        PendingItem(
+            event_id="e1",
+            session_id="s1",
+            adapter_id="codex",
+            hook_name="Stop",
+            payload={"tool_name": "memoryos_commit_session", "arguments": {"session_id": "s1"}},
+        )
+    )
+
+    result = queue.flush(SecretFailHookMCPClient())
+    item = queue.list_items()[0]
+
+    assert result["failed"] == 1
+    assert result["remaining"] == 1
+    assert item.retry_count == 1
+    assert "sk-test" not in item.last_error
+    assert "sk-env" not in item.last_error
+    assert "raw" not in item.last_error
+    assert "token=tok" not in item.last_error
+    assert "/Users/gulf" not in item.last_error
+    assert "/home/gulf" not in item.last_error
+    assert "/tmp/raw" not in item.last_error
+    assert "<redacted>" in item.last_error
+    assert "<redacted-path>" in item.last_error
+
+
+def test_pending_queue_dead_letter_error_is_redacted(tmp_path: Path) -> None:
+    queue = PendingQueue(str(tmp_path / "queue.jsonl"), max_retries=1)
+    queue.enqueue(
+        PendingItem(
+            event_id="e1",
+            session_id="s1",
+            adapter_id="codex",
+            hook_name="Stop",
+            payload={"tool_name": "memoryos_commit_session", "arguments": {"session_id": "s1"}},
+        )
+    )
+
+    result = queue.flush(SecretFailHookMCPClient())
+    dead_letter = queue.dead_letter_path.read_text(encoding="utf-8")
+
+    assert result["dead_lettered"] == 1
+    assert queue.list_items() == []
+    assert "sk-test" not in dead_letter
+    assert "sk-env" not in dead_letter
+    assert "/Users/gulf" not in dead_letter
+    assert "<redacted-path>" in dead_letter
+
+
+def test_pending_queue_mark_failed_redacts_error(tmp_path: Path) -> None:
+    queue = PendingQueue(str(tmp_path / "queue.jsonl"))
+    queue.enqueue(PendingItem(event_id="e1", session_id="s1", adapter_id="codex", hook_name="Stop", payload={}))
+
+    queue.mark_failed("e1", "token=tok password=pw /home/gulf/project /tmp/raw")
+    item = queue.list_items()[0]
+
+    assert "token=tok" not in item.last_error
+    assert "password=pw" not in item.last_error
+    assert "/home/gulf" not in item.last_error
+    assert "/tmp/raw" not in item.last_error
+    assert "<redacted>" in item.last_error
+    assert "<redacted-path>" in item.last_error
+
+
+def test_pending_queue_imports_on_non_posix_but_operations_fail_clearly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    queue = PendingQueue(str(tmp_path / "queue.jsonl"))
+
+    monkeypatch.setattr(queue_module, "_fcntl", None)
+
+    with pytest.raises(RuntimeError, match="POSIX fcntl"):
+        queue.enqueue(PendingItem(event_id="e1", session_id="s1", adapter_id="codex", hook_name="Stop", payload={}))
 
 
 def test_pending_queue_concurrent_enqueue_keeps_all_unique_events(tmp_path: Path) -> None:

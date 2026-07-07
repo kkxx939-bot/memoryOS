@@ -10,6 +10,7 @@ ENV_SECRET_RE = re.compile(
     r"(?i)\b([A-Z0-9_]*(?:API[_-]?KEY|TOKEN|PASSWORD|SECRET)[A-Z0-9_]*)(\s*=\s*)([^\s]+)"
 )
 INLINE_SECRET_RE = re.compile(r"(?i)\b(api[_-]?key|token|password|secret)(\s*[:=]\s*)([^\s,;]+)")
+LOCAL_PATH_RE = re.compile(r"(?:(?:/Users|/home|/tmp|/private/tmp)/[^\s'\",;:)]*)")
 NOISY_PATH_PARTS = {".git", "node_modules", "venv", ".venv", "dist", "build", "__pycache__"}
 MAX_TEXT = 4000
 MAX_LOG_LINES = 80
@@ -51,6 +52,12 @@ def sanitize_text(text: str, *, max_text: int = MAX_TEXT) -> str:
     if len(redacted) > max_text:
         return redacted[:max_text] + f"\n... <{len(redacted) - max_text} chars omitted> ..."
     return redacted
+
+
+def sanitize_error_text(text: str, *, max_text: int = 300) -> str:
+    redacted = sanitize_text(text, max_text=max_text)
+    redacted = LOCAL_PATH_RE.sub("<redacted-path>", redacted)
+    return redacted[:max_text]
 
 
 def sanitize_changed_files(paths: list[str]) -> list[str]:

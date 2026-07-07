@@ -96,6 +96,8 @@ class ContextDB:
     def commit_session(self, archive: SessionArchive, *, async_commit: bool = True) -> SessionCommitResult:
         if self.session_commit_service is None:
             raise RuntimeError("ContextDB requires SessionCommitService to commit sessions")
+        # Public API compatibility: async_commit=True runs the async commit stage now;
+        # False archives synchronously and leaves a worker job.
         if async_commit:
             self.session_commit_service.sync_archive(archive, enqueue_commit_job=False)
             return self.session_commit_service.async_commit(archive)
