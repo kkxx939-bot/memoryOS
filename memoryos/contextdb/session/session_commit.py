@@ -52,6 +52,8 @@ class SessionCommitService:
         return SessionCommitResult(task_id=archive.task_id, archive_uri=archive.archive_uri, status="queued")
 
     def async_commit(self, archive: SessionArchive) -> SessionCommitResult:
+        if self.archive_store.async_outputs_done_for_task(archive):
+            return SessionCommitResult(task_id=archive.task_id, archive_uri=archive.archive_uri, status="done", done=True)
         source_text = "\n".join(
             [
                 *[str(item.get("content", item.get("text", ""))) for item in archive.messages],

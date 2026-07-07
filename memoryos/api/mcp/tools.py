@@ -145,7 +145,7 @@ class MCPToolRouter:
             raise ValueError("requires object field: request")
         metadata = normalize_action_metadata(request_payload.get("connect_metadata") or args.get("connect_metadata"))
         request_payload = {**request_payload, "connect_metadata": metadata.to_dict()}
-        result = self.client.predict(PredictionRequest(**request_payload), _policies(args.get("policies")))
+        result = self.client.predict(_prediction_request(request_payload), _policies(args.get("policies")))
         return ok_payload({"prediction": _to_payload(result)})
 
     def process_observation(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -156,7 +156,7 @@ class MCPToolRouter:
         metadata = require_process_observation_metadata(request_payload.get("connect_metadata") or args.get("connect_metadata"))
         request_payload = {**request_payload, "connect_metadata": metadata.to_dict()}
         result = self.client.process_observation(
-            PredictionRequest(**request_payload),
+            _prediction_request(request_payload),
             _policies(args.get("policies")),
             archive_session=optional_bool(args, "archive_session", True),
             async_commit=optional_bool(args, "async_commit", True),
@@ -204,4 +204,19 @@ def _policies(value: Any) -> list[ActionPolicy] | None:
         return None
     if not isinstance(value, list):
         raise ValueError("policies must be an array")
-    return [item if isinstance(item, ActionPolicy) else ActionPolicy(**item) for item in value]
+    policies = []
+    for item in value:
+        if isinstance(item, ActionPolicy):
+            policies.append(item)
+            continue
+        if not isinstance(item, dict):
+            raise ValueError("policies entries must be objects")
+        policies.append(ActionPolicy(**item))
+    return policies
+
+
+def _prediction_request(payload: dict[str, Any]) -> PredictionRequest:
+    try:
+        return PredictionRequest(**payload)
+    except TypeError as exc:
+        raise ValueError("request payload does not match PredictionRequest schema") from exc

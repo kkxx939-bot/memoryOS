@@ -45,3 +45,23 @@ def test_connect_metadata_rejects_invalid_type_and_mode() -> None:
 
     with pytest.raises(ValueError):
         ConnectMetadata.from_dict({"run_mode": "plugin_runtime"})
+
+
+def test_connect_metadata_rejects_malformed_field_types() -> None:
+    for payload in (
+        "not-object",
+        {"modality": 1},
+        {"modality": {"kind": "text"}},
+        {"modality": ["text", 1]},
+        {"extra": "not-object"},
+        {"extra": ["workspace", "/tmp/repo"]},
+        {"capabilities": "not-object"},
+    ):
+        with pytest.raises(ValueError):
+            ConnectMetadata.from_dict(payload)  # type: ignore[arg-type]
+
+
+def test_connect_metadata_rejects_empty_identity_fields() -> None:
+    for field in ("adapter_id", "source_kind", "world_domain"):
+        with pytest.raises(ValueError, match=f"{field} must be a non-empty string"):
+            ConnectMetadata.from_dict({field: ""})

@@ -74,10 +74,21 @@ class ConnectMetadata:
     extra: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
+        _require_non_empty_string(self.connect_type, "connect_type")
         if self.connect_type not in ConnectType.values():
             raise ValueError(f"Invalid connect_type: {self.connect_type}")
+        _require_non_empty_string(self.adapter_id, "adapter_id")
+        _require_non_empty_string(self.run_mode, "run_mode")
         if self.run_mode not in PipelineMode.values():
             raise ValueError(f"Invalid run_mode: {self.run_mode}")
+        _require_non_empty_string(self.world_domain, "world_domain")
+        _require_non_empty_string(self.source_kind, "source_kind")
+        if not isinstance(self.modality, tuple) or any(
+            not isinstance(item, str) or not item.strip() for item in self.modality
+        ):
+            raise ValueError("modality must be a non-empty string or array of non-empty strings")
+        if not isinstance(self.extra, dict):
+            raise ValueError("extra must be an object")
 
     def to_dict(self) -> dict[str, Any]:
         self.validate()
@@ -99,12 +110,13 @@ class ConnectMetadata:
             metadata = cls()
             metadata.validate()
             return metadata
+        if not isinstance(payload, dict):
+            raise ValueError("connect metadata must be an object")
         modality_payload: Any = payload.get("modality", ("text",))
-        modality: tuple[str, ...]
-        if isinstance(modality_payload, str):
-            modality = (str(modality_payload),)
-        else:
-            modality = tuple(str(item) for item in modality_payload)
+        modality = _parse_modality(modality_payload)
+        extra = payload.get("extra", {})
+        if not isinstance(extra, dict):
+            raise ValueError("extra must be an object")
         metadata = cls(
             connect_type=str(payload.get("connect_type", ConnectType.AGENT)),
             adapter_id=str(payload.get("adapter_id", "generic_agent")),
@@ -114,7 +126,7 @@ class ConnectMetadata:
             source_kind=str(payload.get("source_kind", "chat")),
             modality=modality or ("text",),
             capabilities=CapabilityProfile.from_dict(payload.get("capabilities")),
-            extra=dict(payload.get("extra", {})),
+            extra=dict(extra),
         )
         metadata.validate()
         return metadata
@@ -156,3 +168,23 @@ def _strict_bool(payload: dict[str, Any], key: str, default: bool) -> bool:
     if isinstance(value, bool):
         return value
     raise ValueError(f"capability field must be boolean: {key}")
+
+
+def _parse_modality(value: Any) -> tuple[str, ...]:
+    if isinstance(value, str):
+        if not value.strip():
+            raise ValueError("modality must be a non-empty string or array of non-empty strings")
+        return (value,)
+    if not isinstance(value, list | tuple):
+        raise ValueError("modality must be a non-empty string or array of non-empty strings")
+    parsed: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("modality must be a non-empty string or array of non-empty strings")
+        parsed.append(item)
+    return tuple(parsed)
+
+
+def _require_non_empty_string(value: Any, field_name: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string")

@@ -114,6 +114,8 @@ def required_str(payload: dict[str, Any], key: str) -> str:
 
 def optional_int(payload: dict[str, Any], key: str, default: int, *, minimum: int = 0, maximum: int = 100_000) -> int:
     value = payload.get(key, default)
+    if isinstance(value, bool):
+        raise ToolValidationError(f"requires integer field: {key}")
     try:
         parsed = int(value)
     except (TypeError, ValueError) as exc:

@@ -76,6 +76,23 @@ def test_commit_session_async_true_does_not_leave_worker_session_commit_job(tmp_
     assert len(committer.calls) == call_count_after_commit
 
 
+def test_commit_session_async_true_retry_same_task_does_not_recommit_operations(tmp_path) -> None:
+    queue = InMemoryQueueStore()
+    committer = RecordingCommitter()
+    db = _context_db(tmp_path, queue, committer)
+    archive = _archive()
+
+    first = db.commit_session(archive, async_commit=True)
+    call_count_after_first = len(committer.calls)
+    second = db.commit_session(archive, async_commit=True)
+
+    assert first.task_id == second.task_id
+    assert second.status == "done"
+    assert second.done is True
+    assert len(committer.calls) == call_count_after_first
+    assert queue.lease("session_commit", 1) == []
+
+
 def test_commit_session_async_false_keeps_sync_archive_pending_job(tmp_path) -> None:
     queue = InMemoryQueueStore()
     committer = RecordingCommitter()

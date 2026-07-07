@@ -47,6 +47,16 @@ class SessionArchiveStore:
         (directory / ".done").write_text("done\n", encoding="utf-8")
         return directory
 
+    def async_outputs_done_for_task(self, archive: SessionArchive) -> bool:
+        directory = self._dir(archive.archive_uri)
+        if not (directory / ".done").exists():
+            return False
+        try:
+            payload = json.loads((directory / "memory_diff.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        return payload.get("task_id") == archive.task_id
+
     def _dir(self, archive_uri: str) -> Path:
         return ContextURI.parse(archive_uri).to_source_path(self.root, tenant_id=self.tenant_id)
 

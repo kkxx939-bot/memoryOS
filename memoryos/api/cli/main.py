@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -48,7 +49,7 @@ def main(argv: list[str] | None = None) -> int:
             connect_metadata = _load_predict_connect_metadata(args)
             policies = _load_policies(args.policies_json)
         except (OSError, json.JSONDecodeError, TypeError, ValueError, PermissionError) as exc:
-            print(str(exc), file=sys.stderr)
+            _print_cli_error(exc)
             return 2
         request = PredictionRequest(
             user_id=args.user,
@@ -60,7 +61,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             print(json.dumps(MemoryOSClient(args.root).predict(request, policies).to_dict(), ensure_ascii=False, indent=2))
         except PermissionError as exc:
-            print(str(exc), file=sys.stderr)
+            _print_cli_error(exc)
             return 2
         return 0
     return 2
@@ -108,10 +109,29 @@ def _load_policies(raw: str) -> list[Any] | None:
         return None
     from memoryos.action_policy.model.action_policy import ActionPolicy
 
-    try:
-        return [ActionPolicy(**item) for item in policies_payload]
-    except TypeError as exc:
-        raise ValueError("policies JSON entries must be objects") from exc
+    policies = []
+    for item in policies_payload:
+        if not isinstance(item, dict):
+            raise ValueError("policies JSON entries must be objects")
+        try:
+            policies.append(ActionPolicy(**item))
+        except TypeError as exc:
+            raise ValueError("policies JSON entries must be valid policy objects") from exc
+    return policies
+
+
+SECRET_RE = re.compile(r"(?i)\b(?:api[_-]?key|token|password|secret)\s*[:=]\s*[^\s,;]+")
+PATH_RE = re.compile(r"(?:(?:/Users|/private|/var|/tmp)/[^\s'\",;:)]*)")
+
+
+def _print_cli_error(exc: Exception) -> None:
+    print(_safe_cli_error_message(str(exc)), file=sys.stderr)
+
+
+def _safe_cli_error_message(message: str) -> str:
+    sanitized = SECRET_RE.sub("<redacted>", message)
+    sanitized = PATH_RE.sub("<redacted-path>", sanitized)
+    return sanitized[:500]
 
 
 if __name__ == "__main__":

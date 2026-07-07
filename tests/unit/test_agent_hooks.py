@@ -259,10 +259,22 @@ def test_agent_hook_event_id_changes_for_different_tool_payloads(tmp_path: Path)
     same = AgentHookEvent.from_payload({**base, "tool_input": {"cmd": "ls"}, "tool_output": "one"}, adapter_id="codex", hook_name="PostToolUse")
     different_input = AgentHookEvent.from_payload({**base, "tool_input": {"cmd": "pwd"}, "tool_output": "one"}, adapter_id="codex", hook_name="PostToolUse")
     different_output = AgentHookEvent.from_payload({**base, "tool_input": {"cmd": "ls"}, "tool_output": "two"}, adapter_id="codex", hook_name="PostToolUse")
+    different_files = AgentHookEvent.from_payload(
+        {**base, "tool_input": {"cmd": "ls"}, "tool_output": "one", "changed_files": ["memoryos/a.py"]},
+        adapter_id="codex",
+        hook_name="PostToolUse",
+    )
+    explicit = AgentHookEvent.from_payload(
+        {**base, "event_id": "external-event", "tool_input": {"cmd": "pwd"}, "tool_output": "two"},
+        adapter_id="codex",
+        hook_name="PostToolUse",
+    )
 
     assert first.event_id == same.event_id
     assert different_input.event_id != first.event_id
     assert different_output.event_id != first.event_id
+    assert different_files.event_id != first.event_id
+    assert explicit.event_id == "external-event"
 
 
 def test_fallback_session_id_includes_prompt_hint(tmp_path: Path) -> None:

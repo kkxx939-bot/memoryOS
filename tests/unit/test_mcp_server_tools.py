@@ -111,9 +111,13 @@ def test_mcp_search_context_source_kind_filter_is_explicit_only() -> None:
 
     server.call_tool("memoryos_search_context", {"query": "MCP"})
     server.call_tool("memoryos_search_context", {"query": "MCP", "connect_metadata": {"adapter_id": "codex", "source_kind": "chat"}})
+    server.call_tool("memoryos_assemble_context", {"query": "MCP"})
+    server.call_tool("memoryos_assemble_context", {"query": "MCP", "connect_metadata": {"adapter_id": "codex", "source_kind": "terminal"}})
 
     assert client.search_calls[0]["connect_metadata"] == {"adapter_id": "codex"}
     assert client.search_calls[1]["connect_metadata"] == {"adapter_id": "codex", "source_kind": "chat"}
+    assert client.assemble_calls[0]["connect_metadata"] == {"adapter_id": "codex"}
+    assert client.assemble_calls[1]["connect_metadata"] == {"adapter_id": "codex", "source_kind": "terminal"}
 
 
 def test_mcp_search_context_supports_multiple_context_types() -> None:
@@ -180,6 +184,22 @@ def test_mcp_assemble_context_respects_token_budget_and_dropped_contexts() -> No
     assert result["estimated_tokens"] <= 32
     assert result["dropped_contexts"] == [{"uri": "memoryos://ctx/2", "reason": "token_budget"}]
     assert client.assemble_calls[0]["token_budget"] == 32
+
+
+def test_mcp_optional_int_rejects_bool_and_accepts_numbers() -> None:
+    server, client = _server()
+
+    bad_limit = server.call_tool("memoryos_search_context", {"query": "MCP", "limit": True})
+    bad_budget = server.call_tool("memoryos_assemble_context", {"query": "MCP", "token_budget": True})
+    good_limit = server.call_tool("memoryos_search_context", {"query": "MCP", "limit": "2"})
+    good_budget = server.call_tool("memoryos_assemble_context", {"query": "MCP", "token_budget": 32})
+
+    assert bad_limit["error"]["code"] == "VALIDATION_ERROR"
+    assert bad_budget["error"]["code"] == "VALIDATION_ERROR"
+    assert good_limit["error"] is None
+    assert good_budget["error"] is None
+    assert client.search_calls[-1]["limit"] == 2
+    assert client.assemble_calls[-1]["token_budget"] == 32
 
 
 def test_mcp_commit_session_returns_structured_result() -> None:
@@ -284,6 +304,25 @@ def test_action_tools_reject_string_false_capabilities() -> None:
     assert process["error"]["code"] == "VALIDATION_ERROR"
     assert client.predict_calls == 0
     assert client.process_calls == 0
+
+
+def test_action_tool_request_payload_schema_errors_are_validation_errors() -> None:
+    server, client = _server(enable_action_tools=True)
+    metadata = ConnectMetadata.action_capable_embodied("reachy_mini").to_dict()
+
+    unknown = server.call_tool("memoryos_predict", {"request": {**_request(metadata), "unknown": "/Users/gulf token=abc"}})
+    missing = server.call_tool(
+        "memoryos_predict",
+        {"request": {"episode_id": "s1", "observation": "hot", "available_actions": ["turn_on_ac"], "connect_metadata": metadata}},
+    )
+    bad_policy = server.call_tool("memoryos_predict", {"request": _request(metadata), "policies": ["not-object"]})
+
+    assert unknown["error"]["code"] == "VALIDATION_ERROR"
+    assert missing["error"]["code"] == "VALIDATION_ERROR"
+    assert bad_policy["error"]["code"] == "VALIDATION_ERROR"
+    assert "/Users/gulf" not in unknown["error"]["message"]
+    assert "abc" not in unknown["error"]["message"]
+    assert client.predict_calls == 0
 
 
 def test_stdio_initialize_tools_list_and_health_call_include_stable_schemas() -> None:

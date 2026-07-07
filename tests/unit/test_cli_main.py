@@ -160,14 +160,78 @@ def test_cli_predict_stable_errors_for_bad_metadata_and_policies(tmp_path: Path,
         ]
     )
     bad_policies_err = capsys.readouterr().err
+    bad_policies_json_code = cli_main.main(
+        [
+            "predict",
+            "--user",
+            "u1",
+            "--episode",
+            "s1",
+            "--observation",
+            "hot",
+            "--connect-metadata-json",
+            valid_metadata,
+            "--policies-json",
+            "{bad json",
+        ]
+    )
+    bad_policies_json_err = capsys.readouterr().err
+    bad_policies_item_code = cli_main.main(
+        [
+            "predict",
+            "--user",
+            "u1",
+            "--episode",
+            "s1",
+            "--observation",
+            "hot",
+            "--connect-metadata-json",
+            valid_metadata,
+            "--policies-json",
+            '["not-object"]',
+        ]
+    )
+    bad_policies_item_err = capsys.readouterr().err
 
-    assert missing_code == bad_file_code == bad_json_code == bad_policies_code == 2
+    assert missing_code == bad_file_code == bad_json_code == bad_policies_code == bad_policies_json_code == bad_policies_item_code == 2
     assert "failed to read connect metadata file" in missing_err
     assert str(missing) not in missing_err
     assert "valid JSON" in bad_file_err
     assert "valid JSON" in bad_json_err
     assert "policies JSON must be an array" in bad_policies_err
-    assert "Traceback" not in missing_err + bad_file_err + bad_json_err + bad_policies_err
+    assert "policies JSON must be valid JSON" in bad_policies_json_err
+    assert "policies JSON entries must be objects" in bad_policies_item_err
+    assert "Traceback" not in missing_err + bad_file_err + bad_json_err + bad_policies_err + bad_policies_json_err + bad_policies_item_err
+    assert FakeCLIClient.calls == []
+
+
+def test_cli_predict_error_output_redacts_paths_and_secrets(monkeypatch, capsys) -> None:  # noqa: ANN001
+    FakeCLIClient.calls = []
+    monkeypatch.setattr(cli_main, "MemoryOSClient", FakeCLIClient)
+    metadata = ConnectMetadata.action_capable_embodied("reachy_mini").to_dict()
+    metadata["connect_type"] = "bad /Users/gulf/private password=secret api_key=sk-test token=abc"
+
+    exit_code = cli_main.main(
+        [
+            "predict",
+            "--user",
+            "u1",
+            "--episode",
+            "s1",
+            "--observation",
+            "hot",
+            "--connect-metadata-json",
+            json.dumps(metadata),
+        ]
+    )
+    err = capsys.readouterr().err
+
+    assert exit_code == 2
+    assert "/Users/gulf" not in err
+    assert "secret" not in err
+    assert "sk-test" not in err
+    assert "abc" not in err
+    assert "Traceback" not in err
     assert FakeCLIClient.calls == []
 
 
