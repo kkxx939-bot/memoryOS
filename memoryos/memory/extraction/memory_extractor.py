@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import Protocol
 
+from memoryos.contextdb.session.session_model import SessionArchive
+from memoryos.memory.schema import MemoryCandidateDraft, MemoryTypeSchema
 from memoryos.operations.model.context_operation import ContextOperation
 
 
@@ -26,3 +30,11 @@ class ExtractionResult:
 class MemoryExtractor:
     def extract(self, session_archive) -> ExtractionResult:
         raise NotImplementedError
+
+
+class MemoryExtractorBackend(Protocol):
+    def extract(
+        self,
+        archive: SessionArchive,
+        schemas: Sequence[MemoryTypeSchema],
+    ) -> list[MemoryCandidateDraft]: ...

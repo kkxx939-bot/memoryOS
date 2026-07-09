@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Any
 
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_type import ContextType
@@ -29,6 +30,12 @@ class Memory:
     tags: list[str] = field(default_factory=list)
     supporting_behavior_uris: list[str] = field(default_factory=list)
     constrains_policy_uris: list[str] = field(default_factory=list)
+    memory_type: str | None = None
+    retrieval_views: list[str] = field(default_factory=list)
+    admission: dict[str, Any] | str | None = None
+    merge_key: str = ""
+    source: dict[str, Any] = field(default_factory=dict)
+    memory_schema_version: str = "memory_schema_v1"
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
 
@@ -38,6 +45,25 @@ class Memory:
         self.confidence = max(0.0, min(1.0, float(self.confidence)))
 
     def to_context_object(self) -> ContextObject:
+        metadata: dict[str, Any] = {
+            "memory_kind": self.kind.value,
+            "confidence": self.confidence,
+            "tags": self.tags,
+            "supporting_behavior_uris": self.supporting_behavior_uris,
+            "constrains_policy_uris": self.constrains_policy_uris,
+        }
+        if self.memory_type:
+            metadata["memory_type"] = self.memory_type
+        if self.retrieval_views:
+            metadata["retrieval_views"] = self.retrieval_views
+        if self.admission:
+            metadata["admission"] = self.admission
+        if self.merge_key:
+            metadata["merge_key"] = self.merge_key
+        if self.source:
+            metadata["source"] = self.source
+        if self.memory_schema_version:
+            metadata["schema_version"] = self.memory_schema_version
         return ContextObject(
             uri=self.uri,
             context_type=ContextType.MEMORY,
@@ -46,13 +72,7 @@ class Memory:
             lifecycle_state=LifecycleState.ACTIVE if self.status == "active" else LifecycleState(self.status),
             semantic_hotness=self.confidence,
             behavior_support_hotness=min(1.0, len(self.supporting_behavior_uris) * 0.15),
-            metadata={
-                "memory_kind": self.kind.value,
-                "confidence": self.confidence,
-                "tags": self.tags,
-                "supporting_behavior_uris": self.supporting_behavior_uris,
-                "constrains_policy_uris": self.constrains_policy_uris,
-            },
+            metadata=metadata,
             created_at=self.created_at,
             updated_at=self.updated_at,
         )

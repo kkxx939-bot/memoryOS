@@ -1,5 +1,13 @@
+from memoryos.memory.extraction.fallback_extractor import RuleFallbackExtractor
 from memoryos.memory.extraction.llm_memory_extractor import LLMMemoryExtractor
-from memoryos.memory.extraction.memory_extractor import ExtractionResult, MemoryExtractor
+from memoryos.memory.extraction.memory_extractor import ExtractionResult, MemoryExtractor, MemoryExtractorBackend
 from memoryos.memory.extraction.rule_memory_extractor import RuleMemoryExtractor
 
-__all__ = ["ExtractionResult", "LLMMemoryExtractor", "MemoryExtractor", "RuleMemoryExtractor"]
+__all__ = [
+    "ExtractionResult",
+    "LLMMemoryExtractor",
+    "MemoryExtractor",
+    "MemoryExtractorBackend",
+    "RuleFallbackExtractor",
+    "RuleMemoryExtractor",
+]
