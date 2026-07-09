@@ -17,7 +17,7 @@ from memoryos.memory.schema import (
     MemoryTypeRegistry,
 )
 from memoryos.memory.service.memory_updater import MemoryUpdater
-from memoryos.memory.view import adapter_id_from_archive, project_id_from_archive
+from memoryos.memory.view import MemoryViewRouter, adapter_id_from_archive, project_id_from_archive
 from memoryos.operations.model.context_operation import ContextOperation
 
 
@@ -29,10 +29,12 @@ class RuleMemoryCommitPlanner:
         extractor: MemoryExtractorBackend | None = None,
         registry: MemoryTypeRegistry | None = None,
         admission_gate: MemoryAdmissionGate | None = None,
+        view_router: MemoryViewRouter | None = None,
     ) -> None:
         self.registry = registry or MemoryTypeRegistry()
         self.extractor = extractor or RuleFallbackExtractor()
-        self.admission_gate = admission_gate or MemoryAdmissionGate(self.registry)
+        self.view_router = view_router or getattr(admission_gate, "view_router", None) or MemoryViewRouter()
+        self.admission_gate = admission_gate or MemoryAdmissionGate(self.registry, self.view_router)
         self.updater = MemoryUpdater()
         self.last_group = MemoryOperationGroup()
 

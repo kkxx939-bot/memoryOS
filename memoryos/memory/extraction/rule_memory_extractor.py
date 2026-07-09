@@ -9,6 +9,12 @@ from memoryos.operations.model.operation_action import OperationAction
 
 
 class RuleMemoryExtractor(MemoryExtractor):
+    """Legacy operation-emitting extractor.
+
+    Kept for compatibility tests and old callers. MemoryCommitPlanner uses
+    RuleFallbackExtractor, which emits MemoryCandidateDraft objects instead.
+    """
+
     markers = ("记住：", "记住:", "remember:", "Remember:")
 
     def extract(self, session_archive) -> ExtractionResult:

@@ -5,7 +5,6 @@ from memoryos.memory.extraction import (
     MemoryExtractor,
     MemoryExtractorBackend,
     RuleFallbackExtractor,
-    RuleMemoryExtractor,
 )
 from memoryos.memory.lifecycle import MemoryCoolingPolicy
 from memoryos.memory.model import Memory, MemoryAnchor, MemoryCandidate, MemoryKind
@@ -38,5 +37,4 @@ __all__ = [
     "MemoryTypeSchema",
     "MemoryUpdater",
     "RuleFallbackExtractor",
-    "RuleMemoryExtractor",
 ]

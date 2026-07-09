@@ -6,6 +6,7 @@ from memoryos.contextdb.session.planners.memory_commit_planner import MemoryComm
 from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.memory.extraction import RuleFallbackExtractor
 from memoryos.memory.schema import MemoryCandidateDraft, MemoryType, MemoryTypeSchema
+from memoryos.memory.view import MemoryViewRouter
 
 
 class FakeExtractor:
@@ -116,3 +117,22 @@ def test_memory_operation_payload_contains_schema_metadata() -> None:
     assert operation.payload["schema_version"] == "memory_schema_v1"
     assert metadata["memory_type"] == "project_rule"
     assert metadata["retrieval_views"] == operation.payload["retrieval_views"]
+
+
+def test_memory_commit_planner_accepts_view_router_injection() -> None:
+    class FixedViewRouter(MemoryViewRouter):
+        def route(self, candidate, schema, *, user_id: str, project_id: str = "", adapter_id: str = "") -> list[str]:  # noqa: ANN001, ARG002
+            return [f"custom:{user_id}:{project_id}:{adapter_id}"]
+
+    archive = SessionArchive(
+        user_id="u1",
+        session_id="s1",
+        archive_uri="memoryos://user/u1/sessions/history/s1",
+        messages=[{"role": "user", "content": "Project rule: MemoryOS must keep OperationCommitter in the write path."}],
+        metadata={"project_id": "memoryos", "connect": {"adapter_id": "codex"}},
+    )
+
+    operation = MemoryCommitPlanner(view_router=FixedViewRouter()).plan(archive)[0]
+
+    assert operation.payload["retrieval_views"] == ["custom:u1:memoryos:codex"]
+    assert operation.payload["context_object"]["metadata"]["retrieval_views"] == ["custom:u1:memoryos:codex"]
