@@ -33,6 +33,13 @@ TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "search_scope": {"type": "string"},
             "project_id": {"type": "string"},
             "retrieval_views": {"type": "array", "items": {"type": "string"}},
+            "tenant_id": {"type": "string"},
+            "applicability_scopes": {"type": "array", "items": {"type": "object"}},
+            "memory_states": {"type": "array", "items": {"type": "string"}},
+            "memory_types": {"type": "array", "items": {"type": "string"}},
+            "claim_uris": {"type": "array", "items": {"type": "string"}},
+            "slot_uris": {"type": "array", "items": {"type": "string"}},
+            "query_intent": {"type": "string"},
             "connect_metadata": {"type": "object"},
         },
         "required": ["query"],
@@ -48,6 +55,13 @@ TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "search_scope": {"type": "string"},
             "project_id": {"type": "string"},
             "retrieval_views": {"type": "array", "items": {"type": "string"}},
+            "tenant_id": {"type": "string"},
+            "applicability_scopes": {"type": "array", "items": {"type": "object"}},
+            "memory_states": {"type": "array", "items": {"type": "string"}},
+            "memory_types": {"type": "array", "items": {"type": "string"}},
+            "claim_uris": {"type": "array", "items": {"type": "string"}},
+            "slot_uris": {"type": "array", "items": {"type": "string"}},
+            "query_intent": {"type": "string"},
             "connect_metadata": {"type": "object"},
         },
         "required": ["query"],
@@ -70,12 +84,43 @@ TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
         "required": ["session_id"],
     },
     "memoryos_health": {"type": "object", "properties": {}, "required": []},
-    "memoryos_read": {"type": "object", "properties": {"uri": {"type": "string"}, "layer": {"type": "string"}}, "required": ["uri"]},
-    "memoryos_remember": {"type": "object", "properties": {"user_id": {"type": "string"}, "content": {"type": "string"}, "title": {"type": "string"}, "memory_type": {"type": "string"}, "project_id": {"type": "string"}, "connect_metadata": {"type": "object"}}, "required": ["content"]},
-    "memoryos_forget": {"type": "object", "properties": {"user_id": {"type": "string"}, "uri": {"type": "string"}}, "required": ["uri"]},
-    "memoryos_archive_search": {"type": "object", "properties": {"query": {"type": "string"}, "user_id": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["query"]},
-    "memoryos_archive_read": {"type": "object", "properties": {"archive_uri": {"type": "string"}}, "required": ["archive_uri"]},
-    "memoryos_recall_trace": {"type": "object", "properties": {"trace_id": {"type": "string"}}, "required": ["trace_id"]},
+    "memoryos_read": {
+        "type": "object",
+        "properties": {"uri": {"type": "string"}, "layer": {"type": "string"}},
+        "required": ["uri"],
+    },
+    "memoryos_remember": {
+        "type": "object",
+        "properties": {
+            "user_id": {"type": "string"},
+            "content": {"type": "string"},
+            "title": {"type": "string"},
+            "memory_type": {"type": "string"},
+            "project_id": {"type": "string"},
+            "connect_metadata": {"type": "object"},
+        },
+        "required": ["content"],
+    },
+    "memoryos_forget": {
+        "type": "object",
+        "properties": {"user_id": {"type": "string"}, "uri": {"type": "string"}},
+        "required": ["uri"],
+    },
+    "memoryos_archive_search": {
+        "type": "object",
+        "properties": {"query": {"type": "string"}, "user_id": {"type": "string"}, "limit": {"type": "integer"}},
+        "required": ["query"],
+    },
+    "memoryos_archive_read": {
+        "type": "object",
+        "properties": {"archive_uri": {"type": "string"}},
+        "required": ["archive_uri"],
+    },
+    "memoryos_recall_trace": {
+        "type": "object",
+        "properties": {"trace_id": {"type": "string"}},
+        "required": ["trace_id"],
+    },
     "memoryos_connection_schema": {"type": "object", "properties": {}, "required": []},
     "memoryos_predict": {
         "type": "object",
@@ -177,7 +222,9 @@ def normalize_agent_metadata(payload: dict[str, Any] | None, config: MCPServerCo
         run_mode=PipelineMode.CONTEXT_REDUCTION,
         world_domain="digital",
         source_kind="coding_agent",
-        modality=tuple(str(item) for item in raw.get("modality", ("text",))) if not isinstance(raw.get("modality"), str) else (str(raw.get("modality")),),
+        modality=tuple(str(item) for item in raw.get("modality", ("text",)))
+        if not isinstance(raw.get("modality"), str)
+        else (str(raw.get("modality")),),
         capabilities=CapabilityProfile(
             can_write_memory=True,
             can_search_context=True,
@@ -214,7 +261,9 @@ def normalize_action_metadata(payload: dict[str, Any] | None) -> ConnectMetadata
         or metadata.adapter_id not in ACTION_ADAPTERS
         or not metadata.capabilities.can_predict_behavior
     ):
-        raise PermissionError("action tools require embodied/action_capable metadata with behavior prediction capability")
+        raise PermissionError(
+            "action tools require embodied/action_capable metadata with behavior prediction capability"
+        )
     return metadata
 
 

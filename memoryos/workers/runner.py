@@ -8,6 +8,7 @@ from typing import Any
 
 from memoryos.api.sdk.client import MemoryOSClient
 from memoryos.core.time import utc_now
+from memoryos.workers.memory_proposal_worker import MemoryProposalWorker
 from memoryos.workers.session_commit_worker import SessionCommitWorker
 
 
@@ -36,6 +37,14 @@ class WorkerRunner:
         result: dict[str, Any] = {"kind": kind, "timestamp": utc_now()}
         if kind in {"session-commit", "all"}:
             result["session_commit"] = SessionCommitWorker(self.client.session_commit_service).process_pending(
+                batch_size=self.batch_size,
+                lease_seconds=self.lease_seconds,
+                max_retries=self.max_retries,
+            )
+        if kind in {"memory-projection", "all"}:
+            result["memory_projection"] = self.client.memory_projection_worker.process_pending(limit=self.batch_size)
+        if kind in {"memory-proposal", "all"}:
+            result["memory_proposal"] = MemoryProposalWorker(self.client.session_commit_service).process_pending(
                 batch_size=self.batch_size,
                 lease_seconds=self.lease_seconds,
                 max_retries=self.max_retries,

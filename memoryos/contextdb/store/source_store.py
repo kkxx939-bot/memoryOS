@@ -49,6 +49,10 @@ class SourceStore(Protocol):
 
     def soft_delete(self, uri: str, reason: str) -> None: ...
 
+    def delete_object(self, uri: str) -> None:
+        """Internal rollback primitive; never exposed as an LLM memory operation."""
+        ...
+
 
 class IndexStore(Protocol):
     def upsert_index(self, obj: ContextObject, content: str = "") -> None: ...

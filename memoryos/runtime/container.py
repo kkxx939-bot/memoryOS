@@ -14,6 +14,8 @@ from memoryos.contextdb.store.sqlite_lock_store import SQLiteLockStore
 from memoryos.contextdb.store.sqlite_queue_store import SQLiteQueueStore
 from memoryos.contextdb.store.sqlite_relation_store import SQLiteRelationStore
 from memoryos.contextdb.store.vector_store import VectorStore
+from memoryos.memory.canonical.identity import AliasRegistry
+from memoryos.memory.canonical.projection import CanonicalMemoryProjector, MemoryProjectionWorker
 from memoryos.operations.commit.operation_committer import OperationCommitter
 from memoryos.prediction.model.prediction_ledger import PredictionLedger
 from memoryos.prediction.pipeline.executor import ActionExecutor
@@ -41,6 +43,7 @@ class RuntimeContainer:
     context_db: ContextDB
     engine: PredictionEngine
     executor: ActionExecutor
+    memory_projection_worker: MemoryProjectionWorker
 
 
 def build_runtime_container(
@@ -65,7 +68,9 @@ def build_runtime_container(
     configured_embedding = embedding_provider or config.embedding
     configured_vector_store = vector_store or config.vector_store
     search = hybrid_search or (
-        HybridSearch(index, vector_store=configured_vector_store, embedding_provider=configured_embedding, source_store=source)
+        HybridSearch(
+            index, vector_store=configured_vector_store, embedding_provider=configured_embedding, source_store=source
+        )
         if configured_vector_store is not None and configured_embedding is not None
         else None
     )
@@ -75,15 +80,34 @@ def build_runtime_container(
         config.root,
         lock_store=lock,
         relation_store=relation,
+        queue_store=queue,
     )
     session_archive_store = SessionArchiveStore(root_path)
+    memory_projection_worker = MemoryProjectionWorker(
+        CanonicalMemoryProjector(
+            source,
+            index,
+            root_path,
+            vector_store=configured_vector_store,
+            embedding_provider=configured_embedding,
+        ),
+        queue,
+    )
     session_commit_service = SessionCommitService(
         session_archive_store,
         queue,
         committer=committer,
-        memory_planner=MemoryCommitPlanner(source_store=source, extractor=config.memory_extractor),
+        memory_planner=MemoryCommitPlanner(
+            source_store=source,
+            index_store=index,
+            relation_store=relation,
+            hybrid_search=search,
+            extractor=config.memory_extractor,
+            alias_registry=AliasRegistry(config.memory_aliases),
+        ),
         behavior_planner=BehaviorCommitPlanner(index_store=index, source_store=source),
         action_policy_planner=ActionPolicyCommitPlanner(index_store=index, source_store=source),
+        projection_worker=memory_projection_worker,
     )
     context_db = ContextDB(
         source,
@@ -118,4 +142,5 @@ def build_runtime_container(
         context_db=context_db,
         engine=engine,
         executor=ActionExecutor(tool_registry),
+        memory_projection_worker=memory_projection_worker,
     )

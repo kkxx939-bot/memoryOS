@@ -9,6 +9,11 @@ from memoryos.contextdb.layers.context_packer import ContextPacker
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
 from memoryos.contextdb.retrieval.token_budget import HeuristicTokenCounter, TokenCounter
+from memoryos.memory.canonical.retrieval import (
+    CanonicalMemoryQuery,
+    CanonicalMemoryRetriever,
+    CanonicalQueryIntent,
+)
 from memoryos.memory.retrieval_plan import MemoryRetrievalPlanner
 from memoryos.providers.rerank import Reranker
 
@@ -16,12 +21,27 @@ logger = logging.getLogger(__name__)
 
 
 class ContextAssembler:
-    def __init__(self, context_db: ContextDB, *, reranker: Reranker | None = None, token_counter: TokenCounter | None = None, hybrid_search: HybridSearch | None = None) -> None:
+    def __init__(
+        self,
+        context_db: ContextDB,
+        *,
+        reranker: Reranker | None = None,
+        token_counter: TokenCounter | None = None,
+        hybrid_search: HybridSearch | None = None,
+    ) -> None:
         self.context_db = context_db
         self.reranker = reranker
         self.token_counter = token_counter or HeuristicTokenCounter()
         self.hybrid_search = hybrid_search
         self.retrieval_planner = MemoryRetrievalPlanner()
+        source_store = getattr(context_db, "source_store", None)
+        index_store = getattr(context_db, "index_store", None)
+        relation_store = getattr(context_db, "relation_store", None)
+        self.canonical_retriever = (
+            CanonicalMemoryRetriever(source_store, index_store, relation_store, hybrid_search=self.hybrid_search)
+            if source_store is not None and index_store is not None
+            else None
+        )
 
     def search(
         self,
@@ -35,6 +55,13 @@ class ContextAssembler:
         retrieval_views: list[str] | None = None,
         project_id: str = "",
         adapter_id: str = "",
+        tenant_id: str = "default",
+        applicability_scope_keys: Sequence[str] | None = None,
+        memory_states: Sequence[str] | None = None,
+        memory_types: Sequence[str] | None = None,
+        claim_uris: Sequence[str] | None = None,
+        slot_uris: Sequence[str] | None = None,
+        query_intent: str | None = None,
     ) -> list[dict[str, Any]]:
         parsed_type = self._context_type(context_type)
         requested_limit = max(0, limit)
@@ -49,7 +76,22 @@ class ContextAssembler:
                 project_id=project_id,
                 adapter_id=adapter_id,
             )
-            return self._rerank(query, self._filter_connect(results, connect_filters))[:requested_limit]
+            legacy = self._rerank(query, self._filter_connect(results, connect_filters))[:requested_limit]
+            return self._merge_canonical(
+                query,
+                legacy,
+                user_id=user_id,
+                parsed_type=parsed_type,
+                requested_limit=requested_limit,
+                tenant_id=tenant_id,
+                project_id=project_id,
+                applicability_scope_keys=applicability_scope_keys,
+                memory_states=memory_states,
+                memory_types=memory_types,
+                claim_uris=claim_uris,
+                slot_uris=slot_uris,
+                query_intent=query_intent,
+            )
         search_limit = max(requested_limit * 5, 50) if connect_filters and requested_limit else requested_limit
         hits: Sequence[Any]
         if self.hybrid_search is not None:
@@ -60,7 +102,11 @@ class ContextAssembler:
                 filters["adapter_id"] = adapter_id
             hits = self.hybrid_search.search(query, filters=filters, context_type=parsed_type, limit=search_limit)
         else:
-            search_kwargs: dict[str, Any] = {"owner_user_id": user_id, "context_type": parsed_type, "limit": search_limit}
+            search_kwargs: dict[str, Any] = {
+                "owner_user_id": user_id,
+                "context_type": parsed_type,
+                "limit": search_limit,
+            }
             if project_id:
                 search_kwargs["project_id"] = project_id
             if adapter_id and search_scope == "agent_private":
@@ -68,7 +114,22 @@ class ContextAssembler:
             hits = self.context_db.search(query, **search_kwargs)
         results = [self._hit_payload(hit) for hit in hits]
         scoped = self._filter_project(results, project_id)
-        return self._rerank(query, self._filter_connect(scoped, connect_filters))[:requested_limit]
+        legacy = self._rerank(query, self._filter_connect(scoped, connect_filters))[:requested_limit]
+        return self._merge_canonical(
+            query,
+            legacy,
+            user_id=user_id,
+            parsed_type=parsed_type,
+            requested_limit=requested_limit,
+            tenant_id=tenant_id,
+            project_id=project_id,
+            applicability_scope_keys=applicability_scope_keys,
+            memory_states=memory_states,
+            memory_types=memory_types,
+            claim_uris=claim_uris,
+            slot_uris=slot_uris,
+            query_intent=query_intent,
+        )
 
     def assemble(
         self,
@@ -84,6 +145,13 @@ class ContextAssembler:
         retrieval_views: list[str] | None = None,
         project_id: str = "",
         adapter_id: str = "",
+        tenant_id: str = "default",
+        applicability_scope_keys: Sequence[str] | None = None,
+        memory_states: Sequence[str] | None = None,
+        memory_types: Sequence[str] | None = None,
+        claim_uris: Sequence[str] | None = None,
+        slot_uris: Sequence[str] | None = None,
+        query_intent: str | None = None,
     ) -> dict[str, Any]:
         contexts: list[dict[str, Any]] = []
         if context_types:
@@ -100,6 +168,13 @@ class ContextAssembler:
                         retrieval_views=retrieval_views,
                         project_id=project_id,
                         adapter_id=adapter_id,
+                        tenant_id=tenant_id,
+                        applicability_scope_keys=applicability_scope_keys,
+                        memory_states=memory_states,
+                        memory_types=memory_types,
+                        claim_uris=claim_uris,
+                        slot_uris=slot_uris,
+                        query_intent=query_intent,
                     )
                 )
         else:
@@ -112,6 +187,13 @@ class ContextAssembler:
                 retrieval_views=retrieval_views,
                 project_id=project_id,
                 adapter_id=adapter_id,
+                tenant_id=tenant_id,
+                applicability_scope_keys=applicability_scope_keys,
+                memory_states=memory_states,
+                memory_types=memory_types,
+                claim_uris=claim_uris,
+                slot_uris=slot_uris,
+                query_intent=query_intent,
             )
 
         contexts = self._dedupe(contexts)[: max(0, limit)]
@@ -155,6 +237,70 @@ class ContextAssembler:
             "connect_metadata": dict(connect_metadata or {}),
         }
 
+    def _merge_canonical(
+        self,
+        query: str,
+        legacy: list[dict[str, Any]],
+        *,
+        user_id: str | None,
+        parsed_type: ContextType | None,
+        requested_limit: int,
+        tenant_id: str,
+        project_id: str,
+        applicability_scope_keys: Sequence[str] | None,
+        memory_states: Sequence[str] | None,
+        memory_types: Sequence[str] | None,
+        claim_uris: Sequence[str] | None,
+        slot_uris: Sequence[str] | None,
+        query_intent: str | None,
+    ) -> list[dict[str, Any]]:
+        if requested_limit <= 0 or parsed_type not in {None, ContextType.MEMORY} or self.canonical_retriever is None:
+            return legacy[:requested_limit]
+        scope_keys = list(applicability_scope_keys or [])
+        if user_id:
+            scope_keys.append(f"memoryos:principal:{user_id}")
+        if project_id:
+            scope_keys.append(f"memoryos:workspace:{project_id}")
+        intent = CanonicalQueryIntent(str(query_intent).upper()) if query_intent else None
+        canonical = self.canonical_retriever.search(
+            CanonicalMemoryQuery(
+                text=query,
+                tenant_id=tenant_id,
+                principal_id=user_id,
+                applicability_scope_keys=tuple(dict.fromkeys(scope_keys)),
+                states=tuple(str(state).upper() for state in (memory_states or [])),
+                memory_types=tuple(str(item) for item in (memory_types or [])),
+                claim_uris=tuple(str(item) for item in (claim_uris or [])),
+                slot_uris=tuple(str(item) for item in (slot_uris or [])),
+                intent=intent,
+                limit=requested_limit,
+            )
+        )
+        legacy = [
+            self._normalize_legacy_memory(item)
+            for item in legacy
+            if not dict(item.get("metadata", {}) or {}).get("canonical_kind")
+        ]
+        return self._dedupe([*canonical, *legacy])[:requested_limit]
+
+    def _normalize_legacy_memory(self, item: dict[str, Any]) -> dict[str, Any]:
+        metadata = dict(item.get("metadata", {}) or {})
+        admission = dict(metadata.get("admission", {}) or {})
+        lifecycle = str(metadata.get("lifecycle_state", "active")).casefold()
+        decision = str(admission.get("decision", "accept")).casefold()
+        if decision == "pending":
+            state, category = "PENDING", "candidate"
+        elif lifecycle in {"obsolete", "archived", "deleted"}:
+            state, category = "ARCHIVED", "history"
+        else:
+            state, category = "ACTIVE", "current"
+        return {
+            **item,
+            "memory_state": str(item.get("memory_state") or state),
+            "memory_category": str(item.get("memory_category") or category),
+            "retrieval_source": str(item.get("retrieval_source") or "legacy_normalized"),
+        }
+
     def _search_memory_views(
         self,
         query: str,
@@ -187,7 +333,9 @@ class ContextAssembler:
             if user_id is not None and obj.owner_user_id != user_id:
                 continue
             payload = self._object_payload(obj)
-            if not self._matches_retrieval_plan(payload, plan.retrieval_views, include_candidates=plan.include_candidates):
+            if not self._matches_retrieval_plan(
+                payload, plan.retrieval_views, include_candidates=plan.include_candidates
+            ):
                 continue
             payload["score"] = self._view_score(query, payload)
             if payload["score"] <= 0:
@@ -211,7 +359,9 @@ class ContextAssembler:
             "metadata": dict(obj.metadata or {}),
         }
 
-    def _matches_retrieval_plan(self, item: dict[str, Any], allowed_views: list[str], *, include_candidates: bool) -> bool:
+    def _matches_retrieval_plan(
+        self, item: dict[str, Any], allowed_views: list[str], *, include_candidates: bool
+    ) -> bool:
         metadata = dict(item.get("metadata", {}) or {})
         admission = dict(metadata.get("admission", {}) or {})
         if metadata.get("memory_kind") == "memory_candidate" or admission.get("decision") == "pending":

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import uuid
+from pathlib import Path
 
 from memoryos.action_policy.model.action_policy import ActionPolicy
 from memoryos.action_policy.model.reward_signal import PenaltySignal, RewardSignal
@@ -11,9 +14,17 @@ from memoryos.contextdb.model.context_relation import ContextRelation
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.model.lifecycle import LifecycleState
 from memoryos.contextdb.store.local_stores import InMemoryLockStore
-from memoryos.contextdb.store.source_store import IndexStore, LockStore, RelationStore, SourceStore
+from memoryos.contextdb.store.source_store import (
+    IndexStore,
+    LockStore,
+    QueueJob,
+    QueueStore,
+    RelationStore,
+    SourceStore,
+)
 from memoryos.contextdb.transaction.path_lock import PathLock
 from memoryos.core.time import utc_now
+from memoryos.memory.canonical.transaction import RevisionConflictError
 from memoryos.operations.commit.audit_writer import AuditWriter
 from memoryos.operations.commit.diff_writer import DiffWriter
 from memoryos.operations.commit.operation_coalescer import OperationCoalescer
@@ -34,11 +45,14 @@ class OperationCommitter:
         root: str,
         lock_store: LockStore | None = None,
         relation_store: RelationStore | None = None,
+        queue_store: QueueStore | None = None,
         target_resolver: TargetResolver | None = None,
     ) -> None:
         self.source_store = source_store
         self.index_store = index_store
         self.relation_store = relation_store
+        self.queue_store = queue_store
+        self.root = Path(root)
         self.coalescer = OperationCoalescer()
         self.conflicts = ConflictResolver()
         self.target_resolver = target_resolver or TargetResolver(index_store)
@@ -49,6 +63,26 @@ class OperationCommitter:
         self.action_policy_updater = ActionPolicyUpdater()
 
     def commit(self, user_id: str, operations: list[ContextOperation]) -> ContextDiff:
+        canonical = [operation for operation in operations if operation.payload.get("canonical_memory") is True]
+        if canonical:
+            diffs = []
+            legacy = [operation for operation in operations if operation.payload.get("canonical_memory") is not True]
+            if legacy:
+                diffs.append(self.commit(user_id, legacy))
+            grouped: dict[str, list[ContextOperation]] = {}
+            for operation in canonical:
+                transaction_id = str(operation.payload.get("transaction_id", ""))
+                grouped.setdefault(transaction_id, []).append(operation)
+            diffs.extend(
+                self._commit_canonical_batch(user_id, transaction_operations)
+                for transaction_operations in grouped.values()
+            )
+            return ContextDiff(
+                user_id=user_id,
+                operations=[operation for diff in diffs for operation in diff.operations],
+                pending_operations=[operation for diff in diffs for operation in diff.pending_operations],
+                rejected_operations=[operation for diff in diffs for operation in diff.rejected_operations],
+            )
         resolved_operations: list[ContextOperation] = []
         pending: list[ContextOperation] = []
         for operation in operations:
@@ -77,12 +111,389 @@ class OperationCommitter:
                 self.redo.advance(operation, phase="audit_written")
                 operation.status = OperationStatus.COMMITTED
             committed.append(operation)
-        diff = ContextDiff(user_id=user_id, operations=committed, pending_operations=pending, rejected_operations=conflict_result.rejected)
+        diff = ContextDiff(
+            user_id=user_id,
+            operations=committed,
+            pending_operations=pending,
+            rejected_operations=conflict_result.rejected,
+        )
         self.diff_writer.write(diff)
         for operation in committed:
             self.redo.advance(operation, phase="diff_written")
             self.redo.commit(operation.operation_id)
         return diff
+
+    def _commit_canonical_batch(self, user_id: str, operations: list[ContextOperation]) -> ContextDiff:
+        if not operations:
+            return ContextDiff(user_id=user_id)
+        transaction_ids = {str(operation.payload.get("transaction_id", "")) for operation in operations}
+        idempotency_keys = {str(operation.payload.get("idempotency_key", "")) for operation in operations}
+        if len(transaction_ids) != 1 or "" in transaction_ids or len(idempotency_keys) != 1 or "" in idempotency_keys:
+            raise ValueError("canonical batch requires one transaction_id and idempotency_key")
+        transaction_id = next(iter(transaction_ids))
+        idempotency_key = next(iter(idempotency_keys))
+        completed = self._transaction_marker(idempotency_key)
+        if completed.exists():
+            self._finalize_canonical_outbox(transaction_id, idempotency_key, operations)
+            return self._diff_from_payload(json.loads(completed.read_text(encoding="utf-8")))
+
+        slot_uri = next(
+            (
+                str(payload.get("uri"))
+                for operation in operations
+                if isinstance((payload := operation.payload.get("context_object")), dict)
+                and dict(payload.get("metadata", {}) or {}).get("canonical_kind") == "slot"
+            ),
+            transaction_id,
+        )
+        with self.path_lock.acquire(f"canonical:{slot_uri}"):
+            if completed.exists():
+                self._finalize_canonical_outbox(transaction_id, idempotency_key, operations)
+                return self._diff_from_payload(json.loads(completed.read_text(encoding="utf-8")))
+            self._preflight_canonical_revisions(operations)
+            self._validate_authoritative_batch(operations)
+            backups = self._capture_canonical_state(operations)
+            committed: list[ContextOperation] = []
+            self._write_outbox_event(
+                transaction_id,
+                idempotency_key,
+                operations,
+                status="prepared",
+                before_images=backups,
+            )
+            for operation in operations:
+                self.redo.begin(operation, phase="started")
+            try:
+                for operation in operations:
+                    self._apply_canonical_source(operation)
+                    self.redo.advance(operation, phase="source_written")
+                    self.audit.record(user_id, "canonical_memory_operation_applied", operation.to_dict())
+                    self.redo.advance(operation, phase="audit_written")
+                    operation.status = OperationStatus.COMMITTED
+                    committed.append(operation)
+            except Exception:
+                self._restore_canonical_state(backups)
+                self._write_outbox_event(
+                    transaction_id,
+                    idempotency_key,
+                    operations,
+                    status="aborted",
+                )
+                for operation in operations:
+                    self.redo.commit(operation.operation_id)
+                self.audit.record(
+                    user_id,
+                    "canonical_memory_transaction_rolled_back",
+                    {"transaction_id": transaction_id, "operation_ids": [item.operation_id for item in operations]},
+                )
+                raise
+            diff = ContextDiff(
+                user_id=user_id,
+                operations=committed,
+                diff_id=f"diff_{transaction_id}",
+            )
+            self.diff_writer.write(diff)
+            self._write_transaction_marker(completed, diff)
+            self.audit.record(
+                user_id,
+                "canonical_memory_transaction_committed",
+                {"transaction_id": transaction_id, "operation_ids": [item.operation_id for item in committed]},
+            )
+            self._finalize_canonical_outbox(transaction_id, idempotency_key, committed, slot_uri=slot_uri)
+            for operation in committed:
+                self.redo.commit(operation.operation_id)
+            return diff
+
+    def _finalize_canonical_outbox(
+        self,
+        transaction_id: str,
+        idempotency_key: str,
+        operations: list[ContextOperation],
+        *,
+        slot_uri: str | None = None,
+    ) -> Path:
+        outbox_path = self._write_outbox_event(
+            transaction_id,
+            idempotency_key,
+            operations,
+            status="committed",
+        )
+        resolved_slot = slot_uri or next(
+            (
+                str(payload.get("uri"))
+                for operation in operations
+                if isinstance((payload := operation.payload.get("context_object")), dict)
+                and dict(payload.get("metadata", {}) or {}).get("canonical_kind") == "slot"
+            ),
+            transaction_id,
+        )
+        self._enqueue_outbox(transaction_id, resolved_slot, outbox_path, operations)
+        return outbox_path
+
+    def _preflight_canonical_revisions(self, operations: list[ContextOperation]) -> None:
+        for operation in operations:
+            object_payload = operation.payload.get("context_object")
+            if not isinstance(object_payload, dict) or not object_payload.get("uri"):
+                raise ValueError("canonical operation requires a context_object URI")
+            uri = str(object_payload["uri"])
+            expected = int(operation.payload.get("expected_revision", 0))
+            try:
+                current = self.source_store.read_object(uri)
+                actual = int(dict(current.metadata or {}).get("revision", 0))
+            except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+                actual = 0
+            if actual != expected:
+                raise RevisionConflictError(f"revision conflict for {uri}: expected {expected}, actual {actual}")
+
+    def _validate_authoritative_batch(self, operations: list[ContextOperation]) -> None:
+        slot_active: dict[str, str | None] = {}
+        active_by_slot: dict[str, list[str]] = {}
+        for operation in operations:
+            payload = operation.payload.get("context_object")
+            if not isinstance(payload, dict):
+                continue
+            metadata = dict(payload.get("metadata", {}) or {})
+            if metadata.get("canonical_kind") == "slot":
+                slot_active[str(metadata.get("slot_id", ""))] = (
+                    str(metadata["active_claim_id"]) if metadata.get("active_claim_id") else None
+                )
+            elif (
+                metadata.get("canonical_kind") == "claim"
+                and metadata.get("transition_profile") == "AUTHORITATIVE_STATE"
+                and metadata.get("state") == "ACTIVE"
+            ):
+                active_by_slot.setdefault(str(metadata.get("slot_id", "")), []).append(
+                    str(metadata.get("claim_id", ""))
+                )
+        for slot_id, active_claims in active_by_slot.items():
+            if len(active_claims) > 1:
+                raise ValueError("authoritative slot cannot commit more than one ACTIVE claim")
+            declared = slot_active.get(slot_id)
+            if declared and active_claims and declared != active_claims[0]:
+                raise ValueError("slot active_claim_id does not match active claim revision")
+
+    def _apply_canonical_source(self, operation: ContextOperation) -> None:
+        payload = operation.payload.get("context_object")
+        if not isinstance(payload, dict):
+            raise ValueError("canonical operation requires context_object")
+        obj = ContextObject.from_dict(payload)
+        self.source_store.write_object(obj, content=str(operation.payload.get("content", "")))
+        metadata = dict(obj.metadata or {})
+        relation_metadata = {
+            "tenant_id": obj.tenant_id or "default",
+            "owner_user_id": obj.owner_user_id,
+            "canonical_transaction_id": operation.payload.get("transaction_id"),
+            "canonical_idempotency_key": operation.payload.get("idempotency_key"),
+        }
+        if self.relation_store is not None:
+            for relation in obj.relations:
+                self.relation_store.add_relation(
+                    ContextRelation(
+                        source_uri=relation.source_uri,
+                        relation_type=relation.relation_type,
+                        target_uri=relation.target_uri,
+                        weight=relation.weight,
+                        metadata={**dict(relation.metadata or {}), **relation_metadata},
+                    )
+                )
+        if self.relation_store is not None and metadata.get("canonical_kind") == "claim":
+            slot_uri = obj.uri.rsplit("/claims/", 1)[0]
+            self._add_relation(obj.uri, "belongs_to_slot", slot_uri, relation_metadata)
+            self._add_relation(slot_uri, "has_claim", obj.uri, relation_metadata)
+
+    def _write_outbox_event(
+        self,
+        transaction_id: str,
+        idempotency_key: str,
+        operations: list[ContextOperation],
+        *,
+        status: str = "committed",
+        before_images: list[dict] | None = None,
+    ) -> Path:
+        path = self.root / "system" / "outbox" / f"{transaction_id}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        claim_revisions = []
+        for operation in operations:
+            payload = operation.payload.get("context_object")
+            if not isinstance(payload, dict):
+                continue
+            metadata = dict(payload.get("metadata", {}) or {})
+            if metadata.get("canonical_kind") == "claim":
+                claim_revisions.append(
+                    {
+                        "uri": payload.get("uri"),
+                        "claim_id": metadata.get("claim_id"),
+                        "revision": metadata.get("revision"),
+                    }
+                )
+        event: dict = {
+            "event_type": "MemoryCommitted",
+            "transaction_id": transaction_id,
+            "idempotency_key": idempotency_key,
+            "claim_revisions": claim_revisions,
+            "operation_ids": [operation.operation_id for operation in operations],
+            "operations": [operation.to_dict() for operation in operations],
+            "status": status,
+            "before_images": [self._before_image_payload(item) for item in (before_images or [])],
+        }
+        if path.exists():
+            try:
+                existing = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                existing = {}
+            merged_claims = {
+                str(item.get("uri")): item
+                for item in existing.get("claim_revisions", []) or []
+                if item.get("uri")
+            }
+            for item in claim_revisions:
+                current = merged_claims.get(str(item.get("uri")))
+                if current is None or int(item.get("revision") or 0) >= int(current.get("revision") or 0):
+                    merged_claims[str(item.get("uri"))] = item
+            event["claim_revisions"] = list(merged_claims.values())
+            event["operation_ids"] = list(
+                dict.fromkeys(
+                    [
+                        *[str(item) for item in existing.get("operation_ids", []) or []],
+                        *[operation.operation_id for operation in operations],
+                    ]
+                )
+            )
+            merged_operations = {
+                str(item.get("operation_id")): item
+                for item in existing.get("operations", []) or []
+                if isinstance(item, dict) and item.get("operation_id")
+            }
+            for item in event["operations"]:
+                if isinstance(item, dict) and item.get("operation_id"):
+                    merged_operations[str(item["operation_id"])] = item
+            event["operations"] = list(merged_operations.values())
+            if not event["before_images"]:
+                event["before_images"] = list(existing.get("before_images", []) or [])
+        tmp = path.with_suffix(path.suffix + f".{uuid.uuid4().hex}.tmp")
+        tmp.write_text(json.dumps(event, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+        return path
+
+    def _before_image_payload(self, snapshot: dict) -> dict:
+        obj = snapshot.get("object")
+        return {
+            "uri": str(snapshot.get("uri", "")),
+            "exists": bool(snapshot.get("exists")),
+            "object": obj.to_dict() if isinstance(obj, ContextObject) else None,
+            "content": str(snapshot.get("content", "")),
+        }
+
+    def _capture_canonical_state(self, operations: list[ContextOperation]) -> list[dict]:
+        snapshots = []
+        for operation in operations:
+            payload = operation.payload.get("context_object")
+            if not isinstance(payload, dict):
+                continue
+            uri = str(payload["uri"])
+            try:
+                obj = self.source_store.read_object(uri)
+                exists = True
+            except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+                obj = None
+                exists = False
+            if obj is not None:
+                try:
+                    content = self.source_store.read_content(obj.layers.l2_uri or uri)
+                except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+                    content = ""
+            else:
+                content = ""
+            relations = (
+                self.relation_store.relations_of(
+                    uri,
+                    tenant_id=str(payload.get("tenant_id") or "default"),
+                    owner_user_id=payload.get("owner_user_id"),
+                )
+                if self.relation_store is not None
+                else []
+            )
+            snapshots.append(
+                {"uri": uri, "exists": exists, "object": obj, "content": content, "relations": relations}
+            )
+        return snapshots
+
+    def _restore_canonical_state(self, snapshots: list[dict]) -> None:
+        for snapshot in reversed(snapshots):
+            uri = str(snapshot["uri"])
+            if snapshot["exists"]:
+                self.source_store.write_object(snapshot["object"], content=str(snapshot["content"]))
+                if snapshot["content"] == "":
+                    obj = snapshot["object"]
+                    self.source_store.write_content(obj.layers.l2_uri or uri, "")
+            else:
+                delete = getattr(self.source_store, "delete_object", None)
+                if not callable(delete):
+                    raise RuntimeError("SourceStore must support delete_object for canonical rollback")
+                delete(uri)
+            if self.relation_store is None:
+                continue
+            original = list(snapshot["relations"])
+            current = self.relation_store.relations_of(uri)
+            for relation in current:
+                if relation not in original:
+                    self.relation_store.delete_relation(
+                        relation.source_uri,
+                        relation.relation_type,
+                        relation.target_uri,
+                    )
+            for relation in original:
+                self.relation_store.add_relation(relation)
+
+    def _enqueue_outbox(
+        self,
+        transaction_id: str,
+        slot_uri: str,
+        outbox_path: Path,
+        operations: list[ContextOperation],
+    ) -> None:
+        if self.queue_store is None:
+            return
+        try:
+            self.queue_store.enqueue(
+                QueueJob(
+                    job_id=f"outbox_{transaction_id}",
+                    queue_name="memory_projection",
+                    action="project_memory_committed",
+                    target_uri=slot_uri,
+                    payload={
+                        "transaction_id": transaction_id,
+                        "outbox_path": str(outbox_path),
+                        "operation_ids": [operation.operation_id for operation in operations],
+                    },
+                )
+            )
+        except Exception as exc:
+            self.audit.record(
+                operations[0].user_id,
+                "canonical_memory_outbox_enqueue_failed",
+                {"transaction_id": transaction_id, "error_type": type(exc).__name__},
+            )
+
+    def _transaction_marker(self, idempotency_key: str) -> Path:
+        return self.root / "system" / "transactions" / f"{idempotency_key}.json"
+
+    def _write_transaction_marker(self, path: Path, diff: ContextDiff) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + f".{uuid.uuid4().hex}.tmp")
+        tmp.write_text(json.dumps(diff.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+
+    def _diff_from_payload(self, payload: dict) -> ContextDiff:
+        return ContextDiff(
+            user_id=str(payload["user_id"]),
+            operations=[ContextOperation.from_dict(item) for item in payload.get("operations", [])],
+            pending_operations=[ContextOperation.from_dict(item) for item in payload.get("pending_operations", [])],
+            rejected_operations=[ContextOperation.from_dict(item) for item in payload.get("rejected_operations", [])],
+            diff_id=str(payload.get("diff_id", "")),
+            created_at=str(payload.get("created_at", "")),
+            schema_version=str(payload.get("schema_version", "context_diff_v1")),
+        )
 
     def resume(self, user_id: str, operation: ContextOperation, phase: str) -> bool:
         if phase in {"committed"}:
@@ -91,6 +502,8 @@ class OperationCommitter:
         if phase in {"started", "begin"}:
             diff = self.commit(user_id, [operation])
             return any(op.operation_id == operation.operation_id for op in diff.operations)
+        if operation.payload.get("canonical_memory") is True:
+            return self._resume_canonical(user_id, operation, phase)
         if phase == "source_written":
             self._apply_index(operation)
             self.redo.advance(operation, phase="index_written")
@@ -117,9 +530,114 @@ class OperationCommitter:
             return True
         return False
 
+    def _resume_canonical(self, user_id: str, operation: ContextOperation, phase: str) -> bool:
+        if phase == "source_written":
+            self.audit.record(user_id, "canonical_memory_operation_committed", operation.to_dict())
+            self.redo.advance(operation, phase="audit_written")
+        transaction_id = str(operation.payload.get("transaction_id", ""))
+        idempotency_key = str(operation.payload.get("idempotency_key", ""))
+        object_payload = operation.payload.get("context_object")
+        slot_uri = operation.target_uri or transaction_id
+        if isinstance(object_payload, dict):
+            metadata = dict(object_payload.get("metadata", {}) or {})
+            if metadata.get("canonical_kind") == "claim":
+                slot_uri = str(object_payload.get("uri", slot_uri)).rsplit("/claims/", 1)[0]
+        outbox_path = self._write_outbox_event(transaction_id, idempotency_key, [operation])
+        self._enqueue_outbox(transaction_id, slot_uri, outbox_path, [operation])
+        self._write_recovery_diff(user_id, operation)
+        self.redo.advance(operation, phase="diff_written")
+        self.redo.commit(operation.operation_id)
+        return True
+
+    def resume_canonical_batch(self, user_id: str, entries: list) -> list[str]:  # noqa: ANN001
+        operations = [entry.operation for entry in entries]
+        if not operations:
+            return []
+        transaction_ids = {str(operation.payload.get("transaction_id", "")) for operation in operations}
+        idempotency_keys = {str(operation.payload.get("idempotency_key", "")) for operation in operations}
+        if len(transaction_ids) != 1 or "" in transaction_ids or len(idempotency_keys) != 1:
+            raise ValueError("canonical recovery requires one complete transaction")
+        transaction_id = next(iter(transaction_ids))
+        idempotency_key = next(iter(idempotency_keys))
+        outbox_path = self.root / "system" / "outbox" / f"{transaction_id}.json"
+        prepared = json.loads(outbox_path.read_text(encoding="utf-8"))
+        expected_operation_ids = [str(item) for item in prepared.get("operation_ids", []) or []]
+        by_id = {operation.operation_id: operation for operation in operations}
+        for payload in prepared.get("operations", []) or []:
+            operation = ContextOperation.from_dict(payload)
+            by_id.setdefault(operation.operation_id, operation)
+        if set(expected_operation_ids) != set(by_id):
+            raise RuntimeError("canonical recovery outbox is missing transaction operations")
+        ordered = [by_id[operation_id] for operation_id in expected_operation_ids]
+        slot_uri = next(
+            (
+                str(payload.get("uri"))
+                for operation in ordered
+                if isinstance((payload := operation.payload.get("context_object")), dict)
+                and dict(payload.get("metadata", {}) or {}).get("canonical_kind") == "slot"
+            ),
+            transaction_id,
+        )
+        with self.path_lock.acquire(f"canonical:{slot_uri}"):
+            marker = self._transaction_marker(idempotency_key)
+            if marker.exists():
+                for operation in ordered:
+                    self.redo.commit(operation.operation_id)
+                return [operation.operation_id for operation in ordered]
+            for operation in ordered:
+                payload = operation.payload.get("context_object")
+                if not isinstance(payload, dict):
+                    raise ValueError("canonical recovery requires context_object")
+                uri = str(payload["uri"])
+                expected = int(operation.payload.get("expected_revision", 0))
+                desired = int(dict(payload.get("metadata", {}) or {}).get("revision", 0))
+                try:
+                    actual = int(dict(self.source_store.read_object(uri).metadata or {}).get("revision", 0))
+                except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+                    actual = 0
+                if actual == expected:
+                    self._apply_canonical_source(operation)
+                elif actual != desired:
+                    raise RevisionConflictError(
+                        f"canonical recovery conflict for {uri}: expected {expected} or {desired}, actual {actual}"
+                    )
+                self.audit.record(user_id, "canonical_memory_operation_applied_during_recovery", operation.to_dict())
+                operation.status = OperationStatus.COMMITTED
+            diff = ContextDiff(user_id=user_id, operations=ordered, diff_id=f"diff_{transaction_id}")
+            self.diff_writer.write(diff)
+            self._write_transaction_marker(marker, diff)
+            self.audit.record(
+                user_id,
+                "canonical_memory_transaction_recovered",
+                {"transaction_id": transaction_id, "operation_ids": [item.operation_id for item in ordered]},
+            )
+            self._finalize_canonical_outbox(
+                transaction_id,
+                idempotency_key,
+                ordered,
+                slot_uri=slot_uri,
+            )
+            for operation in ordered:
+                self.redo.commit(operation.operation_id)
+            return [operation.operation_id for operation in ordered]
+
+    def recover_pending_canonical(self, user_id: str) -> list[str]:
+        grouped: dict[str, list] = {}
+        for entry in self.redo.pending_entries():
+            if entry.operation.payload.get("canonical_memory") is not True:
+                continue
+            transaction_id = str(entry.operation.payload.get("transaction_id", ""))
+            grouped.setdefault(transaction_id, []).append(entry)
+        recovered = []
+        for entries in grouped.values():
+            recovered.extend(self.resume_canonical_batch(user_id, entries))
+        return recovered
+
     def _write_recovery_diff(self, user_id: str, operation: ContextOperation) -> None:
         operation.status = OperationStatus.COMMITTED
-        self.diff_writer.write(ContextDiff(user_id=user_id, operations=[operation], diff_id=f"diff_{operation.operation_id}"))
+        self.diff_writer.write(
+            ContextDiff(user_id=user_id, operations=[operation], diff_id=f"diff_{operation.operation_id}")
+        )
 
     def _coalesce_non_policy_operations(self, operations: list[ContextOperation]) -> list[ContextOperation]:
         policy_actions = {
@@ -148,7 +666,11 @@ class OperationCommitter:
                     operation.payload["context_object"] = obj.to_dict()
                 self._apply_relations(obj, operation)
             return
-        if operation.action in {OperationAction.CONFIRM, OperationAction.REJECT} and operation.context_type == ContextType.MEMORY and operation.target_uri:
+        if (
+            operation.action in {OperationAction.CONFIRM, OperationAction.REJECT}
+            and operation.context_type == ContextType.MEMORY
+            and operation.target_uri
+        ):
             obj = self.source_store.read_object(operation.target_uri)
             content = self._read_content_or_empty(operation.target_uri)
             metadata = dict(obj.metadata)
@@ -170,13 +692,17 @@ class OperationCommitter:
             obj.metadata = metadata
             self.source_store.write_object(obj, content=content)
             return
-        if operation.action in {
-            OperationAction.REWARD,
-            OperationAction.PENALIZE,
-            OperationAction.COOLDOWN,
-            OperationAction.SUPPRESS,
-            OperationAction.DISABLE,
-        } and operation.target_uri:
+        if (
+            operation.action
+            in {
+                OperationAction.REWARD,
+                OperationAction.PENALIZE,
+                OperationAction.COOLDOWN,
+                OperationAction.SUPPRESS,
+                OperationAction.DISABLE,
+            }
+            and operation.target_uri
+        ):
             if operation.context_type == ContextType.ACTION_POLICY:
                 policy = self._read_action_policy(operation.target_uri)
                 policy = self._apply_action_policy_mutation(policy, operation)
@@ -187,9 +713,15 @@ class OperationCommitter:
         if operation.action == OperationAction.COMPRESS and operation.target_uri:
             obj = self.source_store.read_object(operation.target_uri)
             content = self._read_content_or_empty(operation.target_uri)
-            LayerRefresher(self.source_store).refresh(obj, content, bullets=[operation.payload.get("reason", "compressed")])
+            LayerRefresher(self.source_store).refresh(
+                obj, content, bullets=[operation.payload.get("reason", "compressed")]
+            )
             obj.lifecycle_state = LifecycleState.COLD
-            obj.metadata = {**obj.metadata, "compressed_at": utc_now(), "compression_reason": operation.payload.get("reason", "")}
+            obj.metadata = {
+                **obj.metadata,
+                "compressed_at": utc_now(),
+                "compression_reason": operation.payload.get("reason", ""),
+            }
             self.source_store.write_object(obj)
             return
         if operation.action == OperationAction.REFRESH_LAYERS and operation.target_uri:
@@ -200,7 +732,11 @@ class OperationCommitter:
         if operation.action == OperationAction.ARCHIVE and operation.target_uri:
             obj = self.source_store.read_object(operation.target_uri)
             obj.lifecycle_state = LifecycleState.ARCHIVED
-            obj.metadata = {**obj.metadata, "archived_at": utc_now(), "archive_reason": operation.payload.get("reason", "")}
+            obj.metadata = {
+                **obj.metadata,
+                "archived_at": utc_now(),
+                "archive_reason": operation.payload.get("reason", ""),
+            }
             content = self._read_content_or_empty(operation.target_uri)
             self.source_store.write_object(obj, content=content)
             return
@@ -218,7 +754,11 @@ class OperationCommitter:
                 obj = ContextObject.from_dict(object_payload)
                 self.index_store.upsert_index(obj, content=str(operation.payload.get("content", "")))
             return
-        if operation.action in {OperationAction.CONFIRM, OperationAction.REJECT} and operation.context_type == ContextType.MEMORY and operation.target_uri:
+        if (
+            operation.action in {OperationAction.CONFIRM, OperationAction.REJECT}
+            and operation.context_type == ContextType.MEMORY
+            and operation.target_uri
+        ):
             if operation.action == OperationAction.REJECT:
                 self.index_store.delete_index(operation.target_uri)
                 return
@@ -247,11 +787,17 @@ class OperationCommitter:
 
     def _apply_action_policy_mutation(self, policy: ActionPolicy, operation: ContextOperation) -> ActionPolicy:
         if operation.action == OperationAction.REWARD:
-            return self.action_policy_updater.reward(policy, RewardSignal.from_payload(operation.payload), operation_id=operation.operation_id)
+            return self.action_policy_updater.reward(
+                policy, RewardSignal.from_payload(operation.payload), operation_id=operation.operation_id
+            )
         if operation.action == OperationAction.PENALIZE:
-            return self.action_policy_updater.penalize(policy, PenaltySignal.from_payload(operation.payload), operation_id=operation.operation_id)
+            return self.action_policy_updater.penalize(
+                policy, PenaltySignal.from_payload(operation.payload), operation_id=operation.operation_id
+            )
         if operation.action == OperationAction.COOLDOWN:
-            return self.action_policy_updater.cooldown(policy, operation.payload.get("cooldown_until"), operation_id=operation.operation_id)
+            return self.action_policy_updater.cooldown(
+                policy, operation.payload.get("cooldown_until"), operation_id=operation.operation_id
+            )
         if operation.action == OperationAction.SUPPRESS:
             return self.action_policy_updater.suppress(policy, operation_id=operation.operation_id)
         if operation.action == OperationAction.DISABLE:
@@ -323,7 +869,16 @@ class OperationCommitter:
             obj,
             content=json.dumps(policy.to_dict(), ensure_ascii=False, indent=2),
         )
-        self._apply_relations(obj, ContextOperation(user_id=policy.user_id, context_type=ContextType.ACTION_POLICY, action=OperationAction.UPDATE, target_uri=policy.uri, payload={}))
+        self._apply_relations(
+            obj,
+            ContextOperation(
+                user_id=policy.user_id,
+                context_type=ContextType.ACTION_POLICY,
+                action=OperationAction.UPDATE,
+                target_uri=policy.uri,
+                payload={},
+            ),
+        )
 
     def _apply_relations(self, obj: ContextObject, operation: ContextOperation) -> None:
         if self.relation_store is None:

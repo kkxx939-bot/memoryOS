@@ -37,7 +37,9 @@ def test_finalize_extract_commit_and_cross_agent_project_recall(tmp_path) -> Non
     )
     assert any("pytest" in item["text"] for item in shared)
     assert isolated == []
-    assembled = client.assemble_context("pytest", user_id="u1", project_id="project-a", search_scope="project_rules", token_budget=100)
+    assembled = client.assemble_context(
+        "pytest", user_id="u1", project_id="project-a", search_scope="project_rules", token_budget=100
+    )
     assert "pytest" in assembled["packed_context"]
     assert client.recall_trace(assembled["trace_id"])["selected"]
 
@@ -86,14 +88,14 @@ def test_user_preference_is_recalled_across_projects(tmp_path) -> None:  # noqa:
 
 def test_runtime_injected_llm_extractor_enters_operation_plane(tmp_path) -> None:  # noqa: ANN001
     provider = FakeMemoryModelProvider(
-        response='{"candidates":[{"memory_type":"project_decision","title":"Use SQLite","content":"Architecture decision: adopted SQLite for the local queue.","fields":{"decision":"adopted SQLite","project_id":"p1"},"confidence":0.9,"source_role":"user"}]}'
+        response='{"candidates":[{"proposal_id":"p-sqlite","memory_type":"project_decision","identity_fields":{"decision_topic":"primary storage backend"},"value_fields":{"canonical_value":"SQLite"},"semantic":{"speech_act":"confirmation","commitment":"confirmed","temporal_scope":"current","relation_to_existing":"unrelated"},"epistemic_status":"EXPLICIT","suggested_scope_refs":[{"namespace":"memoryos","kind":"workspace","id":"p1"}],"evidence_refs":[{"event_id":"message:0"}],"confidence":0.9,"source_role":"user"}]}'
     )
     client = MemoryOSClient(str(tmp_path), memory_extractor=LLMMemoryExtractorBackend(provider))
     client.commit_agent_session(
         user_id="u1",
         session_id="s1",
         project_id="p1",
-        messages=[{"role": "user", "content": "We decided on storage."}],
+        messages=[{"role": "user", "content": "We decided to use SQLite as the primary storage backend."}],
         connect_metadata=ConnectMetadata.default_agent("codex").to_dict(),
         async_commit=True,
     )

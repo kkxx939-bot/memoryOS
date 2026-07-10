@@ -17,7 +17,9 @@ class FakeExtractor:
         return self.candidates
 
 
-def _draft(memory_type: MemoryType, content: str, *, fields: dict, confidence: float = 0.9, role: str = "user") -> MemoryCandidateDraft:
+def _draft(
+    memory_type: MemoryType, content: str, *, fields: dict, confidence: float = 0.9, role: str = "user"
+) -> MemoryCandidateDraft:
     return MemoryCandidateDraft(
         memory_type=memory_type,
         title=content[:40],
@@ -95,23 +97,38 @@ def test_memory_commit_planner_returns_operations_for_accepted_and_pending_only(
         user_id="u1",
         session_id="s1",
         archive_uri="memoryos://user/u1/sessions/history/s1",
+        messages=[{"id": "m1", "role": "user", "content": "MemoryOS must keep URI trees stable."}],
         metadata={"project_id": "memoryos", "connect": {"adapter_id": "codex"}},
     )
     planner = MemoryCommitPlanner(
         extractor=FakeExtractor(
             [
-                _draft(MemoryType.PROJECT_RULE, "MemoryOS must keep URI trees stable.", fields={"rule": "keep URI trees stable", "project_id": "memoryos"}),
-                _draft(MemoryType.PROJECT_RULE, "MemoryOS must maybe do something.", fields={"rule": "maybe do something"}, confidence=0.68),
+                _draft(
+                    MemoryType.PROJECT_RULE,
+                    "MemoryOS must keep URI trees stable.",
+                    fields={"rule": "keep URI trees stable", "project_id": "memoryos"},
+                ),
+                _draft(
+                    MemoryType.PROJECT_RULE,
+                    "MemoryOS must maybe do something.",
+                    fields={"rule": "maybe do something"},
+                    confidence=0.68,
+                ),
                 _draft(MemoryType.EVENT, "shell output\nExit code: 1", fields={"event": "tool"}, role="tool"),
                 _draft(MemoryType.PREFERENCE, "api_key=sk-test", fields={"preference": "api_key=sk-test"}),
-                _draft(MemoryType.EVENT, "This chat discussed memory.", fields={"event": "chat discussed memory"}, confidence=0.5),
+                _draft(
+                    MemoryType.EVENT,
+                    "This chat discussed memory.",
+                    fields={"event": "chat discussed memory"},
+                    confidence=0.5,
+                ),
             ]
         )
     )
 
     operations = planner.plan(archive)
 
-    assert len(operations) == 2
+    assert len(operations) == 3
     assert planner.last_group.summary() == {
         "accepted": 1,
         "pending": 1,
@@ -122,6 +139,7 @@ def test_memory_commit_planner_returns_operations_for_accepted_and_pending_only(
     }
     assert {operation.payload["memory_type"] for operation in operations} == {"project_rule"}
     assert {operation.payload["admission"]["decision"] for operation in operations} == {"accept", "pending"}
+    assert len([operation for operation in operations if operation.payload.get("canonical_memory") is True]) == 2
 
 
 def test_memory_operation_payload_contains_schema_metadata() -> None:
@@ -129,7 +147,9 @@ def test_memory_operation_payload_contains_schema_metadata() -> None:
         user_id="u1",
         session_id="s1",
         archive_uri="memoryos://user/u1/sessions/history/s1",
-        messages=[{"role": "user", "content": "Project rule: MemoryOS must keep OperationCommitter in the write path."}],
+        messages=[
+            {"role": "user", "content": "Project rule: MemoryOS must keep OperationCommitter in the write path."}
+        ],
         metadata={"project_id": "memoryos", "connect": {"adapter_id": "codex"}},
     )
 
@@ -142,7 +162,7 @@ def test_memory_operation_payload_contains_schema_metadata() -> None:
     assert operation.payload["source_adapter_id"] == "codex"
     assert operation.payload["source_session_id"] == "s1"
     assert operation.payload["merge_key"]
-    assert operation.payload["schema_version"] == "memory_schema_v1"
+    assert operation.payload["schema_version"] == "canonical_memory_v1"
     assert metadata["memory_type"] == "project_rule"
     assert metadata["retrieval_views"] == operation.payload["retrieval_views"]
     assert metadata["source_adapter_id"] == "codex"
@@ -206,7 +226,9 @@ def test_raw_tool_output_archive_only() -> None:
         user_id="u1",
         session_id="s1",
         archive_uri="memoryos://user/u1/sessions/history/s1",
-        tool_results=[{"tool_name": "shell", "tool_output": "pytest failed\nTraceback (most recent call last):\nAssertionError"}],
+        tool_results=[
+            {"tool_name": "shell", "tool_output": "pytest failed\nTraceback (most recent call last):\nAssertionError"}
+        ],
         metadata={"project_id": "memoryOS", "connect": {"adapter_id": "codex"}},
     )
     planner = MemoryCommitPlanner()
@@ -228,9 +250,17 @@ def test_secret_restricted() -> None:
         )
     )
 
-    assert planner.plan(
-        SessionArchive(user_id="u1", session_id="s1", archive_uri="memoryos://user/u1/sessions/history/s1")
-    ) == []
+    assert (
+        planner.plan(
+            SessionArchive(
+                user_id="u1",
+                session_id="s1",
+                archive_uri="memoryos://user/u1/sessions/history/s1",
+                messages=[{"id": "m1", "role": "user", "content": "api key OPENAI_API_KEY=sk-test"}],
+            )
+        )
+        == []
+    )
     assert planner.last_group.restricted
 
 
@@ -243,7 +273,9 @@ def test_memory_commit_planner_accepts_view_router_injection() -> None:
         user_id="u1",
         session_id="s1",
         archive_uri="memoryos://user/u1/sessions/history/s1",
-        messages=[{"role": "user", "content": "Project rule: MemoryOS must keep OperationCommitter in the write path."}],
+        messages=[
+            {"role": "user", "content": "Project rule: MemoryOS must keep OperationCommitter in the write path."}
+        ],
         metadata={"project_id": "memoryos", "connect": {"adapter_id": "codex"}},
     )
 

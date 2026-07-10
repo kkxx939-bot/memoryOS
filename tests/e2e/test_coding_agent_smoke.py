@@ -44,10 +44,19 @@ def test_agent_session_to_memory_http_mcp_smoke(tmp_path) -> None:  # noqa: ANN0
             {
                 "candidates": [
                     {
+                        "proposal_id": "p-sqlite-queue",
                         "memory_type": "project_decision",
-                        "title": "Use SQLite queue",
-                        "content": "Architecture decision: adopted SQLite for the local session queue.",
-                        "fields": {"decision": "adopted SQLite", "project_id": "project-a"},
+                        "identity_fields": {"decision_topic": "local queue"},
+                        "value_fields": {"canonical_value": "SQLite"},
+                        "semantic": {
+                            "speech_act": "confirmation",
+                            "commitment": "confirmed",
+                            "temporal_scope": "current",
+                            "relation_to_existing": "unrelated",
+                        },
+                        "epistemic_status": "EXPLICIT",
+                        "suggested_scope_refs": [{"namespace": "memoryos", "kind": "workspace", "id": "project-a"}],
+                        "evidence_refs": [{"event_id": "event-1"}],
                         "confidence": 0.95,
                         "source_role": "user",
                     }

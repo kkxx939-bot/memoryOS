@@ -35,6 +35,13 @@ def handle(route: str, client: MemoryOSClient, payload: dict[str, Any]) -> dict[
             search_scope=payload.get("search_scope"),
             retrieval_views=payload.get("retrieval_views"),
             project_id=str(payload.get("project_id") or ""),
+            tenant_id=str(payload.get("tenant_id") or "default"),
+            applicability_scopes=payload.get("applicability_scopes"),
+            memory_states=payload.get("memory_states"),
+            memory_types=payload.get("memory_types"),
+            claim_uris=payload.get("claim_uris"),
+            slot_uris=payload.get("slot_uris"),
+            query_intent=payload.get("query_intent"),
         )
     if route == "POST /sessions/commit":
         result = client.commit_agent_session(
@@ -52,12 +59,19 @@ def handle(route: str, client: MemoryOSClient, payload: dict[str, Any]) -> dict[
         )
         if result is None:
             return {"status": "accepted"}
-        return {"status": result.status, "task_id": result.task_id, "archive_uri": result.archive_uri, "done": result.done}
+        return {
+            "status": result.status,
+            "task_id": result.task_id,
+            "archive_uri": result.archive_uri,
+            "done": result.done,
+        }
     raise KeyError(f"Unknown route: {route}")
 
 
 class MemoryOSASGI:
-    def __init__(self, client: MemoryOSClient, *, api_token: str | None = None, max_body_bytes: int = 2_000_000) -> None:
+    def __init__(
+        self, client: MemoryOSClient, *, api_token: str | None = None, max_body_bytes: int = 2_000_000
+    ) -> None:
         self.client = client
         self.api_token = api_token
         self.max_body_bytes = max_body_bytes
@@ -95,7 +109,12 @@ class MemoryOSASGI:
             return handle("POST /context/assemble", self.client, payload)
         if method == "POST" and path == "/v1/sessions/events":
             event_name = str(payload.get("event_type") or payload.get("hook_event_name") or "after_turn")
-            event = AgentHookEvent.from_payload(payload, adapter_id=str(payload.get("adapter_id") or "generic_agent"), hook_name=event_name, user_id=str(payload.get("user_id") or "default")).normalize()
+            event = AgentHookEvent.from_payload(
+                payload,
+                adapter_id=str(payload.get("adapter_id") or "generic_agent"),
+                hook_name=event_name,
+                user_id=str(payload.get("user_id") or "default"),
+            ).normalize()
             appended = self.sessions.append_event(event)
             self.sessions.append_transcript(event)
             return {"status": "ARCHIVED", "appended": appended, "session_key": event.session_key}
@@ -104,13 +123,30 @@ class MemoryOSASGI:
         if method == "POST" and path.endswith("/finalize") and path.startswith("/v1/sessions/"):
             session_key = path.split("/")[-2]
             event = self._last_event(session_key)
-            result = handle("POST /sessions/commit", self.client, {**self.sessions.commit_payload(event), "connect_metadata": _connect_metadata(event), "async_commit": bool(payload.get("async_commit", True))})
+            result = handle(
+                "POST /sessions/commit",
+                self.client,
+                {
+                    **self.sessions.commit_payload(event),
+                    "connect_metadata": _connect_metadata(event),
+                    "async_commit": bool(payload.get("async_commit", True)),
+                },
+            )
             self.sessions.finalize(session_key, commit_state="COMMITTED" if result.get("done") else "QUEUED")
             return result
         if method == "POST" and path == "/v1/memories/remember":
-            return self.client.remember(user_id=_required_str(payload, "user_id", path), content=_required_str(payload, "content", path), title=str(payload.get("title") or ""), memory_type=str(payload.get("memory_type") or "project_decision"), project_id=str(payload.get("project_id") or ""), connect_metadata=payload.get("connect_metadata"))
+            return self.client.remember(
+                user_id=_required_str(payload, "user_id", path),
+                content=_required_str(payload, "content", path),
+                title=str(payload.get("title") or ""),
+                memory_type=str(payload.get("memory_type") or "project_decision"),
+                project_id=str(payload.get("project_id") or ""),
+                connect_metadata=payload.get("connect_metadata"),
+            )
         if method == "POST" and path == "/v1/memories/forget":
-            return self.client.forget(user_id=_required_str(payload, "user_id", path), uri=_required_str(payload, "uri", path))
+            return self.client.forget(
+                user_id=_required_str(payload, "user_id", path), uri=_required_str(payload, "uri", path)
+            )
         if method == "GET" and path == "/v1/context/read":
             query = parse_qs(scope.get("query_string", b"").decode())
             return self.client.read(str(query.get("uri", [""])[0]), layer=str(query.get("layer", ["L2"])[0]))
@@ -166,11 +202,23 @@ class MemoryOSASGI:
         return headers.get("x-request-id", "")[:128] or str(uuid.uuid4())
 
     def _error(self, code: str, exc: Exception, retryable: bool, request_id: str) -> dict[str, Any]:
-        return {"error": {"code": code, "message": str(exc)[:300], "retryable": retryable, "request_id": request_id, "operation": "http_request"}}
+        return {
+            "error": {
+                "code": code,
+                "message": str(exc)[:300],
+                "retryable": retryable,
+                "request_id": request_id,
+                "operation": "http_request",
+            }
+        }
 
 
 def create_app(root: str | None = None, *, api_token: str | None = None) -> MemoryOSASGI:
-    return MemoryOSASGI(MemoryOSClient(root or os.environ.get("MEMORYOS_ROOT", "./memory-root"), mode="server"), api_token=api_token if api_token is not None else os.environ.get("MEMORYOS_API_TOKEN"))
+    resolved_root = root or os.environ.get("MEMORYOS_ROOT") or "./memory-root"
+    return MemoryOSASGI(
+        MemoryOSClient(resolved_root, mode="server"),
+        api_token=api_token if api_token is not None else os.environ.get("MEMORYOS_API_TOKEN"),
+    )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -195,11 +243,25 @@ def _search_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
         "search_scope": payload.get("search_scope"),
         "retrieval_views": payload.get("retrieval_views"),
         "project_id": str(payload.get("project_id") or ""),
+        "tenant_id": str(payload.get("tenant_id") or "default"),
+        "applicability_scopes": payload.get("applicability_scopes"),
+        "memory_states": payload.get("memory_states"),
+        "memory_types": payload.get("memory_types"),
+        "claim_uris": payload.get("claim_uris"),
+        "slot_uris": payload.get("slot_uris"),
+        "query_intent": payload.get("query_intent"),
     }
 
 
 def _connect_metadata(event: NormalizedAgentEvent) -> dict[str, Any]:
-    return {"connect_type": "agent", "adapter_id": event.adapter_id, "run_mode": "context_reduction", "world_domain": "digital", "source_kind": "coding_agent", "extra": {"project_id": event.project_id}}
+    return {
+        "connect_type": "agent",
+        "adapter_id": event.adapter_id,
+        "run_mode": "context_reduction",
+        "world_domain": "digital",
+        "source_kind": "coding_agent",
+        "extra": {"project_id": event.project_id},
+    }
 
 
 def _required_str(payload: dict[str, Any], key: str, route: str) -> str:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import uuid
 from pathlib import Path
 
@@ -51,6 +52,11 @@ class FileSystemSourceStore:
         obj.lifecycle_state = LifecycleState.DELETED
         obj.metadata = {**obj.metadata, "delete_reason": reason}
         self.write_object(obj)
+
+    def delete_object(self, uri: str) -> None:
+        directory = self._object_dir(uri)
+        if directory.exists():
+            shutil.rmtree(directory)
 
     def list_objects(self) -> list[ContextObject]:
         if not self.root.exists():

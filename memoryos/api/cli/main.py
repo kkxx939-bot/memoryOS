@@ -21,7 +21,10 @@ def main(argv: list[str] | None = None) -> int:
     doctor = sub.add_parser("doctor")
     doctor.add_argument("--root", default="./memory-root")
     worker = sub.add_parser("worker")
-    worker.add_argument("kind", choices=["session-commit", "maintenance", "all"])
+    worker.add_argument(
+        "kind",
+        choices=["session-commit", "memory-proposal", "memory-projection", "maintenance", "all"],
+    )
     worker.add_argument("--root", default="./memory-root")
     worker.add_argument("--once", action="store_true")
     worker.add_argument("--poll-interval", type=float, default=1.0)

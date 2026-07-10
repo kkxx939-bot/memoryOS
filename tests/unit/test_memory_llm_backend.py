@@ -10,11 +10,12 @@ from memoryos.memory.extraction import FakeMemoryModelProvider, LLMMemoryExtract
 from memoryos.memory.schema import AdmissionDecision, MemoryTypeRegistry
 
 
-def _archive() -> SessionArchive:
+def _archive(content: str = "Please remember this memory extraction test.") -> SessionArchive:
     return SessionArchive(
         user_id="u1",
         session_id="s1",
         archive_uri="memoryos://user/u1/sessions/history/s1",
+        messages=[{"id": "m1", "role": "user", "content": content}],
         metadata={"connect": {"adapter_id": "codex"}},
     )
 
@@ -36,7 +37,7 @@ def test_fake_llm_extractor_backend_outputs_candidates() -> None:
         }
     )
     backend = LLMMemoryExtractorBackend(FakeMemoryModelProvider(response))
-    archive = _archive()
+    archive = _archive("I prefer findings first during code reviews.")
 
     candidates = backend.extract(archive, MemoryTypeRegistry().list())
     operations = MemoryCommitPlanner(extractor=backend).plan(archive)

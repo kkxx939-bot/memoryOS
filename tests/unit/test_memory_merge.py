@@ -44,16 +44,17 @@ def test_merge_key_prevents_duplicate_add(tmp_path) -> None:
         metadata={"connect": {"adapter_id": "codex"}},
     )
     first = planner.plan(archive)
-    db.commit_operation(first[0])
+    db.commit_operations(first)
 
     second = planner.plan(archive)
-    db.commit_operation(second[0])
 
-    objects = [obj for obj in source.list_objects() if obj.metadata.get("memory_type") == "preference"]
+    objects = [
+        obj
+        for obj in source.list_objects()
+        if obj.metadata.get("memory_type") == "preference" and obj.metadata.get("canonical_kind") == "claim"
+    ]
     assert len(objects) == 1
-    assert second[0].action == OperationAction.UPDATE
-    assert second[0].payload["merge_decision"] == "MERGE"
-    assert second[0].payload["existing_uri"] == objects[0].uri
+    assert second == []
 
 
 def test_field_level_merge_preference() -> None:
@@ -87,10 +88,17 @@ def test_conflicting_project_rule_pending_or_supersede(tmp_path) -> None:
         user_id="u1",
         session_id="s1",
         archive_uri="memoryos://user/u1/sessions/history/s1",
+        messages=[
+            {
+                "id": "m1",
+                "role": "user",
+                "content": "Rule topic audit_source: MemoryOS must keep source-only audits.",
+            }
+        ],
         metadata={"project_id": "memoryOS", "connect": {"adapter_id": "codex"}},
     )
-    first = MemoryCommitPlanner(source_store=source, extractor=FakeExtractor(first_candidate)).plan(first_archive)[0]
-    db.commit_operation(first)
+    first = MemoryCommitPlanner(source_store=source, extractor=FakeExtractor(first_candidate)).plan(first_archive)
+    db.commit_operations(first)
     second_candidate = MemoryCandidateDraft(
         memory_type=MemoryType.PROJECT_RULE,
         title="Docs audits",
@@ -106,12 +114,24 @@ def test_conflicting_project_rule_pending_or_supersede(tmp_path) -> None:
         user_id="u1",
         session_id="s2",
         archive_uri="memoryos://user/u1/sessions/history/s2",
+        messages=[
+            {
+                "id": "m1",
+                "role": "user",
+                "content": "Rule topic audit_source: MemoryOS must allow docs during audits.",
+            }
+        ],
         metadata={"project_id": "memoryOS", "connect": {"adapter_id": "codex"}},
     )
-    second = MemoryCommitPlanner(source_store=source, extractor=FakeExtractor(second_candidate)).plan(second_archive)[0]
-
-    assert second.action == OperationAction.SUPERSEDE
-    assert second.payload["merge_decision"] == "SUPERSEDE"
+    second = MemoryCommitPlanner(source_store=source, extractor=FakeExtractor(second_candidate)).plan(second_archive)
+    assert len(second) == 3
+    assert all(operation.payload.get("canonical_memory") is True for operation in second)
+    db.commit_operations(second)
+    claims = [obj for obj in source.list_objects() if obj.metadata.get("canonical_kind") == "claim"]
+    assert {obj.metadata["canonical_value"]: obj.metadata["state"] for obj in claims} == {
+        "source-only-audits": "SUPERSEDED",
+        "allow-docs-during-audits": "ACTIVE",
+    }
 
 
 def test_no_existing_memory_normal_add(tmp_path) -> None:
