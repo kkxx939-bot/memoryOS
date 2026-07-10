@@ -137,13 +137,35 @@ class OperationCommitter:
         if operation.action == OperationAction.SUPERSEDE:
             self._apply_supersede_source(operation)
             return
-        if operation.action in {OperationAction.ADD, OperationAction.UPDATE}:
+        if operation.action in {OperationAction.ADD, OperationAction.UPDATE, OperationAction.MERGE}:
             object_payload = operation.payload.get("context_object")
             if isinstance(object_payload, dict):
                 obj = ContextObject.from_dict(object_payload)
                 content = str(operation.payload.get("content", ""))
                 self.source_store.write_object(obj, content=content)
                 self._apply_relations(obj, operation)
+            return
+        if operation.action in {OperationAction.CONFIRM, OperationAction.REJECT} and operation.context_type == ContextType.MEMORY and operation.target_uri:
+            obj = self.source_store.read_object(operation.target_uri)
+            content = self._read_content_or_empty(operation.target_uri)
+            metadata = dict(obj.metadata)
+            admission = dict(metadata.get("admission", {}) or {})
+            if operation.action == OperationAction.CONFIRM:
+                admission["decision"] = "accept"
+                metadata["admission"] = admission
+                metadata["promotion_required"] = False
+                metadata["confirmation_state"] = "confirmed"
+                metadata["memory_kind"] = metadata.get("promoted_memory_kind") or "explicit_memory"
+                obj.lifecycle_state = LifecycleState.ACTIVE
+            else:
+                admission["decision"] = "reject"
+                metadata["admission"] = admission
+                metadata["promotion_required"] = False
+                metadata["confirmation_state"] = "rejected"
+                metadata["reject_reason"] = operation.payload.get("reason", "")
+                obj.lifecycle_state = LifecycleState.REJECTED
+            obj.metadata = metadata
+            self.source_store.write_object(obj, content=content)
             return
         if operation.action in {
             OperationAction.REWARD,
@@ -187,11 +209,18 @@ class OperationCommitter:
         if operation.action == OperationAction.SUPERSEDE:
             self._apply_supersede_index(operation)
             return
-        if operation.action in {OperationAction.ADD, OperationAction.UPDATE}:
+        if operation.action in {OperationAction.ADD, OperationAction.UPDATE, OperationAction.MERGE}:
             object_payload = operation.payload.get("context_object")
             if isinstance(object_payload, dict):
                 obj = ContextObject.from_dict(object_payload)
                 self.index_store.upsert_index(obj, content=str(operation.payload.get("content", "")))
+            return
+        if operation.action in {OperationAction.CONFIRM, OperationAction.REJECT} and operation.context_type == ContextType.MEMORY and operation.target_uri:
+            if operation.action == OperationAction.REJECT:
+                self.index_store.delete_index(operation.target_uri)
+                return
+            obj = self.source_store.read_object(operation.target_uri)
+            self.index_store.upsert_index(obj, content=self._read_content_or_empty(operation.target_uri))
             return
         if operation.action == OperationAction.DELETE and operation.target_uri:
             self.index_store.delete_index(operation.target_uri)

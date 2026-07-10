@@ -26,6 +26,13 @@ class AdmissionDecision(str, Enum):
     RESTRICTED = "restricted"
 
 
+class FieldMergeMode(str, Enum):
+    REPLACE = "replace"
+    APPEND_UNIQUE = "append_unique"
+    PATCH_TEXT = "patch_text"
+    IMMUTABLE = "immutable"
+
+
 @dataclass(frozen=True)
 class MemoryTypeSchema:
     memory_type: MemoryType
@@ -38,6 +45,7 @@ class MemoryTypeSchema:
     allow_assistant_source: bool = True
     allow_tool_source: bool = False
     share_default: bool = True
+    field_merge_rules: dict[str, FieldMergeMode] = field(default_factory=dict)
 
 
 class MemoryTypeRegistry:
@@ -62,6 +70,13 @@ class MemoryTypeRegistry:
                 optional_fields=("scope", "stability"),
                 default_retrieval_views=("user:{user_id}:profile",),
                 allow_assistant_source=False,
+                field_merge_rules={
+                    "summary": FieldMergeMode.PATCH_TEXT,
+                    "identity": FieldMergeMode.IMMUTABLE,
+                    "scope": FieldMergeMode.IMMUTABLE,
+                    "stability": FieldMergeMode.REPLACE,
+                    "evidence": FieldMergeMode.APPEND_UNIQUE,
+                },
             ),
             MemoryTypeSchema(
                 memory_type=MemoryType.PREFERENCE,
@@ -70,6 +85,13 @@ class MemoryTypeRegistry:
                 optional_fields=("scope", "project_id", "applies_to"),
                 default_retrieval_views=("user:{user_id}:preferences",),
                 allow_assistant_source=False,
+                field_merge_rules={
+                    "topic": FieldMergeMode.IMMUTABLE,
+                    "subject": FieldMergeMode.IMMUTABLE,
+                    "preference": FieldMergeMode.PATCH_TEXT,
+                    "content": FieldMergeMode.PATCH_TEXT,
+                    "evidence": FieldMergeMode.APPEND_UNIQUE,
+                },
             ),
             MemoryTypeSchema(
                 memory_type=MemoryType.ENTITY,
@@ -77,6 +99,14 @@ class MemoryTypeRegistry:
                 required_fields=("name", "entity_type"),
                 optional_fields=("project_id", "aliases", "summary"),
                 default_retrieval_views=("project:{project_id}:knowledge", "user:{user_id}:profile"),
+                field_merge_rules={
+                    "name": FieldMergeMode.IMMUTABLE,
+                    "entity_type": FieldMergeMode.IMMUTABLE,
+                    "type": FieldMergeMode.IMMUTABLE,
+                    "aliases": FieldMergeMode.APPEND_UNIQUE,
+                    "summary": FieldMergeMode.PATCH_TEXT,
+                    "details": FieldMergeMode.PATCH_TEXT,
+                },
             ),
             MemoryTypeSchema(
                 memory_type=MemoryType.EVENT,
@@ -84,6 +114,13 @@ class MemoryTypeRegistry:
                 required_fields=("event",),
                 optional_fields=("project_id", "occurred_at", "outcome"),
                 default_retrieval_views=("project:{project_id}:knowledge",),
+                field_merge_rules={
+                    "event_key": FieldMergeMode.IMMUTABLE,
+                    "event": FieldMergeMode.PATCH_TEXT,
+                    "date": FieldMergeMode.IMMUTABLE,
+                    "occurred_at": FieldMergeMode.IMMUTABLE,
+                    "details": FieldMergeMode.PATCH_TEXT,
+                },
             ),
             MemoryTypeSchema(
                 memory_type=MemoryType.PROJECT_RULE,
@@ -91,6 +128,13 @@ class MemoryTypeRegistry:
                 required_fields=("rule", "project_id"),
                 optional_fields=("scope", "rationale"),
                 default_retrieval_views=("project:{project_id}:rules",),
+                field_merge_rules={
+                    "rule_key": FieldMergeMode.IMMUTABLE,
+                    "rule": FieldMergeMode.PATCH_TEXT,
+                    "content": FieldMergeMode.PATCH_TEXT,
+                    "constraints": FieldMergeMode.APPEND_UNIQUE,
+                    "project_id": FieldMergeMode.IMMUTABLE,
+                },
             ),
             MemoryTypeSchema(
                 memory_type=MemoryType.PROJECT_DECISION,
@@ -98,6 +142,13 @@ class MemoryTypeRegistry:
                 required_fields=("decision", "project_id"),
                 optional_fields=("rationale", "alternatives", "decided_at"),
                 default_retrieval_views=("project:{project_id}:decisions",),
+                field_merge_rules={
+                    "decision_key": FieldMergeMode.IMMUTABLE,
+                    "decision": FieldMergeMode.PATCH_TEXT,
+                    "content": FieldMergeMode.PATCH_TEXT,
+                    "status": FieldMergeMode.REPLACE,
+                    "project_id": FieldMergeMode.IMMUTABLE,
+                },
             ),
             MemoryTypeSchema(
                 memory_type=MemoryType.AGENT_EXPERIENCE,
@@ -106,6 +157,14 @@ class MemoryTypeRegistry:
                 optional_fields=("project_id", "adapter_id", "tooling"),
                 default_retrieval_views=("project:{project_id}:agent_experience",),
                 allow_user_source=False,
+                field_merge_rules={
+                    "situation_key": FieldMergeMode.IMMUTABLE,
+                    "situation": FieldMergeMode.IMMUTABLE,
+                    "approach": FieldMergeMode.PATCH_TEXT,
+                    "reflect": FieldMergeMode.PATCH_TEXT,
+                    "outcome": FieldMergeMode.PATCH_TEXT,
+                    "evidence": FieldMergeMode.APPEND_UNIQUE,
+                },
             ),
         ]
 

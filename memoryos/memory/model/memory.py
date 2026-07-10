@@ -34,6 +34,7 @@ class Memory:
     retrieval_views: list[str] = field(default_factory=list)
     admission: dict[str, Any] | str | None = None
     merge_key: str = ""
+    fields: dict[str, Any] = field(default_factory=dict)
     source: dict[str, Any] = field(default_factory=dict)
     memory_schema_version: str = "memory_schema_v1"
     created_at: str = field(default_factory=utc_now)
@@ -60,8 +61,16 @@ class Memory:
             metadata["admission"] = self.admission
         if self.merge_key:
             metadata["merge_key"] = self.merge_key
+        if self.fields:
+            metadata["fields"] = self.fields
         if self.source:
             metadata["source"] = self.source
+            if self.source.get("adapter_id"):
+                metadata["source_adapter_id"] = self.source["adapter_id"]
+            if self.source.get("session_id"):
+                metadata["source_session_id"] = self.source["session_id"]
+            if self.source.get("roles"):
+                metadata["source_roles"] = self.source["roles"]
         if self.memory_schema_version:
             metadata["schema_version"] = self.memory_schema_version
         return ContextObject(
@@ -108,3 +117,15 @@ class MemoryAnchor(Memory):
 @dataclass
 class MemoryCandidate(Memory):
     confirmation_state: str = "pending"
+
+    def to_context_object(self) -> ContextObject:
+        obj = super().to_context_object()
+        admission = dict(obj.metadata.get("admission", {}) or {})
+        obj.metadata = {
+            **obj.metadata,
+            "admission": admission,
+            "candidate_reason": admission.get("reason", ""),
+            "promotion_required": True,
+            "confirmation_state": self.confirmation_state,
+        }
+        return obj

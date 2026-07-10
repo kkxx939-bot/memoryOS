@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from memoryos.contextdb.context_db import ContextDB
 from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
-from memoryos.contextdb.session.planners import ActionPolicyCommitPlanner, BehaviorCommitPlanner
+from memoryos.contextdb.session.planners import ActionPolicyCommitPlanner, BehaviorCommitPlanner, MemoryCommitPlanner
 from memoryos.contextdb.session.session_archive import SessionArchiveStore
 from memoryos.contextdb.session.session_commit import SessionCommitService
 from memoryos.contextdb.store import FileSystemSourceStore, IndexStore, RelationStore, SourceStore
@@ -77,6 +77,7 @@ def build_runtime_container(
         session_archive_store,
         queue,
         committer=committer,
+        memory_planner=MemoryCommitPlanner(source_store=source),
         behavior_planner=BehaviorCommitPlanner(index_store=index, source_store=source),
         action_policy_planner=ActionPolicyCommitPlanner(index_store=index, source_store=source),
     )

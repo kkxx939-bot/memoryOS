@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from memoryos.contextdb.model.context_type import ContextType
+from memoryos.memory.lifecycle import MemoryCandidateLifecycle
 from memoryos.memory.model.memory import Memory
 from memoryos.operations.model.context_operation import ContextOperation
 from memoryos.operations.model.operation_action import OperationAction
@@ -8,6 +9,9 @@ from memoryos.operations.model.operation_action import OperationAction
 
 class MemoryUpdater:
     """Memory-only operation builder. Behavior and ActionPolicy updates live elsewhere."""
+
+    def __init__(self) -> None:
+        self.candidate_lifecycle = MemoryCandidateLifecycle()
 
     def add_memory(self, memory: Memory, evidence: list[dict] | None = None) -> ContextOperation:
         context_object = memory.to_context_object()
@@ -44,3 +48,12 @@ class MemoryUpdater:
 
     def policy_rule(self, memory: Memory, evidence: list[dict] | None = None) -> ContextOperation:
         return self.add_memory(memory, evidence=evidence)
+
+    def confirm_candidate(self, *, user_id: str, candidate_uri: str, reason: str = "confirmed") -> ContextOperation:
+        return self.candidate_lifecycle.confirm(user_id=user_id, candidate_uri=candidate_uri, reason=reason)
+
+    def reject_candidate(self, *, user_id: str, candidate_uri: str, reason: str = "rejected") -> ContextOperation:
+        return self.candidate_lifecycle.reject(user_id=user_id, candidate_uri=candidate_uri, reason=reason)
+
+    def promote_candidate(self, *, user_id: str, candidate_uri: str, reason: str = "promoted") -> ContextOperation:
+        return self.candidate_lifecycle.promote(user_id=user_id, candidate_uri=candidate_uri, reason=reason)

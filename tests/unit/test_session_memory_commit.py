@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import json
+
+from memoryos.contextdb.session.planners.action_policy_commit_planner import ActionPolicyCommitPlanner
+from memoryos.contextdb.session.planners.behavior_commit_planner import BehaviorCommitPlanner
 from memoryos.contextdb.session.planners.memory_commit_planner import MemoryCommitPlanner
+from memoryos.contextdb.session.session_archive import SessionArchiveStore
+from memoryos.contextdb.session.session_commit import SessionCommitService
 from memoryos.contextdb.session.session_model import SessionArchive
-from memoryos.contextdb.store.local_stores import FileSystemSourceStore, InMemoryIndexStore
+from memoryos.contextdb.store.local_stores import FileSystemSourceStore, InMemoryIndexStore, InMemoryQueueStore
 from memoryos.operations.commit.operation_committer import OperationCommitter
 
 
@@ -67,3 +73,48 @@ def test_committed_memory_context_object_keeps_schema_metadata(tmp_path) -> None
     assert obj.metadata["admission"]["decision"] == "accept"
     assert "user:u1:preferences" in obj.metadata["retrieval_views"]
     assert obj.metadata["source"]["session_id"] == "s1"
+
+
+def test_session_commit_uses_schema_memory_commit_planner(tmp_path) -> None:
+    archive = SessionArchive(
+        user_id="u1",
+        session_id="s1",
+        archive_uri="memoryos://user/u1/sessions/history/s1",
+        messages=[{"role": "user", "content": "Project rule: MemoryOS must keep schema metadata in memory diffs."}],
+        metadata={"project_id": "memoryos", "connect": {"adapter_id": "codex"}},
+    )
+    service = SessionCommitService(
+        SessionArchiveStore(tmp_path),
+        InMemoryQueueStore(),
+        allow_plan_only=True,
+    )
+
+    service.async_commit(archive)
+    payload = json.loads((tmp_path / "tenants/default/users/u1/sessions/history/s1/memory_diff.json").read_text(encoding="utf-8"))
+    operation = payload["operations"][0]
+    metadata = operation["payload"]["context_object"]["metadata"]
+
+    assert operation["payload"]["memory_type"] == "project_rule"
+    assert operation["payload"]["admission"]["decision"] == "accept"
+    assert "project:memoryos:rules" in operation["payload"]["retrieval_views"]
+    assert metadata["memory_type"] == "project_rule"
+    assert metadata["admission"]["decision"] == "accept"
+    assert "project:memoryos:rules" in metadata["retrieval_views"]
+
+
+def test_behavior_action_policy_not_modified_by_memory_pipeline() -> None:
+    archive = SessionArchive(
+        user_id="u1",
+        session_id="s1",
+        archive_uri="memoryos://user/u1/sessions/history/s1",
+        messages=[{"role": "user", "content": "I prefer findings first."}],
+        metadata={"connect": {"adapter_id": "codex"}},
+    )
+
+    memory_ops = MemoryCommitPlanner().plan(archive)
+    behavior_ops = BehaviorCommitPlanner().plan(archive)
+    action_ops = ActionPolicyCommitPlanner().plan(archive)
+
+    assert memory_ops
+    assert behavior_ops == []
+    assert action_ops == []

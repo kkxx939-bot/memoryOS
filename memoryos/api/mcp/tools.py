@@ -55,6 +55,9 @@ class MCPToolRouter:
         filter_metadata = agent_search_filter_metadata(args.get("connect_metadata"), self.config)
         context_type = args.get("context_type")
         context_types = optional_list(args, "context_types")
+        search_scope = args.get("search_scope")
+        project_id = str(args.get("project_id") or "")
+        retrieval_views = optional_list(args, "retrieval_views")
         requested_types = [context_type] if context_type is not None else list(context_types or [])
         if requested_types:
             contexts = []
@@ -66,6 +69,9 @@ class MCPToolRouter:
                         context_type=requested_type,
                         limit=limit,
                         connect_metadata=filter_metadata,
+                        search_scope=str(search_scope) if search_scope else None,
+                        retrieval_views=[str(item) for item in retrieval_views or []],
+                        project_id=project_id,
                     )
                 )
             contexts = _dedupe_contexts(contexts)[:limit]
@@ -76,6 +82,9 @@ class MCPToolRouter:
                 context_type=None,
                 limit=limit,
                 connect_metadata=filter_metadata,
+                search_scope=str(search_scope) if search_scope else None,
+                retrieval_views=[str(item) for item in retrieval_views or []],
+                project_id=project_id,
             )
         source_uris = [str(item.get("uri", "")) for item in contexts if item.get("uri")]
         return ok_payload({"contexts": contexts, "results": contexts, "source_uris": source_uris, "metadata": {"connect": metadata}})
@@ -85,6 +94,9 @@ class MCPToolRouter:
         token_budget = optional_int(args, "token_budget", self.config.token_budget, minimum=0, maximum=200_000)
         limit = optional_int(args, "limit", 20, minimum=0, maximum=200)
         context_types = optional_list(args, "context_types")
+        search_scope = args.get("search_scope")
+        project_id = str(args.get("project_id") or "")
+        retrieval_views = optional_list(args, "retrieval_views")
         metadata = normalize_agent_metadata(args.get("connect_metadata"), self.config)
         filter_metadata = agent_search_filter_metadata(args.get("connect_metadata"), self.config)
         assembled = self.client.assemble_context(
@@ -94,6 +106,9 @@ class MCPToolRouter:
             context_types=context_types,
             limit=limit,
             connect_metadata=filter_metadata,
+            search_scope=str(search_scope) if search_scope else None,
+            retrieval_views=[str(item) for item in retrieval_views or []],
+            project_id=project_id,
         )
         payload = {
             "packed_context": assembled.get("packed_context", ""),

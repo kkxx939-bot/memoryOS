@@ -133,6 +133,26 @@ def test_mcp_search_context_supports_multiple_context_types() -> None:
     }
 
 
+def test_mcp_search_context_passes_memory_scope_arguments() -> None:
+    server, client = _server()
+
+    result = server.call_tool(
+        "memoryos_search_context",
+        {
+            "query": "rules",
+            "search_scope": "project_rules",
+            "project_id": "memoryOS",
+            "retrieval_views": ["project:memoryOS:rules"],
+        },
+    )
+
+    assert result["error"] is None
+    call = client.search_calls[0]
+    assert call["search_scope"] == "project_rules"
+    assert call["project_id"] == "memoryOS"
+    assert call["retrieval_views"] == ["project:memoryOS:rules"]
+
+
 def test_mcp_search_context_rejects_unknown_adapter_id() -> None:
     server, client = _server()
 

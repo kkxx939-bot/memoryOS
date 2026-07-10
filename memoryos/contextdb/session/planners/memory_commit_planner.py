@@ -3,9 +3,11 @@ from __future__ import annotations
 from typing import Any
 
 from memoryos.contextdb.session.session_model import SessionArchive
+from memoryos.contextdb.store.source_store import SourceStore
 from memoryos.core.ids import stable_hash
 from memoryos.memory.admission import MemoryAdmissionGate
 from memoryos.memory.extraction import MemoryExtractorBackend, RuleFallbackExtractor
+from memoryos.memory.merge import MemoryMergePlanner
 from memoryos.memory.model.memory import Memory, MemoryCandidate, MemoryKind
 from memoryos.memory.schema import (
     MEMORY_SCHEMA_VERSION,
@@ -30,12 +32,15 @@ class RuleMemoryCommitPlanner:
         registry: MemoryTypeRegistry | None = None,
         admission_gate: MemoryAdmissionGate | None = None,
         view_router: MemoryViewRouter | None = None,
+        source_store: SourceStore | None = None,
+        merge_planner: MemoryMergePlanner | None = None,
     ) -> None:
         self.registry = registry or MemoryTypeRegistry()
         self.extractor = extractor or RuleFallbackExtractor()
         self.view_router = view_router or getattr(admission_gate, "view_router", None) or MemoryViewRouter()
         self.admission_gate = admission_gate or MemoryAdmissionGate(self.registry, self.view_router)
         self.updater = MemoryUpdater()
+        self.merge_planner = merge_planner or MemoryMergePlanner(source_store, self.registry)
         self.last_group = MemoryOperationGroup()
 
     def plan(self, archive: SessionArchive) -> list[ContextOperation]:
@@ -53,7 +58,19 @@ class RuleMemoryCommitPlanner:
             )
             group.add(candidate, admission)
         for item in [*group.accepted, *group.pending]:
-            operations.append(self._operation(archive, item))
+            operation = self._operation(archive, item)
+            if item.admission.decision == AdmissionDecision.ACCEPT:
+                decision = self.merge_planner.plan(item.candidate, item.admission)
+                operation = self.merge_planner.apply(operation, decision)
+            else:
+                operation.payload.update(
+                    {
+                        "merge_decision": "ADD",
+                        "existing_uri": "",
+                        "merge_reason": "pending_candidate",
+                    }
+                )
+            operations.append(operation)
         self.last_group = group
         return operations
 
@@ -73,6 +90,7 @@ class RuleMemoryCommitPlanner:
             "source_roles": [candidate.source_role],
             "merge_key": admission.merge_key or candidate.merge_key,
             "schema_version": MEMORY_SCHEMA_VERSION,
+            "fields": dict(candidate.fields),
         }
         context_object = operation.payload.get("context_object")
         if isinstance(context_object, dict):
@@ -83,8 +101,12 @@ class RuleMemoryCommitPlanner:
                     "admission": admission.to_metadata(),
                     "retrieval_views": admission.retrieval_views,
                     "source": memory.source,
+                    "source_adapter_id": candidate.source_adapter_id,
+                    "source_session_id": candidate.source_session_id or archive.session_id,
+                    "source_roles": [candidate.source_role],
                     "merge_key": admission.merge_key or candidate.merge_key,
                     "schema_version": MEMORY_SCHEMA_VERSION,
+                    "fields": dict(candidate.fields),
                 }
             )
             context_object["metadata"] = metadata
@@ -116,6 +138,7 @@ class RuleMemoryCommitPlanner:
                 retrieval_views=admission.retrieval_views,
                 admission=admission_metadata,
                 merge_key=merge_key,
+                fields=dict(candidate.fields),
                 source=source,
                 memory_schema_version=MEMORY_SCHEMA_VERSION,
             )
@@ -130,6 +153,7 @@ class RuleMemoryCommitPlanner:
             retrieval_views=admission.retrieval_views,
             admission=admission_metadata,
             merge_key=merge_key,
+            fields=dict(candidate.fields),
             source=source,
             memory_schema_version=MEMORY_SCHEMA_VERSION,
         )

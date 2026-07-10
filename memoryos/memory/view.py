@@ -17,6 +17,12 @@ def project_id_from_archive(archive: Any) -> str:
             value = connect.get(key)
             if value:
                 return str(value)
+        extra = connect.get("extra")
+        if isinstance(extra, dict):
+            for key in ("project_id", "project", "repo"):
+                value = extra.get(key)
+                if value:
+                    return str(value)
     for message in getattr(archive, "messages", []) or []:
         if isinstance(message, dict):
             value = message.get("project_id") or message.get("project")

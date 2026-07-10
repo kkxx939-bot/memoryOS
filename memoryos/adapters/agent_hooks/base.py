@@ -56,6 +56,7 @@ class BaseAgentHookAdapter:
                     "user_id": event.user_id or self.config.user_id,
                     "token_budget": token_budget or self.config.token_budget,
                     "connect_metadata": _agent_hook_metadata(event.adapter_id),
+                    "project_id": _project_id_from_event(event),
                 },
             )
             if result.get("error"):
@@ -154,3 +155,11 @@ def _agent_hook_metadata(adapter_id: str) -> dict[str, Any]:
         world_domain="digital",
         source_kind="coding_agent",
     ).to_dict()
+
+
+def _project_id_from_event(event: AgentHookEvent) -> str:
+    for key in ("project_id", "project"):
+        value = event.metadata.get(key)
+        if value:
+            return str(value)
+    return ""

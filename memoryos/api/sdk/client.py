@@ -16,6 +16,7 @@ from memoryos.core.ids import stable_hash
 from memoryos.prediction.model.prediction_request import PredictionRequest
 from memoryos.prediction.model.prediction_result import PredictionResult
 from memoryos.providers.embedding import EmbeddingProvider
+from memoryos.providers.rerank import Reranker
 from memoryos.runtime import RuntimeConfig, build_runtime_container
 from memoryos.skill.tool_registry import ToolRegistry
 
@@ -33,6 +34,7 @@ class MemoryOSClient:
         vector_store: VectorStore | None = None,
         embedding_provider: EmbeddingProvider | None = None,
         hybrid_search: HybridSearch | None = None,
+        reranker: Reranker | None = None,
     ) -> None:
         self.root = root
         container = build_runtime_container(
@@ -55,6 +57,7 @@ class MemoryOSClient:
         self.vector_store = container.vector_store
         self.embedding_provider = container.embedding_provider
         self.hybrid_search = container.hybrid_search
+        self.reranker = reranker
         self.committer = container.committer
         self.session_archive_store = container.session_archive_store
         self.session_commit_service = container.session_commit_service
@@ -165,15 +168,28 @@ class MemoryOSClient:
         context_type: object | None = None,
         limit: int = 10,
         connect_metadata: dict[str, Any] | None = None,
+        search_scope: str | None = None,
+        retrieval_views: list[str] | None = None,
+        project_id: str = "",
     ) -> list[dict[str, Any]]:
         connect_filters = self._connect_filters_from_metadata(connect_metadata)
-        return ContextAssembler(self.context_db).search(
-            query,
-            user_id=user_id,
-            context_type=context_type,
-            limit=limit,
-            connect_filters=connect_filters,
-        )
+        metadata = self._parse_connect_metadata(connect_metadata)
+        assembler = self._context_assembler()
+        kwargs = {
+            "user_id": user_id,
+            "context_type": context_type,
+            "limit": limit,
+            "connect_filters": connect_filters,
+            "search_scope": search_scope,
+            "retrieval_views": retrieval_views,
+            "project_id": project_id or self._project_id_from_metadata(connect_metadata),
+            "adapter_id": metadata.adapter_id,
+        }
+        try:
+            return assembler.search(query, **kwargs)
+        except TypeError:
+            legacy_kwargs = {key: kwargs[key] for key in ("user_id", "context_type", "limit", "connect_filters")}
+            return assembler.search(query, **legacy_kwargs)
 
     def assemble_context(
         self,
@@ -184,21 +200,33 @@ class MemoryOSClient:
         context_types: list[object] | None = None,
         limit: int = 20,
         connect_metadata: dict[str, Any] | None = None,
+        search_scope: str | None = None,
+        retrieval_views: list[str] | None = None,
+        project_id: str = "",
     ) -> dict[str, Any]:
         metadata = self._parse_connect_metadata(connect_metadata)
         connect_filters = self._connect_filters_from_metadata(connect_metadata)
         parsed_types: list[object] | None = (
             [self._parse_context_type(item) for item in context_types] if context_types else None
         )
-        return ContextAssembler(self.context_db).assemble(
-            query,
-            user_id=user_id,
-            token_budget=token_budget,
-            context_types=parsed_types,
-            limit=limit,
-            connect_metadata=metadata.to_dict(),
-            connect_filters=connect_filters,
-        )
+        assembler = self._context_assembler()
+        kwargs = {
+            "user_id": user_id,
+            "token_budget": token_budget,
+            "context_types": parsed_types,
+            "limit": limit,
+            "connect_metadata": metadata.to_dict(),
+            "connect_filters": connect_filters,
+            "search_scope": search_scope,
+            "retrieval_views": retrieval_views,
+            "project_id": project_id or self._project_id_from_metadata(connect_metadata),
+            "adapter_id": metadata.adapter_id,
+        }
+        try:
+            return assembler.assemble(query, **kwargs)
+        except TypeError:
+            legacy_keys = ("user_id", "token_budget", "context_types", "limit", "connect_metadata", "connect_filters")
+            return assembler.assemble(query, **{key: kwargs[key] for key in legacy_keys})
 
     def commit_agent_session(
         self,
@@ -284,6 +312,27 @@ class MemoryOSClient:
         if isinstance(context_type, ContextType):
             return context_type
         return ContextType(str(context_type))
+
+    def _context_assembler(self) -> ContextAssembler:
+        reranker = getattr(self, "reranker", None)
+        if reranker is None:
+            return ContextAssembler(self.context_db)
+        try:
+            return ContextAssembler(self.context_db, reranker=reranker)
+        except TypeError:
+            return ContextAssembler(self.context_db)
+
+    def _project_id_from_metadata(self, connect_metadata: dict[str, Any] | None) -> str:
+        metadata = dict(connect_metadata or {})
+        for key in ("project_id", "project"):
+            if metadata.get(key):
+                return str(metadata[key])
+        extra = metadata.get("extra")
+        if isinstance(extra, dict):
+            for key in ("project_id", "project", "repo"):
+                if extra.get(key):
+                    return str(extra[key])
+        return ""
 
     def _uri_items(self, uris: list[str]) -> list[dict[str, str]]:
         return [{"uri": uri} for uri in dict.fromkeys(str(uri) for uri in uris if uri)]

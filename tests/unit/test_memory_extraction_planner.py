@@ -4,7 +4,7 @@ from collections.abc import Sequence
 
 from memoryos.contextdb.session.planners.memory_commit_planner import MemoryCommitPlanner
 from memoryos.contextdb.session.session_model import SessionArchive
-from memoryos.memory.extraction import RuleFallbackExtractor
+from memoryos.memory.extraction import LLMMemoryExtractor, RuleFallbackExtractor, RuleMemoryExtractor
 from memoryos.memory.schema import MemoryCandidateDraft, MemoryType, MemoryTypeSchema
 from memoryos.memory.view import MemoryViewRouter
 
@@ -62,6 +62,34 @@ def test_memory_extractor_outputs_structured_candidates() -> None:
     }
 
 
+def test_legacy_extractors_not_used_by_memory_commit_planner() -> None:
+    planner = MemoryCommitPlanner()
+
+    assert isinstance(planner.extractor, RuleFallbackExtractor)
+    assert not isinstance(planner.extractor, RuleMemoryExtractor)
+    assert not isinstance(planner.extractor, LLMMemoryExtractor)
+
+
+def test_memory_commit_planner_uses_schema_pipeline() -> None:
+    planner = MemoryCommitPlanner()
+
+    assert isinstance(planner.extractor, RuleFallbackExtractor)
+    assert hasattr(planner, "admission_gate")
+    assert hasattr(planner, "last_group")
+
+
+def test_legacy_extractors_not_default() -> None:
+    test_legacy_extractors_not_used_by_memory_commit_planner()
+
+
+def test_memory_commit_planner_does_not_use_legacy_rule_extractor() -> None:
+    assert not isinstance(MemoryCommitPlanner().extractor, RuleMemoryExtractor)
+
+
+def test_legacy_llm_extractor_not_default_commit_backend() -> None:
+    assert not isinstance(MemoryCommitPlanner().extractor, LLMMemoryExtractor)
+
+
 def test_memory_commit_planner_returns_operations_for_accepted_and_pending_only() -> None:
     archive = SessionArchive(
         user_id="u1",
@@ -117,6 +145,93 @@ def test_memory_operation_payload_contains_schema_metadata() -> None:
     assert operation.payload["schema_version"] == "memory_schema_v1"
     assert metadata["memory_type"] == "project_rule"
     assert metadata["retrieval_views"] == operation.payload["retrieval_views"]
+    assert metadata["source_adapter_id"] == "codex"
+    assert metadata["source_session_id"] == "s1"
+    assert metadata["source_roles"] == ["user"]
+
+
+def test_project_rule_accepted_with_retrieval_views() -> None:
+    archive = SessionArchive(
+        user_id="u1",
+        session_id="s1",
+        archive_uri="memoryos://user/u1/sessions/history/s1",
+        messages=[{"role": "user", "content": "Project rule: MemoryOS must keep source-only audits."}],
+        metadata={"project_id": "memoryOS", "connect": {"adapter_id": "codex"}},
+    )
+
+    operation = MemoryCommitPlanner().plan(archive)[0]
+
+    assert operation.payload["admission"]["decision"] == "accept"
+    assert "project:memoryOS:rules" in operation.payload["retrieval_views"]
+
+
+def test_user_preference_accepted_with_user_views() -> None:
+    archive = SessionArchive(
+        user_id="u1",
+        session_id="s1",
+        archive_uri="memoryos://user/u1/sessions/history/s1",
+        messages=[{"role": "user", "content": "I prefer concise code review findings first."}],
+        metadata={"connect": {"adapter_id": "codex"}},
+    )
+
+    operation = MemoryCommitPlanner().plan(archive)[0]
+
+    assert operation.payload["memory_type"] == "preference"
+    assert operation.payload["admission"]["decision"] in {"accept", "pending"}
+    assert "user:u1:preferences" in operation.payload["retrieval_views"]
+
+
+def test_agent_experience_from_assistant_result() -> None:
+    archive = SessionArchive(
+        user_id="u1",
+        session_id="s1",
+        archive_uri="memoryos://user/u1/sessions/history/s1",
+        messages=[
+            {
+                "role": "assistant",
+                "content": "Reusable lesson implemented. Approach: run focused checks before broad verification. Outcome: completed successfully.",
+            }
+        ],
+        metadata={"project_id": "memoryOS", "connect": {"adapter_id": "codex"}},
+    )
+
+    operation = MemoryCommitPlanner().plan(archive)[0]
+
+    assert operation.payload["memory_type"] == "agent_experience"
+    assert operation.payload["admission"]["decision"] == "accept"
+
+
+def test_raw_tool_output_archive_only() -> None:
+    archive = SessionArchive(
+        user_id="u1",
+        session_id="s1",
+        archive_uri="memoryos://user/u1/sessions/history/s1",
+        tool_results=[{"tool_name": "shell", "tool_output": "pytest failed\nTraceback (most recent call last):\nAssertionError"}],
+        metadata={"project_id": "memoryOS", "connect": {"adapter_id": "codex"}},
+    )
+    planner = MemoryCommitPlanner()
+
+    assert planner.plan(archive) == []
+    assert planner.last_group.archive_only
+
+
+def test_secret_restricted() -> None:
+    planner = MemoryCommitPlanner(
+        extractor=FakeExtractor(
+            [
+                _draft(
+                    MemoryType.PREFERENCE,
+                    "api key OPENAI_API_KEY=sk-test",
+                    fields={"preference": "api key OPENAI_API_KEY=sk-test"},
+                )
+            ]
+        )
+    )
+
+    assert planner.plan(
+        SessionArchive(user_id="u1", session_id="s1", archive_uri="memoryos://user/u1/sessions/history/s1")
+    ) == []
+    assert planner.last_group.restricted
 
 
 def test_memory_commit_planner_accepts_view_router_injection() -> None:
