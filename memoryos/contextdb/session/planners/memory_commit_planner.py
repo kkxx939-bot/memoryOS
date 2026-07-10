@@ -95,6 +95,7 @@ class RuleMemoryCommitPlanner:
         context_object = operation.payload.get("context_object")
         if isinstance(context_object, dict):
             metadata = dict(context_object.get("metadata", {}) or {})
+            archive_metadata = dict(archive.metadata or {})
             metadata.update(
                 {
                     "memory_type": candidate.memory_type.value,
@@ -107,6 +108,9 @@ class RuleMemoryCommitPlanner:
                     "merge_key": admission.merge_key or candidate.merge_key,
                     "schema_version": MEMORY_SCHEMA_VERSION,
                     "fields": dict(candidate.fields),
+                    "connect": dict(archive_metadata.get("connect", {}) or {}),
+                    "scope": dict(archive_metadata.get("scope", {}) or {}),
+                    "provenance": dict(archive_metadata.get("provenance", {}) or {}),
                 }
             )
             context_object["metadata"] = metadata

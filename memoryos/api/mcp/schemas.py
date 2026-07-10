@@ -62,10 +62,20 @@ TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "tool_results": {"type": "array", "items": {"type": "object"}},
             "connect_metadata": {"type": "object"},
             "async_commit": {"type": "boolean"},
+            "project_id": {"type": "string"},
+            "session_key": {"type": "string"},
+            "scope": {"type": "object"},
+            "provenance": {"type": "object"},
         },
         "required": ["session_id"],
     },
     "memoryos_health": {"type": "object", "properties": {}, "required": []},
+    "memoryos_read": {"type": "object", "properties": {"uri": {"type": "string"}, "layer": {"type": "string"}}, "required": ["uri"]},
+    "memoryos_remember": {"type": "object", "properties": {"user_id": {"type": "string"}, "content": {"type": "string"}, "title": {"type": "string"}, "memory_type": {"type": "string"}, "project_id": {"type": "string"}, "connect_metadata": {"type": "object"}}, "required": ["content"]},
+    "memoryos_forget": {"type": "object", "properties": {"user_id": {"type": "string"}, "uri": {"type": "string"}}, "required": ["uri"]},
+    "memoryos_archive_search": {"type": "object", "properties": {"query": {"type": "string"}, "user_id": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["query"]},
+    "memoryos_archive_read": {"type": "object", "properties": {"archive_uri": {"type": "string"}}, "required": ["archive_uri"]},
+    "memoryos_recall_trace": {"type": "object", "properties": {"trace_id": {"type": "string"}}, "required": ["trace_id"]},
     "memoryos_connection_schema": {"type": "object", "properties": {}, "required": []},
     "memoryos_predict": {
         "type": "object",
@@ -94,13 +104,21 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "memoryos_assemble_context": "Assemble token-bounded MemoryOS context for prompt injection.",
     "memoryos_commit_session": "Commit a sanitized agent session archive.",
     "memoryos_health": "Check MemoryOS availability.",
+    "memoryos_read": "Read one exact MemoryOS URI at L0, L1, or L2.",
+    "memoryos_remember": "Store an explicit confirmed memory.",
+    "memoryos_forget": "Forget one exact MemoryOS URI.",
+    "memoryos_archive_search": "Search archived coding-agent sessions.",
+    "memoryos_archive_read": "Read one exact archived session.",
+    "memoryos_recall_trace": "Explain a recall trace.",
     "memoryos_connection_schema": "Describe allowed MemoryOS connection profiles.",
     "memoryos_predict": "Action-capable embodied behavior prediction. Requires action tools enabled and embodied metadata.",
     "memoryos_process_observation": "Action-capable embodied observation processing. Requires action tools enabled and embodied metadata.",
 }
 
 
-def tool_definitions() -> list[dict[str, Any]]:
+def tool_definitions(config: MCPServerConfig | None = None) -> list[dict[str, Any]]:
+    action_tools = {"memoryos_predict", "memoryos_process_observation"}
+    enabled = config.enable_action_tools if config is not None else False
     return [
         {
             "name": name,
@@ -108,6 +126,7 @@ def tool_definitions() -> list[dict[str, Any]]:
             "inputSchema": schema,
         }
         for name, schema in TOOL_INPUT_SCHEMAS.items()
+        if enabled or name not in action_tools
     ]
 
 

@@ -18,6 +18,16 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("version")
     sub.add_parser("inspect-architecture")
+    doctor = sub.add_parser("doctor")
+    doctor.add_argument("--root", default="./memory-root")
+    worker = sub.add_parser("worker")
+    worker.add_argument("kind", choices=["session-commit", "maintenance", "all"])
+    worker.add_argument("--root", default="./memory-root")
+    worker.add_argument("--once", action="store_true")
+    worker.add_argument("--poll-interval", type=float, default=1.0)
+    worker.add_argument("--batch-size", type=int, default=10)
+    worker.add_argument("--lease-seconds", type=int, default=60)
+    worker.add_argument("--max-retries", type=int, default=3)
     predict = sub.add_parser("predict")
     predict.add_argument("--root", default="./memory-root")
     predict.add_argument("--user", required=True)
@@ -43,6 +53,41 @@ def main(argv: list[str] | None = None) -> int:
                 indent=2,
             )
         )
+        return 0
+    if args.command == "doctor":
+        root = Path(args.root)
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            writable = root.is_dir() and root.stat().st_mode != 0
+            client = MemoryOSClient(str(root))
+            report = {
+                "root": str(root),
+                "writable": writable,
+                **client.health(),
+                "mcp_sdk": "ready" if __import__("importlib.util").util.find_spec("mcp") else "unavailable",
+                "http_runtime": "ready" if __import__("importlib.util").util.find_spec("uvicorn") else "unavailable",
+                "agent_integrations": {
+                    "codex": (Path.home() / ".codex" / "hooks.json").exists(),
+                    "claude_code": (Path.home() / ".claude" / "settings.json").exists(),
+                },
+            }
+            print(json.dumps(report, ensure_ascii=False))
+            return 0
+        except Exception as exc:
+            _print_cli_error(exc)
+            return 2
+    if args.command == "worker":
+        from memoryos.workers.runner import WorkerRunner
+
+        client = MemoryOSClient(args.root)
+        result = WorkerRunner(
+            client,
+            poll_interval=args.poll_interval,
+            batch_size=args.batch_size,
+            lease_seconds=args.lease_seconds,
+            max_retries=args.max_retries,
+        ).run(args.kind, once=args.once)
+        print(json.dumps({"kind": args.kind, "status": "completed", "result": result}, ensure_ascii=False))
         return 0
     if args.command == "predict":
         try:

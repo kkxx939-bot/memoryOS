@@ -1,5 +1,20 @@
 from __future__ import annotations
 
+from typing import Protocol
+
+
+class TokenCounter(Protocol):
+    def count(self, text: str, model: str | None = None) -> int: ...
+
+
+class HeuristicTokenCounter:
+    def count(self, text: str, model: str | None = None) -> int:
+        if not text:
+            return 0
+        cjk = sum(1 for char in text if "\u3400" <= char <= "\u9fff")
+        other = len(text) - cjk
+        return max(1, cjk + other // 4)
+
 
 class TokenBudgetController:
     def __init__(self, total_budget: int) -> None:

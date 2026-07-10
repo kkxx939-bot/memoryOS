@@ -19,6 +19,7 @@ from memoryos.prediction.model.prediction_ledger import PredictionLedger
 from memoryos.prediction.pipeline.executor import ActionExecutor
 from memoryos.prediction.pipeline.prediction_engine import PredictionEngine
 from memoryos.providers.embedding import EmbeddingProvider
+from memoryos.providers.rerank import Reranker
 from memoryos.runtime.config import RuntimeConfig
 from memoryos.skill.tool_registry import ToolRegistry
 
@@ -33,6 +34,7 @@ class RuntimeContainer:
     vector_store: VectorStore | None
     embedding_provider: EmbeddingProvider | None
     hybrid_search: HybridSearch | None
+    reranker: Reranker | None
     committer: OperationCommitter
     session_archive_store: SessionArchiveStore
     session_commit_service: SessionCommitService
@@ -60,9 +62,11 @@ def build_runtime_container(
     relation = relation_store or SQLiteRelationStore(root_path / "indexes" / "relations.sqlite3")
     queue = queue_store or SQLiteQueueStore(root_path / "queues" / "jobs.sqlite3")
     lock = lock_store or SQLiteLockStore(root_path / "system" / "locks.sqlite3")
+    configured_embedding = embedding_provider or config.embedding
+    configured_vector_store = vector_store or config.vector_store
     search = hybrid_search or (
-        HybridSearch(index, vector_store=vector_store, embedding_provider=embedding_provider, source_store=source)
-        if vector_store is not None and embedding_provider is not None
+        HybridSearch(index, vector_store=configured_vector_store, embedding_provider=configured_embedding, source_store=source)
+        if configured_vector_store is not None and configured_embedding is not None
         else None
     )
     committer = OperationCommitter(
@@ -77,7 +81,7 @@ def build_runtime_container(
         session_archive_store,
         queue,
         committer=committer,
-        memory_planner=MemoryCommitPlanner(source_store=source),
+        memory_planner=MemoryCommitPlanner(source_store=source, extractor=config.memory_extractor),
         behavior_planner=BehaviorCommitPlanner(index_store=index, source_store=source),
         action_policy_planner=ActionPolicyCommitPlanner(index_store=index, source_store=source),
     )
@@ -94,8 +98,8 @@ def build_runtime_container(
         PredictionLedger(config.root),
         source_store=source,
         relation_store=relation,
-        vector_store=vector_store,
-        embedding_provider=embedding_provider,
+        vector_store=configured_vector_store,
+        embedding_provider=configured_embedding,
         hybrid_search=search,
     )
     return RuntimeContainer(
@@ -104,9 +108,10 @@ def build_runtime_container(
         relation_store=relation,
         queue_store=queue,
         lock_store=lock,
-        vector_store=vector_store,
-        embedding_provider=embedding_provider,
+        vector_store=configured_vector_store,
+        embedding_provider=configured_embedding,
         hybrid_search=search,
+        reranker=config.reranker,
         committer=committer,
         session_archive_store=session_archive_store,
         session_commit_service=session_commit_service,

@@ -76,12 +76,21 @@ class ContextDB:
         owner_user_id: str | None = None,
         context_type: ContextType | None = None,
         limit: int = 10,
+        project_id: str = "",
+        adapter_id: str = "",
+        admission_status: str = "",
     ) -> list[IndexHit]:
         filters = {}
         if owner_user_id is not None:
             filters["owner_user_id"] = owner_user_id
         if context_type is not None:
             filters["context_type"] = context_type.value
+        if project_id:
+            filters["project_id"] = project_id
+        if adapter_id:
+            filters["adapter_id"] = adapter_id
+        if admission_status:
+            filters["admission_status"] = admission_status
         return self.index_store.search(query, filters=filters, limit=limit)
 
     def relations_of(

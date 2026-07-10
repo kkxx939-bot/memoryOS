@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from memoryos.adapters.agent_hooks.sanitizer import sanitize_error_text
+
 
 class MCPErrorCode:
     VALIDATION_ERROR = "VALIDATION_ERROR"
@@ -29,11 +31,11 @@ class MCPToolError:
 
 
 class ToolValidationError(ValueError):
-    pass
+    """Raised when a tool request violates its public input contract."""
 
 
 class ToolPermissionError(PermissionError):
-    pass
+    """Raised when a tool request exceeds the configured agent capability."""
 
 
 def error_payload(
@@ -58,20 +60,14 @@ def exception_payload(exc: Exception) -> dict[str, Any]:
     if isinstance(exc, ToolPermissionError | PermissionError):
         return error_payload(MCPErrorCode.PERMISSION_DENIED, str(exc), retryable=False)
     if isinstance(exc, FileNotFoundError | OSError):
-        return error_payload(MCPErrorCode.STORAGE_ERROR, exc.__class__.__name__, retryable=True)
+        return error_payload(MCPErrorCode.STORAGE_ERROR, str(exc) or exc.__class__.__name__, retryable=True)
     if isinstance(exc, RuntimeError):
         return error_payload(MCPErrorCode.CLIENT_ERROR, str(exc) or exc.__class__.__name__, retryable=True)
-    return error_payload(MCPErrorCode.INTERNAL_ERROR, exc.__class__.__name__, retryable=True)
+    return error_payload(MCPErrorCode.INTERNAL_ERROR, str(exc) or exc.__class__.__name__, retryable=True)
 
 
 def _safe_message(message: str) -> str:
-    sanitized = str(message)
-    home_markers = ["/Users/", "/private/", "/var/", "/tmp/"]
-    for marker in home_markers:
-        if marker in sanitized:
-            sanitized = sanitized.split(marker, 1)[0] + "<redacted-path>"
-            break
-    return sanitized[:500]
+    return sanitize_error_text(str(message), max_text=500)
 
 
 def _safe_details(details: dict[str, Any]) -> dict[str, Any]:

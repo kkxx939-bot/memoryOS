@@ -1,0 +1,5 @@
+MemoryOS commit: 43ceba49b60acf763fa8bf6fb67f417f279e8ef5
+MemoryOS working tree before: clean (git status --short and git diff --stat produced no entries)
+OpenViking reference commit: 8fb94e9f4d86f1cfeb1f117f382ad76340e7198a
+OpenViking reference path: /Users/gulf/PycharmProjects/OpenViking
+Captured for: production coding-agent integration

@@ -1,0 +1,12 @@
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [{"type": "command", "command": "memoryos-agent-hook claude_code SessionStart --format native", "timeout": 10}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "memoryos-agent-hook claude_code UserPromptSubmit --format native", "timeout": 10}]}],
+    "PostToolUse": [{"hooks": [{"type": "command", "command": "memoryos-agent-hook claude_code PostToolUse --format native", "timeout": 10}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "memoryos-agent-hook claude_code Stop --format native", "timeout": 15}]}],
+    "PreCompact": [{"hooks": [{"type": "command", "command": "memoryos-agent-hook claude_code PreCompact --format native", "timeout": 15}]}],
+    "SessionEnd": [{"hooks": [{"type": "command", "command": "memoryos-agent-hook claude_code SessionEnd --format native", "timeout": 15}]}],
+    "SubagentStop": [{"hooks": [{"type": "command", "command": "memoryos-agent-hook claude_code SubagentStop --format native", "timeout": 10}]}]
+  },
+  "mcpServers": {"memoryos": {"command": "memoryos-mcp-server", "args": []}}
+}

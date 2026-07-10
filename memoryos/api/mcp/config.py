@@ -6,7 +6,7 @@ from pathlib import Path
 
 from memoryos.connect import ConnectMetadata, ConnectType, PipelineMode
 
-DEFAULT_AGENT_ADAPTERS = ("codex", "claude_code", "cursor", "generic_agent")
+DEFAULT_AGENT_ADAPTERS = ("codex", "claude_code", "cursor", "windsurf", "cline", "continue", "generic_agent")
 
 
 @dataclass(frozen=True)

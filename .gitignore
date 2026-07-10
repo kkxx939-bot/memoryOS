@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
+*.egg-info/
 
 # Virtual env
 venv/
@@ -19,10 +20,14 @@ venv/
 # Local database / runtime files
 *.sqlite3
 *.db
-memory-root/index/
+memory-root/
 
 # Logs
 *.log
+
+# TypeScript integrations
+node_modules/
+dist/
 
 # Local planning notes
 步骤.txt

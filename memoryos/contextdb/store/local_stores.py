@@ -164,9 +164,9 @@ class InMemoryQueueStore:
         self.jobs: dict[str, QueueJob] = {}
 
     def enqueue(self, job: QueueJob) -> None:
-        self.jobs[job.job_id] = job
+        self.jobs.setdefault(job.job_id, job)
 
-    def lease(self, queue_name: str, limit: int = 10) -> list[QueueJob]:
+    def lease(self, queue_name: str, limit: int = 10, lease_seconds: int = 60) -> list[QueueJob]:
         leased = []
         for job in self.jobs.values():
             if job.queue_name == queue_name and job.status == "pending":
@@ -185,6 +185,19 @@ class InMemoryQueueStore:
         if job_id in self.jobs:
             job = self.jobs[job_id]
             self.jobs[job_id] = QueueJob(**{**job.__dict__, "status": "failed", "retry_count": job.retry_count + 1, "last_error": error})
+
+    def retry(self, job_id: str, error: str, *, max_retries: int = 3, retryable: bool = True) -> str:
+        job = self.jobs[job_id]
+        retry_count = job.retry_count + 1
+        status = "pending" if retryable and retry_count < max_retries else "dead_letter"
+        self.jobs[job_id] = QueueJob(**{**job.__dict__, "status": status, "leased_until": None, "retry_count": retry_count, "last_error": error[:500]})
+        return status
+
+    def stats(self) -> dict[str, int]:
+        result: dict[str, int] = {}
+        for job in self.jobs.values():
+            result[job.status] = result.get(job.status, 0) + 1
+        return result
 
 
 class InMemoryLockStore:

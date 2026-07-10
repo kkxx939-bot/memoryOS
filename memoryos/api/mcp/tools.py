@@ -18,12 +18,11 @@ from memoryos.api.mcp.schemas import (
     require_process_observation_metadata,
     required_str,
 )
-from memoryos.api.sdk.client import MemoryOSClient
 from memoryos.prediction.model.prediction_request import PredictionRequest
 
 
 class MCPToolRouter:
-    def __init__(self, client: MemoryOSClient, config: MCPServerConfig | None = None) -> None:
+    def __init__(self, client: Any, config: MCPServerConfig | None = None) -> None:
         self.client = client
         self.config = config or MCPServerConfig.from_env()
 
@@ -38,6 +37,19 @@ class MCPToolRouter:
                 return self.commit_session(args)
             if name == "memoryos_health":
                 return self.health()
+            if name == "memoryos_read":
+                return ok_payload(self.client.read(required_str(args, "uri"), layer=str(args.get("layer") or "L2")))
+            if name == "memoryos_remember":
+                metadata = normalize_agent_metadata(args.get("connect_metadata"), self.config)
+                return ok_payload(self.client.remember(user_id=str(args.get("user_id") or self.config.user_id), content=required_str(args, "content"), title=str(args.get("title") or ""), memory_type=str(args.get("memory_type") or "project_decision"), project_id=str(args.get("project_id") or ""), connect_metadata=metadata))
+            if name == "memoryos_forget":
+                return ok_payload(self.client.forget(user_id=str(args.get("user_id") or self.config.user_id), uri=required_str(args, "uri")))
+            if name == "memoryos_archive_search":
+                return ok_payload({"results": self.client.archive_search(required_str(args, "query"), user_id=str(args.get("user_id") or self.config.user_id), limit=optional_int(args, "limit", 20, maximum=100))})
+            if name == "memoryos_archive_read":
+                return ok_payload(self.client.archive_read(required_str(args, "archive_uri")))
+            if name == "memoryos_recall_trace":
+                return ok_payload(self.client.recall_trace(required_str(args, "trace_id")))
             if name == "memoryos_connection_schema":
                 return ok_payload(connection_schema(self.config))
             if name == "memoryos_predict":
@@ -133,6 +145,10 @@ class MCPToolRouter:
             tool_results=list(args.get("tool_results") or []),
             connect_metadata=metadata,
             async_commit=optional_bool(args, "async_commit", False),
+            project_id=str(args.get("project_id") or ""),
+            session_key=str(args.get("session_key") or ""),
+            scope=dict(args.get("scope") or {}),
+            provenance=dict(args.get("provenance") or {}),
         )
         result_payload = _to_payload(result) or {"status": "accepted"}
         return ok_payload({"status": result_payload.get("status", "accepted"), "result": result_payload, "metadata": {"connect": metadata}})
@@ -142,9 +158,13 @@ class MCPToolRouter:
             "root_configured": bool(self.config.root),
             "adapter_id": self.config.adapter_id,
         }
+        health_fn = getattr(self.client, "health", None)
+        raw_health = health_fn() if callable(health_fn) else {}
+        health: dict[str, Any] = raw_health if isinstance(raw_health, dict) else {}
         return ok_payload(
             {
                 "status": "ok",
+                **health,
                 "storage_ready": hasattr(self.client, "source_store"),
                 "contextdb_ready": hasattr(self.client, "context_db"),
                 "client_ready": self.client is not None,

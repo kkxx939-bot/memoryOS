@@ -1,0 +1,3 @@
+[mcp_servers.memoryos]
+command = "memoryos-mcp-server"
+args = []

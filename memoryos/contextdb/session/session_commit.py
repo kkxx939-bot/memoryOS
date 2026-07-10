@@ -8,7 +8,7 @@ from memoryos.contextdb.session.planners import (
     MemoryCommitPlanner,
 )
 from memoryos.contextdb.session.session_archive import SessionArchiveStore
-from memoryos.contextdb.session.session_model import SessionArchive, SessionCommitResult
+from memoryos.contextdb.session.session_model import SessionArchive, SessionCommitResult, SessionCommitState
 from memoryos.contextdb.store.source_store import QueueJob, QueueStore
 from memoryos.core.ids import new_id
 from memoryos.operations.commit.operation_committer import OperationCommitter
@@ -49,11 +49,11 @@ class SessionCommitService:
                     payload={"user_id": archive.user_id, "session_id": archive.session_id},
                 )
             )
-        return SessionCommitResult(task_id=archive.task_id, archive_uri=archive.archive_uri, status="queued")
+        return SessionCommitResult(task_id=archive.task_id, archive_uri=archive.archive_uri, status="queued", state=SessionCommitState.QUEUED)
 
     def async_commit(self, archive: SessionArchive) -> SessionCommitResult:
         if self.archive_store.async_outputs_done_for_task(archive):
-            return SessionCommitResult(task_id=archive.task_id, archive_uri=archive.archive_uri, status="done", done=True)
+            return SessionCommitResult(task_id=archive.task_id, archive_uri=archive.archive_uri, status="done", done=True, state=SessionCommitState.COMMITTED)
         source_text = "\n".join(
             [
                 *[str(item.get("content", item.get("text", ""))) for item in archive.messages],
@@ -72,12 +72,13 @@ class SessionCommitService:
             ],
         )
         memory_ops = self.memory_planner.plan(archive)
-        behavior_ops = self.behavior_planner.plan(archive)
+        coding_agent = self._is_coding_agent(archive)
+        behavior_ops = [] if coding_agent else self.behavior_planner.plan(archive)
         if self.committer is None and not self.allow_plan_only:
             raise RuntimeError("SessionCommitService requires OperationCommitter unless allow_plan_only=True")
         memory_diff = self._commit_or_describe(archive.user_id, memory_ops)
         behavior_diff = self._commit_or_describe(archive.user_id, behavior_ops)
-        action_policy_ops = self.action_policy_planner.plan(archive)
+        action_policy_ops = [] if coding_agent else self.action_policy_planner.plan(archive)
         action_policy_diff = self._commit_or_describe(archive.user_id, action_policy_ops)
         context_ops = self.context_planner.plan(archive)
         context_diff = self._commit_or_describe(archive.user_id, context_ops)
@@ -100,7 +101,11 @@ class SessionCommitService:
                     payload={"task_id": archive.task_id},
                 )
             )
-        return SessionCommitResult(task_id=archive.task_id, archive_uri=archive.archive_uri, status="done", done=True)
+        return SessionCommitResult(task_id=archive.task_id, archive_uri=archive.archive_uri, status="done", done=True, state=SessionCommitState.COMMITTED)
+
+    def _is_coding_agent(self, archive: SessionArchive) -> bool:
+        connect = dict(archive.metadata.get("connect", {}) or {})
+        return connect.get("connect_type") == "agent" and connect.get("run_mode") == "context_reduction"
 
     def _commit_or_describe(self, user_id: str, operations: list[ContextOperation]) -> dict:
         if self.committer is not None and operations:

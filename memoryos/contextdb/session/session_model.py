@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 from memoryos.core.ids import new_id
@@ -47,9 +48,19 @@ class SessionArchive:
         }
 
 
+class SessionCommitState(str, Enum):
+    ARCHIVED = "ARCHIVED"
+    QUEUED = "QUEUED"
+    PROCESSING = "PROCESSING"
+    COMMITTED = "COMMITTED"
+    FAILED = "FAILED"
+    DEAD_LETTER = "DEAD_LETTER"
+
+
 @dataclass(frozen=True)
 class SessionCommitResult:
     task_id: str
     archive_uri: str
     status: str
     done: bool = False
+    state: SessionCommitState = SessionCommitState.QUEUED

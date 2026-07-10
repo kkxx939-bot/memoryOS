@@ -19,19 +19,29 @@ class SQLiteIndexStore:
     def upsert_index(self, obj: ContextObject, content: str = "") -> None:
         metadata_json = json.dumps(obj.metadata, ensure_ascii=False)
         metadata_text = " ".join(str(value) for value in obj.metadata.values())
+        scope = dict(obj.metadata.get("scope", {}) or {})
+        fields = dict(obj.metadata.get("fields", {}) or {})
+        connect = dict(obj.metadata.get("connect", {}) or {})
+        admission = dict(obj.metadata.get("admission", {}) or {})
+        project_id = str(scope.get("project_id") or fields.get("project_id") or obj.metadata.get("project_id") or "")
+        adapter_id = str(connect.get("adapter_id") or obj.metadata.get("source_adapter_id") or "")
+        admission_status = str(admission.get("decision") or "")
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO contexts(
-                  uri, tenant_id, owner_user_id, context_type, title, lifecycle_state,
+                  uri, tenant_id, owner_user_id, context_type, project_id, adapter_id, admission_status, title, lifecycle_state,
                   hotness, semantic_hotness, behavior_support_hotness,
                   metadata_json, content_text, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(uri) DO UPDATE SET
                   tenant_id=excluded.tenant_id,
                   owner_user_id=excluded.owner_user_id,
                   context_type=excluded.context_type,
+                  project_id=excluded.project_id,
+                  adapter_id=excluded.adapter_id,
+                  admission_status=excluded.admission_status,
                   title=excluded.title,
                   lifecycle_state=excluded.lifecycle_state,
                   hotness=excluded.hotness,
@@ -46,6 +56,9 @@ class SQLiteIndexStore:
                     obj.tenant_id or "",
                     obj.owner_user_id or "",
                     obj.context_type.value,
+                    project_id,
+                    adapter_id,
+                    admission_status,
                     obj.title,
                     obj.lifecycle_state.value,
                     obj.hotness,
@@ -90,10 +103,16 @@ class SQLiteIndexStore:
     def _base_filter_sql(self, filters: dict) -> tuple[str, list[str]]:
         sql = ""
         params: list[str] = []
-        for field in ("tenant_id", "owner_user_id", "context_type", "lifecycle_state"):
+        for field in ("tenant_id", "owner_user_id", "context_type", "adapter_id", "admission_status", "lifecycle_state"):
             if filters.get(field) is not None:
                 sql += f" AND c.{field} = ?"
                 params.append(str(filters[field]))
+        if filters.get("project_id") is not None:
+            sql += " AND (c.project_id = ? OR c.project_id = '')"
+            params.append(str(filters["project_id"]))
+        if filters.get("admission_status") is None:
+            sql += " AND c.admission_status NOT IN (?, ?, ?, ?)"
+            params.extend(["pending", "restricted", "archive_only", "reject"])
         if filters.get("lifecycle_state") is None:
             sql += " AND c.lifecycle_state NOT IN (?, ?, ?)"
             params.extend(["deleted", "archived", "obsolete"])
@@ -186,6 +205,9 @@ class SQLiteIndexStore:
                   tenant_id TEXT NOT NULL,
                   owner_user_id TEXT NOT NULL,
                   context_type TEXT NOT NULL,
+                  project_id TEXT NOT NULL DEFAULT '',
+                  adapter_id TEXT NOT NULL DEFAULT '',
+                  admission_status TEXT NOT NULL DEFAULT '',
                   title TEXT NOT NULL,
                   lifecycle_state TEXT NOT NULL,
                   hotness REAL NOT NULL,
@@ -197,6 +219,10 @@ class SQLiteIndexStore:
                 )
                 """
             )
+            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(contexts)").fetchall()}
+            for name in ("project_id", "adapter_id", "admission_status"):
+                if name not in columns:
+                    conn.execute(f"ALTER TABLE contexts ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
             try:
                 conn.execute(
                     """

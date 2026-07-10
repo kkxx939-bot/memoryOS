@@ -15,8 +15,8 @@ from memoryos.memory.schema import (
 from memoryos.memory.view import MemoryViewRouter
 
 RAW_OUTPUT_RE = re.compile(
-    r"(?is)(^diff --git\b|^@@\s|traceback \(most recent call last\)|pytest|failed|error:|stack trace|"
-    r"shell output|tool_result|exit code|chunk id:|process exited|^\+\+\+ |^--- )"
+    r"(?im)(^diff --git\b|^@@\s|^traceback \(most recent call last\)|^pytest\s+.*(?:={3,}|failed)|^failed tests?:|^error:|"
+    r"^stack trace|^shell output|^tool_result|^exit code|^chunk id:|^process exited|^\+\+\+ |^--- )"
 )
 CHAT_EVENT_RE = re.compile(r"(?i)\b(chat|conversation|discussed|talked about|本次聊天|这次对话|讨论了)\b")
 PRIVATE_PROCESS_RE = re.compile(r"(?i)\b(chain of thought|scratchpad|internal reasoning|agent private|内部推理|草稿)\b")

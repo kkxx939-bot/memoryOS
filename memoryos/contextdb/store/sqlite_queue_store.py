@@ -22,16 +22,7 @@ class SQLiteQueueStore:
                 """
                 INSERT INTO queue_jobs(job_id, queue_name, action, target_uri, payload_json, status, leased_until, retry_count, created_at, updated_at, last_error)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(job_id) DO UPDATE SET
-                  queue_name=excluded.queue_name,
-                  action=excluded.action,
-                  target_uri=excluded.target_uri,
-                  payload_json=excluded.payload_json,
-                  status=excluded.status,
-                  leased_until=excluded.leased_until,
-                  retry_count=excluded.retry_count,
-                  last_error=excluded.last_error,
-                  updated_at=excluded.updated_at
+                ON CONFLICT(job_id) DO NOTHING
                 """,
                 (
                     job.job_id,
@@ -48,9 +39,9 @@ class SQLiteQueueStore:
                 ),
             )
 
-    def lease(self, queue_name: str, limit: int = 10) -> list[QueueJob]:
+    def lease(self, queue_name: str, limit: int = 10, lease_seconds: int = 60) -> list[QueueJob]:
         now = utc_now()
-        leased_until = (self._now_dt() + timedelta(seconds=60)).isoformat()
+        leased_until = (self._now_dt() + timedelta(seconds=max(1, lease_seconds))).isoformat()
         with self._connect() as conn:
             rows = conn.execute(
                 """
@@ -80,6 +71,22 @@ class SQLiteQueueStore:
                 "UPDATE queue_jobs SET status = 'failed', retry_count = retry_count + 1, last_error = ?, updated_at = ?, leased_until = NULL WHERE job_id = ?",
                 (error, utc_now(), job_id),
             )
+
+    def retry(self, job_id: str, error: str, *, max_retries: int = 3, retryable: bool = True) -> str:
+        with self._connect() as conn:
+            row = conn.execute("SELECT retry_count FROM queue_jobs WHERE job_id = ?", (job_id,)).fetchone()
+            retry_count = int(row["retry_count"] if row else 0) + 1
+            status = "pending" if retryable and retry_count < max_retries else "dead_letter"
+            conn.execute(
+                "UPDATE queue_jobs SET status = ?, retry_count = ?, last_error = ?, updated_at = ?, leased_until = NULL WHERE job_id = ?",
+                (status, retry_count, error[:500], utc_now(), job_id),
+            )
+        return status
+
+    def stats(self) -> dict[str, int]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT status, COUNT(*) AS count FROM queue_jobs GROUP BY status").fetchall()
+        return {str(row["status"]): int(row["count"]) for row in rows}
 
     def _row_to_job(self, row: sqlite3.Row, status: str | None = None, leased_until: str | None = None) -> QueueJob:
         return QueueJob(

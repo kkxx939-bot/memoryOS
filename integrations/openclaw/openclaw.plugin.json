@@ -1,0 +1,18 @@
+{
+  "id": "memoryos",
+  "name": "MemoryOS",
+  "version": "0.1.0",
+  "entry": "dist/index.js",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "baseUrl": {"type": "string", "default": "http://127.0.0.1:8765"},
+      "apiTokenEnv": {"type": "string", "default": "MEMORYOS_API_TOKEN"},
+      "userId": {"type": "string", "default": "default"},
+      "projectId": {"type": "string"},
+      "timeoutMs": {"type": "integer", "default": 2500},
+      "tokenBudget": {"type": "integer", "default": 1200}
+    },
+    "required": ["baseUrl"]
+  }
+}

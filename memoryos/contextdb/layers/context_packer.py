@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from memoryos.contextdb.retrieval.token_budget import HeuristicTokenCounter, TokenCounter
+
 
 @dataclass(frozen=True)
 class BudgetSlice:
@@ -15,9 +17,10 @@ class BudgetSlice:
 
 
 class ContextPacker:
-    def __init__(self, total_budget: int, allocations: dict[str, int] | None = None) -> None:
+    def __init__(self, total_budget: int, allocations: dict[str, int] | None = None, token_counter: TokenCounter | None = None) -> None:
         self.total_budget = max(0, int(total_budget))
         self.allocations = allocations or {}
+        self.token_counter = token_counter or HeuristicTokenCounter()
 
     def pack(self, sections: dict[str, list[dict]]) -> dict:
         slices = {}
@@ -89,7 +92,7 @@ class ContextPacker:
         return self.total_budget // max(1, len(sections))
 
     def _estimate_tokens(self, text: str) -> int:
-        return max(1, len(text) // 4)
+        return self.token_counter.count(text)
 
     def _drop_payload(self, item: dict, section: str, reason: str, estimate: int | None = None) -> dict:
         token_estimate = int(item.get("token_estimate", estimate or self._estimate_tokens(str(item.get("content", "")))))

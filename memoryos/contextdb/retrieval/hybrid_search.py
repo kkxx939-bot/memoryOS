@@ -144,4 +144,15 @@ class HybridSearch:
             return None
         if filters.get("lifecycle_state") and lifecycle_state != filters["lifecycle_state"]:
             return None
+        scope = dict(metadata.get("scope", {}) or {})
+        fields = dict(metadata.get("fields", {}) or {})
+        connect = dict(metadata.get("connect", {}) or {})
+        admission = dict(metadata.get("admission", {}) or {})
+        project_id = str(scope.get("project_id") or fields.get("project_id") or "")
+        if filters.get("project_id") and project_id not in {"", str(filters["project_id"])}:
+            return None
+        if filters.get("adapter_id") and str(connect.get("adapter_id") or metadata.get("source_adapter_id") or "") != str(filters["adapter_id"]):
+            return None
+        if admission.get("decision") in {"pending", "restricted", "archive_only", "reject"}:
+            return None
         return {"title": title, "context_type": hit_type, "metadata": metadata}

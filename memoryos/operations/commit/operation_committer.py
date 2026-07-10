@@ -143,6 +143,9 @@ class OperationCommitter:
                 obj = ContextObject.from_dict(object_payload)
                 content = str(operation.payload.get("content", ""))
                 self.source_store.write_object(obj, content=content)
+                if content:
+                    LayerRefresher(self.source_store).refresh(obj, content)
+                    operation.payload["context_object"] = obj.to_dict()
                 self._apply_relations(obj, operation)
             return
         if operation.action in {OperationAction.CONFIRM, OperationAction.REJECT} and operation.context_type == ContextType.MEMORY and operation.target_uri:

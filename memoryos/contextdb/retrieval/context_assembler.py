@@ -1,19 +1,26 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from typing import Any
 
 from memoryos.contextdb.context_db import ContextDB
 from memoryos.contextdb.layers.context_packer import ContextPacker
 from memoryos.contextdb.model.context_type import ContextType
+from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
+from memoryos.contextdb.retrieval.token_budget import HeuristicTokenCounter, TokenCounter
 from memoryos.memory.retrieval_plan import MemoryRetrievalPlanner
 from memoryos.providers.rerank import Reranker
 
+logger = logging.getLogger(__name__)
+
 
 class ContextAssembler:
-    def __init__(self, context_db: ContextDB, *, reranker: Reranker | None = None) -> None:
+    def __init__(self, context_db: ContextDB, *, reranker: Reranker | None = None, token_counter: TokenCounter | None = None, hybrid_search: HybridSearch | None = None) -> None:
         self.context_db = context_db
         self.reranker = reranker
+        self.token_counter = token_counter or HeuristicTokenCounter()
+        self.hybrid_search = hybrid_search
         self.retrieval_planner = MemoryRetrievalPlanner()
 
     def search(
@@ -44,9 +51,24 @@ class ContextAssembler:
             )
             return self._rerank(query, self._filter_connect(results, connect_filters))[:requested_limit]
         search_limit = max(requested_limit * 5, 50) if connect_filters and requested_limit else requested_limit
-        hits = self.context_db.search(query, owner_user_id=user_id, context_type=parsed_type, limit=search_limit)
+        hits: Sequence[Any]
+        if self.hybrid_search is not None:
+            filters = {"owner_user_id": user_id} if user_id else {}
+            if project_id:
+                filters["project_id"] = project_id
+            if adapter_id and search_scope == "agent_private":
+                filters["adapter_id"] = adapter_id
+            hits = self.hybrid_search.search(query, filters=filters, context_type=parsed_type, limit=search_limit)
+        else:
+            search_kwargs: dict[str, Any] = {"owner_user_id": user_id, "context_type": parsed_type, "limit": search_limit}
+            if project_id:
+                search_kwargs["project_id"] = project_id
+            if adapter_id and search_scope == "agent_private":
+                search_kwargs["adapter_id"] = adapter_id
+            hits = self.context_db.search(query, **search_kwargs)
         results = [self._hit_payload(hit) for hit in hits]
-        return self._rerank(query, self._filter_connect(results, connect_filters))[:requested_limit]
+        scoped = self._filter_project(results, project_id)
+        return self._rerank(query, self._filter_connect(scoped, connect_filters))[:requested_limit]
 
     def assemble(
         self,
@@ -93,24 +115,36 @@ class ContextAssembler:
             )
 
         contexts = self._dedupe(contexts)[: max(0, limit)]
+        max_item_tokens = max(1, min(token_budget, token_budget // max(1, min(len(contexts), 4))))
+        layered = [self._select_layer(item, query, max_item_tokens) for item in contexts]
         sections = {
             "retrieved_context": [
                 {
                     "uri": item["uri"],
-                    "content": self._context_text(item),
+                    "content": selected["content"],
                     "metadata": item["metadata"],
-                    "layer": item.get("layer", "search"),
-                    "token_estimate": self._estimate_tokens(self._context_text(item)),
+                    "layer": selected["layer"],
+                    "fallback_reason": selected["reason"],
+                    "token_estimate": self._estimate_tokens(selected["content"]),
                 }
-                for item in contexts
+                for item, selected in zip(contexts, layered, strict=False)
             ]
         }
-        packed = ContextPacker(total_budget=token_budget).pack(sections)
+        packed = ContextPacker(total_budget=token_budget, token_counter=self.token_counter).pack(sections)
         selected = packed["slices"].get("retrieved_context", {}).get("items", [])
         source_uris = [str(item.get("uri", "")) for item in selected if item.get("uri")]
         packed_context = "\n\n".join(str(item.get("content", "")) for item in selected if item.get("content"))
         selected_uris = set(source_uris)
-        selected_contexts = [item for item in contexts if item["uri"] in selected_uris]
+        selected_by_uri = {str(item.get("uri", "")): item for item in selected}
+        selected_contexts = [
+            {
+                **item,
+                "selected_layer": selected_by_uri[item["uri"]].get("layer", item.get("layer", "search")),
+                "fallback_reason": selected_by_uri[item["uri"]].get("fallback_reason", ""),
+            }
+            for item in contexts
+            if item["uri"] in selected_uris
+        ]
         return {
             "query": query,
             "token_budget": token_budget,
@@ -206,7 +240,11 @@ class ContextAssembler:
             return items
         try:
             return self.reranker.rerank(query, items)
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "reranker failed; preserving retrieval order",
+                extra={"operation": "context_rerank", "error": str(exc), "retryable": True},
+            )
             return items
 
     def _hit_payload(self, hit: Any) -> dict[str, Any]:
@@ -218,6 +256,7 @@ class ContextAssembler:
             "text": str(getattr(hit, "title", "")),
             "layer": str(getattr(hit, "layer", "search")),
             "metadata": dict(getattr(hit, "metadata", {}) or {}),
+            "retrieval_source": str(getattr(hit, "source", "lexical")),
         }
         try:
             obj = self.context_db.read_object(payload["uri"])
@@ -228,6 +267,7 @@ class ContextAssembler:
                 payload["text"] = self.context_db.source_store.read_content(obj.layers.l2_uri or obj.uri)
             except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
                 payload["text"] = str(obj.metadata.get("summary", obj.title))
+            payload["layer_texts"] = self._layer_texts(obj)
         except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
             pass
         return payload
@@ -251,9 +291,29 @@ class ContextAssembler:
         matched = []
         for item in items:
             connect = dict(item.get("metadata", {}).get("connect", {}) or {})
-            if all(connect.get(key) == value for key, value in simple_filters.items()):
+            views = [str(view) for view in item.get("metadata", {}).get("retrieval_views", []) or []]
+            effective_filters = dict(simple_filters)
+            if any(view.startswith(("project:", "user:")) for view in views):
+                effective_filters.pop("adapter_id", None)
+            if all(connect.get(key) == value for key, value in effective_filters.items()):
                 matched.append(item)
         return matched
+
+    def _filter_project(self, items: list[dict[str, Any]], project_id: str) -> list[dict[str, Any]]:
+        if not project_id:
+            return items
+        scoped = []
+        project_types = {"project_rule", "project_decision", "agent_experience"}
+        for item in items:
+            metadata = dict(item.get("metadata", {}) or {})
+            memory_type = str(metadata.get("memory_type", ""))
+            scope = dict(metadata.get("scope", {}) or {})
+            fields = dict(metadata.get("fields", {}) or {})
+            item_project = str(scope.get("project_id") or fields.get("project_id") or "")
+            if memory_type in project_types and item_project != project_id:
+                continue
+            scoped.append(item)
+        return scoped
 
     def _dedupe(self, contexts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         seen: set[str] = set()
@@ -274,4 +334,37 @@ class ContextAssembler:
         return text
 
     def _estimate_tokens(self, text: str) -> int:
-        return max(1, len(text) // 4)
+        return self.token_counter.count(text)
+
+    def _layer_texts(self, obj: Any) -> dict[str, str]:
+        values: dict[str, str] = {}
+        for name, uri in (("L2", obj.layers.l2_uri or obj.uri), ("L1", obj.layers.l1_uri), ("L0", obj.layers.l0_uri)):
+            if not uri:
+                continue
+            try:
+                values[name] = self.context_db.source_store.read_content(uri)
+            except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+                continue
+        return values
+
+    def _select_layer(self, item: dict[str, Any], query: str, max_tokens: int) -> dict[str, str]:
+        layers = dict(item.get("layer_texts", {}) or {})
+        l2 = str(layers.get("L2") or self._context_text(item))
+        candidates = [("L2", l2, "full_content")]
+        if layers.get("L1"):
+            candidates.append(("L1", str(layers["L1"]), "l2_over_budget"))
+        if layers.get("L0"):
+            candidates.append(("L0", str(layers["L0"]), "l1_over_budget"))
+        excerpt = self._query_excerpt(l2, query, max_tokens)
+        candidates.append(("excerpt", excerpt, "abstract_over_budget"))
+        for layer, content, reason in candidates:
+            if self._estimate_tokens(content) <= max_tokens:
+                return {"layer": layer, "content": content, "reason": reason}
+        return {"layer": "excerpt", "content": excerpt[: max(1, max_tokens * 4)], "reason": "excerpt_truncated"}
+
+    def _query_excerpt(self, text: str, query: str, max_tokens: int) -> str:
+        terms = [term.lower() for term in query.split() if term]
+        lines = text.splitlines() or [text]
+        ranked = sorted(enumerate(lines), key=lambda row: (-sum(term in row[1].lower() for term in terms), row[0]))
+        selected = [line for _, line in ranked[: max(1, min(8, len(ranked)))]]
+        return "\n".join(selected)[: max(1, max_tokens * 4)]

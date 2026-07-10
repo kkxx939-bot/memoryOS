@@ -5,9 +5,47 @@ import json
 import os
 import subprocess
 from dataclasses import asdict, dataclass, field
+from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from memoryos.core.time import utc_now
+
+
+class AgentEventType(str, Enum):
+    SESSION_START = "SESSION_START"
+    PROMPT_SUBMIT = "PROMPT_SUBMIT"
+    TOOL_RESULT = "TOOL_RESULT"
+    TURN_END = "TURN_END"
+    PRE_COMPACT = "PRE_COMPACT"
+    POST_COMPACT = "POST_COMPACT"
+    SESSION_END = "SESSION_END"
+    SUBAGENT_END = "SUBAGENT_END"
+
+
+@dataclass(frozen=True)
+class NormalizedAgentEvent:
+    event_id: str
+    event_type: AgentEventType
+    adapter_id: str
+    user_id: str
+    project_id: str
+    native_session_id: str
+    session_key: str
+    cwd: str | None = None
+    repo_root: str | None = None
+    git_remote: str | None = None
+    branch: str | None = None
+    worktree_id: str | None = None
+    prompt: str | None = None
+    messages: list[dict[str, Any]] = field(default_factory=list)
+    tool_call: dict[str, Any] | None = None
+    changed_files: list[str] = field(default_factory=list)
+    transcript_path: str | None = None
+    transcript_cursor: str | int | None = None
+    timestamp: str = field(default_factory=utc_now)
+    raw_event_name: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -44,6 +82,7 @@ class AgentHookEvent:
         cwd = _str_or_none(data.get("cwd") or data.get("workspace") or os.getcwd())
         repo_root = _str_or_none(data.get("repo_root")) or _git_value(cwd, ["rev-parse", "--show-toplevel"])
         branch = _str_or_none(data.get("branch")) or _git_value(cwd, ["branch", "--show-current"])
+        git_remote = _str_or_none(data.get("git_remote")) or _git_value(cwd, ["config", "--get", "remote.origin.url"])
         prompt = _str_or_none(data.get("prompt") or data.get("user_prompt") or data.get("input"))
         raw_messages = data.get("messages")
         messages: list[Any] = raw_messages if isinstance(raw_messages, list) else []
@@ -67,7 +106,7 @@ class AgentHookEvent:
             "prompt": prompt,
             "tool_name": data.get("tool_name") or data.get("name"),
             "tool_input": data.get("tool_input"),
-            "tool_output": data.get("tool_output", data.get("output")),
+            "tool_output": data.get("tool_output", data.get("tool_response", data.get("output"))),
             "changed_files": changed_files,
             "messages": messages,
         }
@@ -91,6 +130,7 @@ class AgentHookEvent:
             "name",
             "tool_input",
             "tool_output",
+            "tool_response",
             "output",
             "changed_files",
             "timestamp",
@@ -100,6 +140,8 @@ class AgentHookEvent:
         }
         metadata = dict(data.get("metadata", {})) if isinstance(data.get("metadata"), dict) else {}
         metadata.update({key: value for key, value in data.items() if key not in known})
+        if git_remote:
+            metadata["git_remote"] = git_remote
         return cls(
             event_id=event_id,
             agent_name=_str_or_none(data.get("agent_name")) or agent_name or adapter_id,
@@ -114,7 +156,7 @@ class AgentHookEvent:
             messages=[dict(item) for item in messages if isinstance(item, dict)],
             tool_name=_str_or_none(data.get("tool_name") or data.get("name")),
             tool_input=dict(data.get("tool_input", {})) if isinstance(data.get("tool_input"), dict) else None,
-            tool_output=data.get("tool_output", data.get("output")),
+            tool_output=data.get("tool_output", data.get("tool_response", data.get("output"))),
             changed_files=[str(item) for item in changed_files],
             timestamp=_str_or_none(data.get("timestamp")) or utc_now(),
             metadata=metadata,
@@ -126,6 +168,68 @@ class AgentHookEvent:
     def query(self) -> str:
         parts = [self.prompt or "", self.repo_root or self.cwd or "", self.branch or ""]
         return "\n".join(part for part in parts if part)
+
+    def normalize(self) -> NormalizedAgentEvent:
+        project_id = str(self.metadata.get("project_id") or project_identity(self.repo_root, self.cwd, self.metadata.get("git_remote")))
+        user_id = self.user_id or "default"
+        session_key = make_session_key(user_id, project_id, self.adapter_id, self.session_id)
+        event_type = EVENT_TYPE_MAP.get(self.hook_name, AgentEventType.TURN_END)
+        tool_call = None
+        if self.tool_name or self.tool_input is not None or self.tool_output is not None:
+            tool_call = {"name": self.tool_name, "input": self.tool_input, "output": self.tool_output}
+        return NormalizedAgentEvent(
+            event_id=self.event_id, event_type=event_type, adapter_id=self.adapter_id,
+            user_id=user_id, project_id=project_id, native_session_id=self.session_id,
+            session_key=session_key, cwd=self.cwd, repo_root=self.repo_root,
+            git_remote=_str_or_none(self.metadata.get("git_remote")), branch=self.branch,
+            worktree_id=_str_or_none(self.metadata.get("worktree_id")), prompt=self.prompt,
+            messages=list(self.messages), tool_call=tool_call, changed_files=list(self.changed_files),
+            transcript_path=_str_or_none(self.metadata.get("transcript_path")),
+            transcript_cursor=self.metadata.get("transcript_cursor"), timestamp=self.timestamp,
+            raw_event_name=self.hook_name, metadata=dict(self.metadata),
+        )
+
+
+EVENT_TYPE_MAP = {
+    **{event.value: event for event in AgentEventType},
+    "SessionStart": AgentEventType.SESSION_START, "session_start": AgentEventType.SESSION_START,
+    "UserPromptSubmit": AgentEventType.PROMPT_SUBMIT, "before_prompt": AgentEventType.PROMPT_SUBMIT,
+    "user_prompt_submit": AgentEventType.PROMPT_SUBMIT,
+    "PostToolUse": AgentEventType.TOOL_RESULT, "tool_result": AgentEventType.TOOL_RESULT,
+    "post_tool_use": AgentEventType.TOOL_RESULT,
+    "Stop": AgentEventType.TURN_END, "after_turn": AgentEventType.TURN_END,
+    "PreCompact": AgentEventType.PRE_COMPACT, "pre_compact": AgentEventType.PRE_COMPACT,
+    "PostCompact": AgentEventType.POST_COMPACT, "post_compact": AgentEventType.POST_COMPACT,
+    "SessionEnd": AgentEventType.SESSION_END, "session_end": AgentEventType.SESSION_END,
+    "SubagentStop": AgentEventType.SUBAGENT_END, "subagent_end": AgentEventType.SUBAGENT_END,
+    "subagent_stop": AgentEventType.SUBAGENT_END,
+}
+
+
+def project_identity(repo_root: str | None, cwd: str | None, git_remote: str | None = None) -> str:
+    identity = _normalize_git_remote(git_remote or "")
+    if not identity:
+        path = Path(repo_root or cwd or "").expanduser()
+        identity = f"local-repository:{path.name.lower()}"
+    return "project-" + hashlib.sha256(identity.encode()).hexdigest()[:24]
+
+
+def make_session_key(user_id: str, project_id: str, adapter_id: str, native_session_id: str) -> str:
+    raw = "|".join((user_id, project_id, adapter_id, native_session_id))
+    return "session-" + hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+
+def _normalize_git_remote(remote: str) -> str:
+    value = remote.strip().lower().removesuffix(".git").rstrip("/")
+    if not value:
+        return ""
+    if value.startswith("git@") and ":" in value:
+        host, path = value[4:].split(":", 1)
+        return f"{host}/{path}"
+    value = value.removeprefix("https://").removeprefix("http://").removeprefix("ssh://")
+    if "@" in value.split("/", 1)[0]:
+        value = value.split("@", 1)[1]
+    return value
 
 
 def _stable_hash(payload: dict[str, Any]) -> str:

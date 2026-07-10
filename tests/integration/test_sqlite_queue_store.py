@@ -54,7 +54,7 @@ def test_queue_duplicate_enqueue_is_idempotent_for_both_stores(tmp_path) -> None
     assert [item.job_id for item in sqlite_store.lease("session_commit", 10)] == ["same"]
 
 
-def test_queue_reenqueue_failed_job_restores_pending_for_both_stores(tmp_path) -> None:
+def test_queue_reenqueue_failed_job_preserves_terminal_state_for_idempotency(tmp_path) -> None:
     job = QueueJob(job_id="j3", queue_name="session_commit", action="commit", target_uri="memoryos://user/u1/sessions/s1")
     for store in (InMemoryQueueStore(), SQLiteQueueStore(tmp_path / "queue.sqlite3")):
         store.enqueue(job)
@@ -64,13 +64,10 @@ def test_queue_reenqueue_failed_job_restores_pending_for_both_stores(tmp_path) -
 
         store.enqueue(job)
 
-        leased_again = store.lease("session_commit", 1)
-        assert [item.job_id for item in leased_again] == ["j3"]
-        assert leased_again[0].retry_count == 0
-        assert leased_again[0].last_error == ""
+        assert store.lease("session_commit", 1) == []
 
 
-def test_queue_reenqueue_done_job_restores_pending_for_both_stores(tmp_path) -> None:
+def test_queue_reenqueue_done_job_does_not_duplicate_work(tmp_path) -> None:
     job = QueueJob(job_id="j4", queue_name="session_commit", action="commit", target_uri="memoryos://user/u1/sessions/s2")
     for store in (InMemoryQueueStore(), SQLiteQueueStore(tmp_path / "queue_done.sqlite3")):
         store.enqueue(job)
@@ -80,7 +77,4 @@ def test_queue_reenqueue_done_job_restores_pending_for_both_stores(tmp_path) -> 
 
         store.enqueue(job)
 
-        leased_again = store.lease("session_commit", 1)
-        assert [item.job_id for item in leased_again] == ["j4"]
-        assert leased_again[0].retry_count == 0
-        assert leased_again[0].last_error == ""
+        assert store.lease("session_commit", 1) == []

@@ -80,7 +80,9 @@ def test_codex_user_prompt_submit_injects_bounded_context(tmp_path: Path) -> Non
 def test_format_injection_wraps_context_and_sources_inside_boundary() -> None:
     text = format_injection({"packed_context": "remember the local MCP plan", "source_uris": ["memoryos://ctx/1"]})
 
-    assert text == "<memoryos_context>\nremember the local MCP plan\n\nSources:\n- memoryos://ctx/1\n</memoryos_context>"
+    assert "This is recalled reference data" in text
+    assert "remember the local MCP plan" in text
+    assert "- memoryos://ctx/1" in text
 
 
 def test_format_injection_empty_context_returns_empty_string() -> None:
@@ -88,7 +90,7 @@ def test_format_injection_empty_context_returns_empty_string() -> None:
     assert format_injection({"source_uris": ["memoryos://ctx/1"]}) == ""
 
 
-def test_codex_post_tool_use_enqueues_without_immediate_flush(tmp_path: Path) -> None:
+def test_codex_post_tool_use_appends_without_session_commit(tmp_path: Path) -> None:
     fake = FakeHookMCPClient(fail_commit=True)
     adapter = CodexHookAdapter(_config(tmp_path), mcp_client=fake)
 
@@ -97,10 +99,11 @@ def test_codex_post_tool_use_enqueues_without_immediate_flush(tmp_path: Path) ->
         {"event_id": "e1", "session_id": "s1", "tool_name": "shell", "tool_output": "ok", "changed_files": ["memoryos/api/mcp/server.py"]},
     ).to_dict()
 
-    assert result["queued"] is True
+    assert result["queued"] is False
+    assert result["metadata"]["state"] == "ARCHIVED"
     assert result["flushed"] == {}
     assert fake.calls == []
-    assert len(PendingQueue(_config(tmp_path).queue_path).list_items()) == 1
+    assert PendingQueue(_config(tmp_path).queue_path).list_items() == []
 
 
 def test_codex_stop_commits_and_flushes_queue(tmp_path: Path) -> None:
@@ -123,7 +126,7 @@ def test_codex_stop_commits_and_flushes_queue(tmp_path: Path) -> None:
     assert result["committed"] is True
     assert result["flushed"]["flushed"] == 1
     assert queue.list_items() == []
-    assert fake.calls[0][1]["async_commit"] is False
+    assert fake.calls[0][1]["async_commit"] is True
 
 
 def test_codex_precompact_assembles_and_commits(tmp_path: Path) -> None:

@@ -8,16 +8,17 @@ from typing import Any
 from memoryos.adapters.agent_hooks.claude_code import ClaudeCodeHookAdapter
 from memoryos.adapters.agent_hooks.codex import CodexHookAdapter
 from memoryos.adapters.agent_hooks.config import AgentHookConfig
+from memoryos.adapters.agent_hooks.contracts import ClaudeCodeOutputRenderer, CodexOutputRenderer
 from memoryos.adapters.agent_hooks.cursor import CursorHookAdapter
 from memoryos.adapters.agent_hooks.queue import PendingQueue
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="MemoryOS agent hook bridge")
-    parser.add_argument("adapter", choices=["codex", "claude_code", "cursor", "flush"])
+    parser.add_argument("adapter", choices=["codex", "claude_code", "cursor", "openclaw", "opencode", "flush"])
     parser.add_argument("hook", nargs="?")
     parser.add_argument("--payload-file")
-    parser.add_argument("--format", choices=["json", "text"], default="json")
+    parser.add_argument("--format", choices=["json", "text", "native"], default="json")
     args = parser.parse_args(argv)
     if args.adapter == "flush":
         config = AgentHookConfig.from_env("codex")
@@ -31,7 +32,15 @@ def main(argv: list[str] | None = None) -> int:
         _emit({"ok": False, "error": {"code": "VALIDATION_ERROR", "message": "hook is required"}}, "json")
         return 2
     adapter = _adapter(args.adapter)
-    result = adapter.handle(args.hook, payload).to_dict()
+    hook_result = adapter.handle(args.hook, payload)
+    result = hook_result.to_dict()
+    if args.format == "native":
+        if args.adapter == "claude_code":
+            result = ClaudeCodeOutputRenderer().render(args.hook, hook_result)
+        elif args.adapter == "codex":
+            result = CodexOutputRenderer().render(args.hook, hook_result)
+        _emit(result, "json")
+        return 0 if hook_result.ok else 2
     _emit(result, args.format)
     return 0 if result.get("ok", False) else 2
 
@@ -42,6 +51,8 @@ def _adapter(name: str) -> Any:
     if name == "claude_code":
         return ClaudeCodeHookAdapter.from_env()
     if name == "cursor":
+        return CursorHookAdapter.from_env()
+    if name in {"openclaw", "opencode"}:
         return CursorHookAdapter.from_env()
     raise ValueError(name)
 

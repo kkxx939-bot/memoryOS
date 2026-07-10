@@ -1,0 +1,11 @@
+{
+  "hooks": {
+    "SessionStart": [{"hooks":[{"type":"command","command":"memoryos-agent-hook codex SessionStart --format native","timeout":10}]}],
+    "UserPromptSubmit": [{"hooks":[{"type":"command","command":"memoryos-agent-hook codex UserPromptSubmit --format native","timeout":10}]}],
+    "PostToolUse": [{"hooks":[{"type":"command","command":"memoryos-agent-hook codex PostToolUse --format native","timeout":10}]}],
+    "Stop": [{"hooks":[{"type":"command","command":"memoryos-agent-hook codex Stop --format native","timeout":15}]}],
+    "PreCompact": [{"hooks":[{"type":"command","command":"memoryos-agent-hook codex PreCompact --format native","timeout":15}]}],
+    "PostCompact": [{"hooks":[{"type":"command","command":"memoryos-agent-hook codex PostCompact --format native","timeout":10}]}],
+    "SubagentStop": [{"hooks":[{"type":"command","command":"memoryos-agent-hook codex SubagentStop --format native","timeout":10}]}]
+  }
+}

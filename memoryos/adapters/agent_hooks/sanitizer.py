@@ -12,6 +12,7 @@ ENV_SECRET_RE = re.compile(
 INLINE_SECRET_RE = re.compile(r"(?i)\b(api[_-]?key|token|password|secret)(\s*[:=]\s*)([^\s,;]+)")
 LOCAL_PATH_RE = re.compile(r"(?:(?:/Users|/home|/tmp|/private/tmp)/[^\s'\",;:)]*)")
 NOISY_PATH_PARTS = {".git", "node_modules", "venv", ".venv", "dist", "build", "__pycache__"}
+SENSITIVE_FILE_NAMES = {".env", ".gitignore", ".memoryosignore", "id_rsa", "id_ed25519", "credentials", "credentials.json"}
 MAX_TEXT = 4000
 MAX_LOG_LINES = 80
 
@@ -77,4 +78,5 @@ def _is_noisy_path(value: Any) -> bool:
     if not isinstance(value, str):
         return False
     parts = set(value.replace("\\", "/").split("/"))
-    return bool(parts & NOISY_PATH_PARTS)
+    name = value.replace("\\", "/").rsplit("/", 1)[-1]
+    return bool(parts & NOISY_PATH_PARTS) or name in SENSITIVE_FILE_NAMES or name.startswith(".env.")

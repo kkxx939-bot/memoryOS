@@ -57,6 +57,26 @@ class SessionArchiveStore:
             return False
         return payload.get("task_id") == archive.task_id
 
+    def read_archive(self, archive_uri: str) -> SessionArchive:
+        directory = self._dir(archive_uri)
+        manifest = self._read_json(directory / "commit_manifest.json")
+        return SessionArchive(
+            user_id=str(manifest["user_id"]),
+            session_id=str(manifest["session_id"]),
+            archive_uri=archive_uri,
+            messages=self._read_jsonl(directory / "messages.jsonl"),
+            observations=self._read_jsonl(directory / "observations.jsonl"),
+            predictions=self._read_jsonl(directory / "predictions.jsonl"),
+            action_results=self._read_jsonl(directory / "action_results.jsonl"),
+            feedback=self._read_jsonl(directory / "feedback.jsonl"),
+            used_contexts=list(self._read_json(directory / "used_contexts.json") or []),
+            used_skills=list(self._read_json(directory / "used_skills.json") or []),
+            tool_results=self._read_jsonl(directory / "tool_results.jsonl"),
+            metadata=dict(manifest.get("metadata", {}) or {}),
+            task_id=str(manifest["task_id"]),
+            created_at=str(manifest.get("created_at", "")),
+        )
+
     def _dir(self, archive_uri: str) -> Path:
         return ContextURI.parse(archive_uri).to_source_path(self.root, tenant_id=self.tenant_id)
 
@@ -67,3 +87,18 @@ class SessionArchiveStore:
 
     def _write_json(self, path: Path, payload) -> None:
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _read_json(self, path: Path):
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def _read_jsonl(self, path: Path) -> list[dict]:
+        if not path.exists():
+            return []
+        rows = []
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    value = json.loads(line)
+                    if isinstance(value, dict):
+                        rows.append(value)
+        return rows
