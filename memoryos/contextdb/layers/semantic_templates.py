@@ -1,3 +1,5 @@
+"""上下文数据库里的语义模板。"""
+
 from __future__ import annotations
 
 from typing import Any

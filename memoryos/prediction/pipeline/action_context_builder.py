@@ -1,3 +1,5 @@
+"""预测模块里的动作上下文组装。"""
+
 from __future__ import annotations
 
 from memoryos.action_policy.model.action_policy import ActionCandidate, ActionPolicy

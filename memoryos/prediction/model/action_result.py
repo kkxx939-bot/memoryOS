@@ -1,3 +1,5 @@
+"""预测模块里的动作结果。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

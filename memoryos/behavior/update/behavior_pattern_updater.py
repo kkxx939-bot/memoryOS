@@ -1,3 +1,5 @@
+"""行为模块里的行为模式更新器。"""
+
 from __future__ import annotations
 
 from memoryos.behavior.model.behavior_pattern import BehaviorPattern

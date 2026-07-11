@@ -1,3 +1,5 @@
+"""操作提交里的目标解析器。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

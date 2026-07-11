@@ -1,3 +1,5 @@
+"""核心工具里的标识。"""
+
 from __future__ import annotations
 
 import hashlib

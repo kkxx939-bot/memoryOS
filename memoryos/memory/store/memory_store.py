@@ -1,3 +1,5 @@
+"""记忆系统里的记忆存储。"""
+
 from __future__ import annotations
 
 from typing import Protocol
@@ -6,7 +8,7 @@ from memoryos.memory.model.memory import Memory
 
 
 class MemoryStore(Protocol):
-    """Storage boundary for memory-specific repositories."""
+    """负责 MemoryStore 的持久化读写。"""
 
     def get_memory(self, uri: str) -> Memory | None: ...
 

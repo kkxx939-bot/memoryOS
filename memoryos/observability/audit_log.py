@@ -1,3 +1,5 @@
+"""日志追踪里的审计日志。"""
+
 from __future__ import annotations
 
 import hashlib

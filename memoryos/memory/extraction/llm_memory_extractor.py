@@ -1,3 +1,5 @@
+"""记忆系统里的旧大模型记忆提取器。"""
+
 from __future__ import annotations
 
 import json

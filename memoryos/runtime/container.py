@@ -1,3 +1,5 @@
+"""运行时里的依赖组装。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -28,6 +30,8 @@ from memoryos.skill.tool_registry import ToolRegistry
 
 @dataclass
 class RuntimeContainer:
+    """把 SDK、接口和后台任务共用的运行组件放在一起。"""
+
     source_store: SourceStore
     index_store: IndexStore
     relation_store: RelationStore
@@ -59,6 +63,10 @@ def build_runtime_container(
     embedding_provider: EmbeddingProvider | None = None,
     hybrid_search: HybridSearch | None = None,
 ) -> RuntimeContainer:
+    """组装默认运行链路，并拒绝会直接生成数据库操作的旧提取器。"""
+
+    if config.memory_extractor is not None and not getattr(config.memory_extractor, "candidate_backend", False):
+        raise TypeError("memory_extractor must be a semantic candidate/proposal backend")
     root_path = config.root_path
     source = source_store or FileSystemSourceStore(root_path)
     index = index_store or SQLiteIndexStore(root_path / "indexes" / "context.sqlite3")

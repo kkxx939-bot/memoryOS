@@ -36,6 +36,7 @@ from memoryos.memory.canonical import (
     SpeechAct,
     StableMemoryIdentityResolver,
     VisibilityPolicy,
+    bind_field_evidence,
 )
 from memoryos.memory.canonical.reconcile import MemorySemanticReconciler
 from memoryos.operations.commit.operation_committer import OperationCommitter
@@ -105,8 +106,7 @@ def _setup(tmp_path):  # noqa: ANN001, ANN202
         relation_store=relations,
         queue_store=queue,
     )
-    episode = SessionArchiveEpisodeAdapter().adapt(
-        SessionArchive(
+    archive = SessionArchive(
             user_id="u1",
             session_id="s1",
             archive_uri="memoryos://user/u1/sessions/history/s1",
@@ -119,7 +119,8 @@ def _setup(tmp_path):  # noqa: ANN001, ANN202
             ],
             metadata={"tenant_id": "t1", "project_id": "memoryos"},
         )
-    )
+    SessionArchiveStore(tmp_path, tenant_id="t1").write_sync_archive(archive)
+    episode = SessionArchiveEpisodeAdapter().adapt(archive)
     assert episode.origin.primary_scope is not None
     scope = MemoryScope(
         ScopeSelector((episode.origin.primary_scope,)),
@@ -129,19 +130,29 @@ def _setup(tmp_path):  # noqa: ANN001, ANN202
     return source, index, queue, relations, committer, episode, scope
 
 
+def _persisted_episode(tmp_path, archive: SessionArchive):  # noqa: ANN001, ANN202
+    tenant_id = str(archive.metadata.get("tenant_id") or "default")
+    SessionArchiveStore(tmp_path, tenant_id=tenant_id).write_sync_archive(archive)
+    return SessionArchiveEpisodeAdapter().adapt(archive)
+
+
 def _proposal(episode, proposal_id: str, value: str, speech: str, commitment: str):  # noqa: ANN001, ANN202
     assert episode.origin.primary_scope is not None
+    identity_fields = {"decision_topic": "primary storage backend"}
+    value_fields = {"canonical_value": value}
+    evidence_refs = (EvidenceRef.from_event(episode.events[0], source_uri=episode.source_uris[0]),)
     return MemorySemanticNormalizer().normalize(
         MemorySemanticProposal(
             proposal_id=proposal_id,
             memory_type="project_decision",
-            identity_fields={"decision_topic": "primary storage backend"},
-            value_fields={"canonical_value": value},
+            identity_fields=identity_fields,
+            value_fields=value_fields,
             semantic=SemanticAssessment(speech, commitment, "current", "alternative"),
             epistemic_status=EpistemicStatus.EXPLICIT,
             suggested_scope_refs=(episode.origin.primary_scope,),
             related_memory_ids=(),
-            evidence_refs=(EvidenceRef.from_event(episode.events[0]),),
+            evidence_refs=evidence_refs,
+            field_evidence_refs=bind_field_evidence(identity_fields, value_fields, evidence_refs),
             confidence=0.95,
             extractor_version="fake",
         )
@@ -246,13 +257,65 @@ def test_canonical_batch_rolls_back_all_source_and_relations_on_mid_batch_failur
     assert not list((tmp_path / "system" / "transactions").glob("*.json"))
 
 
+def test_canonical_preflight_rejects_evidence_archive_tampering_before_any_write(tmp_path) -> None:  # noqa: ANN001
+    source, _index, _queue, _relations, committer, episode, scope = _setup(tmp_path)
+    archive = SessionArchive(
+        user_id="u1",
+        session_id=episode.episode_id,
+        archive_uri="memoryos://user/u1/sessions/history/s1",
+        messages=[{"id": "m1", "role": "user", "content": episode.events[0].text()}],
+        metadata={"tenant_id": "t1", "project_id": "memoryos"},
+    )
+    archive_store = SessionArchiveStore(tmp_path)
+    directory = archive_store.write_sync_archive(archive)
+    proposal = _proposal(episode, "p-evidence", "SQLite", "confirmation", "confirmed")
+    proposal = replace(
+        proposal,
+        evidence_refs=(EvidenceRef.from_event(episode.events[0], source_uri=archive.archive_uri),),
+    )
+    _identity, _, plan = _plan(source, episode, scope, proposal)
+    (directory / "messages.jsonl").write_text(
+        json.dumps({"id": "m1", "role": "user", "content": "tampered"}) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="content hash no longer matches"):
+        committer.commit(
+            "u1",
+            plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=episode.episode_id),
+        )
+    assert not [obj for obj in source.list_objects() if obj.metadata.get("canonical_kind")]
+
+
+def test_canonical_preflight_rejects_owner_mismatch_and_outbox_prepare_failure_writes_nothing(
+    tmp_path, monkeypatch
+) -> None:  # noqa: ANN001
+    source, _index, _queue, _relations, committer, episode, scope = _setup(tmp_path)
+    proposal = _proposal(episode, "p-owner", "SQLite", "confirmation", "confirmed")
+    _identity, _, plan = _plan(source, episode, scope, proposal)
+    operations = plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=episode.episode_id)
+    forged = deepcopy(operations)
+    forged[0].payload["context_object"]["owner_user_id"] = "u2"
+    with pytest.raises(ValueError, match="tenant or owner"):
+        committer.commit("u1", forged)
+    assert not [obj for obj in source.list_objects() if obj.metadata.get("canonical_kind")]
+
+    def fail_outbox(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        raise OSError("injected outbox prepare failure")
+
+    monkeypatch.setattr(committer, "_write_outbox_event", fail_outbox)
+    with pytest.raises(OSError, match="outbox prepare"):
+        committer.commit("u1", operations)
+    assert not [obj for obj in source.list_objects() if obj.metadata.get("canonical_kind")]
+
+
 def test_committed_outbox_is_dispatched_after_initial_queue_outage(tmp_path) -> None:  # noqa: ANN001
     source = FileSystemSourceStore(tmp_path)
     index = InMemoryIndexStore()
     queue = FailOnceQueue()
     relations = InMemoryRelationStore()
     committer = OperationCommitter(source, index, str(tmp_path), relation_store=relations, queue_store=queue)
-    episode = SessionArchiveEpisodeAdapter().adapt(
+    episode = _persisted_episode(
+        tmp_path,
         SessionArchive(
             user_id="u1",
             session_id="s1",
@@ -281,13 +344,42 @@ def test_committed_outbox_is_dispatched_after_initial_queue_outage(tmp_path) -> 
     assert index.indexed_uris()
 
 
+def test_source_committed_transaction_recovers_when_final_outbox_write_fails(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    source, _index, queue, _relations, committer, episode, scope = _setup(tmp_path)
+    proposal = _proposal(episode, "p-final-outbox", "SQLite", "confirmation", "confirmed")
+    identity, _, plan = _plan(source, episode, scope, proposal)
+    operations = plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=episode.episode_id)
+    original_finalize = committer._finalize_canonical_outbox
+    calls = 0
+
+    def fail_once(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("injected final outbox failure")
+        return original_finalize(*args, **kwargs)
+
+    monkeypatch.setattr(committer, "_finalize_canonical_outbox", fail_once)
+    with pytest.raises(OSError, match="final outbox"):
+        committer.commit("u1", operations)
+    outbox = next((tmp_path / "system" / "outbox").glob("*.json"))
+    assert json.loads(outbox.read_text(encoding="utf-8"))["status"] == "source_committed"
+    assert CanonicalMemoryRepository(source).load(identity)[0] is not None
+
+    monkeypatch.setattr(committer, "_finalize_canonical_outbox", original_finalize)
+    assert set(committer.recover_pending_canonical("u1")) == {operation.operation_id for operation in operations}
+    assert json.loads(outbox.read_text(encoding="utf-8"))["status"] == "committed"
+    assert queue.jobs
+
+
 def test_prepared_outbox_and_redo_recover_complete_transaction_after_crash(tmp_path) -> None:  # noqa: ANN001
     source = CrashSecondWriteSource(tmp_path)
     index = InMemoryIndexStore()
     queue = InMemoryQueueStore()
     relations = InMemoryRelationStore()
     committer = OperationCommitter(source, index, str(tmp_path), relation_store=relations, queue_store=queue)
-    episode = SessionArchiveEpisodeAdapter().adapt(
+    episode = _persisted_episode(
+        tmp_path,
         SessionArchive(
             user_id="u1",
             session_id="s1",
@@ -329,7 +421,7 @@ def test_session_commit_revision_conflict_rereads_and_reconciles_same_proposal(t
         ],
         metadata={"tenant_id": "t1", "project_id": "memoryos"},
     )
-    postgres_episode = SessionArchiveEpisodeAdapter().adapt(postgres_archive)
+    postgres_episode = _persisted_episode(tmp_path, postgres_archive)
     postgres = _proposal(postgres_episode, "p-postgres", "PostgreSQL", "future_option", "exploratory")
     _identity, _, stale_plan = _plan(source, postgres_episode, scope, postgres)
     stale_operations = stale_plan.to_context_operations(
@@ -367,7 +459,8 @@ def test_uncommitted_partial_switch_is_invisible_until_transaction_recovery(tmp_
     queue = InMemoryQueueStore()
     relations = InMemoryRelationStore()
     committer = OperationCommitter(source, index, str(tmp_path), relation_store=relations, queue_store=queue)
-    episode = SessionArchiveEpisodeAdapter().adapt(
+    episode = _persisted_episode(
+        tmp_path,
         SessionArchive(
             user_id="u1",
             session_id="s1",

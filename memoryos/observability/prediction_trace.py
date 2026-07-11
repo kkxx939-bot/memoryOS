@@ -1,3 +1,5 @@
+"""日志追踪里的预测追踪。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

@@ -1,3 +1,5 @@
+"""安全模块里的动作风险。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

@@ -1,3 +1,5 @@
+"""记忆系统里的预取。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -13,10 +15,16 @@ from memoryos.memory.canonical.visibility import read_committed_canonical, relat
 
 @dataclass(frozen=True)
 class PrefetchedMemory:
+    """负责 PrefetchedMemory 这部分逻辑。"""
+
     uri: str
     memory_type: str
     state: str
     revision: int
+    slot_id: str
+    claim_id: str
+    canonical_value: str
+    identity_fields: dict[str, Any]
     scope: dict[str, Any]
     l0: str
     l1: str
@@ -25,6 +33,8 @@ class PrefetchedMemory:
 
 
 class ExistingMemoryPrefetcher:
+    """提取前先取回相关 Slot、Claim 和当前 Revision。"""
+
     def __init__(
         self,
         source_store: SourceStore | None,
@@ -45,6 +55,8 @@ class ExistingMemoryPrefetcher:
         self.timeout_ms = max(10, int(timeout_ms))
 
     def prefetch(self, episode: EvidenceEpisode, *, owner_user_id: str) -> tuple[PrefetchedMemory, ...]:
+        """处理 prefetch 这一步。"""
+
         if self.source_store is None or self.index_store is None:
             return ()
         started = monotonic()
@@ -77,6 +89,8 @@ class ExistingMemoryPrefetcher:
             if str(obj.tenant_id or "default") != episode.tenant_id:
                 continue
             metadata = dict(obj.metadata or {})
+            if metadata.get("canonical_kind") == "slot":
+                continue
             if type_hints and str(metadata.get("memory_type", "")) not in type_hints:
                 continue
             if not self._visible(metadata, episode.tenant_id, owner_user_id):
@@ -86,10 +100,7 @@ class ExistingMemoryPrefetcher:
             if metadata.get("canonical_kind") == "claim" and metadata.get("state") not in {
                 "ACTIVE",
                 "PROPOSED",
-                "PENDING",
                 "CONFLICTED",
-                "VALIDATED",
-                "OBSERVED",
             }:
                 continue
             l0 = self._read(obj.layers.l0_uri) or obj.title
@@ -114,6 +125,10 @@ class ExistingMemoryPrefetcher:
                     memory_type=str(metadata.get("memory_type", "")),
                     state=str(metadata.get("state", metadata.get("lifecycle_state", "ACTIVE"))),
                     revision=int(metadata.get("revision", 0)),
+                    slot_id=str(metadata.get("slot_id", "")),
+                    claim_id=str(metadata.get("claim_id", "")),
+                    canonical_value=str(metadata.get("canonical_value", "")),
+                    identity_fields=dict(metadata.get("identity_fields", {}) or {}),
                     scope=dict(metadata.get("scope", {}) or {}),
                     l0=l0,
                     l1=l1,
@@ -137,7 +152,7 @@ class ExistingMemoryPrefetcher:
 
     def _recall(self, query: str, filters: dict[str, Any], episode: EvidenceEpisode) -> list[Any]:
         exact_uris: list[str] = []
-        # Adapters may provide already-resolved canonical identities. The model never controls these fields.
+        # 适配器可以带入已经解析好的规范身份，但模型不能控制这些字段。
         for event in episode.events:
             exact_uris.extend(str(uri) for uri in event.metadata.get("canonical_memory_uris", []) or [])
         exact_hits = []

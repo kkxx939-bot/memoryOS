@@ -1,3 +1,5 @@
+"""后台任务里的冷却任务。"""
+
 from __future__ import annotations
 
 from memoryos.behavior.model.behavior_pattern import BehaviorPattern

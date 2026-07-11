@@ -1,3 +1,5 @@
+"""记忆系统里的记忆冷却。"""
+
 from __future__ import annotations
 
 from memoryos.contextdb.model.context_object import ContextObject

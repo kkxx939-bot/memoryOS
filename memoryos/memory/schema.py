@@ -1,10 +1,23 @@
+"""记忆系统里的数据结构。"""
+
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
 MEMORY_SCHEMA_VERSION = "memory_schema_v1"
+
+
+def _validated_confidence(value: Any) -> float:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("confidence must be a finite number between 0 and 1") from exc
+    if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+        raise ValueError("confidence must be a finite number between 0 and 1")
+    return confidence
 
 
 class MemoryType(str, Enum):
@@ -191,7 +204,7 @@ class MemoryCandidateDraft:
     def __post_init__(self) -> None:
         if isinstance(self.memory_type, str):
             self.memory_type = MemoryType(self.memory_type)
-        self.confidence = max(0.0, min(1.0, float(self.confidence)))
+        self.confidence = _validated_confidence(self.confidence)
 
 
 @dataclass
@@ -211,7 +224,7 @@ class MemoryAdmissionResult:
             self.decision = AdmissionDecision(self.decision)
         if isinstance(self.memory_type, str):
             self.memory_type = MemoryType(self.memory_type)
-        self.confidence = max(0.0, min(1.0, float(self.confidence)))
+        self.confidence = _validated_confidence(self.confidence)
 
     def to_metadata(self) -> dict[str, Any]:
         return {

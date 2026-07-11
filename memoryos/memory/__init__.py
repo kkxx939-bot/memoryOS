@@ -1,7 +1,8 @@
+"""这个包的公开接口都从这里导出。"""
+
 from memoryos.memory.admission import MemoryAdmissionGate
 from memoryos.memory.extraction import (
     ExtractionResult,
-    LLMMemoryExtractor,
     MemoryExtractor,
     MemoryExtractorBackend,
     RuleFallbackExtractor,
@@ -21,7 +22,6 @@ from memoryos.memory.service import MemoryUpdater
 __all__ = [
     "AdmissionDecision",
     "ExtractionResult",
-    "LLMMemoryExtractor",
     "Memory",
     "MemoryAnchor",
     "MemoryAdmissionGate",

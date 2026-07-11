@@ -1,3 +1,5 @@
+"""接口层里的客户端。"""
+
 from __future__ import annotations
 
 import inspect
@@ -29,8 +31,8 @@ from memoryos.memory.canonical import (
     PlannedMemoryOperation,
     SemanticAssessment,
     TransitionProfile,
+    bind_field_evidence,
 )
-from memoryos.memory.canonical.evidence import evidence_hash
 from memoryos.memory.extraction import MemoryExtractorBackend
 from memoryos.memory.schema import MemoryType
 from memoryos.operations.model.context_operation import ContextOperation
@@ -44,6 +46,8 @@ from memoryos.skill.tool_registry import ToolRegistry
 
 
 class MemoryOSClient:
+    """对外提供记忆写入、检索和会话提交这些常用入口。"""
+
     def __init__(
         self,
         root: str,
@@ -99,6 +103,8 @@ class MemoryOSClient:
         self.memory_projection_worker = container.memory_projection_worker
 
     def predict(self, request: PredictionRequest, policies: list[ActionPolicy] | None = None) -> PredictionResult:
+        """处理 predict 这一步。"""
+
         self._require_predict_metadata(request.connect_metadata)
         return self.engine.process(request, policies=policies)
 
@@ -110,6 +116,8 @@ class MemoryOSClient:
         archive_session: bool = True,
         async_commit: bool = True,
     ) -> ProcessObservationResult:
+        """处理一次观察并返回预测结果，记忆仍由会话提交形成。"""
+
         metadata = self._require_process_observation_metadata(request.connect_metadata)
         connect_metadata = metadata.to_dict()
         result = self.engine.process(request, policies=policies)
@@ -213,6 +221,8 @@ class MemoryOSClient:
         slot_uris: list[str] | None = None,
         query_intent: str | None = None,
     ) -> list[dict[str, Any]]:
+        """按用户、工作区、状态和查询意图检索上下文。"""
+
         connect_filters = self._connect_filters_from_metadata(connect_metadata)
         metadata = self._parse_connect_metadata(connect_metadata)
         assembler = self._context_assembler()
@@ -257,6 +267,8 @@ class MemoryOSClient:
         slot_uris: list[str] | None = None,
         query_intent: str | None = None,
     ) -> dict[str, Any]:
+        """检索并打包本次请求能看到的上下文。"""
+
         metadata = self._parse_connect_metadata(connect_metadata)
         connect_filters = self._connect_filters_from_metadata(connect_metadata)
         parsed_types: list[object] | None = (
@@ -309,6 +321,8 @@ class MemoryOSClient:
         project_id: str = "",
         connect_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        """把显式记忆请求转成证据和提案，再走完整提交链。"""
+
         if not content.strip():
             raise ValueError("content is required")
         normalized_type = _normalize_explicit_memory_type(memory_type)
@@ -329,6 +343,7 @@ class MemoryOSClient:
             ],
             metadata={"connect": connect, "project_id": project_id},
         )
+        self.session_archive_store.write_sync_archive(archive)
         planner = self.session_commit_service.memory_planner
         episode = planner.episode_adapter.adapt(archive)
         identity_fields = _explicit_identity_fields(
@@ -351,16 +366,19 @@ class MemoryOSClient:
                 and scope.kind == ("workspace" if project_id else "principal")
             )
         )
+        evidence_refs = (EvidenceRef.from_event(episode.events[0], source_uri=archive.archive_uri),)
+        value_fields = {"canonical_value": content}
         proposal = MemorySemanticProposal(
             proposal_id=f"proposal_{event_id}",
             memory_type=normalized_type,
             identity_fields=identity_fields,
-            value_fields={"canonical_value": content},
+            value_fields=value_fields,
             semantic=SemanticAssessment("confirmation", "confirmed", "current", "unrelated"),
             epistemic_status=EpistemicStatus.EXPLICIT,
             suggested_scope_refs=suggested_scopes,
             related_memory_ids=(),
-            evidence_refs=(EvidenceRef.from_event(episode.events[0], source_uri=archive.archive_uri),),
+            evidence_refs=evidence_refs,
+            field_evidence_refs=bind_field_evidence(identity_fields, value_fields, evidence_refs),
             confidence=1.0,
             extractor_version="explicit_remember_v1",
             metadata={
@@ -403,9 +421,13 @@ class MemoryOSClient:
         return {"uri": uri, "status": "COMMITTED", "diff_id": diff.diff_id}
 
     def forget(self, *, user_id: str, uri: str) -> dict[str, Any]:
+        """撤回或软删除自己拥有的记忆，同时保留审计信息。"""
+
         if not uri.startswith(f"memoryos://user/{user_id}/"):
             raise PermissionError("forget requires an exact URI owned by user_id")
         obj = self.context_db.read_object(uri)
+        if obj.owner_user_id != user_id:
+            raise PermissionError("forget requires an exact URI owned by user_id")
         if obj.metadata.get("canonical_kind") == "claim":
             return self._forget_canonical_claim(user_id, obj)
         operation = ContextOperation(
@@ -430,11 +452,27 @@ class MemoryOSClient:
             profile=profile,
             revisions=tuple(MemoryRevision.from_dict(item) for item in metadata.get("revisions", []) or []),
         )
-        state = "RETRACTED" if profile == TransitionProfile.AUTHORITATIVE_STATE else "ARCHIVED"
+        state = "RETRACTED"
         if claim.current.state == state:
             return {"uri": obj.uri, "status": "COMMITTED", "memory_state": state, "diff_id": ""}
         event_id = f"forget:{stable_hash([user_id, obj.uri, claim.current.revision], length=24)}"
-        evidence = EvidenceRef(event_id, None, evidence_hash(obj.uri))
+        archive = SessionArchive(
+            user_id=user_id,
+            session_id=event_id,
+            archive_uri=f"memoryos://user/{user_id}/sessions/history/{event_id}",
+            messages=[
+                {
+                    "id": event_id,
+                    "role": "user",
+                    "event_type": "RETRACTION",
+                    "content": f"I retract memory {obj.uri}.",
+                }
+            ],
+            metadata={"tenant_id": str(obj.tenant_id or "default")},
+        )
+        self.session_archive_store.write_sync_archive(archive)
+        episode = self.session_commit_service.memory_planner.episode_adapter.adapt(archive)
+        evidence = EvidenceRef.from_event(episode.events[0], source_uri=archive.archive_uri)
         revision = MemoryRevision(
             revision=claim.current.revision + 1,
             state=state,
@@ -487,6 +525,9 @@ class MemoryOSClient:
         plan = MemoryTransactionPlan(
             transaction_id=f"memory_tx_{idempotency_key}",
             idempotency_key=idempotency_key,
+            tenant_id=str(obj.tenant_id or "default"),
+            owner_user_id=user_id,
+            slot_id=claim.slot_id,
             expected_revisions={obj.uri: claim.current.revision, slot_uri: int(slot_metadata.get("revision", 0))},
             operations=(
                 PlannedMemoryOperation(
@@ -600,6 +641,8 @@ class MemoryOSClient:
         scope: dict[str, Any] | None = None,
         provenance: dict[str, Any] | None = None,
     ) -> Any:
+        """归档并提交一次 Agent 会话。"""
+
         metadata = self._parse_connect_metadata(connect_metadata)
         stable_session_id = session_key or session_id
         archive_uri = f"memoryos://user/{user_id}/sessions/history/{stable_session_id}"
@@ -638,6 +681,7 @@ class MemoryOSClient:
                 "scope": normalized_scope,
                 "provenance": normalized_provenance,
                 "project_id": normalized_scope.get("project_id", ""),
+                "tenant_id": normalized_scope.get("tenant_id", "default"),
             },
             task_id=task_id,
         )
@@ -729,7 +773,7 @@ def _stable_session_commit_task_id(payload: dict[str, Any]) -> str:
 
 
 def _supported_kwargs(function: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Normalize a protocol boundary without hiding errors raised inside the call."""
+    """处理  supported kwargs 这一步。"""
     parameters = inspect.signature(function).parameters
     if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
         return kwargs
@@ -799,4 +843,4 @@ def _explicit_identity_fields(
 
 
 class LocalMemoryOSClient(MemoryOSClient):
-    """Explicit name for the in-process ContextDB transport."""
+    """负责 LocalMemoryOSClient 这部分逻辑。"""

@@ -1,3 +1,5 @@
+"""上下文数据库里的会话归档。"""
+
 from __future__ import annotations
 
 import json
@@ -13,7 +15,7 @@ class SessionArchiveStore:
         self.tenant_id = tenant_id
 
     def write_sync_archive(self, archive: SessionArchive) -> Path:
-        directory = self._dir(archive.archive_uri)
+        directory = self._dir(archive.archive_uri, tenant_id=self._archive_tenant(archive))
         directory.mkdir(parents=True, exist_ok=True)
         self._write_jsonl(directory / "messages.jsonl", archive.messages)
         self._write_jsonl(directory / "observations.jsonl", archive.observations)
@@ -35,8 +37,9 @@ class SessionArchiveStore:
         behavior_diff: dict,
         action_policy_diff: dict,
         context_diff: dict,
+        tenant_id: str | None = None,
     ) -> Path:
-        directory = self._dir(archive_uri)
+        directory = self._dir(archive_uri, tenant_id=tenant_id)
         directory.mkdir(parents=True, exist_ok=True)
         (directory / ".abstract.md").write_text(abstract, encoding="utf-8")
         (directory / ".overview.md").write_text(overview, encoding="utf-8")
@@ -48,7 +51,7 @@ class SessionArchiveStore:
         return directory
 
     def async_outputs_done_for_task(self, archive: SessionArchive) -> bool:
-        directory = self._dir(archive.archive_uri)
+        directory = self._dir(archive.archive_uri, tenant_id=self._archive_tenant(archive))
         if not (directory / ".done").exists():
             return False
         try:
@@ -57,8 +60,8 @@ class SessionArchiveStore:
             return False
         return payload.get("task_id") == archive.task_id
 
-    def read_archive(self, archive_uri: str) -> SessionArchive:
-        directory = self._dir(archive_uri)
+    def read_archive(self, archive_uri: str, *, tenant_id: str | None = None) -> SessionArchive:
+        directory = self._dir(archive_uri, tenant_id=tenant_id)
         manifest = self._read_json(directory / "commit_manifest.json")
         return SessionArchive(
             user_id=str(manifest["user_id"]),
@@ -77,8 +80,13 @@ class SessionArchiveStore:
             created_at=str(manifest.get("created_at", "")),
         )
 
-    def _dir(self, archive_uri: str) -> Path:
-        return ContextURI.parse(archive_uri).to_source_path(self.root, tenant_id=self.tenant_id)
+    def _dir(self, archive_uri: str, *, tenant_id: str | None = None) -> Path:
+        return ContextURI.parse(archive_uri).to_source_path(self.root, tenant_id=tenant_id or self.tenant_id)
+
+    def _archive_tenant(self, archive: SessionArchive) -> str:
+        metadata = dict(archive.metadata or {})
+        scope = dict(metadata.get("scope", {}) or {})
+        return str(metadata.get("tenant_id") or scope.get("tenant_id") or self.tenant_id)
 
     def _write_jsonl(self, path: Path, rows: list[dict]) -> None:
         with path.open("w", encoding="utf-8") as fp:

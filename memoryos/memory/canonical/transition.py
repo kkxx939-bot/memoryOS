@@ -1,3 +1,5 @@
+"""记忆系统里的状态转换。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
@@ -23,6 +25,8 @@ from memoryos.memory.canonical.state import (
 
 @dataclass(frozen=True)
 class MemoryStateTransition:
+    """负责 MemoryStateTransition 这部分逻辑。"""
+
     slot: MemorySlot
     claims: tuple[MemoryClaim, ...]
     changed_claim_ids: tuple[str, ...]
@@ -31,6 +35,8 @@ class MemoryStateTransition:
 
 
 class MemoryTransitionPolicy:
+    """按记忆类型决定 Claim 应该怎么变更。"""
+
     VERSION = "memory_transition_v1"
 
     def apply(
@@ -39,6 +45,8 @@ class MemoryTransitionPolicy:
         identity: ResolvedMemoryIdentity,
         reconciliation: ReconciliationResult,
     ) -> MemoryStateTransition:
+        """执行这一步处理，并保持已有状态约束。"""
+
         semantic = proposal.semantic
         if not isinstance(semantic, NormalizedSemanticAssessment):
             raise ValueError("transition policy accepts normalized semantic assessments only")
@@ -60,7 +68,13 @@ class MemoryTransitionPolicy:
         if target is None:
             if reconciliation.relation == SemanticRelation.CONTRADICTS and target_state != "ACTIVE":
                 target_state = "CONFLICTED"
-            revision = self._revision(1, target_state, proposal, reconciliation.relation)
+            revision = self._revision(
+                1,
+                target_state,
+                proposal,
+                reconciliation.relation,
+                self._proposal_qualifiers(semantic, target_state),
+            )
             target = MemoryClaim(
                 identity.claim_id,
                 identity.claim_uri,
@@ -112,6 +126,7 @@ class MemoryTransitionPolicy:
                         policy_version=self.VERSION,
                         schema_version="canonical_memory_v1",
                         qualifiers={"superseded_by": target.claim_id},
+                        previous_revision=claim.current.revision,
                     )
                 )
                 changed.append(claim.claim_id)
@@ -144,13 +159,9 @@ class MemoryTransitionPolicy:
         semantic = proposal.semantic
         assert isinstance(semantic, NormalizedSemanticAssessment)
         if profile == TransitionProfile.OBSERVATIONAL:
-            return (
-                "ACTIVE"
-                if proposal.epistemic_status in {EpistemicStatus.EXPLICIT, EpistemicStatus.OBSERVED}
-                else "OBSERVED"
-            )
+            return "ACTIVE"
         if profile == TransitionProfile.EXPERIENCE:
-            return "VALIDATED" if proposal.epistemic_status == EpistemicStatus.EXPLICIT else "OBSERVED"
+            return "ACTIVE"
         if semantic.speech_act in {SpeechAct.RETRACTION, SpeechAct.REJECTION}:
             return "RETRACTED"
         confirmed = (
@@ -158,8 +169,6 @@ class MemoryTransitionPolicy:
             or semantic.commitment == Commitment.CONFIRMED
         )
         if confirmed and proposal.epistemic_status == EpistemicStatus.EXPLICIT:
-            return "ACTIVE"
-        if semantic.speech_act == SpeechAct.OBSERVATION and proposal.epistemic_status == EpistemicStatus.EXPLICIT:
             return "ACTIVE"
         return "PROPOSED"
 
@@ -175,9 +184,16 @@ class MemoryTransitionPolicy:
         if claim.current.state == "ACTIVE" and target_state == "PROPOSED":
             return "ACTIVE", dict(claim.current.qualifiers)
         qualifiers = dict(claim.current.qualifiers)
+        if target_state == "ACTIVE":
+            qualifiers.pop("phase", None)
         if semantic.speech_act == SpeechAct.EVALUATION_REQUEST and target_state == "PROPOSED":
-            qualifiers["phase"] = "evaluation"
+            qualifiers["phase"] = "evaluation_candidate"
         return target_state, qualifiers
+
+    def _proposal_qualifiers(self, semantic: NormalizedSemanticAssessment, target_state: str) -> dict:
+        if semantic.speech_act == SpeechAct.EVALUATION_REQUEST and target_state == "PROPOSED":
+            return {"phase": "evaluation_candidate"}
+        return {}
 
     def _revision(
         self,
@@ -202,4 +218,5 @@ class MemoryTransitionPolicy:
             policy_version=self.VERSION,
             schema_version="canonical_memory_v1",
             qualifiers=qualifiers or {},
+            previous_revision=revision - 1 if revision > 1 else None,
         )

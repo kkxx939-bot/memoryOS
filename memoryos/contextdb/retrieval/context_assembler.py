@@ -1,5 +1,8 @@
+"""上下文数据库里的上下文组装。"""
+
 from __future__ import annotations
 
+import inspect
 import logging
 from collections.abc import Sequence
 from typing import Any
@@ -7,6 +10,7 @@ from typing import Any
 from memoryos.contextdb.context_db import ContextDB
 from memoryos.contextdb.layers.context_packer import ContextPacker
 from memoryos.contextdb.model.context_type import ContextType
+from memoryos.contextdb.model.lifecycle import LifecycleState
 from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
 from memoryos.contextdb.retrieval.token_budget import HeuristicTokenCounter, TokenCounter
 from memoryos.memory.canonical.retrieval import (
@@ -20,7 +24,19 @@ from memoryos.providers.rerank import Reranker
 logger = logging.getLogger(__name__)
 
 
+def _supported_search_kwargs(function: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    try:
+        signature = inspect.signature(function)
+    except (TypeError, ValueError):
+        return kwargs
+    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
+        return kwargs
+    return {key: value for key, value in kwargs.items() if key in signature.parameters}
+
+
 class ContextAssembler:
+    """先筛出有权读取的上下文，再按预算打包。"""
+
     def __init__(
         self,
         context_db: ContextDB,
@@ -63,6 +79,8 @@ class ContextAssembler:
         slot_uris: Sequence[str] | None = None,
         query_intent: str | None = None,
     ) -> list[dict[str, Any]]:
+        """按给定条件查找匹配结果。"""
+
         parsed_type = self._context_type(context_type)
         requested_limit = max(0, limit)
         if search_scope or retrieval_views:
@@ -75,6 +93,7 @@ class ContextAssembler:
                 retrieval_views=retrieval_views,
                 project_id=project_id,
                 adapter_id=adapter_id,
+                tenant_id=tenant_id,
             )
             legacy = self._rerank(query, self._filter_connect(results, connect_filters))[:requested_limit]
             return self._merge_canonical(
@@ -93,9 +112,20 @@ class ContextAssembler:
                 query_intent=query_intent,
             )
         search_limit = max(requested_limit * 5, 50) if connect_filters and requested_limit else requested_limit
+        allowed_source_uris = self._allowed_source_uris(
+            user_id=user_id,
+            tenant_id=tenant_id,
+            context_type=parsed_type,
+            project_id=project_id,
+            applicability_scope_keys=applicability_scope_keys,
+        )
         hits: Sequence[Any]
         if self.hybrid_search is not None:
-            filters = {"owner_user_id": user_id} if user_id else {}
+            filters: dict[str, Any] = {"tenant_id": tenant_id}
+            if allowed_source_uris is not None:
+                filters["allowed_uris"] = allowed_source_uris
+            if user_id:
+                filters["owner_user_id"] = user_id
             if project_id:
                 filters["project_id"] = project_id
             if adapter_id and search_scope == "agent_private":
@@ -104,14 +134,17 @@ class ContextAssembler:
         else:
             search_kwargs: dict[str, Any] = {
                 "owner_user_id": user_id,
+                "tenant_id": tenant_id,
                 "context_type": parsed_type,
                 "limit": search_limit,
             }
+            if allowed_source_uris is not None:
+                search_kwargs["allowed_uris"] = allowed_source_uris
             if project_id:
                 search_kwargs["project_id"] = project_id
             if adapter_id and search_scope == "agent_private":
                 search_kwargs["adapter_id"] = adapter_id
-            hits = self.context_db.search(query, **search_kwargs)
+            hits = self.context_db.search(query, **_supported_search_kwargs(self.context_db.search, search_kwargs))
         results = [self._hit_payload(hit) for hit in hits]
         scoped = self._filter_project(results, project_id)
         legacy = self._rerank(query, self._filter_connect(scoped, connect_filters))[:requested_limit]
@@ -130,6 +163,74 @@ class ContextAssembler:
             slot_uris=slot_uris,
             query_intent=query_intent,
         )
+
+    def _allowed_source_uris(
+        self,
+        *,
+        user_id: str | None,
+        tenant_id: str,
+        context_type: ContextType | None,
+        project_id: str,
+        applicability_scope_keys: Sequence[str] | None,
+        include_candidates: bool = False,
+    ) -> tuple[str, ...] | None:
+        source_store = getattr(self.context_db, "source_store", None)
+        if source_store is None:
+            return None
+        available_scopes = set(str(item) for item in applicability_scope_keys or [])
+        if user_id:
+            available_scopes.add(f"memoryos:principal:{user_id}")
+        if project_id:
+            available_scopes.add(f"memoryos:workspace:{project_id}")
+        allowed = []
+        for obj in source_store.list_objects():
+            if obj.lifecycle_state != LifecycleState.ACTIVE:
+                continue
+            if str(obj.tenant_id or "default") != tenant_id:
+                continue
+            if user_id is not None and obj.owner_user_id != user_id:
+                continue
+            if context_type is not None and obj.context_type != context_type:
+                continue
+            metadata = dict(obj.metadata or {})
+            admission = dict(metadata.get("admission", {}) or {})
+            if admission.get("decision") in {"restricted", "archive_only", "reject"}:
+                continue
+            if admission.get("decision") == "pending" and not include_candidates:
+                continue
+            if (
+                metadata.get("canonical_kind") == "claim"
+                and metadata.get("state") != "ACTIVE"
+                and not include_candidates
+            ):
+                continue
+            scope = dict(metadata.get("scope", {}) or {})
+            visibility = dict(scope.get("visibility", {}) or {})
+            if visibility:
+                if str(visibility.get("tenant_id", "default")) != tenant_id:
+                    continue
+                principals = {str(item) for item in visibility.get("allowed_principal_ids", []) or []}
+                if principals and (user_id is None or user_id not in principals):
+                    continue
+            applicability = dict(scope.get("applicability", {}) or {})
+            required_scopes = {
+                f"{item.get('namespace', 'memoryos')}:{item.get('kind')}:{item.get('id')}"
+                for item in applicability.get("all_of", []) or []
+                if isinstance(item, dict) and item.get("kind") and item.get("id")
+            }
+            if required_scopes and not required_scopes.issubset(available_scopes):
+                continue
+            fields = dict(metadata.get("fields", {}) or {})
+            item_project = str(scope.get("project_id") or fields.get("project_id") or metadata.get("project_id") or "")
+            if (
+                project_id
+                and str(metadata.get("memory_type", "")) in {"project_rule", "project_decision", "agent_experience"}
+                and item_project
+                and item_project != project_id
+            ):
+                continue
+            allowed.append(obj.uri)
+        return tuple(allowed)
 
     def assemble(
         self,
@@ -153,6 +254,8 @@ class ContextAssembler:
         slot_uris: Sequence[str] | None = None,
         query_intent: str | None = None,
     ) -> dict[str, Any]:
+        """处理 assemble 这一步。"""
+
         contexts: list[dict[str, Any]] = []
         if context_types:
             per_type_limit = max(1, limit)
@@ -312,6 +415,7 @@ class ContextAssembler:
         retrieval_views: list[str] | None,
         project_id: str,
         adapter_id: str,
+        tenant_id: str,
     ) -> list[dict[str, Any]]:
         if limit <= 0:
             return []
@@ -326,9 +430,29 @@ class ContextAssembler:
         )
         if not plan.retrieval_views:
             return []
+        allowed_source_uris = set(
+            self._allowed_source_uris(
+                user_id=user_id,
+                tenant_id=tenant_id,
+                context_type=context_type,
+                project_id=project_id,
+                applicability_scope_keys=None,
+                include_candidates=plan.include_candidates,
+            )
+            or ()
+        )
         items: list[dict[str, Any]] = []
         for obj in self.context_db.source_store.list_objects():
+            if obj.uri not in allowed_source_uris:
+                continue
             if obj.context_type != ContextType.MEMORY:
+                continue
+            if str(obj.tenant_id or "default") != tenant_id:
+                continue
+            if obj.lifecycle_state != LifecycleState.ACTIVE:
+                continue
+            metadata = dict(obj.metadata or {})
+            if metadata.get("canonical_kind") == "claim" and metadata.get("state") != "ACTIVE":
                 continue
             if user_id is not None and obj.owner_user_id != user_id:
                 continue

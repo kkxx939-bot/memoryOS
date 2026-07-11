@@ -1,3 +1,5 @@
+"""记忆系统里的语义。"""
+
 from __future__ import annotations
 
 from dataclasses import replace
@@ -13,6 +15,8 @@ from memoryos.memory.canonical.proposal import (
 
 
 class MemorySemanticNormalizer:
+    """负责 MemorySemanticNormalizer 这部分逻辑。"""
+
     _SPEECH = {
         "observation": SpeechAct.OBSERVATION,
         "proposal": SpeechAct.PROPOSAL,
@@ -46,6 +50,8 @@ class MemorySemanticNormalizer:
     )
 
     def normalize(self, proposal: MemorySemanticProposal) -> MemorySemanticProposal:
+        """处理 normalize 这一步。"""
+
         semantic = proposal.semantic
         if isinstance(semantic, NormalizedSemanticAssessment):
             return proposal

@@ -1,3 +1,5 @@
+"""向量服务的基础接口。"""
+
 from __future__ import annotations
 
 from typing import Protocol

@@ -1,3 +1,5 @@
+"""L2 原文内容。"""
+
 from __future__ import annotations
 
 import json

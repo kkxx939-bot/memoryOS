@@ -1,3 +1,5 @@
+"""操作提交里的关系解析器。"""
+
 from __future__ import annotations
 
 from memoryos.contextdb.model.context_relation import ContextRelation

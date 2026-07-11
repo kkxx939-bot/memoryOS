@@ -1,3 +1,5 @@
+"""行为模块里的行为生命周期。"""
+
 from __future__ import annotations
 
 from collections import Counter
@@ -19,7 +21,7 @@ class BehaviorLifecycleResult:
 
 
 class BehaviorLifecycleService:
-    """Deprecated compatibility wrapper around BehaviorWindowEvaluator."""
+    """负责 BehaviorLifecycleService 这部分逻辑。"""
 
     def evaluate(self, user_id: str, scene_key: str, cases: list[BehaviorCase]) -> BehaviorLifecycleResult:
         relevant = [case for case in cases if case.user_id == user_id and case.scene_key == scene_key]

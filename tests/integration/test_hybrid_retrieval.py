@@ -29,6 +29,14 @@ class BrokenVectorStore(InMemoryVectorStore):
         raise RuntimeError("vector db down")
 
 
+class FixedEmbeddingProvider:
+    model_name = "fixed"
+    dimension = 2
+
+    def embed(self, text: str) -> list[float]:  # noqa: ARG002
+        return [1.0, 0.0]
+
+
 def test_hybrid_search_falls_back_to_index_without_vector(tmp_path) -> None:
     source = FileSystemSourceStore(tmp_path)
     index = InMemoryIndexStore()
@@ -98,6 +106,38 @@ def test_vector_only_hit_and_namespace_isolation(tmp_path) -> None:
     hits = HybridSearch(index, vector, provider, source).search("hot room", filters={"owner_user_id": "u1"}, namespace="memoryos://user/u1/", context_type=ContextType.MEMORY)
     assert [hit.uri for hit in hits] == [obj.uri]
     assert hits[0].source == "vector"
+
+
+def test_vector_allowed_uri_filter_overfetches_before_limit(tmp_path) -> None:  # noqa: ANN001
+    source = FileSystemSourceStore(tmp_path)
+    index = InMemoryIndexStore()
+    vector = InMemoryVectorStore()
+    provider = FixedEmbeddingProvider()
+    blocked = ContextObject(
+        uri="memoryos://user/u1/memories/blocked",
+        context_type=ContextType.MEMORY,
+        title="blocked",
+        owner_user_id="u1",
+    )
+    allowed = ContextObject(
+        uri="memoryos://user/u1/memories/allowed",
+        context_type=ContextType.MEMORY,
+        title="allowed",
+        owner_user_id="u1",
+    )
+    source.write_object(blocked, content="blocked")
+    source.write_object(allowed, content="allowed")
+    vector.upsert_vector(blocked.uri, [1.0, 0.0], metadata={"owner_user_id": "u1", "context_type": "memory"})
+    vector.upsert_vector(allowed.uri, [0.9, 0.1], metadata={"owner_user_id": "u1", "context_type": "memory"})
+
+    hits = HybridSearch(index, vector, provider, source).search(
+        "anything",
+        filters={"owner_user_id": "u1", "allowed_uris": [allowed.uri]},
+        context_type=ContextType.MEMORY,
+        limit=1,
+    )
+
+    assert [hit.uri for hit in hits] == [allowed.uri]
 
 
 def test_index_and_vector_same_uri_merge_score(tmp_path) -> None:

@@ -1,3 +1,5 @@
+"""Agent 对话记录整理。"""
+
 from __future__ import annotations
 
 import json
@@ -65,7 +67,7 @@ class GenericJsonlTranscriptReader:
 
 
 class ClaudeCodeTranscriptReader(GenericJsonlTranscriptReader):
-    """Normalize Claude Code's message envelope while retaining unknown records."""
+    """负责 ClaudeCodeTranscriptReader 这部分逻辑。"""
 
     def _normalize_item(self, item: dict[str, Any]) -> dict[str, Any]:
         message = item.get("message")
@@ -79,7 +81,7 @@ class ClaudeCodeTranscriptReader(GenericJsonlTranscriptReader):
 
 
 class CodexTranscriptReader(GenericJsonlTranscriptReader):
-    """Normalize Codex rollout response_item message records."""
+    """负责 CodexTranscriptReader 这部分逻辑。"""
 
     def _normalize_item(self, item: dict[str, Any]) -> dict[str, Any]:
         payload = item.get("payload")

@@ -1,3 +1,5 @@
+"""操作提交里的上下文差异。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

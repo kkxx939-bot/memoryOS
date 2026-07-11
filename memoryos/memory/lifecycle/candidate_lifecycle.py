@@ -1,3 +1,5 @@
+"""记忆系统里的候选生命周期。"""
+
 from __future__ import annotations
 
 from memoryos.contextdb.model.context_type import ContextType

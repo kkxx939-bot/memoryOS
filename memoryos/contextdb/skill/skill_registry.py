@@ -1,3 +1,5 @@
+"""上下文数据库里的技能注册表。"""
+
 from __future__ import annotations
 
 from memoryos.contextdb.skill.skill_model import Skill

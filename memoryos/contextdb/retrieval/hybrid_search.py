@@ -1,3 +1,5 @@
+"""上下文数据库里的混合检索。"""
+
 from __future__ import annotations
 
 import logging
@@ -14,6 +16,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class HybridHit:
+    """保存 HybridHit 需要的这组数据。"""
+
     uri: str
     title: str
     context_type: str
@@ -23,6 +27,8 @@ class HybridHit:
 
 
 class HybridSearch:
+    """合并关键词和向量结果，过滤条件始终以源数据为准。"""
+
     def __init__(
         self,
         index_store: IndexStore,
@@ -43,6 +49,8 @@ class HybridSearch:
         context_type: ContextType | None = None,
         limit: int = 10,
     ) -> list[HybridHit]:
+        """按给定条件查找匹配结果。"""
+
         filters = dict(filters or {})
         if context_type is not None:
             filters["context_type"] = context_type.value
@@ -61,7 +69,10 @@ class HybridSearch:
         if self.vector_store is not None and self.embedding_provider is not None:
             try:
                 embedding = self.embedding_provider.embed(query)
-                for vector_hit in self.vector_store.search_vector(embedding, namespace=namespace, limit=limit):
+                vector_limit = limit
+                if self.source_store is not None and "allowed_uris" in filters:
+                    vector_limit = max(limit, len(self.source_store.list_objects()))
+                for vector_hit in self.vector_store.search_vector(embedding, namespace=namespace, limit=vector_limit):
                     item = self._vector_item(vector_hit.uri, vector_hit.metadata, filters, context_type)
                     if item is None:
                         continue
@@ -122,6 +133,7 @@ class HybridSearch:
         title = str(metadata.get("title", ""))
         hit_type = str(metadata.get("context_type", ""))
         owner_user_id = metadata.get("owner_user_id")
+        tenant_id = metadata.get("tenant_id")
         lifecycle_state = metadata.get("lifecycle_state")
         if self.source_store is not None:
             try:
@@ -134,6 +146,7 @@ class HybridSearch:
                 title = obj.title
                 hit_type = obj.context_type.value
                 owner_user_id = obj.owner_user_id
+                tenant_id = obj.tenant_id or "default"
                 lifecycle_state = obj.lifecycle_state.value
                 metadata = {**obj.metadata, **metadata}
         if context_type is not None and hit_type != context_type.value:
@@ -142,15 +155,42 @@ class HybridSearch:
             return None
         if filters.get("owner_user_id") and owner_user_id not in {None, "", filters["owner_user_id"]}:
             return None
+        if filters.get("tenant_id") and str(tenant_id or "default") != str(filters["tenant_id"]):
+            return None
+        if "allowed_uris" in filters and uri not in set(filters.get("allowed_uris", []) or []):
+            return None
         if filters.get("lifecycle_state") and lifecycle_state != filters["lifecycle_state"]:
             return None
         scope = dict(metadata.get("scope", {}) or {})
         fields = dict(metadata.get("fields", {}) or {})
         connect = dict(metadata.get("connect", {}) or {})
         admission = dict(metadata.get("admission", {}) or {})
+        for filter_name, actual in (
+            ("claim_state", metadata.get("state") or metadata.get("claim_state")),
+            ("slot_id", metadata.get("slot_id")),
+            ("memory_type", metadata.get("memory_type")),
+        ):
+            expected = filters.get(filter_name)
+            if expected is None:
+                continue
+            values = set(expected) if isinstance(expected, (list, tuple, set, frozenset)) else {expected}
+            if actual not in values:
+                return None
+        required_scopes = set(filters.get("applicability_scope_keys", []) or [])
+        if required_scopes:
+            applicability = dict(scope.get("applicability", {}) or {})
+            actual_scopes = {
+                f"{item.get('namespace', 'memoryos')}:{item.get('kind')}:{item.get('id')}"
+                for item in applicability.get("all_of", []) or []
+                if isinstance(item, dict) and item.get("kind") and item.get("id")
+            }
+            if not actual_scopes.issubset(required_scopes):
+                return None
         project_id = str(scope.get("project_id") or fields.get("project_id") or "")
-        if filters.get("project_id") and project_id not in {"", str(filters["project_id"])}:
-            return None
+        if filters.get("project_id"):
+            memory_type = str(metadata.get("memory_type") or "")
+            if memory_type in {"project_rule", "project_decision", "agent_experience"} and project_id != str(filters["project_id"]):
+                return None
         if filters.get("adapter_id") and str(connect.get("adapter_id") or metadata.get("source_adapter_id") or "") != str(filters["adapter_id"]):
             return None
         if admission.get("decision") in {"pending", "restricted", "archive_only", "reject"}:

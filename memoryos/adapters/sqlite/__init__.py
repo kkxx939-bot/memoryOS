@@ -1,3 +1,5 @@
+"""这个包的公开接口都从这里导出。"""
+
 from memoryos.adapters.sqlite.sqlite_index_store import SqliteIndexStore
 from memoryos.adapters.sqlite.sqlite_metadata_store import SqliteMetadataStore
 from memoryos.adapters.sqlite.sqlite_queue_store import SqliteQueueStore

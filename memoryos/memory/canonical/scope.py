@@ -1,3 +1,5 @@
+"""记忆系统里的作用域。"""
+
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -17,6 +19,8 @@ def _required(value: str, name: str) -> str:
 
 @dataclass(frozen=True)
 class ScopeRef:
+    """表示一个用户、工作区、环境、设备、位置或会话范围。"""
+
     namespace: str
     kind: str
     id: str
@@ -60,7 +64,7 @@ class ScopeRef:
 
 @dataclass(frozen=True)
 class ScopeSelector:
-    """A small conjunction of core scopes; it is intentionally not a rule DSL."""
+    """负责 ScopeSelector 这部分逻辑。"""
 
     all_of: tuple[ScopeRef, ...]
 
@@ -76,6 +80,8 @@ class ScopeSelector:
 
 @dataclass(frozen=True)
 class VisibilityPolicy:
+    """记录哪些租户和用户可以读取这条记忆。"""
+
     tenant_id: str
     allowed_principal_ids: tuple[str, ...] = ()
     allowed_service_ids: tuple[str, ...] = ()
@@ -107,6 +113,8 @@ class VisibilityPolicy:
 
 @dataclass(frozen=True)
 class MemoryScope:
+    """把事件来源、记忆适用范围和可见范围分开保存。"""
+
     applicability: ScopeSelector
     visibility: VisibilityPolicy
     origin_refs: tuple[ScopeRef, ...] = ()
@@ -128,6 +136,8 @@ class MemoryScope:
 
 
 def canonical_scope_kind(external_kind: str) -> str:
+    """把外部作用域名称收敛到系统支持的几种类型。"""
+
     aliases = {
         "person": "principal",
         "user": "principal",
@@ -155,6 +165,8 @@ def scope_from_external(
     parent_id: str | None = None,
     attributes: Mapping[str, Any] | None = None,
 ) -> ScopeRef:
+    """把 SDK 传入的作用域转换成 ScopeRef。"""
+
     return ScopeRef(
         namespace=namespace,
         kind=canonical_scope_kind(kind),

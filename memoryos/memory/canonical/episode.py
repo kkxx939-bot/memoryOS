@@ -1,3 +1,5 @@
+"""规范记忆使用的证据片段。"""
+
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
@@ -25,6 +27,8 @@ def _parse_time(value: Any) -> datetime:
 
 @dataclass(frozen=True)
 class EvidenceEpisode:
+    """负责 EvidenceEpisode 这部分逻辑。"""
+
     episode_id: str
     tenant_id: str
     events: tuple[EventEnvelope, ...]
@@ -68,9 +72,11 @@ class EvidenceEpisode:
 
 
 class SessionArchiveEpisodeAdapter:
-    """Compatibility view over SessionArchive; it does not create a second store."""
+    """负责 SessionArchiveEpisodeAdapter 这部分逻辑。"""
 
     def adapt(self, archive: SessionArchive) -> EvidenceEpisode:
+        """处理 adapt 这一步。"""
+
         metadata = dict(archive.metadata or {})
         boundary_scope = dict(metadata.get("scope", {}) or {})
         tenant_id = str(metadata.get("tenant_id") or boundary_scope.get("tenant_id") or "default")

@@ -1,3 +1,5 @@
+"""接口层里的HTTP客户端。"""
+
 from __future__ import annotations
 
 import json
@@ -9,7 +11,7 @@ from typing import Any
 
 
 class HTTPMemoryOSClient:
-    """Small dependency-free remote client; failures expose structured diagnostics."""
+    """负责 HTTPMemoryOSClient 这部分逻辑。"""
 
     def __init__(
         self,

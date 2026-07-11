@@ -1,3 +1,5 @@
+"""适配器里的队列。"""
+
 from __future__ import annotations
 
 import json

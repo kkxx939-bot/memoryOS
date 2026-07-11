@@ -1,3 +1,5 @@
+"""上下文数据库里的会话提交。"""
+
 from __future__ import annotations
 
 from memoryos.contextdb.layers.layer_generator import l0_abstract, l1_overview
@@ -18,6 +20,8 @@ from memoryos.operations.model.context_operation import ContextOperation
 
 
 class SessionCommitService:
+    """先归档会话，再规划并提交各类上下文变更。"""
+
     def __init__(
         self,
         archive_store: SessionArchiveStore,
@@ -41,6 +45,8 @@ class SessionCommitService:
         self.projection_worker = projection_worker
 
     def sync_archive(self, archive: SessionArchive, *, enqueue_commit_job: bool = True) -> SessionCommitResult:
+        """先把原始会话证据写稳，再投递异步提交任务。"""
+
         self.archive_store.write_sync_archive(archive)
         if enqueue_commit_job:
             self.queue_store.enqueue(
@@ -57,6 +63,8 @@ class SessionCommitService:
         )
 
     def async_commit(self, archive: SessionArchive) -> SessionCommitResult:
+        """根据已归档会话生成并提交记忆、行为和上下文变更。"""
+
         if self.archive_store.async_outputs_done_for_task(archive):
             return SessionCommitResult(
                 task_id=archive.task_id,
@@ -65,6 +73,7 @@ class SessionCommitService:
                 done=True,
                 state=SessionCommitState.COMMITTED,
             )
+        self.archive_store.write_sync_archive(archive)
         source_text = "\n".join(
             [
                 *[str(item.get("content", item.get("text", ""))) for item in archive.messages],
@@ -111,6 +120,11 @@ class SessionCommitService:
             behavior_diff={"task_id": archive.task_id, **behavior_diff},
             action_policy_diff={"task_id": archive.task_id, **action_policy_diff},
             context_diff={"task_id": archive.task_id, **context_diff},
+            tenant_id=str(
+                archive.metadata.get("tenant_id")
+                or dict(archive.metadata.get("scope", {}) or {}).get("tenant_id")
+                or "default"
+            ),
         )
         for queue_name in ("semantic", "embedding", "reindex"):
             self.queue_store.enqueue(

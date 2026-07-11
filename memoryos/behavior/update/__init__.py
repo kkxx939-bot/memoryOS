@@ -1,3 +1,5 @@
+"""这个包的公开接口都从这里导出。"""
+
 from memoryos.behavior.update.behavior_case_writer import BehaviorCaseWriter
 from memoryos.behavior.update.behavior_cluster_updater import BehaviorClusterUpdater
 from memoryos.behavior.update.behavior_cooling import BehaviorCoolingService

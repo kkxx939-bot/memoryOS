@@ -4,6 +4,7 @@ from collections.abc import Sequence
 
 from memoryos.contextdb.context_db import ContextDB
 from memoryos.contextdb.session.planners.memory_commit_planner import MemoryCommitPlanner
+from memoryos.contextdb.session.session_archive import SessionArchiveStore
 from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.contextdb.store.local_stores import (
     FileSystemSourceStore,
@@ -43,6 +44,7 @@ def test_merge_key_prevents_duplicate_add(tmp_path) -> None:
         messages=[{"role": "user", "content": "I prefer findings first during code reviews."}],
         metadata={"connect": {"adapter_id": "codex"}},
     )
+    SessionArchiveStore(tmp_path).write_sync_archive(archive)
     first = planner.plan(archive)
     db.commit_operations(first)
 
@@ -97,6 +99,7 @@ def test_conflicting_project_rule_pending_or_supersede(tmp_path) -> None:
         ],
         metadata={"project_id": "memoryOS", "connect": {"adapter_id": "codex"}},
     )
+    SessionArchiveStore(tmp_path).write_sync_archive(first_archive)
     first = MemoryCommitPlanner(source_store=source, extractor=FakeExtractor(first_candidate)).plan(first_archive)
     db.commit_operations(first)
     second_candidate = MemoryCandidateDraft(
@@ -123,6 +126,7 @@ def test_conflicting_project_rule_pending_or_supersede(tmp_path) -> None:
         ],
         metadata={"project_id": "memoryOS", "connect": {"adapter_id": "codex"}},
     )
+    SessionArchiveStore(tmp_path).write_sync_archive(second_archive)
     second = MemoryCommitPlanner(source_store=source, extractor=FakeExtractor(second_candidate)).plan(second_archive)
     assert len(second) == 3
     assert all(operation.payload.get("canonical_memory") is True for operation in second)
@@ -144,6 +148,7 @@ def test_no_existing_memory_normal_add(tmp_path) -> None:
         messages=[{"role": "user", "content": "I prefer short final reports."}],
         metadata={"connect": {"adapter_id": "codex"}},
     )
+    SessionArchiveStore(tmp_path).write_sync_archive(archive)
 
     operation = planner.plan(archive)[0]
 

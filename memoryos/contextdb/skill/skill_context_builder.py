@@ -1,3 +1,5 @@
+"""上下文数据库里的技能上下文组装器。"""
+
 from __future__ import annotations
 
 from memoryos.contextdb.skill.skill_registry import SkillRegistry

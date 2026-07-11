@@ -1,3 +1,5 @@
+"""运行时里的配置。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

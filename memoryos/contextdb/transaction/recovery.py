@@ -1,3 +1,5 @@
+"""事务故障恢复。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

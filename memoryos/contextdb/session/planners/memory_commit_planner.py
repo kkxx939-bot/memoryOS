@@ -1,3 +1,5 @@
+"""上下文数据库里的记忆提交规划器。"""
+
 from __future__ import annotations
 
 from typing import Any
@@ -33,7 +35,7 @@ from memoryos.operations.model.context_operation import ContextOperation
 
 
 class RuleMemoryCommitPlanner:
-    """Schema-driven memory planner with deterministic fallback extraction."""
+    """把会话证据整理成规范记忆事务。"""
 
     def __init__(
         self,
@@ -64,14 +66,18 @@ class RuleMemoryCommitPlanner:
         self.formation = CanonicalMemoryFormationService(source_store, alias_registry=alias_registry)
         self.last_prefetch: tuple[Any, ...] = ()
         self.last_canonical_inputs: list[tuple[MemorySemanticProposal, list[str]]] = []
+        self.last_canonical_results: list[Any] = []
         self.last_group = MemoryOperationGroup()
 
     def plan(self, archive: SessionArchive) -> list[ContextOperation]:
+        """处理 plan 这一步。"""
+
         operations: list[ContextOperation] = []
         group = MemoryOperationGroup()
         schemas = self.registry.list()
         self.formation.begin_planning()
         self.last_canonical_inputs = []
+        self.last_canonical_results = []
         episode = self.episode_adapter.adapt(archive)
         if not self.salience_gate.evaluate(episode).salient:
             self.last_group = group
@@ -112,6 +118,7 @@ class RuleMemoryCommitPlanner:
                 episode=episode,
                 retrieval_views=item.admission.retrieval_views,
             )
+            self.last_canonical_results.append(formed)
             operations.extend(formed.operations)
             self.formation.stage(formed.operations)
         for item in group.pending:
@@ -133,12 +140,15 @@ class RuleMemoryCommitPlanner:
                 episode=episode,
                 retrieval_views=views,
             )
+            self.last_canonical_results.append(formed)
             operations.extend(formed.operations)
             self.formation.stage(formed.operations)
         self.last_group = group
         return operations
 
     def replan_last(self, archive: SessionArchive) -> list[ContextOperation]:
+        """处理 replan last 这一步。"""
+
         episode = self.episode_adapter.adapt(archive)
         inputs = list(self.last_canonical_inputs)
         self.formation.begin_planning()
@@ -258,7 +268,7 @@ class RuleMemoryCommitPlanner:
 
     def _uri(self, user_id: str, candidate: MemoryCandidateDraft, decision: AdmissionDecision) -> str:
         bucket = "candidates" if decision == AdmissionDecision.PENDING else self._bucket(candidate.memory_type)
-        digest = stable_hash([user_id, candidate.memory_type.value, candidate.merge_key, candidate.content], length=20)
+        digest = stable_hash([user_id, candidate.memory_type.value, candidate.merge_key], length=20)
         return f"memoryos://user/{user_id}/memories/{bucket}/{digest}"
 
     def _bucket(self, memory_type: MemoryType) -> str:

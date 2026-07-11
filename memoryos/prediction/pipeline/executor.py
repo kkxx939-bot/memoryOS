@@ -1,3 +1,5 @@
+"""预测模块里的执行器。"""
+
 from __future__ import annotations
 
 from memoryos.core.time import utc_now

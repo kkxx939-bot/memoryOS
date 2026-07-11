@@ -1,3 +1,5 @@
+"""上下文数据库里的资源导入器。"""
+
 from __future__ import annotations
 
 from memoryos.contextdb.resource.resource_model import Resource

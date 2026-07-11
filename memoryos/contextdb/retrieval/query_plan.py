@@ -1,3 +1,5 @@
+"""上下文数据库里的查询计划。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

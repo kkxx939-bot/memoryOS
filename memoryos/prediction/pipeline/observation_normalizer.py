@@ -1,3 +1,5 @@
+"""预测模块里的观察归一化。"""
+
 from __future__ import annotations
 
 from memoryos.behavior.model.observation import Observation

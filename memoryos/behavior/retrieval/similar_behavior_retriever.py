@@ -1,3 +1,5 @@
+"""行为模块里的相似行为检索。"""
+
 from __future__ import annotations
 
 from memoryos.behavior.model.observation import Observation

@@ -1,3 +1,5 @@
+"""上下文数据库里的分层检索器。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

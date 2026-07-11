@@ -1,3 +1,5 @@
+"""记忆系统里的身份。"""
+
 from __future__ import annotations
 
 import re
@@ -12,11 +14,15 @@ from memoryos.memory.canonical.scope import MemoryScope, ScopeRef
 
 
 def canonical_text(value: Any) -> str:
+    """把身份字段整理成稳定格式，不带标题、时间或向量信息。"""
+
     text = unicodedata.normalize("NFKC", str(value)).strip().casefold()
     return re.sub(r"[\s_-]+", "-", text).strip("-")
 
 
 class AliasRegistry:
+    """负责 AliasRegistry 这部分逻辑。"""
+
     def __init__(self, aliases: Mapping[str, Mapping[str, str]] | None = None) -> None:
         self._aliases: dict[str, dict[str, str]] = {}
         for namespace, values in dict(aliases or {}).items():
@@ -25,6 +31,8 @@ class AliasRegistry:
             }
 
     def resolve(self, namespace: str, value: Any) -> str:
+        """结合当前状态解析出确定结果。"""
+
         normalized = canonical_text(value)
         return self._aliases.get(namespace, {}).get(normalized, normalized)
 
@@ -35,6 +43,8 @@ class AliasRegistry:
 
 @dataclass(frozen=True)
 class ResolvedMemoryIdentity:
+    """负责 ResolvedMemoryIdentity 这部分逻辑。"""
+
     slot_id: str
     slot_uri: str
     claim_id: str
@@ -45,7 +55,7 @@ class ResolvedMemoryIdentity:
 
 
 class StableMemoryIdentityResolver:
-    """Schema-field identity only; content, title, time, and embeddings are excluded."""
+    """根据结构化字段和适用范围生成稳定的 Slot 与 Claim 身份。"""
 
     SLOT_FIELDS = {
         "profile": ("attribute_key",),
@@ -68,6 +78,8 @@ class StableMemoryIdentityResolver:
         tenant_id: str,
         owner_user_id: str,
     ) -> ResolvedMemoryIdentity:
+        """结合当前状态解析出确定结果。"""
+
         expected = self.SLOT_FIELDS.get(proposal.memory_type)
         if expected is None:
             raise ValueError(f"no identity schema for memory type: {proposal.memory_type}")
@@ -79,7 +91,7 @@ class StableMemoryIdentityResolver:
             for field in expected
         }
         scopes = tuple(sorted(self.aliases.canonical_scope(scope).key for scope in memory_scope.applicability.all_of))
-        slot_id = stable_hash([tenant_id, proposal.memory_type, scopes, slot_identity], length=32)
+        slot_id = stable_hash([tenant_id, owner_user_id, proposal.memory_type, scopes, slot_identity], length=32)
         canonical_value = self._canonical_value(proposal)
         claim_id = stable_hash([slot_id, canonical_value], length=32)
         root = f"memoryos://user/{owner_user_id}/memories/canonical/slots/{slot_id}"

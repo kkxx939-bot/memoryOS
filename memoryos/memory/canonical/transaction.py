@@ -1,3 +1,5 @@
+"""记忆系统里的事务。"""
+
 from __future__ import annotations
 
 import json
@@ -16,11 +18,15 @@ from memoryos.operations.model.operation_action import OperationAction
 
 
 class RevisionConflictError(RuntimeError):
+    """预期 Revision 已过期时抛出这个异常。"""
+
     pass
 
 
 @dataclass(frozen=True)
 class PlannedMemoryOperation:
+    """负责 PlannedMemoryOperation 这部分逻辑。"""
+
     context_object: ContextObject
     expected_revision: int
     content: str
@@ -28,8 +34,13 @@ class PlannedMemoryOperation:
 
 @dataclass(frozen=True)
 class MemoryTransactionPlan:
+    """描述一次原子、可重试的规范记忆变更。"""
+
     transaction_id: str
     idempotency_key: str
+    tenant_id: str
+    owner_user_id: str
+    slot_id: str
     expected_revisions: Mapping[str, int]
     operations: tuple[PlannedMemoryOperation, ...]
     evidence_refs: tuple[EvidenceRef, ...]
@@ -39,6 +50,8 @@ class MemoryTransactionPlan:
     proposal_fingerprints: tuple[str, ...]
 
     def to_context_operations(self, *, user_id: str, tenant_id: str, episode_id: str) -> list[ContextOperation]:
+        """把一个事务计划展开成同一事务信封里的 ContextOperation。"""
+
         results = []
         for planned in self.operations:
             obj = planned.context_object
@@ -48,6 +61,7 @@ class MemoryTransactionPlan:
                 "canonical_idempotency_key": self.idempotency_key,
             }
             operation_id = f"op_{stable_hash([self.idempotency_key, obj.uri], length=32)}"
+            metadata = dict(obj.metadata or {})
             results.append(
                 ContextOperation(
                     context_type=obj.context_type,
@@ -62,6 +76,8 @@ class MemoryTransactionPlan:
                         "transaction_id": self.transaction_id,
                         "idempotency_key": self.idempotency_key,
                         "expected_revision": planned.expected_revision,
+                        "slot_id": str(metadata.get("slot_id") or self.slot_id),
+                        "claim_id": str(metadata.get("claim_id") or ""),
                         "policy_version": self.policy_version,
                         "schema_version": self.schema_version,
                         "proposal_ids": list(self.proposal_ids),
@@ -76,6 +92,8 @@ class MemoryTransactionPlan:
 
 
 class MemoryTransactionPlanner:
+    """只生成事务计划，不直接写存储。"""
+
     SCHEMA_VERSION = "canonical_memory_v1"
 
     def build(
@@ -88,6 +106,8 @@ class MemoryTransactionPlanner:
         owner_user_id: str,
         episode_id: str,
     ) -> MemoryTransactionPlan:
+        """根据输入组装结果对象。"""
+
         scope_payload = memory_scope.to_dict()
         changed = set(transition.changed_claim_ids)
         planned: list[PlannedMemoryOperation] = []
@@ -99,6 +119,9 @@ class MemoryTransactionPlanner:
             return MemoryTransactionPlan(
                 transaction_id=f"memory_tx_{idempotency_key}",
                 idempotency_key=idempotency_key,
+                tenant_id=tenant_id,
+                owner_user_id=owner_user_id,
+                slot_id=transition.slot.slot_id,
                 expected_revisions=dict(transition.expected_revisions),
                 operations=(),
                 evidence_refs=proposal.evidence_refs,
@@ -119,7 +142,7 @@ class MemoryTransactionPlanner:
             related_uris = {
                 existing.uri
                 for existing in transition.claims
-                if existing.claim_id in proposal.related_memory_ids or existing.uri in proposal.related_memory_ids
+                if existing.claim_id in proposal.all_related_memory_ids or existing.uri in proposal.all_related_memory_ids
             }
             obj.relations.extend(
                 ContextRelation(
@@ -183,6 +206,9 @@ class MemoryTransactionPlanner:
         return MemoryTransactionPlan(
             transaction_id=f"memory_tx_{idempotency_key}",
             idempotency_key=idempotency_key,
+            tenant_id=tenant_id,
+            owner_user_id=owner_user_id,
+            slot_id=transition.slot.slot_id,
             expected_revisions=dict(transition.expected_revisions),
             operations=tuple(planned),
             evidence_refs=proposal.evidence_refs,

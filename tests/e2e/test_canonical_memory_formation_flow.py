@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any, cast
 
 from memoryos.api.sdk.client import MemoryOSClient
 from memoryos.connect import ConnectMetadata
@@ -24,11 +25,13 @@ def _proposal(
     relation: str = "unrelated",
     scopes: list[dict] | None = None,
 ) -> dict:
+    evidence_refs = [{"event_id": "message:0"}]
+    value_fields = {"canonical_value": value}
     return {
         "proposal_id": proposal_id,
         "memory_type": memory_type,
         "identity_fields": identity_fields,
-        "value_fields": {"canonical_value": value},
+        "value_fields": value_fields,
         "semantic": {
             "speech_act": speech_act,
             "commitment": commitment,
@@ -37,7 +40,14 @@ def _proposal(
         },
         "epistemic_status": "EXPLICIT",
         "suggested_scope_refs": scopes or [],
-        "evidence_refs": [{"event_id": "message:0"}],
+        "evidence_refs": evidence_refs,
+        "field_evidence_refs": {
+            **{f"identity.{key}": evidence_refs for key in identity_fields},
+            **{f"value.{key}": evidence_refs for key in value_fields},
+            "semantic.speech_act": evidence_refs,
+            "semantic.temporal_scope": evidence_refs,
+            "transition": evidence_refs,
+        },
         "confidence": 0.98,
         "source_role": "user",
     }
@@ -113,11 +123,7 @@ def test_coding_agent_event_to_projection_retrieval_and_safe_transition(tmp_path
         query_intent="OPTIONS",
     )
     assert {item["metadata"]["canonical_value"] for item in current} == {"sqlite", "forbidden"}
-    assert {item["metadata"]["canonical_value"] for item in options} == {
-        "sqlite",
-        "postgresql",
-        "forbidden",
-    }
+    assert {item["metadata"]["canonical_value"] for item in options} == {"postgresql"}
     assert "EXISTING_MEMORIES=" in prompts[0]
     assert all(item["metadata"]["projection_revision"] == item["metadata"]["revision"] for item in options)
 
@@ -207,6 +213,135 @@ def test_coding_agent_event_to_projection_retrieval_and_safe_transition(tmp_path
     } == {"postgresql"}
 
 
+def test_default_fallback_mixed_database_statement_and_user_confirmation(tmp_path) -> None:  # noqa: ANN001
+    client = MemoryOSClient(str(tmp_path))
+    connect = ConnectMetadata.default_agent("codex").to_dict()
+    client.commit_agent_session(
+        user_id="u1",
+        session_id="fallback-s1",
+        project_id="memoryos",
+        messages=[
+            {
+                "id": "m1",
+                "role": "user",
+                "content": "这个项目继续使用 SQLite，不要引入 Redis。PostgreSQL 以后可以评估。",
+            }
+        ],
+        connect_metadata=connect,
+    )
+    current = client.search_context(
+        "",
+        user_id="u1",
+        project_id="memoryos",
+        context_type="memory",
+        query_intent="CURRENT",
+    )
+    options = client.search_context(
+        "",
+        user_id="u1",
+        project_id="memoryos",
+        context_type="memory",
+        query_intent="OPTIONS",
+    )
+    assert {
+        (item["metadata"]["memory_type"], item["metadata"]["canonical_value"], item["memory_state"])
+        for item in current
+    } == {
+        ("project_decision", "sqlite", "ACTIVE"),
+        ("project_rule", "forbidden", "ACTIVE"),
+    }
+    postgres = next(item for item in options if item["metadata"]["canonical_value"] == "postgresql")
+    assert postgres["memory_state"] == "PROPOSED"
+    assert postgres["metadata"]["revisions"][-1]["qualifiers"]["phase"] == "evaluation_candidate"
+
+    client.commit_agent_session(
+        user_id="u1",
+        session_id="fallback-s2",
+        project_id="memoryos",
+        messages=[{"id": "m2", "role": "assistant", "content": "PostgreSQL 更适合并发，建议评估。"}],
+        connect_metadata=connect,
+    )
+    assert {
+        item["metadata"]["canonical_value"]
+        for item in client.search_context(
+            "",
+            user_id="u1",
+            project_id="memoryos",
+            context_type="memory",
+            query_intent="CURRENT",
+        )
+        if item["metadata"]["memory_type"] == "project_decision"
+    } == {"sqlite"}
+
+    client.commit_agent_session(
+        user_id="u1",
+        session_id="fallback-s3",
+        project_id="memoryos",
+        messages=[{"id": "m3", "role": "user", "content": "评估通过，主存储正式改成 PostgreSQL。"}],
+        connect_metadata=connect,
+    )
+    active = client.search_context(
+        "",
+        user_id="u1",
+        project_id="memoryos",
+        context_type="memory",
+        memory_states=["ACTIVE"],
+    )
+    history = client.search_context(
+        "",
+        user_id="u1",
+        project_id="memoryos",
+        context_type="memory",
+        memory_states=["SUPERSEDED"],
+    )
+    assert {
+        item["metadata"]["canonical_value"]
+        for item in active
+        if item["metadata"]["memory_type"] == "project_decision"
+    } == {"postgresql"}
+    assert {item["metadata"]["canonical_value"] for item in history} == {"sqlite"}
+
+
+def test_canonical_memory_isolates_owner_tenant_and_workspace_during_supersede_and_recall(tmp_path) -> None:  # noqa: ANN001
+    client = MemoryOSClient(str(tmp_path))
+    connect = ConnectMetadata.default_agent("codex").to_dict()
+
+    def commit(user_id: str, session_id: str, project_id: str, text: str, *, tenant_id: str = "default") -> None:
+        client.commit_agent_session(
+            user_id=user_id,
+            session_id=session_id,
+            project_id=project_id,
+            messages=[{"id": f"{session_id}:m1", "role": "user", "content": text}],
+            connect_metadata=connect,
+            scope={"tenant_id": tenant_id},
+        )
+
+    commit("u1", "u1-a-sqlite", "workspace-a", "这个项目继续使用 SQLite。")
+    commit("u2", "u2-a-sqlite", "workspace-a", "这个项目继续使用 SQLite。")
+    commit("u1", "u1-b-sqlite", "workspace-b", "这个项目继续使用 SQLite。")
+    commit("u1", "u1-other-sqlite", "workspace-a", "这个项目继续使用 SQLite。", tenant_id="other")
+    commit("u1", "u1-a-postgres", "workspace-a", "主存储正式改成 PostgreSQL。")
+
+    def active(user_id: str, project_id: str, tenant_id: str = "default") -> set[str]:
+        return {
+            item["metadata"]["canonical_value"]
+            for item in client.search_context(
+                "",
+                user_id=user_id,
+                project_id=project_id,
+                tenant_id=tenant_id,
+                context_type="memory",
+                memory_states=["ACTIVE"],
+            )
+            if item["metadata"]["memory_type"] == "project_decision"
+        }
+
+    assert active("u1", "workspace-a") == {"postgresql"}
+    assert active("u2", "workspace-a") == {"sqlite"}
+    assert active("u1", "workspace-b") == {"sqlite"}
+    assert active("u1", "workspace-a", "other") == {"sqlite"}
+
+
 def test_reachy_compatible_origin_forms_person_environment_preference(tmp_path) -> None:  # noqa: ANN001
     principal = {"namespace": "memoryos", "kind": "principal", "id": "user_1"}
     environment = {"namespace": "memoryos", "kind": "environment", "id": "home_01"}
@@ -265,6 +400,14 @@ def test_reachy_compatible_origin_forms_person_environment_preference(tmp_path) 
         ("principal", "user_1"),
         ("environment", "home_01"),
     }
+    origin = results[0]["metadata"]["scope"]["origin_refs"]
+    assert {(item["kind"], item["id"]) for item in origin} >= {
+        ("environment", "home_01"),
+        ("location", "home_01:kitchen"),
+        ("asset", "reachy_01"),
+    }
+    visibility = results[0]["metadata"]["scope"]["visibility"]
+    assert visibility["tenant_id"] == "home"
 
 
 def test_runtime_aliases_converge_llm_wording_to_one_slot(tmp_path) -> None:  # noqa: ANN001
@@ -330,7 +473,7 @@ def test_runtime_aliases_converge_llm_wording_to_one_slot(tmp_path) -> None:  # 
         query_intent="OPTIONS",
     )
     decisions = [item for item in options if item["metadata"]["memory_type"] == "project_decision"]
-    assert {item["metadata"]["canonical_value"] for item in decisions} == {"sqlite", "postgresql"}
+    assert {item["metadata"]["canonical_value"] for item in decisions} == {"postgresql"}
     assert len({item["metadata"]["slot_id"] for item in decisions}) == 1
 
 
@@ -369,7 +512,7 @@ def test_llm_outage_archives_evidence_and_deferred_proposal_replays(tmp_path) ->
         connect_metadata=ConnectMetadata.default_agent("codex").to_dict(),
     )
     assert result.done
-    assert client.queue_store.stats().get("pending", 0) >= 1
+    assert cast(Any, client.queue_store).stats().get("pending", 0) >= 1
 
     replay = MemoryProposalWorker(client.session_commit_service).process_pending()
     assert replay["committed"] == 1
@@ -398,6 +541,11 @@ def test_explicit_forget_creates_retracted_revision_without_physical_delete(tmp_
     obj = client.source_store.read_object(remembered["uri"])
     assert obj.lifecycle_state.value == "active"
     assert obj.metadata["state"] == "RETRACTED"
+    evidence = obj.metadata["revisions"][-1]["evidence_refs"][0]
+    assert evidence["source_uri"].endswith("/sessions/history/" + evidence["event_id"])
+    archived = client.session_archive_store.read_archive(evidence["source_uri"])
+    assert archived.messages[0]["id"] == evidence["event_id"]
+    assert archived.messages[0]["event_type"] == "RETRACTION"
     slot = client.source_store.read_object(remembered["uri"].rsplit("/claims/", 1)[0])
     assert slot.metadata["active_claim_id"] is None
     assert client.search_context(

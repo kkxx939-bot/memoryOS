@@ -1,3 +1,5 @@
+"""核心工具里的数据结构版本。"""
+
 from __future__ import annotations
 
 CONTEXT_OBJECT_SCHEMA_VERSION = "context_object_v1"

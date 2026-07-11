@@ -1,3 +1,5 @@
+"""接口层里的异常。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -31,11 +33,11 @@ class MCPToolError:
 
 
 class ToolValidationError(ValueError):
-    """Raised when a tool request violates its public input contract."""
+    """ToolValidationError 对应的异常。"""
 
 
 class ToolPermissionError(PermissionError):
-    """Raised when a tool request exceeds the configured agent capability."""
+    """ToolPermissionError 对应的异常。"""
 
 
 def error_payload(

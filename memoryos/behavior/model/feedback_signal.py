@@ -1,3 +1,5 @@
+"""行为模块里的反馈信号。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

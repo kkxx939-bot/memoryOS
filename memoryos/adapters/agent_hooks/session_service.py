@@ -1,3 +1,5 @@
+"""适配器里的会话服务。"""
+
 from __future__ import annotations
 
 import json
@@ -20,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 
 class AgentSessionService:
-    """Persistent append-only live journal; long-term writes stay in ContextDB."""
+    """负责 AgentSessionService 这部分逻辑。"""
 
     def __init__(self, root: str) -> None:
         self.root = Path(root) / "agent-sessions" / "live"

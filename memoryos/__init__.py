@@ -1,4 +1,4 @@
-"""MemoryOS package."""
+"""这个包的公开接口都从这里导出。"""
 
 from memoryos.action_policy.model.action_policy import ActionCandidate, ActionPolicy
 from memoryos.api.sdk.client import MemoryOSClient

@@ -1,3 +1,5 @@
+"""行为模块里的行为案例写入器。"""
+
 from __future__ import annotations
 
 from memoryos.behavior.model.behavior_case import BehaviorCase

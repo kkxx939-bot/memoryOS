@@ -1,10 +1,12 @@
+"""后台任务里的记忆提案任务。"""
+
 from __future__ import annotations
 
 from memoryos.contextdb.session.session_commit import SessionCommitService
 
 
 class MemoryProposalWorker:
-    """Retries deferred semantic extraction without blocking Evidence archival."""
+    """跑 MemoryProposalWorker 对应的后台任务。"""
 
     def __init__(self, service: SessionCommitService) -> None:
         self.service = service

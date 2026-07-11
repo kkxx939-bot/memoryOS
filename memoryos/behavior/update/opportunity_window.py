@@ -1,3 +1,5 @@
+"""行为模块里的机会窗口。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

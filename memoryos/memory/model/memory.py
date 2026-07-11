@@ -1,3 +1,5 @@
+"""记忆系统里的记忆。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

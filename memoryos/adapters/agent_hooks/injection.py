@@ -1,3 +1,5 @@
+"""Agent 上下文注入。"""
+
 from __future__ import annotations
 
 from typing import Any

@@ -1,3 +1,5 @@
+"""模型服务的结果重排接口。"""
+
 from __future__ import annotations
 
 from typing import Any, Protocol

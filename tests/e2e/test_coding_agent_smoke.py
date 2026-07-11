@@ -57,6 +57,13 @@ def test_agent_session_to_memory_http_mcp_smoke(tmp_path) -> None:  # noqa: ANN0
                         "epistemic_status": "EXPLICIT",
                         "suggested_scope_refs": [{"namespace": "memoryos", "kind": "workspace", "id": "project-a"}],
                         "evidence_refs": [{"event_id": "event-1"}],
+                        "field_evidence_refs": {
+                            "identity.decision_topic": [{"event_id": "event-1"}],
+                            "value.canonical_value": [{"event_id": "event-1"}],
+                            "semantic.speech_act": [{"event_id": "event-1"}],
+                            "semantic.temporal_scope": [{"event_id": "event-1"}],
+                            "transition": [{"event_id": "event-1"}],
+                        },
                         "confidence": 0.95,
                         "source_role": "user",
                     }

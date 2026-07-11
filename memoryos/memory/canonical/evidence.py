@@ -1,8 +1,12 @@
+"""记忆系统里的证据。"""
+
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from enum import Enum
 from typing import Any
 
 from memoryos.memory.canonical.episode import EvidenceEpisode
@@ -11,11 +15,189 @@ from memoryos.memory.canonical.proposal import EpistemicStatus, MemorySemanticPr
 
 
 def evidence_hash(text: str) -> str:
+    """计算证据文本的 SHA-256，用来发现内容被改动。"""
+
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+class EvidenceSignalKind(str, Enum):
+    """列出确认、约束、偏好、提议、评估、撤回和否定这些信号类型。"""
+
+    CONFIRMATION = "confirmation"
+    CONSTRAINT = "constraint"
+    PREFERENCE = "preference"
+    PROPOSAL = "proposal"
+    EVALUATION = "evaluation"
+    RETRACTION = "retraction"
+    NEGATION = "negation"
+
+
+EVIDENCE_SIGNAL_PHRASES: dict[EvidenceSignalKind, tuple[str, ...]] = {
+    EvidenceSignalKind.CONFIRMATION: (
+        "formally change",
+        "continue using",
+        "remains active",
+        "confirmed",
+        "confirm",
+        "decide",
+        "decided",
+        "adopt",
+        "adopted",
+        "正式改成",
+        "继续使用",
+        "保持为当前",
+        "确认",
+        "决定",
+        "采用",
+    ),
+    EvidenceSignalKind.CONSTRAINT: (
+        "must not",
+        "do not",
+        "forbidden",
+        "must",
+        "不得",
+        "禁止",
+        "不允许",
+        "不要",
+        "必须",
+    ),
+    EvidenceSignalKind.PREFERENCE: (
+        "preference",
+        "do not like",
+        "dislike",
+        "prefer",
+        "like",
+        "不喜欢",
+        "偏好",
+        "喜欢",
+    ),
+    EvidenceSignalKind.PROPOSAL: (
+        "recommended",
+        "recommend",
+        "can consider",
+        "consider",
+        "might",
+        "possible",
+        "may",
+        "可以考虑",
+        "以后考虑",
+        "候选",
+        "建议",
+    ),
+    EvidenceSignalKind.EVALUATION: (
+        "can evaluate",
+        "evaluate",
+        "可以评估",
+        "评估",
+    ),
+    EvidenceSignalKind.RETRACTION: (
+        "no longer",
+        "retract",
+        "revoke",
+        "不再",
+        "取消",
+        "撤回",
+    ),
+    EvidenceSignalKind.NEGATION: (
+        "not confirmed",
+        "unconfirmed",
+        "did not approve",
+        "没有同意",
+        "还没有确认",
+        "尚未确认",
+        "未确认",
+    ),
+}
+
+
+@dataclass(frozen=True)
+class EvidenceSignalMatch:
+    """保存一次词法命中的位置和上下文状态。"""
+
+    kind: EvidenceSignalKind
+    phrase: str
+    start: int
+    end: int
+    negated: bool
+    hypothetical: bool
+    quoted: bool
+    metalinguistic: bool
+    confidence: float
+
+
+class EvidenceSignalMatcher:
+    """找出词法信号，同时标记否定、假设、引用和元语言。"""
+
+    _HYPOTHETICAL_RE = re.compile(r"(?i)(?:\bif\b|\blater\b|如果|假如|以后).{0,32}$")
+    _NEGATION_RE = re.compile(r"(?i)(?:\bnot\b|\bno\b|\bnever\b|\bdid\s+not\b|不|未|没有|尚未).{0,16}$")
+    _POST_NEGATION_RE = re.compile(r"(?i)(?:did\s+not\s+approve|not\s+approved|没有同意|未同意|没有批准|未批准)")
+    _META_RE = re.compile(r"(?i)(interpret|phrase|example|counterexample|理解成|词语|短语|文档|反例|示例)")
+    _ATTRIBUTED_RE = re.compile(
+        r"(?i)(?:codex|agent|assistant|模型|助手).{0,24}(?:said|says|recommended|recommend|说|建议)"
+    )
+    _QUOTE_PAIRS = (("\"", "\""), ("'", "'"), ("“", "”"), ("‘", "’"))
+
+    def match(self, text: str) -> tuple[EvidenceSignalMatch, ...]:
+        """处理 match 这一步。"""
+
+        matches: list[EvidenceSignalMatch] = []
+        for kind, phrases in EVIDENCE_SIGNAL_PHRASES.items():
+            for phrase in phrases:
+                pattern = self._pattern(phrase)
+                for found in pattern.finditer(text):
+                    start, end = found.span()
+                    before = text[max(0, start - 48) : start]
+                    sentence = self._sentence(text, start, end)
+                    after = text[end : min(len(text), end + 64)]
+                    explicitly_negative = kind == EvidenceSignalKind.NEGATION
+                    matches.append(
+                        EvidenceSignalMatch(
+                            kind=kind,
+                            phrase=found.group(0),
+                            start=start,
+                            end=end,
+                            negated=(
+                                explicitly_negative
+                                or bool(self._NEGATION_RE.search(before))
+                                or bool(self._POST_NEGATION_RE.search(after))
+                            ),
+                            hypothetical=bool(self._HYPOTHETICAL_RE.search(before)),
+                            quoted=self._quoted(text, start, end),
+                            metalinguistic=bool(
+                                self._META_RE.search(sentence) or self._ATTRIBUTED_RE.search(sentence)
+                            ),
+                            confidence=0.95 if not explicitly_negative else 0.99,
+                        )
+                    )
+        return tuple(sorted(matches, key=lambda item: (item.start, -(item.end - item.start), item.kind.value)))
+
+    def _pattern(self, phrase: str) -> re.Pattern[str]:
+        escaped = re.escape(phrase)
+        if phrase.isascii():
+            return re.compile(rf"(?i)(?<![A-Za-z0-9_]){escaped}(?![A-Za-z0-9_])")
+        return re.compile(escaped, re.IGNORECASE)
+
+    def _sentence(self, text: str, start: int, end: int) -> str:
+        left = max(text.rfind(mark, 0, start) for mark in ("。", "！", "？", ".", "!", "?", "\n")) + 1
+        positions = [position for mark in ("。", "！", "？", ".", "!", "?", "\n") if (position := text.find(mark, end)) >= 0]
+        right = min(positions) if positions else len(text)
+        return text[left:right]
+
+    def _quoted(self, text: str, start: int, end: int) -> bool:
+        for opening, closing in self._QUOTE_PAIRS:
+            left = text.rfind(opening, 0, start)
+            if left < 0:
+                continue
+            right = text.find(closing, end)
+            if right >= 0 and (opening != closing or text.count(opening, left, start + 1) % 2 == 1):
+                return True
+        return False
 
 
 @dataclass(frozen=True)
 class EvidenceRef:
+    """指向原始事件或其中一段经过哈希校验的文本。"""
+
     event_id: str
     source_uri: str | None
     content_hash: str
@@ -32,6 +214,8 @@ class EvidenceRef:
         span_start: int | None = None,
         span_end: int | None = None,
     ) -> EvidenceRef:
+        """从原始事件生成带内容哈希和可选文本片段的 EvidenceRef。"""
+
         text = event.text()
         quoted_hash = None
         if span_start is not None and span_end is not None:
@@ -56,8 +240,26 @@ class EvidenceRef:
         }
 
 
+def bind_field_evidence(
+    identity_fields: Mapping[str, Any],
+    value_fields: Mapping[str, Any],
+    evidence_refs: tuple[EvidenceRef, ...],
+) -> dict[str, tuple[EvidenceRef, ...]]:
+    """给原子提案里的身份、值和状态依据分别绑定证据。"""
+
+    return {
+        **{f"identity.{key}": evidence_refs for key in identity_fields},
+        **{f"value.{key}": evidence_refs for key in value_fields},
+        "semantic.speech_act": evidence_refs,
+        "semantic.temporal_scope": evidence_refs,
+        "transition": evidence_refs,
+    }
+
+
 @dataclass(frozen=True)
 class ProposalValidationResult:
+    """保存校验后的提案、错误原因和缺少证据的字段。"""
+
     valid: bool
     proposal: MemorySemanticProposal
     errors: tuple[str, ...] = ()
@@ -65,11 +267,17 @@ class ProposalValidationResult:
 
 
 class ProposalEvidenceValidator:
-    """Validates model references against immutable episode content."""
+    """拿原始事件核对提案字段、角色和语义是否站得住。"""
+
+    def __init__(self, signal_matcher: EvidenceSignalMatcher | None = None) -> None:
+        self.signal_matcher = signal_matcher or EvidenceSignalMatcher()
 
     def validate(self, proposal: MemorySemanticProposal, episode: EvidenceEpisode) -> ProposalValidationResult:
+        """检查输入是否满足这里的约束。"""
+
         errors: list[str] = []
         evidence_texts: list[str] = []
+        evidence_text_by_ref: dict[EvidenceRef, str] = {}
         evidence_actor_kinds: list[str] = []
         if not proposal.evidence_refs:
             errors.append("missing_evidence")
@@ -96,13 +304,15 @@ class ProposalEvidenceValidator:
                     errors.append(f"quoted_text_hash_mismatch:{ref.event_id}")
                     continue
             evidence_texts.append(selected)
+            evidence_text_by_ref[ref] = selected
 
-        unsupported = self._unsupported_fields(proposal, evidence_texts)
+        errors.extend(self._field_evidence_errors(proposal, evidence_text_by_ref))
+        unsupported = self._unsupported_fields(proposal, evidence_texts, evidence_text_by_ref)
         hardened = proposal
         if unsupported and proposal.epistemic_status in {EpistemicStatus.EXPLICIT, EpistemicStatus.OBSERVED}:
             hardened = replace(proposal, epistemic_status=EpistemicStatus.INFERRED)
             errors.append("unsupported_core_fields")
-        semantic_errors = self._semantic_errors(proposal, evidence_texts, evidence_actor_kinds)
+        semantic_errors = self._semantic_errors(proposal, evidence_actor_kinds, evidence_text_by_ref)
         if semantic_errors and hardened.epistemic_status == EpistemicStatus.EXPLICIT:
             hardened = replace(hardened, epistemic_status=EpistemicStatus.INFERRED)
         errors.extend(semantic_errors)
@@ -116,8 +326,8 @@ class ProposalEvidenceValidator:
     def _semantic_errors(
         self,
         proposal: MemorySemanticProposal,
-        evidence_texts: list[str],
         actor_kinds: list[str],
+        evidence_text_by_ref: Mapping[EvidenceRef, str],
     ) -> list[str]:
         errors = []
         if proposal.epistemic_status == EpistemicStatus.EXPLICIT and not any(
@@ -127,59 +337,97 @@ class ProposalEvidenceValidator:
         semantic = proposal.semantic
         speech = str(getattr(semantic.speech_act, "value", semantic.speech_act)).casefold()
         commitment = str(getattr(semantic.commitment, "value", semantic.commitment)).casefold()
+        temporal_scope = str(getattr(semantic.temporal_scope, "value", semantic.temporal_scope)).casefold()
+        semantic_refs = tuple(proposal.field_evidence_refs.get("transition", ())) or tuple(
+            proposal.field_evidence_refs.get("semantic.speech_act", ())
+        )
+        semantic_texts = [evidence_text_by_ref[ref] for ref in semantic_refs if ref in evidence_text_by_ref]
+        matches = tuple(match for text in semantic_texts for match in self.signal_matcher.match(text))
+        usable = tuple(
+            match
+            for match in matches
+            if not (match.negated or match.hypothetical or match.quoted or match.metalinguistic)
+        )
         if speech in {"confirmation", "correction"} or commitment in {"confirmed", "committed"}:
-            text = "\n".join(evidence_texts).casefold()
-            signals = (
-                "confirm",
-                "confirmed",
-                "decided",
-                "adopted",
-                "formally change",
-                "remains active",
-                "continue using",
-                "must",
-                "do not",
-                "prefer",
-                "确认",
-                "决定",
-                "采用",
-                "正式改成",
-                "继续使用",
-                "必须",
-                "禁止",
-                "偏好",
-                "喜欢",
-            )
-            negative_signals = (
-                "no confirmation",
-                "not confirmed",
-                "only a future option",
-                "future option; no",
-                "尚未确认",
-                "未确认",
-                "只是候选",
-                "仅供评估",
-            )
-            if any(signal in text for signal in negative_signals) or not any(signal in text for signal in signals):
+            compatible = {
+                "preference": {EvidenceSignalKind.PREFERENCE, EvidenceSignalKind.CONFIRMATION},
+                "project_rule": {EvidenceSignalKind.CONSTRAINT, EvidenceSignalKind.CONFIRMATION},
+                "project_decision": {EvidenceSignalKind.CONFIRMATION},
+                "profile": {EvidenceSignalKind.CONFIRMATION},
+            }.get(proposal.memory_type, {EvidenceSignalKind.CONFIRMATION})
+            if not any(match.kind in compatible for match in usable):
                 errors.append("semantic_confirmation_unsupported")
+        if speech == "retraction" and not any(match.kind == EvidenceSignalKind.RETRACTION for match in usable):
+            errors.append("semantic_retraction_unsupported")
+        if temporal_scope == "future":
+            temporal_refs = tuple(proposal.field_evidence_refs.get("semantic.temporal_scope", ()))
+            text = "\n".join(evidence_text_by_ref[ref] for ref in temporal_refs if ref in evidence_text_by_ref)
+            if not re.search(r"(?i)(\bfuture\b|\blater\b|\bwill\b|以后|未来|稍后|届时)", text):
+                errors.append("temporal_scope_unsupported")
         return errors
 
-    def _unsupported_fields(self, proposal: MemorySemanticProposal, evidence_texts: list[str]) -> list[str]:
+    def _unsupported_fields(
+        self,
+        proposal: MemorySemanticProposal,
+        evidence_texts: list[str],
+        evidence_text_by_ref: Mapping[EvidenceRef, str],
+    ) -> list[str]:
         if not evidence_texts:
             return [
                 *[f"identity.{key}" for key in proposal.identity_fields],
                 *[f"value.{key}" for key in proposal.value_fields],
             ]
-        haystack = "\n".join(evidence_texts).casefold()
         unsupported = []
         system_identity_fields = {str(item) for item in proposal.metadata.get("system_identity_fields", []) or []}
         for prefix, fields in (("identity", proposal.identity_fields), ("value", proposal.value_fields)):
             for key, value in fields.items():
                 if prefix == "identity" and key in system_identity_fields:
                     continue
-                if not self._supported(value, haystack):
+                binding = f"{prefix}.{key}"
+                field_texts = [
+                    evidence_text_by_ref[ref]
+                    for ref in proposal.field_evidence_refs.get(binding, ())
+                    if ref in evidence_text_by_ref
+                ]
+                haystack = "\n".join(field_texts).casefold()
+                if not self._supported(value, haystack) and not self._semantically_supported(key, value, field_texts):
                     unsupported.append(f"{prefix}.{key}")
         return unsupported
+
+    def _field_evidence_errors(
+        self,
+        proposal: MemorySemanticProposal,
+        evidence_text_by_ref: Mapping[EvidenceRef, str],
+    ) -> list[str]:
+        required = {
+            *[f"identity.{key}" for key in proposal.identity_fields],
+            *[f"value.{key}" for key in proposal.value_fields],
+            "semantic.speech_act",
+            "semantic.temporal_scope",
+            "transition",
+        }
+        errors = []
+        for field_name in sorted(required):
+            refs = tuple(proposal.field_evidence_refs.get(field_name, ()))
+            if not refs:
+                errors.append(f"missing_field_evidence:{field_name}")
+            elif any(ref not in evidence_text_by_ref for ref in refs):
+                errors.append(f"invalid_field_evidence:{field_name}")
+        unknown = set(proposal.field_evidence_refs) - required
+        if unknown:
+            errors.append(f"unknown_field_evidence:{','.join(sorted(unknown))}")
+        return errors
+
+    def _semantically_supported(self, key: str, value: Any, evidence_texts: list[str]) -> bool:
+        if key != "canonical_value" or str(value).casefold() not in {"forbidden", "required"}:
+            return False
+        usable = tuple(
+            match
+            for text in evidence_texts
+            for match in self.signal_matcher.match(text)
+            if not (match.negated or match.hypothetical or match.quoted or match.metalinguistic)
+        )
+        return any(match.kind == EvidenceSignalKind.CONSTRAINT for match in usable)
 
     def _supported(self, value: Any, haystack: str) -> bool:
         if value is None or value == "":

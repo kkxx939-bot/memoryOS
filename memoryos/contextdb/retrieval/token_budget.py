@@ -1,3 +1,5 @@
+"""上下文数据库里的令牌预算。"""
+
 from __future__ import annotations
 
 from typing import Protocol

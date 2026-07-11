@@ -1,3 +1,5 @@
+"""行为模块里的机会衰减。"""
+
 from __future__ import annotations
 
 from memoryos.behavior.model.behavior_pattern import BehaviorPattern

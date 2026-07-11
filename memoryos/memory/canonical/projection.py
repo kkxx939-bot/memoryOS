@@ -1,3 +1,5 @@
+"""记忆系统里的投影。"""
+
 from __future__ import annotations
 
 import json
@@ -20,12 +22,16 @@ from memoryos.providers.embedding import EmbeddingProvider, HashingEmbeddingProv
 
 @dataclass(frozen=True)
 class ProjectionResult:
+    """保存 ProjectionResult 需要的这组数据。"""
+
     claim_uri: str
     source_revision: int
     status: str
 
 
 class CanonicalMemoryProjector:
+    """从 Claim Revision 生成可重建的索引、向量、视图和 L0/L1/L2。"""
+
     GENERATOR = "deterministic-template-v1"
     PROMPT_VERSION = "none"
 
@@ -45,6 +51,8 @@ class CanonicalMemoryProjector:
         self.embedding_provider = embedding_provider or HashingEmbeddingProvider()
 
     def project(self, claim_uri: str, source_revision: int | None = None) -> ProjectionResult:
+        """处理 project 这一步。"""
+
         committed = read_committed_canonical(self.source_store, claim_uri)
         obj = committed.object
         if committed.from_before_image:
@@ -96,12 +104,14 @@ class CanonicalMemoryProjector:
         projection_created_at = utc_now()
         manifest = {
             "memory_id": metadata.get("claim_id"),
+            "slot_id": metadata.get("slot_id"),
             "claim_id": metadata.get("claim_id"),
             "source_revision": current_revision,
             "projection_levels": ["L0", "L1", "L2"],
             "projections": [
                 {
                     "memory_id": metadata.get("claim_id"),
+                    "slot_id": metadata.get("slot_id"),
                     "claim_id": metadata.get("claim_id"),
                     "source_revision": current_revision,
                     "projection_level": level,
@@ -133,6 +143,8 @@ class CanonicalMemoryProjector:
         return ProjectionResult(claim_uri, current_revision, "projected")
 
     def rebuild(self, *, clear_views: bool = True) -> dict[str, int]:
+        """处理 rebuild 这一步。"""
+
         if clear_views:
             for name in ("scope", "taxonomy"):
                 path = self.root / "views" / name
@@ -169,6 +181,7 @@ class CanonicalMemoryProjector:
                 "tenant_id": obj.tenant_id,
                 "owner_user_id": obj.owner_user_id,
                 "claim_id": obj.metadata.get("claim_id"),
+                "slot_id": obj.metadata.get("slot_id"),
                 "source_revision": obj.metadata.get("revision"),
                 "embedding_model": self.embedding_provider.model_name,
                 "schema_version": "canonical_vector_projection_v1",
@@ -179,6 +192,7 @@ class CanonicalMemoryProjector:
         metadata = dict(obj.metadata or {})
         reference = {
             "claim_uri": obj.uri,
+            "slot_id": metadata.get("slot_id"),
             "claim_id": metadata.get("claim_id"),
             "source_revision": revision,
         }
@@ -252,11 +266,15 @@ class CanonicalMemoryProjector:
 
 
 class MemoryProjectionWorker:
+    """消费投影任务，自动跳过旧版本并重试临时失败。"""
+
     def __init__(self, projector: CanonicalMemoryProjector, queue_store: QueueStore) -> None:
         self.projector = projector
         self.queue_store = queue_store
 
     def process_pending(self, limit: int = 10) -> dict[str, list[str]]:
+        """处理待投影任务，失败时保留任务以便重试。"""
+
         self.dispatch_outbox()
         processed: list[str] = []
         stale: list[str] = []
@@ -281,6 +299,8 @@ class MemoryProjectionWorker:
         return {"processed": processed, "stale": stale, "failed": failed}
 
     def dispatch_outbox(self) -> list[str]:
+        """分发已提交的 Outbox 事件，不反向修改规范记忆。"""
+
         dispatched: list[str] = []
         outbox_root = self.projector.root / "system" / "outbox"
         if not outbox_root.exists():

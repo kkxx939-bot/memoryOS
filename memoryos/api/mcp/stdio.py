@@ -1,3 +1,5 @@
+"""MCP 标准输入输出传输。"""
+
 from __future__ import annotations
 
 import json

@@ -1,3 +1,5 @@
+"""记忆系统里的可见性。"""
+
 from __future__ import annotations
 
 import json
@@ -11,12 +13,16 @@ from memoryos.contextdb.store.source_store import SourceStore
 
 @dataclass(frozen=True)
 class CommittedCanonicalRead:
+    """负责 CommittedCanonicalRead 这部分逻辑。"""
+
     object: ContextObject
     content_override: str | None = None
     from_before_image: bool = False
 
 
 def read_committed_canonical(source_store: SourceStore, uri: str) -> CommittedCanonicalRead:
+    """只读取已经完成事务提交的规范记忆。"""
+
     obj = source_store.read_object(uri)
     metadata = dict(obj.metadata or {})
     idempotency_key = str(metadata.get("canonical_idempotency_key", ""))
@@ -46,6 +52,8 @@ def read_committed_canonical(source_store: SourceStore, uri: str) -> CommittedCa
 
 
 def relation_is_committed(source_store: SourceStore, relation: ContextRelation) -> bool:
+    """检查关系两端是否都已提交并且当前可见。"""
+
     metadata = dict(relation.metadata or {})
     idempotency_key = str(metadata.get("canonical_idempotency_key", ""))
     root = getattr(source_store, "root", None)

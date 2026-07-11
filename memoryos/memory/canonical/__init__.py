@@ -1,3 +1,5 @@
+"""这个包的公开接口都从这里导出。"""
+
 from memoryos.memory.canonical.admission import (
     ProposalAdmissionDecision,
     ProposalAdmissionGate,
@@ -5,7 +7,16 @@ from memoryos.memory.canonical.admission import (
 )
 from memoryos.memory.canonical.episode import EvidenceEpisode, SessionArchiveEpisodeAdapter
 from memoryos.memory.canonical.event import ActorRef, EventEnvelope, OriginContext, SubjectRef
-from memoryos.memory.canonical.evidence import EvidenceRef, ProposalEvidenceValidator, ProposalValidationResult
+from memoryos.memory.canonical.evidence import (
+    EVIDENCE_SIGNAL_PHRASES,
+    EvidenceRef,
+    EvidenceSignalKind,
+    EvidenceSignalMatch,
+    EvidenceSignalMatcher,
+    ProposalEvidenceValidator,
+    ProposalValidationResult,
+    bind_field_evidence,
+)
 from memoryos.memory.canonical.formation import (
     CanonicalFormationResult,
     CanonicalMemoryFormationService,
@@ -45,7 +56,7 @@ from memoryos.memory.canonical.scope import (
     scope_from_external,
 )
 from memoryos.memory.canonical.semantic import MemorySemanticNormalizer
-from memoryos.memory.canonical.state import MemoryClaim, MemoryRevision, MemorySlot, TransitionProfile
+from memoryos.memory.canonical.state import ClaimState, MemoryClaim, MemoryRevision, MemorySlot, TransitionProfile
 from memoryos.memory.canonical.transaction import (
     MemoryTransactionPlan,
     MemoryTransactionPlanner,
@@ -63,8 +74,13 @@ __all__ = [
     "MemorySemanticNormalizer",
     "MemorySemanticProposal",
     "EvidenceRef",
+    "EvidenceSignalKind",
+    "EvidenceSignalMatch",
+    "EvidenceSignalMatcher",
+    "EVIDENCE_SIGNAL_PHRASES",
     "ProposalEvidenceValidator",
     "ProposalValidationResult",
+    "bind_field_evidence",
     "ProposalAdmissionDecision",
     "ProposalAdmissionGate",
     "ProposalAdmissionResult",
@@ -83,6 +99,7 @@ __all__ = [
     "MemorySlot",
     "MemoryClaim",
     "MemoryRevision",
+    "ClaimState",
     "TransitionProfile",
     "MemoryStateTransition",
     "MemoryTransitionPolicy",

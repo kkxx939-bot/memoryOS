@@ -1,6 +1,9 @@
+"""上下文数据库里的上下文数据库入口。"""
+
 from __future__ import annotations
 
 from collections import defaultdict
+from typing import Any
 
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_relation import ContextRelation
@@ -16,6 +19,8 @@ CommitResult = ContextDiff
 
 
 class ContextDB:
+    """统一封装上下文读写、检索、关系和会话提交。"""
+
     def __init__(
         self,
         source_store: SourceStore,
@@ -36,15 +41,11 @@ class ContextDB:
         return self.source_store.read_object(uri)
 
     def write_object(self, obj: ContextObject, content: str | bytes = "") -> None:
-        """Seed/import helper only; not for production long-term writes.
-
-        Production updates must use ContextOperation through commit_operation(),
-        commit_operations(), or SessionCommit/OperationCommitter.
-        """
+        """写入 object。"""
         self.seed_object(obj, content=content)
 
     def seed_object(self, obj: ContextObject, content: str | bytes = "") -> None:
-        """Write SourceStore and IndexStore directly for tests, imports, and seed data."""
+        """处理 seed object 这一步。"""
         self.source_store.write_object(obj, content=content)
         self.index_store.upsert_index(obj, content=self._index_content(obj, content))
 
@@ -76,13 +77,19 @@ class ContextDB:
         owner_user_id: str | None = None,
         context_type: ContextType | None = None,
         limit: int = 10,
+        tenant_id: str = "",
         project_id: str = "",
         adapter_id: str = "",
         admission_status: str = "",
+        allowed_uris: list[str] | tuple[str, ...] | None = None,
     ) -> list[IndexHit]:
-        filters = {}
+        """按给定条件查找匹配结果。"""
+
+        filters: dict[str, Any] = {}
         if owner_user_id is not None:
             filters["owner_user_id"] = owner_user_id
+        if tenant_id:
+            filters["tenant_id"] = tenant_id
         if context_type is not None:
             filters["context_type"] = context_type.value
         if project_id:
@@ -91,6 +98,8 @@ class ContextDB:
             filters["adapter_id"] = adapter_id
         if admission_status:
             filters["admission_status"] = admission_status
+        if allowed_uris is not None:
+            filters["allowed_uris"] = tuple(allowed_uris)
         return self.index_store.search(query, filters=filters, limit=limit)
 
     def relations_of(
@@ -105,8 +114,7 @@ class ContextDB:
     def commit_session(self, archive: SessionArchive, *, async_commit: bool = True) -> SessionCommitResult:
         if self.session_commit_service is None:
             raise RuntimeError("ContextDB requires SessionCommitService to commit sessions")
-        # Public API compatibility: async_commit=True runs the async commit stage now;
-        # False archives synchronously and leaves a worker job.
+        # 兼容原有公开接口：True 会立刻跑异步提交阶段，False 只归档并留下后台任务。
         if async_commit:
             self.session_commit_service.sync_archive(archive, enqueue_commit_job=False)
             return self.session_commit_service.async_commit(archive)

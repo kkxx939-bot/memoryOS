@@ -25,6 +25,38 @@ class SQLiteIndexStoreTest(unittest.TestCase):
             store.delete_index(u1.uri)
             self.assertFalse(store.search("26", filters={"owner_user_id": "u1"}))
 
+    def test_applicability_filter_treats_query_scopes_as_available_superset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteIndexStore(Path(tmp) / "index.sqlite3")
+            obj = ContextObject(
+                uri="memoryos://user/u1/memories/preferences/music",
+                context_type=ContextType.MEMORY,
+                title="quiet hours",
+                owner_user_id="u1",
+                metadata={
+                    "scope": {
+                        "applicability": {
+                            "all_of": [
+                                {"namespace": "memoryos", "kind": "principal", "id": "u1"},
+                                {"namespace": "memoryos", "kind": "environment", "id": "home"},
+                            ]
+                        }
+                    }
+                },
+            )
+            store.upsert_index(obj, content="quiet music")
+            available = [
+                "memoryos:principal:u1",
+                "memoryos:environment:home",
+                "memoryos:asset:reachy_01",
+                "memoryos:location:kitchen",
+            ]
+            assert store.search("quiet", filters={"applicability_scope_keys": available})
+            assert not store.search(
+                "quiet",
+                filters={"applicability_scope_keys": ["memoryos:principal:u1"]},
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

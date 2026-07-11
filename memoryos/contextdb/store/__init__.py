@@ -1,3 +1,5 @@
+"""这个包的公开接口都从这里导出。"""
+
 from memoryos.contextdb.store.index_consistency import IndexConsistencyResult, IndexConsistencyService
 from memoryos.contextdb.store.local_stores import (
     FileSystemSourceStore,

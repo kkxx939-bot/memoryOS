@@ -1,3 +1,5 @@
+"""Agent 适配器基础接口。"""
+
 from __future__ import annotations
 
 import uuid

@@ -1,3 +1,5 @@
+"""动作策略里的动作策略排序器。"""
+
 from __future__ import annotations
 
 from memoryos.action_policy.model.action_policy import ActionCandidate, ActionPolicy

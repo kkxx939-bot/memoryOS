@@ -1,3 +1,5 @@
+"""上下文数据库里的路径锁。"""
+
 from __future__ import annotations
 
 from contextlib import contextmanager

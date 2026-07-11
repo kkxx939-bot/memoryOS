@@ -1,3 +1,5 @@
+"""预测模块里的预测观察处理。"""
+
 from __future__ import annotations
 
 from memoryos.action_policy.model.action_policy import ActionPolicy
@@ -9,7 +11,7 @@ from memoryos.prediction.pipeline.prediction_engine import PredictionEngine
 
 
 class PredictiveObservationProcessor:
-    """Production observation entrypoint for the predictive pipeline."""
+    """负责 PredictiveObservationProcessor 这部分逻辑。"""
 
     def __init__(self, prediction_engine: PredictionEngine, session_commit_service: SessionCommitService | None = None) -> None:
         self.prediction_engine = prediction_engine

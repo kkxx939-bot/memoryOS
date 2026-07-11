@@ -1,3 +1,5 @@
+"""操作提交里的操作合并器。"""
+
 from __future__ import annotations
 
 from collections import defaultdict
@@ -8,7 +10,7 @@ from memoryos.operations.model.operation_status import OperationStatus
 
 
 class OperationCoalescer:
-    """Coalesce multiple operations on one target into one final operation."""
+    """负责 OperationCoalescer 这部分逻辑。"""
 
     def coalesce(self, operations: list[ContextOperation]) -> list[ContextOperation]:
         grouped: dict[tuple[str, str | None], list[ContextOperation]] = defaultdict(list)

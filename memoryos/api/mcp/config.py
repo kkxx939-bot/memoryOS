@@ -1,3 +1,5 @@
+"""接口层里的配置。"""
+
 from __future__ import annotations
 
 import os

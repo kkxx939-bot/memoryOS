@@ -1,3 +1,5 @@
+"""基于哈希的本地向量实现。"""
+
 from __future__ import annotations
 
 

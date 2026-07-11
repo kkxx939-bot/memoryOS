@@ -1,3 +1,5 @@
+"""上下文数据库里的本地存储集合。"""
+
 from __future__ import annotations
 
 import json
@@ -14,7 +16,7 @@ from memoryos.contextdb.store.source_store import IndexHit, LockToken, QueueJob
 
 
 class FileSystemSourceStore:
-    """Filesystem source of truth for ContextObject metadata and L2 content."""
+    """负责 FileSystemSourceStore 的持久化读写。"""
 
     def __init__(self, root: str | Path, tenant_id: str = "default") -> None:
         self.root = Path(root).expanduser().resolve()
@@ -104,6 +106,8 @@ class InMemoryIndexStore:
         terms = [term.lower() for term in str(query).split() if term.strip()]
         hits = []
         for obj, content in self.rows.values():
+            if "allowed_uris" in filters and obj.uri not in set(filters.get("allowed_uris", []) or []):
+                continue
             if filters.get("lifecycle_state") is None and obj.lifecycle_state in {
                 LifecycleState.DELETED,
                 LifecycleState.ARCHIVED,
@@ -114,8 +118,56 @@ class InMemoryIndexStore:
                 continue
             if filters.get("owner_user_id") and obj.owner_user_id != filters["owner_user_id"]:
                 continue
+            if filters.get("tenant_id") and str(obj.tenant_id or "default") != str(filters["tenant_id"]):
+                continue
             if filters.get("context_type") and obj.context_type.value != filters["context_type"]:
                 continue
+            metadata = dict(obj.metadata or {})
+            if filters.get("project_id"):
+                scope = dict(metadata.get("scope", {}) or {})
+                fields = dict(metadata.get("fields", {}) or {})
+                applicability = dict(scope.get("applicability", {}) or {})
+                workspace = next(
+                    (
+                        str(item.get("id"))
+                        for item in applicability.get("all_of", []) or []
+                        if isinstance(item, dict) and item.get("kind") == "workspace"
+                    ),
+                    "",
+                )
+                project_id = str(scope.get("project_id") or fields.get("project_id") or metadata.get("project_id") or workspace)
+                memory_type = str(metadata.get("memory_type") or "")
+                if memory_type in {"project_rule", "project_decision", "agent_experience"} and project_id != str(filters["project_id"]):
+                    continue
+            metadata_matches = True
+            for field in ("adapter_id", "admission_status", "claim_state", "slot_id", "memory_type"):
+                expected = filters.get(field)
+                if expected is None:
+                    continue
+                values = set(expected) if isinstance(expected, (list, tuple, set, frozenset)) else {expected}
+                actual = {
+                    "adapter_id": metadata.get("source_adapter_id") or dict(metadata.get("connect", {}) or {}).get("adapter_id"),
+                    "admission_status": dict(metadata.get("admission", {}) or {}).get("decision"),
+                    "claim_state": metadata.get("state") or metadata.get("claim_state"),
+                    "slot_id": metadata.get("slot_id"),
+                    "memory_type": metadata.get("memory_type"),
+                }[field]
+                if actual not in values:
+                    metadata_matches = False
+                    break
+            if not metadata_matches:
+                continue
+            required_scopes = set(filters.get("applicability_scope_keys", []) or [])
+            if required_scopes:
+                scope = dict(metadata.get("scope", {}) or {})
+                applicability = dict(scope.get("applicability", {}) or {})
+                actual_scopes = {
+                    f"{item.get('namespace', 'memoryos')}:{item.get('kind')}:{item.get('id')}"
+                    for item in applicability.get("all_of", []) or []
+                    if isinstance(item, dict) and item.get("kind") and item.get("id")
+                }
+                if not actual_scopes.issubset(required_scopes):
+                    continue
             text = " ".join([obj.title, content, json.dumps(obj.metadata, ensure_ascii=False)]).lower()
             score = sum(1.0 for term in terms if term in text)
             if not terms:

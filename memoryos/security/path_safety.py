@@ -1,3 +1,5 @@
+"""安全模块里的路径安全检查。"""
+
 from __future__ import annotations
 
 import re

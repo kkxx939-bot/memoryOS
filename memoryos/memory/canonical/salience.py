@@ -1,3 +1,5 @@
+"""记忆系统里的显著性。"""
+
 from __future__ import annotations
 
 from collections import Counter
@@ -8,12 +10,14 @@ from memoryos.memory.canonical.episode import EvidenceEpisode
 
 @dataclass(frozen=True)
 class SalienceDecision:
+    """保存 SalienceDecision 需要的这组数据。"""
+
     salient: bool
     reasons: tuple[str, ...]
 
 
 class EpisodeSalienceGate:
-    """A deliberately small episode gate; it never creates memory content."""
+    """负责 EpisodeSalienceGate 这部分逻辑。"""
 
     IMPORTANT_EVENT_TYPES = {
         "DECISION",
@@ -30,6 +34,8 @@ class EpisodeSalienceGate:
     }
 
     def evaluate(self, episode: EvidenceEpisode) -> SalienceDecision:
+        """处理 evaluate 这一步。"""
+
         reasons: list[str] = []
         repeated = Counter(event.text().strip().casefold() for event in episode.events if event.text().strip())
         if any(count > 1 for count in repeated.values()):

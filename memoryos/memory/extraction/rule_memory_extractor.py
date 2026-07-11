@@ -1,3 +1,5 @@
+"""记忆系统里的旧规则记忆提取器。"""
+
 from __future__ import annotations
 
 from memoryos.contextdb.model.context_type import ContextType
@@ -9,11 +11,7 @@ from memoryos.operations.model.operation_action import OperationAction
 
 
 class RuleMemoryExtractor(MemoryExtractor):
-    """Legacy operation-emitting extractor.
-
-    Kept for compatibility tests and old callers. MemoryCommitPlanner uses
-    RuleFallbackExtractor, which emits MemoryCandidateDraft objects instead.
-    """
+    """负责 RuleMemoryExtractor 这部分逻辑。"""
 
     markers = ("记住：", "记住:", "remember:", "Remember:")
 

@@ -1,7 +1,9 @@
+"""记忆系统里的状态。"""
+
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
 
@@ -13,26 +15,36 @@ from memoryos.memory.canonical.evidence import EvidenceRef
 
 
 class TransitionProfile(str, Enum):
+    """负责 TransitionProfile 这部分逻辑。"""
+
     AUTHORITATIVE_STATE = "AUTHORITATIVE_STATE"
     OBSERVATIONAL = "OBSERVATIONAL"
     EXPERIENCE = "EXPERIENCE"
 
 
-AUTHORITATIVE_STATES = frozenset({"PROPOSED", "PENDING", "ACTIVE", "SUPERSEDED", "RETRACTED", "CONFLICTED"})
-OBSERVATIONAL_STATES = frozenset({"OBSERVED", "ACTIVE", "STALE", "ARCHIVED", "CONFLICTED"})
-EXPERIENCE_STATES = frozenset({"OBSERVED", "VALIDATED", "ACTIVE", "STALE", "ARCHIVED"})
+class ClaimState(str, Enum):
+    """规范记忆 Claim 只使用这五种业务状态。"""
+
+    PROPOSED = "PROPOSED"
+    ACTIVE = "ACTIVE"
+    SUPERSEDED = "SUPERSEDED"
+    CONFLICTED = "CONFLICTED"
+    RETRACTED = "RETRACTED"
+
+
+CLAIM_STATES = frozenset(state.value for state in ClaimState)
 
 
 def states_for(profile: TransitionProfile) -> frozenset[str]:
-    return {
-        TransitionProfile.AUTHORITATIVE_STATE: AUTHORITATIVE_STATES,
-        TransitionProfile.OBSERVATIONAL: OBSERVATIONAL_STATES,
-        TransitionProfile.EXPERIENCE: EXPERIENCE_STATES,
-    }[profile]
+    """处理 states for 这一步。"""
+
+    return CLAIM_STATES
 
 
 @dataclass(frozen=True)
 class MemoryRevision:
+    """保存某个 Claim 的一版不可变历史。"""
+
     revision: int
     state: str
     value_fields: Mapping[str, Any]
@@ -48,6 +60,13 @@ class MemoryRevision:
     schema_version: str = ""
     qualifiers: Mapping[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=utc_now)
+    previous_revision: int | None = None
+    valid_from: str = ""
+    valid_to: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.valid_from:
+            object.__setattr__(self, "valid_from", self.created_at)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -66,6 +85,9 @@ class MemoryRevision:
             "schema_version": self.schema_version,
             "qualifiers": dict(self.qualifiers),
             "created_at": self.created_at,
+            "previous_revision": self.previous_revision,
+            "valid_from": self.valid_from,
+            "valid_to": self.valid_to,
         }
 
     @classmethod
@@ -86,11 +108,16 @@ class MemoryRevision:
             schema_version=str(payload.get("schema_version", "")),
             qualifiers=dict(payload.get("qualifiers", {}) or {}),
             created_at=str(payload.get("created_at", "")),
+            previous_revision=int(payload["previous_revision"]) if payload.get("previous_revision") is not None else None,
+            valid_from=str(payload.get("valid_from", "")),
+            valid_to=str(payload["valid_to"]) if payload.get("valid_to") else None,
         )
 
 
 @dataclass(frozen=True)
 class MemoryClaim:
+    """表示同一 Slot 下的一个候选值。"""
+
     claim_id: str
     uri: str
     slot_id: str
@@ -109,13 +136,14 @@ class MemoryClaim:
             raise ValueError("claim revision must increase by exactly one")
         if revision.state not in states_for(self.profile):
             raise ValueError(f"invalid {self.profile.value} state: {revision.state}")
+        previous = replace(self.current, valid_to=revision.valid_from)
         return MemoryClaim(
             self.claim_id,
             self.uri,
             self.slot_id,
             self.canonical_value,
             self.profile,
-            (*self.revisions, revision),
+            (*self.revisions[:-1], previous, revision),
         )
 
     def to_context_object(
@@ -151,6 +179,8 @@ class MemoryClaim:
 
 @dataclass(frozen=True)
 class MemorySlot:
+    """表示系统正在回答的那个稳定问题。"""
+
     slot_id: str
     uri: str
     memory_type: str
@@ -185,6 +215,8 @@ class MemorySlot:
 
 
 def profile_for(memory_type: str) -> TransitionProfile:
+    """处理 profile for 这一步。"""
+
     if memory_type in {"profile", "preference", "project_rule", "project_decision"}:
         return TransitionProfile.AUTHORITATIVE_STATE
     if memory_type == "agent_experience":

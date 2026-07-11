@@ -39,12 +39,80 @@ class ConflictResolverTest(unittest.TestCase):
         self.assertEqual(candidate.status, OperationStatus.REJECTED)
 
     def test_policy_memory_constrains_action_policy(self) -> None:
-        policy_memory = self.op(OperationAction.ADD, target="rule", payload={"memory_kind": "policy_memory", "content": "以后不要自动开空调", "action": "turn_on_ac"})
+        policy_memory = self.op(
+            OperationAction.ADD,
+            target="rule",
+            payload={
+                "memory_type": "project_rule",
+                "context_object": {
+                    "metadata": {
+                        "memory_kind": "policy_memory",
+                        "state": "ACTIVE",
+                        "canonical_rule_type": "action_auto_execute",
+                        "related_action": "turn_on_ac",
+                        "revisions": [{"value_fields": {"canonical_value": "forbidden"}}],
+                    }
+                },
+            },
+        )
         action_update = self.op(OperationAction.UPDATE, target="policy", payload={"action": "turn_on_ac"}, context_type=ContextType.ACTION_POLICY)
         result = self.resolver.resolve([policy_memory, action_update])
         self.assertFalse(action_update.payload["auto_execute_allowed"])
         self.assertEqual(action_update.payload["status"], "disabled_auto_execute")
         self.assertTrue(any(item["type"] == ConflictType.POLICY_MEMORY_CONSTRAINS_ACTION.value for item in result.conflicts))
+
+    def test_lexical_rule_without_active_structured_relation_cannot_modify_action_policy(self) -> None:
+        memory = self.op(
+            OperationAction.ADD,
+            target="rule",
+            payload={"memory_kind": "policy_memory", "content": "不要自动执行"},
+        )
+        action_update = self.op(
+            OperationAction.UPDATE,
+            target="policy",
+            payload={"action": "turn_on_ac", "auto_execute_allowed": True},
+            context_type=ContextType.ACTION_POLICY,
+        )
+        self.resolver.resolve([memory, action_update])
+        self.assertTrue(action_update.payload["auto_execute_allowed"])
+
+    def test_structured_policy_memory_cannot_constrain_another_scope(self) -> None:
+        def scope(identifier: str) -> dict:
+            return {
+                "applicability": {
+                    "all_of": [{"namespace": "memoryos", "kind": "workspace", "id": identifier}]
+                }
+            }
+
+        policy_memory = self.op(
+            OperationAction.ADD,
+            target="rule",
+            payload={
+                "memory_type": "project_rule",
+                "context_object": {
+                    "metadata": {
+                        "memory_kind": "policy_memory",
+                        "state": "ACTIVE",
+                        "canonical_rule_type": "action_auto_execute",
+                        "related_action": "turn_on_ac",
+                        "scope": scope("workspace-a"),
+                        "revisions": [{"value_fields": {"canonical_value": "forbidden"}}],
+                    }
+                },
+            },
+        )
+        action_update = self.op(
+            OperationAction.UPDATE,
+            target="policy",
+            payload={
+                "action": "turn_on_ac",
+                "auto_execute_allowed": True,
+                "scope": scope("workspace-b"),
+            },
+            context_type=ContextType.ACTION_POLICY,
+        )
+        self.resolver.resolve([policy_memory, action_update])
+        self.assertTrue(action_update.payload["auto_execute_allowed"])
 
     def test_disabled_auto_execute_reward_does_not_restore_auto_execute(self) -> None:
         reward = self.op(OperationAction.REWARD, target="policy", payload={"auto_execute_allowed": False}, context_type=ContextType.ACTION_POLICY)

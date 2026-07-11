@@ -1,3 +1,5 @@
+"""技能系统里的工具注册表。"""
+
 from __future__ import annotations
 
 from collections.abc import Callable

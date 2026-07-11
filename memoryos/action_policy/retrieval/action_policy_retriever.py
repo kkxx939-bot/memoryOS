@@ -1,3 +1,5 @@
+"""动作策略里的动作策略检索器。"""
+
 from __future__ import annotations
 
 import json

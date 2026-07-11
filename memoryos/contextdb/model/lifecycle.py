@@ -1,3 +1,5 @@
+"""上下文数据库里的生命周期。"""
+
 from __future__ import annotations
 
 from enum import Enum

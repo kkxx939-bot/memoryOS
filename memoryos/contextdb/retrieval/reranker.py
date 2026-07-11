@@ -1,3 +1,5 @@
+"""检索结果重排。"""
+
 from __future__ import annotations
 
 from memoryos.contextdb.store.source_store import IndexHit

@@ -1,3 +1,5 @@
+"""记忆系统里的准入。"""
+
 from __future__ import annotations
 
 import json
@@ -16,6 +18,8 @@ _PRIVATE_PROCESS_RE = re.compile(r"(?i)\b(chain of thought|scratchpad|internal r
 
 
 class ProposalAdmissionDecision(str, Enum):
+    """保存 ProposalAdmissionDecision 需要的这组数据。"""
+
     ACCEPT_FOR_RECONCILE = "ACCEPT_FOR_RECONCILE"
     PENDING = "PENDING"
     ARCHIVE_ONLY = "ARCHIVE_ONLY"
@@ -26,11 +30,15 @@ class ProposalAdmissionDecision(str, Enum):
 
 @dataclass(frozen=True)
 class ProposalAdmissionResult:
+    """保存 ProposalAdmissionResult 需要的这组数据。"""
+
     decision: ProposalAdmissionDecision
     reason: str
 
 
 class ProposalAdmissionGate:
+    """负责 ProposalAdmissionGate 这部分逻辑。"""
+
     def __init__(self, registry: MemoryTypeRegistry | None = None) -> None:
         self.registry = registry or MemoryTypeRegistry()
 
@@ -42,6 +50,8 @@ class ProposalAdmissionGate:
         memory_scope: MemoryScope,
         source_role: str,
     ) -> ProposalAdmissionResult:
+        """处理 evaluate 这一步。"""
+
         proposal = validation.proposal
         try:
             memory_type = MemoryType(proposal.memory_type)
@@ -63,6 +73,8 @@ class ProposalAdmissionGate:
             ensure_ascii=False,
             sort_keys=True,
         )
+        if self._raw_tool_output(text):
+            return ProposalAdmissionResult(ProposalAdmissionDecision.ARCHIVE_ONLY, "raw_tool_output")
         if self._secret_like(text):
             return ProposalAdmissionResult(ProposalAdmissionDecision.RESTRICTED, "secret_or_sensitive_content")
         if _PRIVATE_PROCESS_RE.search(text) or source_role in {"agent_private", "internal"}:
@@ -89,4 +101,17 @@ class ProposalAdmissionGate:
             or INLINE_SECRET_RE.search(text)
             or ("<redacted" in text.casefold() and SECRET_KEY_RE.search(text))
             or re.search(r"(?i)\b(authorization\s*:|cookie\s*:)", text)
+        )
+
+    def _raw_tool_output(self, text: str) -> bool:
+        normalized = text.casefold()
+        return any(
+            marker in normalized
+            for marker in (
+                "traceback (most recent call last)",
+                "assertionerror",
+                "exit code:",
+                "stdout:",
+                "stderr:",
+            )
         )

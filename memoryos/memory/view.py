@@ -1,3 +1,5 @@
+"""记忆视图的路由规则。"""
+
 from __future__ import annotations
 
 from typing import Any

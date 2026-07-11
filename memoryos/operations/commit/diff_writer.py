@@ -1,3 +1,5 @@
+"""操作提交里的差异写入器。"""
+
 from __future__ import annotations
 
 import json

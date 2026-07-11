@@ -1,3 +1,5 @@
+"""上下文数据库里的上下文类型。"""
+
 from __future__ import annotations
 
 from enum import Enum

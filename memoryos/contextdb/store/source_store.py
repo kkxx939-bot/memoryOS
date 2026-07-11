@@ -1,3 +1,5 @@
+"""上下文数据库里的源数据存储。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -50,7 +52,7 @@ class SourceStore(Protocol):
     def soft_delete(self, uri: str, reason: str) -> None: ...
 
     def delete_object(self, uri: str) -> None:
-        """Internal rollback primitive; never exposed as an LLM memory operation."""
+        """处理 delete object 这一步。"""
         ...
 
 
@@ -82,7 +84,7 @@ class RelationStore(Protocol):
 
 class QueueStore(Protocol):
     def enqueue(self, job: QueueJob) -> None:
-        """Insert or replace by job_id; repeated enqueue of the same job_id must not duplicate work."""
+        """处理 enqueue 这一步。"""
         ...
 
     def lease(self, queue_name: str, limit: int = 10, lease_seconds: int = 60) -> list[QueueJob]: ...

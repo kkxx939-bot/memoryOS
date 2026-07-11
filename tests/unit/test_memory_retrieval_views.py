@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from memoryos.contextdb.context_db import ContextDB
 from memoryos.contextdb.model.context_type import ContextType
+from memoryos.contextdb.model.lifecycle import LifecycleState
 from memoryos.contextdb.retrieval.context_assembler import ContextAssembler
 from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
 from memoryos.contextdb.store.local_stores import InMemoryIndexStore, InMemoryQueueStore, InMemoryRelationStore
@@ -156,6 +157,94 @@ def test_pending_candidate_not_shared_by_default(tmp_path) -> None:
 
     assert default_hits == []
     assert [hit["uri"] for hit in candidate_hits] == ["memoryos://user/u1/memories/candidates/c1"]
+
+
+def test_source_view_scan_excludes_inactive_lifecycle_before_scoring_and_limit(tmp_path) -> None:  # noqa: ANN001
+    db = _db(tmp_path)
+    for index in range(20):
+        memory = Memory(
+            uri=f"memoryos://user/u1/memories/rules/inactive-{index}",
+            user_id="u1",
+            title=f"inactive matching rule {index}",
+            content="target phrase",
+            kind=MemoryKind.POLICY,
+            memory_type="project_rule",
+            retrieval_views=["project:memoryOS:rules"],
+            admission={"decision": "accept"},
+            merge_key=f"inactive-{index}",
+        )
+        uri = _commit_memory(db, memory)
+        obj = db.source_store.read_object(uri)
+        obj.lifecycle_state = LifecycleState.OBSOLETE
+        db.source_store.write_object(obj, content=memory.content)
+    active_uri = _commit_memory(
+        db,
+        Memory(
+            uri="memoryos://user/u1/memories/rules/active-target",
+            user_id="u1",
+            title="active target",
+            content="target phrase",
+            kind=MemoryKind.POLICY,
+            memory_type="project_rule",
+            retrieval_views=["project:memoryOS:rules"],
+            admission={"decision": "accept"},
+            merge_key="active-target",
+        ),
+    )
+    hits = ContextAssembler(db).search(
+        "target phrase",
+        user_id="u1",
+        context_type=ContextType.MEMORY,
+        search_scope="default",
+        project_id="memoryOS",
+        limit=1,
+    )
+    assert [item["uri"] for item in hits] == [active_uri]
+
+
+def test_source_view_scan_filters_tenant_before_limit(tmp_path) -> None:  # noqa: ANN001
+    db = _db(tmp_path)
+    other_uri = _commit_memory(
+        db,
+        Memory(
+            uri="memoryos://user/u1/memories/rules/other-tenant",
+            user_id="u1",
+            title="target target target",
+            content="target phrase",
+            kind=MemoryKind.POLICY,
+            memory_type="project_rule",
+            retrieval_views=["project:memoryOS:rules"],
+            admission={"decision": "accept"},
+            merge_key="other-tenant",
+        ),
+    )
+    other = db.source_store.read_object(other_uri)
+    other.tenant_id = "other"
+    db.source_store.write_object(other, content="target phrase")
+    target_uri = _commit_memory(
+        db,
+        Memory(
+            uri="memoryos://user/u1/memories/rules/default-tenant",
+            user_id="u1",
+            title="target",
+            content="target phrase",
+            kind=MemoryKind.POLICY,
+            memory_type="project_rule",
+            retrieval_views=["project:memoryOS:rules"],
+            admission={"decision": "accept"},
+            merge_key="default-tenant",
+        ),
+    )
+    hits = ContextAssembler(db).search(
+        "target",
+        user_id="u1",
+        context_type=ContextType.MEMORY,
+        search_scope="default",
+        project_id="memoryOS",
+        tenant_id="default",
+        limit=1,
+    )
+    assert [item["uri"] for item in hits] == [target_uri]
 
 
 def test_candidate_confirm_reject_promote(tmp_path) -> None:

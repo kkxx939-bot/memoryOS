@@ -1,3 +1,5 @@
+"""行为模块里的行为案例。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

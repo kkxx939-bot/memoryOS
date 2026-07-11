@@ -1,3 +1,5 @@
+"""动作策略里的候选生成器。"""
+
 from __future__ import annotations
 
 from memoryos.action_policy.model.action_policy import ActionPolicy

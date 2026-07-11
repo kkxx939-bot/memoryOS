@@ -1,3 +1,5 @@
+"""大模型服务的基础接口。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

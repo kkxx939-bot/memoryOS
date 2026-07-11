@@ -1,13 +1,15 @@
+"""核心工具里的异常。"""
+
 from __future__ import annotations
 
 
 class MemoryOSError(Exception):
-    """Base error for production MemoryOS components."""
+    """MemoryOSError 对应的异常。"""
 
 
 class InvalidContextURI(MemoryOSError, ValueError):
-    """Raised when a memoryos:// URI is malformed or unsafe."""
+    """负责 InvalidContextURI 这部分逻辑。"""
 
 
 class PolicyBlocked(MemoryOSError):
-    """Raised when a policy gate blocks execution."""
+    """负责 PolicyBlocked 这部分逻辑。"""

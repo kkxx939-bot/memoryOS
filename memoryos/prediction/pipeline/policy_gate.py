@@ -1,3 +1,5 @@
+"""预测模块里的策略门控。"""
+
 from __future__ import annotations
 
 from datetime import datetime, timezone

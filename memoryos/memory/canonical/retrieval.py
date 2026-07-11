@@ -1,3 +1,5 @@
+"""记忆系统里的检索。"""
+
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -6,12 +8,15 @@ from enum import Enum
 from typing import Any
 
 from memoryos.contextdb.model.context_type import ContextType
+from memoryos.contextdb.model.lifecycle import LifecycleState
 from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
 from memoryos.contextdb.store.source_store import IndexStore, RelationStore, SourceStore
 from memoryos.memory.canonical.visibility import read_committed_canonical, relation_is_committed
 
 
 class CanonicalQueryIntent(str, Enum):
+    """负责 CanonicalQueryIntent 这部分逻辑。"""
+
     CURRENT = "CURRENT"
     OPTIONS = "OPTIONS"
     HISTORY = "HISTORY"
@@ -20,6 +25,8 @@ class CanonicalQueryIntent(str, Enum):
 
 @dataclass(frozen=True)
 class CanonicalMemoryQuery:
+    """负责 CanonicalMemoryQuery 这部分逻辑。"""
+
     text: str
     tenant_id: str
     principal_id: str | None = None
@@ -35,6 +42,8 @@ class CanonicalMemoryQuery:
 
 
 class CanonicalMemoryRetriever:
+    """按当前状态、候选方案或历史演进三种意图检索规范记忆。"""
+
     def __init__(
         self,
         source_store: SourceStore,
@@ -48,6 +57,8 @@ class CanonicalMemoryRetriever:
         self.hybrid_search = hybrid_search
 
     def search(self, query: CanonicalMemoryQuery) -> list[dict[str, Any]]:
+        """按给定条件查找匹配结果。"""
+
         intent = query.intent or self.classify_intent(query.text)
         allowed_states = set(query.states or self._states_for(intent))
         filters: dict[str, Any] = {
@@ -56,6 +67,9 @@ class CanonicalMemoryRetriever:
         }
         if query.principal_id:
             filters["owner_user_id"] = query.principal_id
+        filters["claim_state"] = tuple(sorted(allowed_states))
+        if query.memory_types:
+            filters["memory_type"] = query.memory_types
         hits = self._recall(query, filters)
         results = []
         result_uris: set[str] = set()
@@ -87,6 +101,19 @@ class CanonicalMemoryRetriever:
         hits: list[Any] = []
         for uri in dict.fromkeys(exact_uris):
             hits.append(type("ExactHit", (), {"uri": uri, "score": 100.0})())
+        terms = [term.casefold() for term in query.text.split() if term.strip()]
+        allowed_states = set(str(item) for item in filters.get("claim_state", []) or [])
+        allowed_uris: set[str] = set()
+        for obj in self.source_store.list_objects():
+            if self._accepted_state(obj, query, allowed_states) is None:
+                continue
+            allowed_uris.add(obj.uri)
+            metadata = dict(obj.metadata or {})
+            haystack = " ".join((obj.title, str(metadata))).casefold()
+            score = sum(1.0 for term in terms if term in haystack) if terms else 0.1
+            if score > 0:
+                hits.append(type("SourceHit", (), {"uri": obj.uri, "score": score})())
+        filters["allowed_uris"] = tuple(sorted(allowed_uris))
         recalled = (
             self.hybrid_search.search(
                 query.text,
@@ -113,6 +140,8 @@ class CanonicalMemoryRetriever:
         allowed_states: set[str],
     ) -> str | None:
         metadata = dict(obj.metadata or {})
+        if obj.lifecycle_state != LifecycleState.ACTIVE:
+            return None
         if metadata.get("canonical_kind") != "claim":
             return None
         if str(obj.tenant_id or "default") != query.tenant_id:
@@ -163,6 +192,8 @@ class CanonicalMemoryRetriever:
         return expanded
 
     def classify_intent(self, text: str) -> CanonicalQueryIntent:
+        """判断查询是在问当前状态、候选方案还是历史变化。"""
+
         normalized = str(text).casefold()
         if any(token in normalized for token in ("history", "historical", "previous", "历史", "曾经", "之前")):
             return CanonicalQueryIntent.HISTORY
@@ -177,23 +208,12 @@ class CanonicalMemoryRetriever:
 
     def _states_for(self, intent: CanonicalQueryIntent) -> tuple[str, ...]:
         if intent == CanonicalQueryIntent.CURRENT:
-            return ("ACTIVE", "VALIDATED", "OBSERVED")
+            return ("ACTIVE",)
         if intent == CanonicalQueryIntent.OPTIONS:
-            return ("ACTIVE", "VALIDATED", "OBSERVED", "PROPOSED", "PENDING", "CONFLICTED")
+            return ("PROPOSED", "CONFLICTED")
         if intent == CanonicalQueryIntent.CONFLICTS:
             return ("CONFLICTED",)
-        return (
-            "ACTIVE",
-            "VALIDATED",
-            "OBSERVED",
-            "PROPOSED",
-            "PENDING",
-            "SUPERSEDED",
-            "RETRACTED",
-            "STALE",
-            "ARCHIVED",
-            "CONFLICTED",
-        )
+        return ("SUPERSEDED", "RETRACTED")
 
     def _visible(self, metadata: dict[str, Any], query: CanonicalMemoryQuery) -> bool:
         scope = dict(metadata.get("scope", {}) or {})
@@ -285,9 +305,9 @@ class CanonicalMemoryRetriever:
     def _category(self, state: str, epistemic: str) -> str:
         if state == "CONFLICTED":
             return "conflict"
-        if state in {"PROPOSED", "PENDING"}:
+        if state == "PROPOSED":
             return "candidate"
-        if state in {"SUPERSEDED", "RETRACTED", "STALE", "ARCHIVED"}:
+        if state in {"SUPERSEDED", "RETRACTED"}:
             return "history"
         if epistemic in {"INFERRED", "HYPOTHESIZED"}:
             return "inference"
@@ -296,9 +316,9 @@ class CanonicalMemoryRetriever:
     def _rank(self, item: dict[str, Any], intent: CanonicalQueryIntent) -> float:
         state = str(item.get("memory_state", ""))
         state_bonus = {
-            CanonicalQueryIntent.CURRENT: {"ACTIVE": 5.0, "VALIDATED": 4.0, "OBSERVED": 3.0},
-            CanonicalQueryIntent.OPTIONS: {"ACTIVE": 4.0, "PROPOSED": 3.0, "PENDING": 2.0},
-            CanonicalQueryIntent.HISTORY: {"SUPERSEDED": 5.0, "RETRACTED": 4.0, "STALE": 3.0},
+            CanonicalQueryIntent.CURRENT: {"ACTIVE": 5.0},
+            CanonicalQueryIntent.OPTIONS: {"PROPOSED": 3.0},
+            CanonicalQueryIntent.HISTORY: {"SUPERSEDED": 5.0, "RETRACTED": 4.0},
             CanonicalQueryIntent.CONFLICTS: {"CONFLICTED": 5.0},
         }[intent].get(state, 0.0)
         return float(item.get("score", 0.0)) + state_bonus

@@ -1,3 +1,5 @@
+"""规范记忆的仓库读取逻辑。"""
+
 from __future__ import annotations
 
 from memoryos.contextdb.store.source_store import SourceStore
@@ -12,7 +14,7 @@ from memoryos.memory.canonical.visibility import read_committed_canonical
 
 
 class CanonicalMemoryRepository:
-    """Exact canonical identity reads only; no SourceStore scan is used."""
+    """负责 CanonicalMemoryRepository 的持久化读写。"""
 
     def __init__(self, source_store: SourceStore) -> None:
         self.source_store = source_store

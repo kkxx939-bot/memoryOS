@@ -65,6 +65,7 @@ def test_committed_memory_context_object_keeps_schema_metadata(tmp_path) -> None
         metadata={"connect": {"adapter_id": "codex"}},
     )
     operation = MemoryCommitPlanner().plan(archive)[0]
+    SessionArchiveStore(tmp_path).write_sync_archive(archive)
 
     committer.commit("u1", [operation])
     obj = source.read_object(str(operation.target_uri))

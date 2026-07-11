@@ -1,3 +1,5 @@
+"""后台任务里的启动器。"""
+
 from __future__ import annotations
 
 import json

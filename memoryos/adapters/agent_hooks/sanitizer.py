@@ -1,3 +1,5 @@
+"""Agent 输入清理。"""
+
 from __future__ import annotations
 
 import re

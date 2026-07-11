@@ -1,3 +1,5 @@
+"""记忆系统里的形成。"""
+
 from __future__ import annotations
 
 import re
@@ -13,7 +15,7 @@ from memoryos.memory.canonical.admission import (
     ProposalAdmissionGate,
 )
 from memoryos.memory.canonical.episode import EvidenceEpisode
-from memoryos.memory.canonical.evidence import EvidenceRef, ProposalEvidenceValidator
+from memoryos.memory.canonical.evidence import EvidenceRef, ProposalEvidenceValidator, bind_field_evidence
 from memoryos.memory.canonical.identity import AliasRegistry, StableMemoryIdentityResolver
 from memoryos.memory.canonical.proposal import (
     EpistemicStatus,
@@ -39,6 +41,8 @@ from memoryos.operations.model.context_operation import ContextOperation
 
 @dataclass(frozen=True)
 class CanonicalFormationResult:
+    """保存 CanonicalFormationResult 需要的这组数据。"""
+
     operations: tuple[ContextOperation, ...]
     decision: ProposalAdmissionDecision
     reason: str
@@ -46,12 +50,16 @@ class CanonicalFormationResult:
 
 
 class LegacyCandidateProposalAdapter:
+    """负责 LegacyCandidateProposalAdapter 这部分逻辑。"""
+
     def adapt(
         self,
         candidate: MemoryCandidateDraft,
         episode: EvidenceEpisode,
         archive: SessionArchive,
     ) -> MemorySemanticProposal:
+        """处理 adapt 这一步。"""
+
         events = [episode.event(event_id) for event_id in candidate.source_message_ids]
         matched = [event for event in events if event is not None]
         if not matched and episode.events:
@@ -60,16 +68,18 @@ class LegacyCandidateProposalAdapter:
         identity, system_fields = self._identity(candidate, episode)
         speech, commitment, temporal, relation = self._semantic(candidate)
         epistemic = self._epistemic(candidate.source_role)
+        value_fields = self._values(candidate)
         return MemorySemanticProposal(
             proposal_id=f"proposal_{stable_hash([archive.task_id, candidate.memory_type.value, identity, candidate.fields, candidate.source_message_ids], length=32)}",
             memory_type=candidate.memory_type.value,
             identity_fields=identity,
-            value_fields=self._values(candidate),
+            value_fields=value_fields,
             semantic=SemanticAssessment(speech, commitment, temporal, relation),
             epistemic_status=epistemic,
             suggested_scope_refs=self._suggested_scopes(candidate, episode, archive.user_id),
             related_memory_ids=(),
             evidence_refs=evidence_refs,
+            field_evidence_refs=bind_field_evidence(identity, value_fields, evidence_refs),
             confidence=candidate.confidence,
             extractor_version="legacy_candidate_adapter_v1",
             model_id=None,
@@ -86,20 +96,25 @@ class LegacyCandidateProposalAdapter:
         fields = candidate.fields
         topic = self._topic(candidate.content)
         if candidate.memory_type == MemoryType.PROFILE:
-            return {"attribute_key": str(fields.get("attribute_key") or topic)}, []
+            explicit_key = fields.get("attribute_key")
+            return {"attribute_key": str(explicit_key or topic)}, ["attribute_key"] if explicit_key else []
         if candidate.memory_type == MemoryType.PREFERENCE:
             subject = str(fields.get("subject") or topic)
             dimension = str(fields.get("dimension") or topic)
-            return {"subject": subject, "dimension": dimension}, []
+            system_fields = [field for field in ("subject", "dimension") if fields.get(field)]
+            return {"subject": subject, "dimension": dimension}, system_fields
         if candidate.memory_type == MemoryType.ENTITY:
+            explicit_entity = fields.get("canonical_entity_id") or fields.get("name")
             return {
                 "entity_type": str(fields.get("entity_type") or fields.get("type") or "entity"),
-                "canonical_entity_id": str(fields.get("canonical_entity_id") or fields.get("name") or topic),
-            }, []
+                "canonical_entity_id": str(explicit_entity or topic),
+            }, ["entity_type", "canonical_entity_id"] if explicit_entity else []
         if candidate.memory_type == MemoryType.PROJECT_RULE:
-            return {"rule_topic": str(fields.get("rule_topic") or fields.get("rule_key") or topic)}, []
+            explicit_topic = fields.get("rule_topic") or fields.get("rule_key")
+            return {"rule_topic": str(explicit_topic or topic)}, ["rule_topic"] if explicit_topic else []
         if candidate.memory_type == MemoryType.PROJECT_DECISION:
-            return {"decision_topic": str(fields.get("decision_topic") or fields.get("decision_key") or topic)}, []
+            explicit_topic = fields.get("decision_topic") or fields.get("decision_key")
+            return {"decision_topic": str(explicit_topic or topic)}, ["decision_topic"] if explicit_topic else []
         if candidate.memory_type == MemoryType.EVENT:
             source_event_id = candidate.source_message_ids[0] if candidate.source_message_ids else topic
             event_key = f"{episode.episode_id}:{source_event_id}"
@@ -126,7 +141,24 @@ class LegacyCandidateProposalAdapter:
         semantic_fields = {
             field_name: value
             for field_name, value in candidate.fields.items()
-            if field_name not in {"project_id", "adapter_id", "tenant_id", "scope"}
+            if field_name
+            not in {
+                "project_id",
+                "adapter_id",
+                "tenant_id",
+                "scope",
+                "attribute_key",
+                "subject",
+                "dimension",
+                "canonical_entity_id",
+                "rule_topic",
+                "rule_key",
+                "decision_topic",
+                "decision_key",
+                "event_key",
+                "task_pattern",
+                "environment_signature",
+            }
         }
         return {key: candidate.content, **semantic_fields}
 
@@ -137,7 +169,8 @@ class LegacyCandidateProposalAdapter:
         if candidate.memory_type == MemoryType.PROJECT_DECISION and any(
             token in text for token in ("future", "later", "evaluate", "以后", "评估", "候选")
         ):
-            return "proposal", "exploratory", "future", "alternative"
+            speech = "evaluation_request" if any(token in text for token in ("evaluate", "评估")) else "proposal"
+            return speech, "exploratory", "future", "alternative"
         if any(token in text for token in ("retract", "撤回", "不再")):
             return "retraction", "confirmed", "current", "corrects"
         return "confirmation", "confirmed", "current", "unrelated"
@@ -203,6 +236,8 @@ class LegacyCandidateProposalAdapter:
 
 
 class CanonicalMemoryFormationService:
+    """串起证据校验、准入、身份解析、状态转换和事务规划。"""
+
     def __init__(self, source_store: SourceStore | None, *, alias_registry: AliasRegistry | None = None) -> None:
         self.source_store = source_store
         self.validator = ProposalEvidenceValidator()
@@ -232,6 +267,8 @@ class CanonicalMemoryFormationService:
         episode: EvidenceEpisode,
         retrieval_views: list[str] | None = None,
     ) -> CanonicalFormationResult:
+        """处理 plan 这一步。"""
+
         proposal = self._bind_system_identity(proposal, episode)
         memory_scope = self._memory_scope(proposal, archive, episode)
         validation = self.validator.validate(proposal, episode)
@@ -295,6 +332,10 @@ class CanonicalMemoryFormationService:
         return replace(
             proposal,
             identity_fields={**dict(proposal.identity_fields), "event_key": f"{episode.episode_id}:{','.join(event_ids)}"},
+            field_evidence_refs={
+                **dict(proposal.field_evidence_refs),
+                "identity.event_key": proposal.evidence_refs,
+            },
             metadata=metadata,
         )
 

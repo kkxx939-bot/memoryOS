@@ -15,7 +15,8 @@ from memoryos.connect import ConnectMetadata
 from memoryos.contextdb.session import SessionArchive, SessionArchiveStore, SessionCommitService
 from memoryos.contextdb.store import FileSystemSourceStore, InMemoryIndexStore, InMemoryQueueStore
 from memoryos.contextdb.store.vector_store import InMemoryVectorStore
-from memoryos.memory.extraction import LLMMemoryExtractor, RuleMemoryExtractor
+from memoryos.memory.extraction.llm_memory_extractor import LLMMemoryExtractor
+from memoryos.memory.extraction.rule_memory_extractor import RuleMemoryExtractor
 from memoryos.operations.commit import OperationCommitter, RedoLog
 from memoryos.operations.model import ContextOperation, OperationAction
 from memoryos.prediction.model import PredictionRequest

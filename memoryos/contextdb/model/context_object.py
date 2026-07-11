@@ -1,3 +1,5 @@
+"""上下文数据库里的上下文对象。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

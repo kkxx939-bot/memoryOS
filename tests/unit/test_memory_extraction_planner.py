@@ -4,8 +4,10 @@ from collections.abc import Sequence
 
 from memoryos.contextdb.session.planners.memory_commit_planner import MemoryCommitPlanner
 from memoryos.contextdb.session.session_model import SessionArchive
-from memoryos.memory.extraction import LLMMemoryExtractor, RuleFallbackExtractor, RuleMemoryExtractor
-from memoryos.memory.schema import MemoryCandidateDraft, MemoryType, MemoryTypeSchema
+from memoryos.memory.extraction import RuleFallbackExtractor
+from memoryos.memory.extraction.llm_memory_extractor import LLMMemoryExtractor
+from memoryos.memory.extraction.rule_memory_extractor import RuleMemoryExtractor
+from memoryos.memory.schema import MemoryCandidateDraft, MemoryType, MemoryTypeRegistry, MemoryTypeSchema
 from memoryos.memory.view import MemoryViewRouter
 
 
@@ -62,6 +64,43 @@ def test_memory_extractor_outputs_structured_candidates() -> None:
         MemoryType.PROJECT_RULE,
         MemoryType.AGENT_EXPERIENCE,
     }
+
+
+def test_fallback_identity_is_semantic_and_unknown_constraint_is_archive_only() -> None:
+    extractor = RuleFallbackExtractor()
+    schemas = MemoryTypeRegistry().list()
+    first = extractor.extract(
+        SessionArchive(
+            user_id="u1",
+            session_id="s1",
+            archive_uri="memoryos://user/u1/sessions/history/s1",
+            messages=[{"id": "m1", "role": "user", "content": "I prefer findings first during code reviews."}],
+        ),
+        schemas,
+    )[0]
+    second = extractor.extract(
+        SessionArchive(
+            user_id="u1",
+            session_id="s2",
+            archive_uri="memoryos://user/u1/sessions/history/s2",
+            messages=[{"id": "m2", "role": "user", "content": "I prefer concise code review results."}],
+        ),
+        schemas,
+    )[0]
+    unknown = extractor.extract(
+        SessionArchive(
+            user_id="u1",
+            session_id="s3",
+            archive_uri="memoryos://user/u1/sessions/history/s3",
+            messages=[{"id": "m3", "role": "user", "content": "The project must preserve the frobnicator convention."}],
+            metadata={"project_id": "memoryos"},
+        ),
+        schemas,
+    )
+
+    assert first.fields["dimension"] == second.fields["dimension"] == "code_review_style"
+    assert first.merge_key == second.merge_key
+    assert not any(candidate.memory_type == MemoryType.PROJECT_RULE for candidate in unknown)
 
 
 def test_legacy_extractors_not_used_by_memory_commit_planner() -> None:

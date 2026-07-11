@@ -1,3 +1,5 @@
+"""预测模块里的预测台账。"""
+
 from __future__ import annotations
 
 import json

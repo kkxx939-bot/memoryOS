@@ -1,3 +1,5 @@
+"""MCP 工具定义。"""
+
 from __future__ import annotations
 
 from dataclasses import asdict, is_dataclass
@@ -85,7 +87,7 @@ class MCPToolRouter:
                     "details": {},
                 }
             }
-        except Exception as exc:  # Tools are a fail-safe boundary for external agents.
+        except Exception as exc:  # 工具层是外部 Agent 的最后一道安全边界。
             return exception_payload(exc)
 
     def search_context(self, args: dict[str, Any]) -> dict[str, Any]:

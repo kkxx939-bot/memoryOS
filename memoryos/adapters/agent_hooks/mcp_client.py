@@ -1,3 +1,5 @@
+"""适配器里的MCP客户端。"""
+
 from __future__ import annotations
 
 import os
@@ -57,5 +59,5 @@ class AgentHookTransportClient:
         return self.server.call_tool(name, arguments)
 
 
-# Deprecated compatibility alias. This client selects local router or HTTP; it is not an MCP transport.
+# 这是保留给旧调用方的别名。它只会选择本地路由或 HTTP，并不负责 MCP 传输。
 AgentHookMCPClient = AgentHookTransportClient

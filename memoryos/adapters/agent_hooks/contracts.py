@@ -1,3 +1,5 @@
+"""Agent 钩子的接口约定。"""
+
 from __future__ import annotations
 
 from typing import Any

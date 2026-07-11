@@ -1,3 +1,5 @@
+"""操作提交里的操作提交。"""
+
 from __future__ import annotations
 
 import json
@@ -13,6 +15,7 @@ from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_relation import ContextRelation
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.model.lifecycle import LifecycleState
+from memoryos.contextdb.session.session_archive import SessionArchiveStore
 from memoryos.contextdb.store.local_stores import InMemoryLockStore
 from memoryos.contextdb.store.source_store import (
     IndexStore,
@@ -24,6 +27,8 @@ from memoryos.contextdb.store.source_store import (
 )
 from memoryos.contextdb.transaction.path_lock import PathLock
 from memoryos.core.time import utc_now
+from memoryos.memory.canonical.episode import EvidenceEpisode, SessionArchiveEpisodeAdapter
+from memoryos.memory.canonical.evidence import evidence_hash
 from memoryos.memory.canonical.transaction import RevisionConflictError
 from memoryos.operations.commit.audit_writer import AuditWriter
 from memoryos.operations.commit.diff_writer import DiffWriter
@@ -38,6 +43,8 @@ from memoryos.operations.resolver.target_resolver import TargetResolver
 
 
 class OperationCommitter:
+    """负责加锁、版本校验、批量提交、故障恢复和 Outbox 落盘。"""
+
     def __init__(
         self,
         source_store: SourceStore,
@@ -63,6 +70,8 @@ class OperationCommitter:
         self.action_policy_updater = ActionPolicyUpdater()
 
     def commit(self, user_id: str, operations: list[ContextOperation]) -> ContextDiff:
+        """执行这一步处理，并保持已有状态约束。"""
+
         canonical = [operation for operation in operations if operation.payload.get("canonical_memory") is True]
         if canonical:
             diffs = []
@@ -171,6 +180,13 @@ class OperationCommitter:
                     self.redo.advance(operation, phase="audit_written")
                     operation.status = OperationStatus.COMMITTED
                     committed.append(operation)
+                self._write_outbox_event(
+                    transaction_id,
+                    idempotency_key,
+                    committed,
+                    status="source_committed",
+                    before_images=backups,
+                )
             except Exception:
                 self._restore_canonical_state(backups)
                 self._write_outbox_event(
@@ -231,11 +247,28 @@ class OperationCommitter:
         return outbox_path
 
     def _preflight_canonical_revisions(self, operations: list[ContextOperation]) -> None:
+        tenants: set[str] = set()
+        owners: set[str] = set()
+        slot_ids: set[str] = set()
+        scope_payloads: set[str] = set()
         for operation in operations:
             object_payload = operation.payload.get("context_object")
             if not isinstance(object_payload, dict) or not object_payload.get("uri"):
                 raise ValueError("canonical operation requires a context_object URI")
             uri = str(object_payload["uri"])
+            metadata = dict(object_payload.get("metadata", {}) or {})
+            object_tenant = str(object_payload.get("tenant_id") or "default")
+            operation_tenant = str(operation.payload.get("tenant_id") or "default")
+            object_owner = str(object_payload.get("owner_user_id") or operation.user_id)
+            if object_tenant != operation_tenant or object_owner != operation.user_id:
+                raise ValueError("canonical operation tenant or owner does not match its transaction envelope")
+            tenants.add(object_tenant)
+            owners.add(object_owner)
+            slot_ids.add(str(metadata.get("slot_id") or operation.payload.get("slot_id") or ""))
+            scope_payloads.add(json.dumps(metadata.get("scope", {}), ensure_ascii=False, sort_keys=True))
+            if not operation.evidence or any(not item.get("event_id") or not item.get("content_hash") for item in operation.evidence):
+                raise ValueError("canonical operation requires durable evidence references")
+            self._validate_canonical_evidence(operation)
             expected = int(operation.payload.get("expected_revision", 0))
             try:
                 current = self.source_store.read_object(uri)
@@ -244,6 +277,40 @@ class OperationCommitter:
                 actual = 0
             if actual != expected:
                 raise RevisionConflictError(f"revision conflict for {uri}: expected {expected}, actual {actual}")
+        if len(tenants) != 1 or len(owners) != 1 or len(slot_ids - {""}) != 1 or len(scope_payloads) != 1:
+            raise ValueError("canonical transaction must preserve tenant, owner, slot, and scope boundaries")
+
+    def _validate_canonical_evidence(self, operation: ContextOperation) -> None:
+        episodes: dict[str, EvidenceEpisode] = {}
+        for payload in operation.evidence:
+            source_uri = str(payload.get("source_uri") or "")
+            if not source_uri:
+                raise ValueError("canonical evidence requires a durable source_uri")
+            if source_uri not in episodes:
+                archive = SessionArchiveStore(
+                    self.root,
+                    tenant_id=str(operation.payload.get("tenant_id") or "default"),
+                ).read_archive(source_uri, tenant_id=str(operation.payload.get("tenant_id") or "default"))
+                episodes[source_uri] = SessionArchiveEpisodeAdapter().adapt(archive)
+            episode = episodes[source_uri]
+            event = episode.event(str(payload["event_id"]))
+            if event is None or event.episode_id != operation.source_episode_id:
+                raise ValueError("canonical evidence event is not part of the source episode")
+            text = event.text()
+            if evidence_hash(text) != str(payload["content_hash"]):
+                raise ValueError("canonical evidence content hash no longer matches the archive")
+            span_start = payload.get("span_start")
+            span_end = payload.get("span_end")
+            if (span_start is None) != (span_end is None):
+                raise ValueError("canonical evidence span is incomplete")
+            if span_start is None or span_end is None:
+                continue
+            start, end = int(span_start), int(span_end)
+            if start < 0 or end <= start or end > len(text):
+                raise ValueError("canonical evidence span is invalid")
+            quoted_hash = payload.get("quoted_text_hash")
+            if quoted_hash and evidence_hash(text[start:end]) != str(quoted_hash):
+                raise ValueError("canonical evidence quote hash no longer matches the archive")
 
     def _validate_authoritative_batch(self, operations: list[ContextOperation]) -> None:
         slot_active: dict[str, str | None] = {}
@@ -496,6 +563,8 @@ class OperationCommitter:
         )
 
     def resume(self, user_id: str, operation: ContextOperation, phase: str) -> bool:
+        """处理 resume 这一步。"""
+
         if phase in {"committed"}:
             self.redo.commit(operation.operation_id)
             return False
@@ -550,6 +619,8 @@ class OperationCommitter:
         return True
 
     def resume_canonical_batch(self, user_id: str, entries: list) -> list[str]:  # noqa: ANN001
+        """从事务日志记录的阶段继续完成整批写入。"""
+
         operations = [entry.operation for entry in entries]
         if not operations:
             return []
@@ -581,6 +652,12 @@ class OperationCommitter:
         with self.path_lock.acquire(f"canonical:{slot_uri}"):
             marker = self._transaction_marker(idempotency_key)
             if marker.exists():
+                self._finalize_canonical_outbox(
+                    transaction_id,
+                    idempotency_key,
+                    ordered,
+                    slot_uri=slot_uri,
+                )
                 for operation in ordered:
                     self.redo.commit(operation.operation_id)
                 return [operation.operation_id for operation in ordered]
@@ -622,6 +699,8 @@ class OperationCommitter:
             return [operation.operation_id for operation in ordered]
 
     def recover_pending_canonical(self, user_id: str) -> list[str]:
+        """恢复卡在准备阶段或源数据已写入阶段的记忆事务。"""
+
         grouped: dict[str, list] = {}
         for entry in self.redo.pending_entries():
             if entry.operation.payload.get("canonical_memory") is not True:

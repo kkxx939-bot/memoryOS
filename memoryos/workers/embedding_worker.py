@@ -1,3 +1,5 @@
+"""后台任务里的向量化任务。"""
+
 from __future__ import annotations
 
 from collections.abc import Callable

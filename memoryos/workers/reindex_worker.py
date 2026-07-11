@@ -1,3 +1,5 @@
+"""负责重建索引的后台任务。"""
+
 from __future__ import annotations
 
 from memoryos.contextdb.store.source_store import IndexStore, SourceStore

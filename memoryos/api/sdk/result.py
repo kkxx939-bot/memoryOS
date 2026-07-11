@@ -1,3 +1,5 @@
+"""接口层里的结果。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

@@ -1,3 +1,5 @@
+"""上下文数据库里的SQLite索引存储。"""
+
 from __future__ import annotations
 
 import json
@@ -10,6 +12,8 @@ from memoryos.contextdb.store.source_store import IndexHit
 
 
 class SQLiteIndexStore:
+    """保存可检索元数据，并在截断结果前完成结构化过滤。"""
+
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self.fts_enabled = True
@@ -17,24 +21,40 @@ class SQLiteIndexStore:
         self._init_db()
 
     def upsert_index(self, obj: ContextObject, content: str = "") -> None:
+        """写入检索文本以及租户、用户、状态和作用域等过滤字段。"""
+
         metadata_json = json.dumps(obj.metadata, ensure_ascii=False)
         metadata_text = " ".join(str(value) for value in obj.metadata.values())
         scope = dict(obj.metadata.get("scope", {}) or {})
         fields = dict(obj.metadata.get("fields", {}) or {})
         connect = dict(obj.metadata.get("connect", {}) or {})
         admission = dict(obj.metadata.get("admission", {}) or {})
-        project_id = str(scope.get("project_id") or fields.get("project_id") or obj.metadata.get("project_id") or "")
+        applicability = dict(scope.get("applicability", {}) or {})
+        scope_keys = [
+            f"{item.get('namespace', 'memoryos')}:{item.get('kind')}:{item.get('id')}"
+            for item in applicability.get("all_of", []) or []
+            if isinstance(item, dict) and item.get("kind") and item.get("id")
+        ]
+        workspace = next(
+            (str(item.get("id")) for item in applicability.get("all_of", []) or [] if isinstance(item, dict) and item.get("kind") == "workspace"),
+            "",
+        )
+        project_id = str(scope.get("project_id") or fields.get("project_id") or obj.metadata.get("project_id") or workspace)
         adapter_id = str(connect.get("adapter_id") or obj.metadata.get("source_adapter_id") or "")
         admission_status = str(admission.get("decision") or "")
+        claim_state = str(obj.metadata.get("state") or obj.metadata.get("claim_state") or "")
+        slot_id = str(obj.metadata.get("slot_id") or "")
+        memory_type = str(obj.metadata.get("memory_type") or "")
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO contexts(
-                  uri, tenant_id, owner_user_id, context_type, project_id, adapter_id, admission_status, title, lifecycle_state,
+                  uri, tenant_id, owner_user_id, context_type, project_id, adapter_id, admission_status, claim_state,
+                  slot_id, memory_type, scope_keys, title, lifecycle_state,
                   hotness, semantic_hotness, behavior_support_hotness,
                   metadata_json, content_text, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(uri) DO UPDATE SET
                   tenant_id=excluded.tenant_id,
                   owner_user_id=excluded.owner_user_id,
@@ -42,6 +62,10 @@ class SQLiteIndexStore:
                   project_id=excluded.project_id,
                   adapter_id=excluded.adapter_id,
                   admission_status=excluded.admission_status,
+                  claim_state=excluded.claim_state,
+                  slot_id=excluded.slot_id,
+                  memory_type=excluded.memory_type,
+                  scope_keys=excluded.scope_keys,
                   title=excluded.title,
                   lifecycle_state=excluded.lifecycle_state,
                   hotness=excluded.hotness,
@@ -59,6 +83,10 @@ class SQLiteIndexStore:
                     project_id,
                     adapter_id,
                     admission_status,
+                    claim_state,
+                    slot_id,
+                    memory_type,
+                    json.dumps(scope_keys, ensure_ascii=False),
                     obj.title,
                     obj.lifecycle_state.value,
                     obj.hotness,
@@ -73,6 +101,8 @@ class SQLiteIndexStore:
             conn.execute("INSERT INTO contexts_fts(uri, title, content_text, metadata_text) VALUES (?, ?, ?, ?)", (obj.uri, obj.title, content, metadata_text))
 
     def delete_index(self, uri: str) -> None:
+        """删除可重建的索引记录，不碰权威源数据。"""
+
         with self._connect() as conn:
             conn.execute("DELETE FROM contexts WHERE uri = ?", (uri,))
             self._delete_fts(conn, uri)
@@ -87,6 +117,8 @@ class SQLiteIndexStore:
             conn.execute("DELETE FROM contexts_fts")
 
     def search(self, query: str, filters: dict | None = None, limit: int = 10) -> list[IndexHit]:
+        """按给定条件查找匹配结果。"""
+
         filters = filters or {}
         exact_hits = self._search_metadata_exact(query, filters, limit)
         if len(exact_hits) >= limit:
@@ -103,19 +135,46 @@ class SQLiteIndexStore:
     def _base_filter_sql(self, filters: dict) -> tuple[str, list[str]]:
         sql = ""
         params: list[str] = []
-        for field in ("tenant_id", "owner_user_id", "context_type", "adapter_id", "admission_status", "lifecycle_state"):
-            if filters.get(field) is not None:
-                sql += f" AND c.{field} = ?"
-                params.append(str(filters[field]))
+        for field in (
+            "tenant_id",
+            "owner_user_id",
+            "context_type",
+            "adapter_id",
+            "admission_status",
+            "lifecycle_state",
+            "claim_state",
+            "slot_id",
+            "memory_type",
+        ):
+            value = filters.get(field)
+            if value is None:
+                continue
+            values = list(value) if isinstance(value, (list, tuple, set, frozenset)) else [value]
+            sql += f" AND c.{field} IN ({','.join('?' for _ in values)})"
+            params.extend(str(item) for item in values)
         if filters.get("project_id") is not None:
-            sql += " AND (c.project_id = ? OR c.project_id = '')"
+            sql += " AND (c.project_id = ? OR (c.project_id = '' AND c.memory_type NOT IN (?, ?, ?)))"
             params.append(str(filters["project_id"]))
+            params.extend(["project_rule", "project_decision", "agent_experience"])
+        allowed_uris = list(filters.get("allowed_uris", []) or [])
+        if allowed_uris:
+            sql += f" AND c.uri IN ({','.join('?' for _ in allowed_uris)})"
+            params.extend(str(uri) for uri in allowed_uris)
+        elif "allowed_uris" in filters:
+            sql += " AND 1 = 0"
         if filters.get("admission_status") is None:
             sql += " AND c.admission_status NOT IN (?, ?, ?, ?)"
             params.extend(["pending", "restricted", "archive_only", "reject"])
         if filters.get("lifecycle_state") is None:
             sql += " AND c.lifecycle_state NOT IN (?, ?, ?)"
             params.extend(["deleted", "archived", "obsolete"])
+        available_scopes = list(filters.get("applicability_scope_keys", []) or [])
+        if available_scopes:
+            sql += (
+                " AND NOT EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(c.scope_keys) THEN c.scope_keys ELSE '[]' END) "
+                f"WHERE value NOT IN ({','.join('?' for _ in available_scopes)}))"
+            )
+            params.extend(str(scope_key) for scope_key in available_scopes)
         return sql, params
 
     def _search_fts(self, query: str, filters: dict, limit: int) -> list[IndexHit]:
@@ -208,6 +267,10 @@ class SQLiteIndexStore:
                   project_id TEXT NOT NULL DEFAULT '',
                   adapter_id TEXT NOT NULL DEFAULT '',
                   admission_status TEXT NOT NULL DEFAULT '',
+                  claim_state TEXT NOT NULL DEFAULT '',
+                  slot_id TEXT NOT NULL DEFAULT '',
+                  memory_type TEXT NOT NULL DEFAULT '',
+                  scope_keys TEXT NOT NULL DEFAULT '[]',
                   title TEXT NOT NULL,
                   lifecycle_state TEXT NOT NULL,
                   hotness REAL NOT NULL,
@@ -220,9 +283,11 @@ class SQLiteIndexStore:
                 """
             )
             columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(contexts)").fetchall()}
-            for name in ("project_id", "adapter_id", "admission_status"):
+            for name in ("project_id", "adapter_id", "admission_status", "claim_state", "slot_id", "memory_type", "scope_keys"):
                 if name not in columns:
-                    conn.execute(f"ALTER TABLE contexts ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
+                    default = "'[]'" if name == "scope_keys" else "''"
+                    conn.execute(f"ALTER TABLE contexts ADD COLUMN {name} TEXT NOT NULL DEFAULT {default}")
+            conn.execute("UPDATE contexts SET scope_keys = '[]' WHERE NOT json_valid(scope_keys)")
             try:
                 conn.execute(
                     """

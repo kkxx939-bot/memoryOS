@@ -1,3 +1,5 @@
+"""记忆系统里的事件。"""
+
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -11,6 +13,8 @@ from memoryos.memory.canonical.scope import ScopeRef
 
 @dataclass(frozen=True)
 class ActorRef:
+    """保存 ActorRef 需要的这组数据。"""
+
     kind: str
     id: str
 
@@ -26,6 +30,8 @@ class ActorRef:
 
 @dataclass(frozen=True)
 class SubjectRef:
+    """保存 SubjectRef 需要的这组数据。"""
+
     kind: str
     id: str
 
@@ -39,6 +45,8 @@ class SubjectRef:
 
 @dataclass(frozen=True)
 class OriginContext:
+    """保存 OriginContext 需要的这组数据。"""
+
     world_domain: str
     connect_type: str
     adapter_id: str
@@ -70,6 +78,8 @@ class OriginContext:
 
 @dataclass(frozen=True)
 class EventEnvelope:
+    """保存 EventEnvelope 需要的这组数据。"""
+
     event_id: str
     event_type: str
     tenant_id: str

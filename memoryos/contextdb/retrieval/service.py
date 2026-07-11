@@ -1,3 +1,5 @@
+"""上下文数据库里的服务。"""
+
 from __future__ import annotations
 
 import json

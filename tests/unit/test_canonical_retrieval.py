@@ -131,7 +131,7 @@ def test_retrieval_distinguishes_current_options_history_visibility_and_scope(tm
     current = retriever.search(query(intent=CanonicalQueryIntent.CURRENT))
     assert [item["uri"] for item in current] == [active]
     options = retriever.search(query(intent=CanonicalQueryIntent.OPTIONS))
-    assert {item["uri"] for item in options} == {active, proposed}
+    assert {item["uri"] for item in options} == {proposed}
     history = retriever.search(query(states=("SUPERSEDED",)))
     assert [item["uri"] for item in history] == [superseded]
     assert history[0]["memory_category"] == "history"
@@ -145,6 +145,41 @@ def test_retrieval_distinguishes_current_options_history_visibility_and_scope(tm
         )
         == []
     )
+
+
+def test_canonical_scope_filter_precedes_limit(tmp_path) -> None:  # noqa: ANN001
+    source = FileSystemSourceStore(tmp_path)
+    index = InMemoryIndexStore()
+    projector = CanonicalMemoryProjector(source, index, tmp_path)
+    for number in range(30):
+        _write_claim(
+            source,
+            projector,
+            claim_id=f"other-{number}",
+            value=f"shared target {number}",
+            state="ACTIVE",
+            memory_type="project_decision",
+            scope=_scope(("workspace", "other")),
+        )
+    target = _write_claim(
+        source,
+        projector,
+        claim_id="target-workspace",
+        value="shared target",
+        state="ACTIVE",
+        memory_type="project_decision",
+        scope=_scope(("workspace", "memoryos")),
+    )
+    results = CanonicalMemoryRetriever(source, index).search(
+        CanonicalMemoryQuery(
+            text="shared target",
+            tenant_id="t1",
+            principal_id="u1",
+            applicability_scope_keys=("memoryos:workspace:memoryos",),
+            limit=1,
+        )
+    )
+    assert [item["uri"] for item in results] == [target]
 
 
 def test_reachy_preference_applies_to_person_and_environment_not_device_only(tmp_path) -> None:  # noqa: ANN001
@@ -223,30 +258,47 @@ def test_canonical_retrieval_supports_exact_vector_and_relation_expansion(tmp_pa
         memory_type="project_decision",
         scope=scope,
     )
+    cockroach = _write_claim(
+        source,
+        projector,
+        claim_id="cockroach-related",
+        value="cockroachdb distributed option",
+        state="PROPOSED",
+        memory_type="project_decision",
+        scope=scope,
+    )
     relations.add_relation(
         ContextRelation(
-            source_uri=sqlite,
+            source_uri=postgres,
             relation_type="alternative",
-            target_uri=postgres,
+            target_uri=cockroach,
             metadata={"tenant_id": "t1", "owner_user_id": "u1"},
         )
     )
     hybrid = HybridSearch(index, vector_store=vectors, embedding_provider=embedding, source_store=source)
     retriever = CanonicalMemoryRetriever(source, index, relations, hybrid_search=hybrid)
-    base = dict(
-        tenant_id="t1",
-        principal_id="u1",
-        applicability_scope_keys=("memoryos:workspace:memoryos",),
-        intent=CanonicalQueryIntent.OPTIONS,
-        limit=10,
-    )
+    def query(
+        text: str,
+        *,
+        claim_uris: tuple[str, ...] = (),
+        intent: CanonicalQueryIntent = CanonicalQueryIntent.OPTIONS,
+    ) -> CanonicalMemoryQuery:
+        return CanonicalMemoryQuery(
+            text=text,
+            tenant_id="t1",
+            principal_id="u1",
+            applicability_scope_keys=("memoryos:workspace:memoryos",),
+            intent=intent,
+            claim_uris=claim_uris,
+            limit=10,
+        )
 
-    exact = retriever.search(CanonicalMemoryQuery(text="no lexical match", claim_uris=(sqlite,), **base))
-    assert exact[0]["uri"] == sqlite
-    vector = retriever.search(CanonicalMemoryQuery(text="durable local database", **base))
-    assert any(item["uri"] == sqlite for item in vector)
-    expanded = CanonicalMemoryRetriever(source, index, relations).search(
-        CanonicalMemoryQuery(text="sqlite", **base)
+    exact = retriever.search(
+        query("no lexical match", claim_uris=(sqlite,), intent=CanonicalQueryIntent.CURRENT)
     )
-    assert {item["uri"] for item in expanded} >= {sqlite, postgres}
+    assert exact[0]["uri"] == sqlite
+    vector = retriever.search(query("durable local database", intent=CanonicalQueryIntent.CURRENT))
+    assert any(item["uri"] == sqlite for item in vector)
+    expanded = CanonicalMemoryRetriever(source, index, relations).search(query("postgresql"))
+    assert {item["uri"] for item in expanded} >= {postgres, cockroach}
     assert any(item["retrieval_source"] == "canonical_relation_expansion" for item in expanded)

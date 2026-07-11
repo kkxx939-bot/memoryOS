@@ -1,3 +1,5 @@
+"""这个包的公开接口都从这里导出。"""
+
 from memoryos.behavior.model.behavior_case import BehaviorCase
 from memoryos.behavior.model.behavior_pattern import BehaviorCluster, BehaviorPattern
 from memoryos.behavior.model.feedback_signal import FeedbackSignal

@@ -1,3 +1,5 @@
+"""这个包的公开接口都从这里导出。"""
+
 from memoryos.contextdb.retrieval.context_selector import ContextSelector
 from memoryos.contextdb.retrieval.hierarchical_retriever import HierarchicalRetrievalResult, HierarchicalRetriever
 from memoryos.contextdb.retrieval.hybrid_search import HybridHit, HybridSearch

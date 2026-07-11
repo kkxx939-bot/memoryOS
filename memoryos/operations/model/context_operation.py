@@ -1,5 +1,8 @@
+"""操作提交里的上下文操作。"""
+
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 from memoryos.contextdb.model.context_type import ContextType
@@ -33,7 +36,13 @@ class ContextOperation:
             self.action = OperationAction(self.action)
         if isinstance(self.status, str):
             self.status = OperationStatus(self.status)
-        self.confidence = max(0.0, min(1.0, float(self.confidence)))
+        try:
+            confidence = float(self.confidence)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("confidence must be a finite number between 0 and 1") from exc
+        if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+            raise ValueError("confidence must be a finite number between 0 and 1")
+        self.confidence = confidence
         if not self.operation_id:
             self.operation_id = new_id("op")
         if not self.created_at:

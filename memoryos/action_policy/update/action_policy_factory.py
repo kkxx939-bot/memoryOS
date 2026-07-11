@@ -1,3 +1,5 @@
+"""动作策略里的动作策略工厂。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

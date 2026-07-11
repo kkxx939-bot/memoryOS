@@ -1,3 +1,5 @@
+"""行为模块里的场景标识组装器。"""
+
 from __future__ import annotations
 
 from memoryos.behavior.model.observation import Observation

@@ -19,6 +19,7 @@ from memoryos.memory.canonical import (
     SpeechAct,
     StableMemoryIdentityResolver,
     VisibilityPolicy,
+    bind_field_evidence,
 )
 from memoryos.memory.canonical.reconcile import MemorySemanticReconciler
 
@@ -54,17 +55,21 @@ def _context():  # noqa: ANN202
 
 def _proposal(episode, value: str, speech: str, commitment: str, proposal_id: str):  # noqa: ANN001, ANN202
     assert episode.origin.primary_scope is not None
+    identity_fields = {"decision_topic": "primary storage backend"}
+    value_fields = {"canonical_value": value}
+    evidence_refs = (EvidenceRef.from_event(episode.events[0], source_uri=episode.source_uris[0]),)
     return MemorySemanticNormalizer().normalize(
         MemorySemanticProposal(
             proposal_id=proposal_id,
             memory_type="project_decision",
-            identity_fields={"decision_topic": "primary storage backend"},
-            value_fields={"canonical_value": value},
+            identity_fields=identity_fields,
+            value_fields=value_fields,
             semantic=SemanticAssessment(speech, commitment, "current", "alternative"),
             epistemic_status=EpistemicStatus.EXPLICIT,
             suggested_scope_refs=(episode.origin.primary_scope,),
             related_memory_ids=(),
-            evidence_refs=(EvidenceRef.from_event(episode.events[0]),),
+            evidence_refs=evidence_refs,
+            field_evidence_refs=bind_field_evidence(identity_fields, value_fields, evidence_refs),
             confidence=0.95,
             extractor_version="fake",
         )
@@ -103,6 +108,16 @@ def test_different_workspaces_do_not_share_slot_and_agents_in_one_workspace_do()
     agent_changed = replace(proposal, model_id="another-agent")
     assert first.slot_id != other.slot_id
     assert first.slot_id == resolver.resolve(agent_changed, scope, tenant_id="t1", owner_user_id="u1").slot_id
+
+
+def test_tenant_and_owner_are_part_of_stable_slot_boundary() -> None:
+    episode, scope = _context()
+    proposal = _proposal(episode, "SQLite", "confirmation", "confirmed", "p-owner")
+    resolver = StableMemoryIdentityResolver()
+    first = resolver.resolve(proposal, scope, tenant_id="t1", owner_user_id="u1")
+    other_owner = resolver.resolve(proposal, scope, tenant_id="t1", owner_user_id="u2")
+    other_tenant = resolver.resolve(proposal, scope, tenant_id="t2", owner_user_id="u1")
+    assert len({first.slot_id, other_owner.slot_id, other_tenant.slot_id}) == 3
 
 
 def test_alias_registry_maps_reachy_names_to_one_stable_asset() -> None:
@@ -148,3 +163,27 @@ def test_sqlite_active_postgres_proposed_then_confirmation_atomically_supersedes
         claim.claim_id for claim in third.claims if claim.canonical_value == "postgresql"
     )
     assert len([claim for claim in third.claims if claim.current.state == "ACTIVE"]) == 1
+
+
+def test_authoritative_explicit_observation_cannot_bypass_confirmation_transition() -> None:
+    episode, scope = _context()
+    observation = _proposal(episode, "SQLite", "observation", "weak", "p-observation")
+    _, transition = _apply(observation, scope)
+    assert transition.claims[0].current.state == "PROPOSED"
+
+
+def test_claim_revision_history_links_previous_and_validity_interval() -> None:
+    episode, scope = _context()
+    first = _proposal(episode, "SQLite", "confirmation", "confirmed", "p-first")
+    _, initial = _apply(first, scope)
+    corrected = replace(
+        first,
+        proposal_id="p-corrected",
+        value_fields={"canonical_value": "SQLite", "reason": "verified"},
+        semantic=replace(first.semantic, speech_act=SpeechAct.CORRECTION),
+    )
+    _, updated = _apply(corrected, scope, initial.slot, initial.claims)
+    revisions = updated.claims[0].revisions
+    assert len(revisions) == 2
+    assert revisions[1].previous_revision == 1
+    assert revisions[0].valid_to == revisions[1].valid_from

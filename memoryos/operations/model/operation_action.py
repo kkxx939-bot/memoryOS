@@ -1,3 +1,5 @@
+"""操作提交里的操作动作。"""
+
 from __future__ import annotations
 
 from enum import Enum

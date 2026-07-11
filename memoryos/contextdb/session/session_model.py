@@ -1,3 +1,5 @@
+"""上下文数据库里的会话数据模型。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

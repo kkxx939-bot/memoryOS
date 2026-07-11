@@ -1,3 +1,5 @@
+"""记忆系统里的准入。"""
+
 from __future__ import annotations
 
 import re
@@ -170,7 +172,30 @@ class MemoryAdmissionGate:
         return any(token in text for token in ("must", "never", "do not", "禁止", "不允许", "必须", "不要", "项目规则", "约束", "最高强约束"))
 
     def _project_decision(self, text: str) -> bool:
-        return any(token in text for token in ("decided", "adopted", "deferred", "rejected", "决定", "采用", "暂缓", "不做", "取舍", "架构决策"))
+        return any(
+            token in text
+            for token in (
+                "continue using",
+                "remains active",
+                "decided",
+                "adopted",
+                "deferred",
+                "rejected",
+                "evaluate",
+                "future option",
+                "继续使用",
+                "保持为当前",
+                "正式改成",
+                "决定",
+                "采用",
+                "暂缓",
+                "不做",
+                "评估",
+                "候选",
+                "取舍",
+                "架构决策",
+            )
+        )
 
     def _agent_experience(self, candidate: MemoryCandidateDraft) -> bool:
         fields = candidate.fields

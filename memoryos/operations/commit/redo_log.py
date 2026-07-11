@@ -1,3 +1,5 @@
+"""操作提交里的重做日志。"""
+
 from __future__ import annotations
 
 import json

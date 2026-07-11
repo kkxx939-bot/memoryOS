@@ -1,3 +1,5 @@
+"""上下文数据库里的上下文打包器。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

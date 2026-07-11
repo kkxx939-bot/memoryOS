@@ -123,8 +123,10 @@ def test_projection_revision_binding_retry_idempotency_stale_guard_and_rebuild(t
     assert "/projections/rev-1/" in projected.layers.l0_uri
     manifest = json.loads(source.read_content(projected.metadata["projection_manifest_uri"]))
     assert manifest["source_revision"] == 1
+    assert manifest["slot_id"] == "slot1"
     assert manifest["projection_levels"] == ["L0", "L1", "L2"]
     assert {item["projection_level"] for item in manifest["projections"]} == {"L0", "L1", "L2"}
+    assert {item["slot_id"] for item in manifest["projections"]} == {"slot1"}
     assert all(item["source_revision"] == 1 and item["created_at"] for item in manifest["projections"])
     assert vectors.rows[claim.uri][1]["source_revision"] == 1
     assert claim.uri in index.indexed_uris()

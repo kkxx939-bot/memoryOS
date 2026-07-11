@@ -1,3 +1,5 @@
+"""记忆系统里的记忆更新。"""
+
 from __future__ import annotations
 
 from memoryos.contextdb.model.context_type import ContextType
@@ -8,7 +10,7 @@ from memoryos.operations.model.operation_action import OperationAction
 
 
 class MemoryUpdater:
-    """Memory-only operation builder. Behavior and ActionPolicy updates live elsewhere."""
+    """负责 MemoryUpdater 这部分逻辑。"""
 
     def __init__(self) -> None:
         self.candidate_lifecycle = MemoryCandidateLifecycle()

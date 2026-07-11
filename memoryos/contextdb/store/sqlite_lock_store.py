@@ -1,3 +1,5 @@
+"""上下文数据库里的SQLite锁存储。"""
+
 from __future__ import annotations
 
 import sqlite3

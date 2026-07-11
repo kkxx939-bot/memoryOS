@@ -1,3 +1,5 @@
+"""Agent 事件定义。"""
+
 from __future__ import annotations
 
 import hashlib

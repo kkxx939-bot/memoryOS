@@ -1,3 +1,5 @@
+"""动作策略里的奖励信号。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
