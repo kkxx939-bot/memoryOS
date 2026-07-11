@@ -45,7 +45,9 @@ def _proposal(
             **{f"identity.{key}": evidence_refs for key in identity_fields},
             **{f"value.{key}": evidence_refs for key in value_fields},
             "semantic.speech_act": evidence_refs,
+            "semantic.commitment": evidence_refs,
             "semantic.temporal_scope": evidence_refs,
+            "semantic.relation_to_existing": evidence_refs,
             "transition": evidence_refs,
         },
         "confidence": 0.98,
@@ -244,8 +246,7 @@ def test_default_fallback_mixed_database_statement_and_user_confirmation(tmp_pat
         query_intent="OPTIONS",
     )
     assert {
-        (item["metadata"]["memory_type"], item["metadata"]["canonical_value"], item["memory_state"])
-        for item in current
+        (item["metadata"]["memory_type"], item["metadata"]["canonical_value"], item["memory_state"]) for item in current
     } == {
         ("project_decision", "sqlite", "ACTIVE"),
         ("project_rule", "forbidden", "ACTIVE"),
@@ -295,14 +296,12 @@ def test_default_fallback_mixed_database_statement_and_user_confirmation(tmp_pat
         memory_states=["SUPERSEDED"],
     )
     assert {
-        item["metadata"]["canonical_value"]
-        for item in active
-        if item["metadata"]["memory_type"] == "project_decision"
+        item["metadata"]["canonical_value"] for item in active if item["metadata"]["memory_type"] == "project_decision"
     } == {"postgresql"}
     assert {item["metadata"]["canonical_value"] for item in history} == {"sqlite"}
 
 
-def test_canonical_memory_isolates_owner_tenant_and_workspace_during_supersede_and_recall(tmp_path) -> None:  # noqa: ANN001
+def test_canonical_memory_shares_workspace_subject_but_isolates_tenant_and_workspace(tmp_path) -> None:  # noqa: ANN001
     client = MemoryOSClient(str(tmp_path))
     connect = ConnectMetadata.default_agent("codex").to_dict()
 
@@ -337,7 +336,7 @@ def test_canonical_memory_isolates_owner_tenant_and_workspace_during_supersede_a
         }
 
     assert active("u1", "workspace-a") == {"postgresql"}
-    assert active("u2", "workspace-a") == {"sqlite"}
+    assert active("u2", "workspace-a") == {"postgresql"}
     assert active("u1", "workspace-b") == {"sqlite"}
     assert active("u1", "workspace-a", "other") == {"sqlite"}
 
@@ -511,7 +510,9 @@ def test_llm_outage_archives_evidence_and_deferred_proposal_replays(tmp_path) ->
         messages=[{"role": "user", "content": "I confirm the storage backend is SQLite."}],
         connect_metadata=ConnectMetadata.default_agent("codex").to_dict(),
     )
-    assert result.done
+    assert not result.done
+    assert result.status == "canonical_pending"
+    assert not result.canonical_committed
     assert cast(Any, client.queue_store).stats().get("pending", 0) >= 1
 
     replay = MemoryProposalWorker(client.session_commit_service).process_pending()
@@ -548,13 +549,16 @@ def test_explicit_forget_creates_retracted_revision_without_physical_delete(tmp_
     assert archived.messages[0]["event_type"] == "RETRACTION"
     slot = client.source_store.read_object(remembered["uri"].rsplit("/claims/", 1)[0])
     assert slot.metadata["active_claim_id"] is None
-    assert client.search_context(
-        "SQLite",
-        user_id="u1",
-        project_id="memoryos",
-        context_type="memory",
-        query_intent="CURRENT",
-    ) == []
+    assert (
+        client.search_context(
+            "SQLite",
+            user_id="u1",
+            project_id="memoryos",
+            context_type="memory",
+            query_intent="CURRENT",
+        )
+        == []
+    )
     history = client.search_context(
         "SQLite",
         user_id="u1",

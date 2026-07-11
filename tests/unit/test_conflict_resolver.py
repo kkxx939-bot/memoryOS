@@ -13,8 +13,16 @@ class ConflictResolverTest(unittest.TestCase):
     def setUp(self) -> None:
         self.resolver = ConflictResolver()
 
-    def op(self, action: OperationAction, target: str | None = "uri", payload: dict | None = None, context_type: ContextType = ContextType.MEMORY) -> ContextOperation:
-        return ContextOperation(user_id="u1", context_type=context_type, action=action, target_uri=target, payload=payload or {})
+    def op(
+        self,
+        action: OperationAction,
+        target: str | None = "uri",
+        payload: dict | None = None,
+        context_type: ContextType = ContextType.MEMORY,
+    ) -> ContextOperation:
+        return ContextOperation(
+            user_id="u1", context_type=context_type, action=action, target_uri=target, payload=payload or {}
+        )
 
     def test_delete_overrides_update(self) -> None:
         result = self.resolver.resolve([self.op(OperationAction.UPDATE), self.op(OperationAction.DELETE)])
@@ -29,14 +37,6 @@ class ConflictResolverTest(unittest.TestCase):
         self.assertEqual(result.accepted[0].action, OperationAction.SUPERSEDE)
         self.assertEqual(result.accepted[0].payload["a"], 1)
         self.assertEqual(result.accepted[0].payload["b"], 2)
-
-    def test_explicit_memory_overrides_candidate_memory(self) -> None:
-        candidate = self.op(OperationAction.ADD, target="m", payload={"memory_kind": "memory_candidate"})
-        explicit = self.op(OperationAction.ADD, target="m", payload={"memory_kind": "explicit_memory"})
-        result = self.resolver.resolve([candidate, explicit])
-        self.assertIn(explicit, result.accepted)
-        self.assertIn(candidate, result.rejected)
-        self.assertEqual(candidate.status, OperationStatus.REJECTED)
 
     def test_policy_memory_constrains_action_policy(self) -> None:
         policy_memory = self.op(
@@ -55,11 +55,18 @@ class ConflictResolverTest(unittest.TestCase):
                 },
             },
         )
-        action_update = self.op(OperationAction.UPDATE, target="policy", payload={"action": "turn_on_ac"}, context_type=ContextType.ACTION_POLICY)
+        action_update = self.op(
+            OperationAction.UPDATE,
+            target="policy",
+            payload={"action": "turn_on_ac"},
+            context_type=ContextType.ACTION_POLICY,
+        )
         result = self.resolver.resolve([policy_memory, action_update])
         self.assertFalse(action_update.payload["auto_execute_allowed"])
         self.assertEqual(action_update.payload["status"], "disabled_auto_execute")
-        self.assertTrue(any(item["type"] == ConflictType.POLICY_MEMORY_CONSTRAINS_ACTION.value for item in result.conflicts))
+        self.assertTrue(
+            any(item["type"] == ConflictType.POLICY_MEMORY_CONSTRAINS_ACTION.value for item in result.conflicts)
+        )
 
     def test_lexical_rule_without_active_structured_relation_cannot_modify_action_policy(self) -> None:
         memory = self.op(
@@ -78,11 +85,7 @@ class ConflictResolverTest(unittest.TestCase):
 
     def test_structured_policy_memory_cannot_constrain_another_scope(self) -> None:
         def scope(identifier: str) -> dict:
-            return {
-                "applicability": {
-                    "all_of": [{"namespace": "memoryos", "kind": "workspace", "id": identifier}]
-                }
-            }
+            return {"applicability": {"all_of": [{"namespace": "memoryos", "kind": "workspace", "id": identifier}]}}
 
         policy_memory = self.op(
             OperationAction.ADD,
@@ -115,7 +118,12 @@ class ConflictResolverTest(unittest.TestCase):
         self.assertTrue(action_update.payload["auto_execute_allowed"])
 
     def test_disabled_auto_execute_reward_does_not_restore_auto_execute(self) -> None:
-        reward = self.op(OperationAction.REWARD, target="policy", payload={"auto_execute_allowed": False}, context_type=ContextType.ACTION_POLICY)
+        reward = self.op(
+            OperationAction.REWARD,
+            target="policy",
+            payload={"auto_execute_allowed": False},
+            context_type=ContextType.ACTION_POLICY,
+        )
         result = self.resolver.resolve([reward])
         self.assertTrue(result.accepted[0].payload["do_not_restore_auto_execute"])
         self.assertFalse(result.accepted[0].payload["auto_execute_allowed"])

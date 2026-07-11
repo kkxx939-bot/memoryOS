@@ -16,14 +16,18 @@ class MemoryProposalWorker:
         jobs = self.service.queue_store.lease("memory_proposal", limit=batch_size, lease_seconds=lease_seconds)
         for job in jobs:
             try:
-                archive = self.service.archive_store.read_archive(job.target_uri)
-                operations = self.service.memory_planner.plan(archive)
-                self.service._commit_or_describe(archive.user_id, operations)
-                if self.service.projection_worker is not None:
-                    self.service.projection_worker.process_pending()
-                self.service.queue_store.ack(job.job_id)
-                committed += 1
-            except Exception as exc:
+                archive = self.service.archive_store.read_archive(
+                    job.target_uri,
+                    tenant_id=str(job.payload.get("tenant_id") or "default"),
+                    manifest_digest=str(job.payload.get("manifest_digest") or "") or None,
+                )
+                result = self.service.async_commit(archive)
+                if result.canonical_committed:
+                    self.service.queue_store.ack(job.job_id)
+                    committed += 1
+                    continue
+                raise RuntimeError(result.status)
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
                 retry = getattr(self.service.queue_store, "retry", None)
                 if callable(retry):
                     status = str(

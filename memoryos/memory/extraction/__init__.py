@@ -7,12 +7,10 @@ from memoryos.memory.extraction.llm_backend import (
     MemoryExtractionPromptBuilder,
     MemoryModelProvider,
 )
-from memoryos.memory.extraction.memory_extractor import ExtractionResult, MemoryExtractor, MemoryExtractorBackend
+from memoryos.memory.extraction.memory_extractor import MemoryExtractorBackend
 
 __all__ = [
-    "ExtractionResult",
     "LLMMemoryExtractorBackend",
-    "MemoryExtractor",
     "MemoryExtractorBackend",
     "MemoryExtractionPromptBuilder",
     "MemoryModelProvider",

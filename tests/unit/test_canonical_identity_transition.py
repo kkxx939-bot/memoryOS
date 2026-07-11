@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import replace
 
 from memoryos.contextdb.session.session_model import SessionArchive
@@ -22,6 +23,23 @@ from memoryos.memory.canonical import (
     bind_field_evidence,
 )
 from memoryos.memory.canonical.reconcile import MemorySemanticReconciler
+
+
+def _explicit_bindings(
+    identity_fields: Mapping[str, object],
+    value_fields: Mapping[str, object],
+    evidence_refs: tuple[EvidenceRef, ...],
+) -> dict[str, tuple[EvidenceRef, ...]]:
+    bindings = {
+        **{f"identity.{key}": evidence_refs for key in identity_fields},
+        **{f"value.{key}": evidence_refs for key in value_fields},
+        "semantic.speech_act": evidence_refs,
+        "semantic.commitment": evidence_refs,
+        "semantic.temporal_scope": evidence_refs,
+        "semantic.relation_to_existing": evidence_refs,
+        "transition": evidence_refs,
+    }
+    return bind_field_evidence(identity_fields, value_fields, evidence_refs, bindings=bindings)
 
 
 def _context():  # noqa: ANN202
@@ -69,9 +87,10 @@ def _proposal(episode, value: str, speech: str, commitment: str, proposal_id: st
             suggested_scope_refs=(episode.origin.primary_scope,),
             related_memory_ids=(),
             evidence_refs=evidence_refs,
-            field_evidence_refs=bind_field_evidence(identity_fields, value_fields, evidence_refs),
+            field_evidence_refs=_explicit_bindings(identity_fields, value_fields, evidence_refs),
             confidence=0.95,
             extractor_version="fake",
+            metadata={"transition_evidence_validated": True},
         )
     )
 
@@ -110,14 +129,16 @@ def test_different_workspaces_do_not_share_slot_and_agents_in_one_workspace_do()
     assert first.slot_id == resolver.resolve(agent_changed, scope, tenant_id="t1", owner_user_id="u1").slot_id
 
 
-def test_tenant_and_owner_are_part_of_stable_slot_boundary() -> None:
+def test_tenant_and_canonical_subject_are_stable_slot_boundary_not_author() -> None:
     episode, scope = _context()
     proposal = _proposal(episode, "SQLite", "confirmation", "confirmed", "p-owner")
     resolver = StableMemoryIdentityResolver()
     first = resolver.resolve(proposal, scope, tenant_id="t1", owner_user_id="u1")
     other_owner = resolver.resolve(proposal, scope, tenant_id="t1", owner_user_id="u2")
     other_tenant = resolver.resolve(proposal, scope, tenant_id="t2", owner_user_id="u1")
-    assert len({first.slot_id, other_owner.slot_id, other_tenant.slot_id}) == 3
+    assert first.slot_id == other_owner.slot_id
+    assert first.slot_uri == other_owner.slot_uri
+    assert first.slot_id != other_tenant.slot_id
 
 
 def test_alias_registry_maps_reachy_names_to_one_stable_asset() -> None:

@@ -14,6 +14,7 @@ from memoryos.behavior.update.behavior_window import BehaviorWindowEvaluator
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.contextdb.store.source_store import IndexStore, SourceStore
+from memoryos.core.ids import stable_hash
 from memoryos.memory.model.memory import MemoryAnchor
 from memoryos.memory.service.memory_updater import MemoryUpdater
 from memoryos.operations.model.context_operation import ContextOperation
@@ -33,7 +34,7 @@ class BehaviorCommitPlanner:
     def plan(self, archive: SessionArchive) -> list[ContextOperation]:
         operations: list[ContextOperation] = []
         cases_by_scene: dict[str, list[BehaviorCase]] = {}
-        for observation in archive.observations:
+        for observation_index, observation in enumerate(archive.observations):
             scene_key = str(observation.get("scene_key", observation.get("scene", "default")))
             prediction = self._prediction_for_scene(archive, scene_key)
             candidates = list(prediction.get("candidates", [])) if isinstance(prediction, dict) else []
@@ -43,29 +44,54 @@ class BehaviorCommitPlanner:
                 user_id=archive.user_id,
                 scene_key=scene_key,
                 observation=observation,
+                case_id=f"case_{stable_hash([archive.task_id, observation_index, scene_key, observation], length=24)}",
                 predicted_candidates=candidates,
                 selected_action=selected_action,
                 executed_action=feedback.get("executed_action"),
                 user_actual_action=feedback.get("actual_action"),
                 feedback_type=str(feedback.get("feedback_type", "unknown")),
                 reward=float(feedback.get("reward", feedback.get("reward_value", 0.0)) or 0.0),
-                related_policy_uris=[str(item.get("policy_uri")) for item in candidates if isinstance(item, dict) and item.get("policy_uri")],
+                related_policy_uris=[
+                    str(item.get("policy_uri"))
+                    for item in candidates
+                    if isinstance(item, dict) and item.get("policy_uri")
+                ],
+                created_at=str(observation.get("observed_at") or observation.get("created_at") or archive.created_at),
             )
             cases_by_scene.setdefault(scene_key, []).append(case)
             operations.append(self.case_writer.add_case(case))
 
         for scene_key, cases in cases_by_scene.items():
             anchor_uri = f"memoryos://user/{archive.user_id}/memories/anchors/{scene_key}_anchor"
-            current_case_refs = [f"memoryos://user/{archive.user_id}/behavior/cases/{case.scene_key}/{case.case_id}" for case in cases]
+            current_case_refs = [
+                f"memoryos://user/{archive.user_id}/behavior/cases/{case.scene_key}/{case.case_id}" for case in cases
+            ]
             history_records = self._history_records(archive.user_id, scene_key)
             decision = self.window_evaluator.evaluate(scene_key, cases, history_records)
             case_refs = decision.similar_refs_30d or [*current_case_refs]
             if decision.create_cluster:
-                operations.append(self.memory_updater.add_memory(self._anchor(archive.user_id, scene_key, case_refs), evidence=[{"source": "behavior_cluster", "case_refs": case_refs}]))
-                cluster = BehaviorCluster(user_id=archive.user_id, scene_key=scene_key, memory_anchor_uri=anchor_uri, case_refs=decision.similar_refs_3d)
+                operations.append(
+                    self.memory_updater.add_memory(
+                        self._anchor(archive.user_id, scene_key, case_refs),
+                        evidence=[{"source": "behavior_cluster", "case_refs": case_refs}],
+                    )
+                )
+                cluster = BehaviorCluster(
+                    user_id=archive.user_id,
+                    scene_key=scene_key,
+                    memory_anchor_uri=anchor_uri,
+                    case_refs=decision.similar_refs_3d,
+                )
+                cluster.cluster_id = (
+                    f"cluster_{stable_hash([archive.task_id, scene_key, sorted(cluster.case_refs)], length=24)}"
+                )
+                cluster.updated_at = archive.created_at
                 operations.append(self.cluster_updater.add_cluster(cluster))
             if decision.create_pattern:
-                actions = Counter(case.selected_action or case.executed_action or case.user_actual_action or "unknown" for case in cases)
+                actions = Counter(
+                    case.selected_action or case.executed_action or case.user_actual_action or "unknown"
+                    for case in cases
+                )
                 pattern = BehaviorPattern(
                     user_id=archive.user_id,
                     scene_key=scene_key,
@@ -75,9 +101,13 @@ class BehaviorCommitPlanner:
                     action_distribution=[{"action": action, "count": count} for action, count in actions.items()],
                     hotness=0.65,
                     confidence=0.72,
+                    pattern_id=f"pattern_{stable_hash([archive.task_id, scene_key, sorted(case_refs)], length=24)}",
+                    updated_at=archive.created_at,
                 )
                 operations.append(self.pattern_updater.add_pattern(pattern))
-            if (decision.archive_stale_single or len(case_refs) == 1) and any(self._observation_age_days(item) > 3 for item in archive.observations):
+            if (decision.archive_stale_single or len(case_refs) == 1) and any(
+                self._observation_age_days(item) > 3 for item in archive.observations
+            ):
                 operations.append(
                     ContextOperation(
                         user_id=archive.user_id,
@@ -113,7 +143,9 @@ class BehaviorCommitPlanner:
         records: list[dict] = []
         seen: set[str] = set()
         for context_type in (ContextType.BEHAVIOR_CASE, ContextType.BEHAVIOR_CLUSTER, ContextType.BEHAVIOR_PATTERN):
-            hits = self.index_store.search(scene_key, filters={"owner_user_id": user_id, "context_type": context_type.value}, limit=20)
+            hits = self.index_store.search(
+                scene_key, filters={"owner_user_id": user_id, "context_type": context_type.value}, limit=20
+            )
             for hit in hits:
                 if hit.uri in seen:
                     continue

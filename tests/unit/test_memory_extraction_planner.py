@@ -5,8 +5,6 @@ from collections.abc import Sequence
 from memoryos.contextdb.session.planners.memory_commit_planner import MemoryCommitPlanner
 from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.memory.extraction import RuleFallbackExtractor
-from memoryos.memory.extraction.llm_memory_extractor import LLMMemoryExtractor
-from memoryos.memory.extraction.rule_memory_extractor import RuleMemoryExtractor
 from memoryos.memory.schema import MemoryCandidateDraft, MemoryType, MemoryTypeRegistry, MemoryTypeSchema
 from memoryos.memory.view import MemoryViewRouter
 
@@ -103,32 +101,13 @@ def test_fallback_identity_is_semantic_and_unknown_constraint_is_archive_only() 
     assert not any(candidate.memory_type == MemoryType.PROJECT_RULE for candidate in unknown)
 
 
-def test_legacy_extractors_not_used_by_memory_commit_planner() -> None:
-    planner = MemoryCommitPlanner()
-
-    assert isinstance(planner.extractor, RuleFallbackExtractor)
-    assert not isinstance(planner.extractor, RuleMemoryExtractor)
-    assert not isinstance(planner.extractor, LLMMemoryExtractor)
-
-
 def test_memory_commit_planner_uses_schema_pipeline() -> None:
     planner = MemoryCommitPlanner()
 
     assert isinstance(planner.extractor, RuleFallbackExtractor)
     assert hasattr(planner, "admission_gate")
-    assert hasattr(planner, "last_group")
-
-
-def test_legacy_extractors_not_default() -> None:
-    test_legacy_extractors_not_used_by_memory_commit_planner()
-
-
-def test_memory_commit_planner_does_not_use_legacy_rule_extractor() -> None:
-    assert not isinstance(MemoryCommitPlanner().extractor, RuleMemoryExtractor)
-
-
-def test_legacy_llm_extractor_not_default_commit_backend() -> None:
-    assert not isinstance(MemoryCommitPlanner().extractor, LLMMemoryExtractor)
+    assert not hasattr(planner, "last_group")
+    assert not hasattr(planner, "last_canonical_inputs")
 
 
 def test_memory_commit_planner_returns_operations_for_accepted_and_pending_only() -> None:
@@ -167,8 +146,8 @@ def test_memory_commit_planner_returns_operations_for_accepted_and_pending_only(
 
     operations = planner.plan(archive)
 
-    assert len(operations) == 3
-    assert planner.last_group.summary() == {
+    assert len(operations.operations) == 3
+    assert dict(operations.context.admission_summary) == {
         "accepted": 1,
         "pending": 1,
         "rejected": 1,
@@ -176,9 +155,15 @@ def test_memory_commit_planner_returns_operations_for_accepted_and_pending_only(
         "private_only": 0,
         "restricted": 1,
     }
-    assert {operation.payload["memory_type"] for operation in operations} == {"project_rule"}
-    assert {operation.payload["admission"]["decision"] for operation in operations} == {"accept", "pending"}
-    assert len([operation for operation in operations if operation.payload.get("canonical_memory") is True]) == 2
+    assert {operation.payload["memory_type"] for operation in operations.operations} == {"project_rule"}
+    assert {operation.payload["admission"]["decision"] for operation in operations.operations} == {
+        "accept",
+        "pending",
+    }
+    assert (
+        len([operation for operation in operations.operations if operation.payload.get("canonical_memory") is True])
+        == 2
+    )
 
 
 def test_memory_operation_payload_contains_schema_metadata() -> None:
@@ -192,7 +177,7 @@ def test_memory_operation_payload_contains_schema_metadata() -> None:
         metadata={"project_id": "memoryos", "connect": {"adapter_id": "codex"}},
     )
 
-    operation = MemoryCommitPlanner().plan(archive)[0]
+    operation = MemoryCommitPlanner().plan(archive).operations[0]
     metadata = operation.payload["context_object"]["metadata"]
 
     assert operation.payload["memory_type"] == "project_rule"
@@ -201,7 +186,7 @@ def test_memory_operation_payload_contains_schema_metadata() -> None:
     assert operation.payload["source_adapter_id"] == "codex"
     assert operation.payload["source_session_id"] == "s1"
     assert operation.payload["merge_key"]
-    assert operation.payload["schema_version"] == "canonical_memory_v1"
+    assert operation.payload["schema_version"] == "canonical_memory_v2"
     assert metadata["memory_type"] == "project_rule"
     assert metadata["retrieval_views"] == operation.payload["retrieval_views"]
     assert metadata["source_adapter_id"] == "codex"
@@ -218,7 +203,7 @@ def test_project_rule_accepted_with_retrieval_views() -> None:
         metadata={"project_id": "memoryOS", "connect": {"adapter_id": "codex"}},
     )
 
-    operation = MemoryCommitPlanner().plan(archive)[0]
+    operation = MemoryCommitPlanner().plan(archive).operations[0]
 
     assert operation.payload["admission"]["decision"] == "accept"
     assert "project:memoryOS:rules" in operation.payload["retrieval_views"]
@@ -233,7 +218,7 @@ def test_user_preference_accepted_with_user_views() -> None:
         metadata={"connect": {"adapter_id": "codex"}},
     )
 
-    operation = MemoryCommitPlanner().plan(archive)[0]
+    operation = MemoryCommitPlanner().plan(archive).operations[0]
 
     assert operation.payload["memory_type"] == "preference"
     assert operation.payload["admission"]["decision"] in {"accept", "pending"}
@@ -254,7 +239,7 @@ def test_agent_experience_from_assistant_result() -> None:
         metadata={"project_id": "memoryOS", "connect": {"adapter_id": "codex"}},
     )
 
-    operation = MemoryCommitPlanner().plan(archive)[0]
+    operation = MemoryCommitPlanner().plan(archive).operations[0]
 
     assert operation.payload["memory_type"] == "agent_experience"
     assert operation.payload["admission"]["decision"] == "accept"
@@ -272,8 +257,10 @@ def test_raw_tool_output_archive_only() -> None:
     )
     planner = MemoryCommitPlanner()
 
-    assert planner.plan(archive) == []
-    assert planner.last_group.archive_only
+    result = planner.plan(archive)
+    assert result.operations == ()
+    assert "ordinary_tool_result" in result.context.salience_reasons
+    assert "unconfirmed_tool_output" in result.context.salience_reasons
 
 
 def test_secret_restricted() -> None:
@@ -289,18 +276,16 @@ def test_secret_restricted() -> None:
         )
     )
 
-    assert (
-        planner.plan(
-            SessionArchive(
-                user_id="u1",
-                session_id="s1",
-                archive_uri="memoryos://user/u1/sessions/history/s1",
-                messages=[{"id": "m1", "role": "user", "content": "api key OPENAI_API_KEY=sk-test"}],
-            )
+    result = planner.plan(
+        SessionArchive(
+            user_id="u1",
+            session_id="s1",
+            archive_uri="memoryos://user/u1/sessions/history/s1",
+            messages=[{"id": "m1", "role": "user", "content": "api key OPENAI_API_KEY=sk-test"}],
         )
-        == []
     )
-    assert planner.last_group.restricted
+    assert result.operations == ()
+    assert "privacy_or_sensitivity_risk" in result.context.salience_reasons
 
 
 def test_memory_commit_planner_accepts_view_router_injection() -> None:
@@ -318,7 +303,7 @@ def test_memory_commit_planner_accepts_view_router_injection() -> None:
         metadata={"project_id": "memoryos", "connect": {"adapter_id": "codex"}},
     )
 
-    operation = MemoryCommitPlanner(view_router=FixedViewRouter()).plan(archive)[0]
+    operation = MemoryCommitPlanner(view_router=FixedViewRouter()).plan(archive).operations[0]
 
     assert operation.payload["retrieval_views"] == ["custom:u1:memoryos:codex"]
     assert operation.payload["context_object"]["metadata"]["retrieval_views"] == ["custom:u1:memoryos:codex"]

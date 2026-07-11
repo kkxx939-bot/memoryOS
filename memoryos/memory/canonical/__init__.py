@@ -18,16 +18,29 @@ from memoryos.memory.canonical.evidence import (
     bind_field_evidence,
 )
 from memoryos.memory.canonical.formation import (
+    CandidateProposalAdapter,
     CanonicalFormationResult,
     CanonicalMemoryFormationService,
-    LegacyCandidateProposalAdapter,
 )
-from memoryos.memory.canonical.identity import AliasRegistry, ResolvedMemoryIdentity, StableMemoryIdentityResolver
+from memoryos.memory.canonical.identity import (
+    IDENTITY_ALGORITHM_V2,
+    AliasRegistry,
+    ResolvedMemoryIdentity,
+    StableMemoryIdentityResolver,
+    canonical_identity_json,
+    canonical_identity_value,
+)
 from memoryos.memory.canonical.prefetch import ExistingMemoryPrefetcher, PrefetchedMemory
 from memoryos.memory.canonical.projection import (
     CanonicalMemoryProjector,
     MemoryProjectionWorker,
     ProjectionResult,
+)
+from memoryos.memory.canonical.projection_state import (
+    ProjectionRecord,
+    ProjectionRecordStore,
+    ProjectionStatus,
+    ProjectionStepStatus,
 )
 from memoryos.memory.canonical.proposal import (
     Commitment,
@@ -42,6 +55,7 @@ from memoryos.memory.canonical.proposal import (
 from memoryos.memory.canonical.reconcile import AmbiguousSemanticReconciler, MemorySemanticReconciler
 from memoryos.memory.canonical.repository import CanonicalMemoryRepository
 from memoryos.memory.canonical.retrieval import (
+    CanonicalInvariantViolation,
     CanonicalMemoryQuery,
     CanonicalMemoryRetriever,
     CanonicalQueryIntent,
@@ -49,24 +63,44 @@ from memoryos.memory.canonical.retrieval import (
 from memoryos.memory.canonical.salience import EpisodeSalienceGate, SalienceDecision
 from memoryos.memory.canonical.scope import (
     CORE_SCOPE_KINDS,
+    HIERARCHICAL_SCOPE_KINDS,
+    AuthorityPolicy,
     MemoryScope,
     ScopeRef,
+    ScopeResolutionSource,
     ScopeSelector,
     VisibilityPolicy,
     scope_from_external,
+    scope_key_candidates_from_payload,
+    scope_key_from_payload,
 )
 from memoryos.memory.canonical.semantic import MemorySemanticNormalizer
-from memoryos.memory.canonical.state import ClaimState, MemoryClaim, MemoryRevision, MemorySlot, TransitionProfile
+from memoryos.memory.canonical.state import (
+    ActiveClaimInvariantError,
+    CanonicalMemoryInvariantError,
+    ClaimState,
+    MemoryClaim,
+    MemoryRevision,
+    MemorySlot,
+    MissingClaimInvariantError,
+    RevisionSequenceError,
+    TransitionProfile,
+)
 from memoryos.memory.canonical.transaction import (
     MemoryTransactionPlan,
     MemoryTransactionPlanner,
     PlannedMemoryOperation,
     RevisionConflictError,
 )
-from memoryos.memory.canonical.transition import MemoryStateTransition, MemoryTransitionPolicy
+from memoryos.memory.canonical.transition import (
+    MemoryStateTransition,
+    MemoryTransitionPolicy,
+    PendingSemanticReconciliation,
+)
 
 __all__ = [
     "CORE_SCOPE_KINDS",
+    "HIERARCHICAL_SCOPE_KINDS",
     "ActorRef",
     "EventEnvelope",
     "EvidenceEpisode",
@@ -94,15 +128,23 @@ __all__ = [
     "SemanticAssessment",
     "NormalizedSemanticAssessment",
     "AliasRegistry",
+    "IDENTITY_ALGORITHM_V2",
     "ResolvedMemoryIdentity",
     "StableMemoryIdentityResolver",
+    "canonical_identity_json",
+    "canonical_identity_value",
     "MemorySlot",
     "MemoryClaim",
     "MemoryRevision",
     "ClaimState",
     "TransitionProfile",
+    "CanonicalMemoryInvariantError",
+    "ActiveClaimInvariantError",
+    "MissingClaimInvariantError",
+    "RevisionSequenceError",
     "MemoryStateTransition",
     "MemoryTransitionPolicy",
+    "PendingSemanticReconciliation",
     "CanonicalMemoryRepository",
     "AmbiguousSemanticReconciler",
     "MemorySemanticReconciler",
@@ -113,19 +155,28 @@ __all__ = [
     "CanonicalMemoryProjector",
     "MemoryProjectionWorker",
     "ProjectionResult",
+    "ProjectionRecord",
+    "ProjectionRecordStore",
+    "ProjectionStatus",
+    "ProjectionStepStatus",
     "CanonicalMemoryQuery",
     "CanonicalMemoryRetriever",
     "CanonicalQueryIntent",
+    "CanonicalInvariantViolation",
     "CanonicalFormationResult",
     "CanonicalMemoryFormationService",
-    "LegacyCandidateProposalAdapter",
+    "CandidateProposalAdapter",
     "ExistingMemoryPrefetcher",
     "PrefetchedMemory",
     "OriginContext",
     "ScopeRef",
+    "ScopeResolutionSource",
     "ScopeSelector",
     "SessionArchiveEpisodeAdapter",
     "SubjectRef",
     "VisibilityPolicy",
+    "AuthorityPolicy",
+    "scope_key_from_payload",
+    "scope_key_candidates_from_payload",
     "scope_from_external",
 ]

@@ -21,16 +21,18 @@ from memoryos.contextdb.store.source_store import LockStore, QueueStore
 from memoryos.contextdb.store.vector_store import VectorStore
 from memoryos.core.ids import stable_hash
 from memoryos.memory.canonical import (
+    IDENTITY_ALGORITHM_V2,
+    CanonicalMemoryRepository,
     EpistemicStatus,
     EvidenceRef,
-    MemoryClaim,
-    MemoryRevision,
+    MemoryScope,
+    MemorySemanticNormalizer,
     MemorySemanticProposal,
-    MemorySlot,
-    MemoryTransactionPlan,
-    PlannedMemoryOperation,
+    MemorySemanticReconciler,
+    MemoryTransactionPlanner,
+    MemoryTransitionPolicy,
+    ResolvedMemoryIdentity,
     SemanticAssessment,
-    TransitionProfile,
     bind_field_evidence,
 )
 from memoryos.memory.extraction import MemoryExtractorBackend
@@ -358,8 +360,7 @@ class MemoryOSClient:
             scope
             for scope in episode.legal_scope_candidates()
             if (
-                normalized_type in {MemoryType.PROFILE.value, MemoryType.PREFERENCE.value}
-                and scope.kind == "principal"
+                normalized_type in {MemoryType.PROFILE.value, MemoryType.PREFERENCE.value} and scope.kind == "principal"
             )
             or (
                 normalized_type not in {MemoryType.PROFILE.value, MemoryType.PREFERENCE.value}
@@ -378,9 +379,9 @@ class MemoryOSClient:
             suggested_scope_refs=suggested_scopes,
             related_memory_ids=(),
             evidence_refs=evidence_refs,
-            field_evidence_refs=bind_field_evidence(identity_fields, value_fields, evidence_refs),
+            field_evidence_refs=_explicit_field_evidence(identity_fields, value_fields, evidence_refs),
             confidence=1.0,
-            extractor_version="explicit_remember_v1",
+            extractor_version="explicit_remember_v2",
             metadata={
                 "source_role": "user",
                 "source_adapter_id": str(connect.get("adapter_id", "")),
@@ -388,7 +389,6 @@ class MemoryOSClient:
                 "system_identity_fields": system_fields,
             },
         )
-        planner.formation.begin_planning()
         formed = planner.formation.plan(
             proposal,
             archive=archive,
@@ -413,9 +413,7 @@ class MemoryOSClient:
         uri = next(
             str(operation.target_uri)
             for operation in operations
-            if dict(operation.payload.get("context_object", {}).get("metadata", {}) or {}).get(
-                "canonical_kind"
-            )
+            if dict(operation.payload.get("context_object", {}).get("metadata", {}) or {}).get("canonical_kind")
             == "claim"
         )
         return {"uri": uri, "status": "COMMITTED", "diff_id": diff.diff_id}
@@ -423,10 +421,12 @@ class MemoryOSClient:
     def forget(self, *, user_id: str, uri: str) -> dict[str, Any]:
         """撤回或软删除自己拥有的记忆，同时保留审计信息。"""
 
-        if not uri.startswith(f"memoryos://user/{user_id}/"):
-            raise PermissionError("forget requires an exact URI owned by user_id")
         obj = self.context_db.read_object(uri)
-        if obj.owner_user_id != user_id:
+        metadata = dict(obj.metadata or {})
+        scope = dict(metadata.get("scope", {}) or {})
+        visibility = dict(scope.get("visibility", {}) or {})
+        allowed = {str(item) for item in visibility.get("allowed_principal_ids", []) or []}
+        if obj.owner_user_id != user_id and metadata.get("asserted_by") != user_id and user_id not in allowed:
             raise PermissionError("forget requires an exact URI owned by user_id")
         if obj.metadata.get("canonical_kind") == "claim":
             return self._forget_canonical_claim(user_id, obj)
@@ -443,19 +443,32 @@ class MemoryOSClient:
 
     def _forget_canonical_claim(self, user_id: str, obj) -> dict[str, Any]:  # noqa: ANN001
         metadata = dict(obj.metadata or {})
-        profile = TransitionProfile(str(metadata["transition_profile"]))
-        claim = MemoryClaim(
-            claim_id=str(metadata["claim_id"]),
-            uri=obj.uri,
+        slot_uri = obj.uri.rsplit("/claims/", 1)[0]
+        slot_obj = self.source_store.read_object(slot_uri)
+        slot_metadata = dict(slot_obj.metadata or {})
+        memory_scope = MemoryScope.from_dict(dict(metadata.get("scope", {}) or {}))
+        canonical_subject = memory_scope.canonical_subject
+        if canonical_subject is None:
+            raise ValueError("Identity V2 canonical memory is missing its subject")
+        identity = ResolvedMemoryIdentity(
             slot_id=str(metadata["slot_id"]),
+            slot_uri=slot_uri,
+            claim_id=str(metadata["claim_id"]),
+            claim_uri=obj.uri,
+            slot_identity=dict(slot_metadata.get("identity_fields", {}) or {}),
             canonical_value=str(metadata["canonical_value"]),
-            profile=profile,
-            revisions=tuple(MemoryRevision.from_dict(item) for item in metadata.get("revisions", []) or []),
+            scope_keys=tuple(str(item) for item in slot_metadata.get("scope_keys", []) or []),
+            identity_algorithm_version=str(metadata.get("identity_algorithm_version") or IDENTITY_ALGORITHM_V2),
+            canonical_subject=canonical_subject,
         )
+        slot, claims = CanonicalMemoryRepository(self.source_store).load(identity)
+        if slot is None:
+            raise FileNotFoundError(slot_uri)
+        claim = next(item for item in claims if item.claim_id == identity.claim_id)
         state = "RETRACTED"
         if claim.current.state == state:
             return {"uri": obj.uri, "status": "COMMITTED", "memory_state": state, "diff_id": ""}
-        event_id = f"forget:{stable_hash([user_id, obj.uri, claim.current.revision], length=24)}"
+        event_id = f"forget:{stable_hash([user_id, obj.uri, claim.latest_revision.revision], length=24)}"
         archive = SessionArchive(
             user_id=user_id,
             session_id=event_id,
@@ -465,7 +478,10 @@ class MemoryOSClient:
                     "id": event_id,
                     "role": "user",
                     "event_type": "RETRACTION",
-                    "content": f"I retract memory {obj.uri}.",
+                    "content": (
+                        f"I retract memory {obj.uri}: "
+                        f"{json.dumps(dict(claim.current.value_fields), ensure_ascii=False, sort_keys=True)}."
+                    ),
                 }
             ],
             metadata={"tenant_id": str(obj.tenant_id or "default")},
@@ -473,104 +489,60 @@ class MemoryOSClient:
         self.session_archive_store.write_sync_archive(archive)
         episode = self.session_commit_service.memory_planner.episode_adapter.adapt(archive)
         evidence = EvidenceRef.from_event(episode.events[0], source_uri=archive.archive_uri)
-        revision = MemoryRevision(
-            revision=claim.current.revision + 1,
-            state=state,
-            value_fields=claim.current.value_fields,
-            evidence_refs=(evidence,),
-            proposal_id=event_id,
-            relation="RETRACTION",
-            epistemic_status="EXPLICIT",
-            proposal_fingerprint=stable_hash([event_id, obj.uri], length=40),
-            extractor_version="explicit_forget_v1",
-            prompt_version="none",
-            policy_version="explicit_forget_v1",
-            schema_version="canonical_memory_v1",
-            qualifiers={"reason": "explicit_forget"},
+        proposal = MemorySemanticNormalizer().normalize(
+            MemorySemanticProposal(
+                proposal_id=event_id,
+                memory_type=str(metadata["memory_type"]),
+                identity_fields=slot.identity_fields,
+                value_fields=claim.current.value_fields,
+                semantic=SemanticAssessment("retraction", "confirmed", "current", "corrects"),
+                epistemic_status=EpistemicStatus.EXPLICIT,
+                suggested_scope_refs=memory_scope.applicability.all_of,
+                related_memory_ids=(claim.claim_id,),
+                evidence_refs=(evidence,),
+                field_evidence_refs=_explicit_field_evidence(
+                    slot.identity_fields,
+                    claim.current.value_fields,
+                    (evidence,),
+                ),
+                confidence=1.0,
+                extractor_version="explicit_forget_v2",
+                prompt_version="explicit_forget_v2",
+                metadata={
+                    "source_role": "user",
+                    "source_session_id": event_id,
+                    "asserted_by": user_id,
+                    "system_identity_fields": list(slot.identity_fields),
+                },
+            )
         )
-        updated_claim = claim.with_revision(revision)
-        slot_uri = obj.uri.rsplit("/claims/", 1)[0]
-        slot_obj = self.source_store.read_object(slot_uri)
-        slot_metadata = dict(slot_obj.metadata or {})
-        slot = MemorySlot(
-            slot_id=str(slot_metadata["slot_id"]),
-            uri=slot_uri,
-            memory_type=str(slot_metadata["memory_type"]),
-            identity_fields=dict(slot_metadata.get("identity_fields", {}) or {}),
-            scope_keys=tuple(str(item) for item in slot_metadata.get("scope_keys", []) or []),
-            claim_ids=tuple(str(item) for item in slot_metadata.get("claim_ids", []) or []),
-            active_claim_id=(
-                None
-                if slot_metadata.get("active_claim_id") == claim.claim_id
-                else str(slot_metadata["active_claim_id"])
-                if slot_metadata.get("active_claim_id")
-                else None
-            ),
-            revision=int(slot_metadata.get("revision", 0)) + 1,
+        reconciliation = MemorySemanticReconciler().reconcile(
+            proposal,
+            identity,
+            slot=slot,
+            claims=claims,
         )
-        scope = dict(metadata.get("scope", {}) or {})
-        updated_claim_obj = updated_claim.to_context_object(
+        transition = MemoryTransitionPolicy().apply(proposal, identity, reconciliation)
+        plan = MemoryTransactionPlanner().build(
+            proposal,
+            memory_scope,
+            transition,
             tenant_id=str(obj.tenant_id or "default"),
             owner_user_id=user_id,
-            memory_type=str(metadata["memory_type"]),
-            scope=scope,
+            episode_id=event_id,
         )
-        updated_claim_obj.relations = list(obj.relations)
-        updated_slot_obj = slot.to_context_object(
-            tenant_id=str(slot_obj.tenant_id or "default"),
-            owner_user_id=user_id,
-            scope=dict(slot_metadata.get("scope", {}) or {}),
-        )
-        idempotency_key = stable_hash(["explicit_forget", user_id, obj.uri, claim.current.revision], length=40)
-        plan = MemoryTransactionPlan(
-            transaction_id=f"memory_tx_{idempotency_key}",
-            idempotency_key=idempotency_key,
+        operations = plan.to_context_operations(
+            user_id=user_id,
             tenant_id=str(obj.tenant_id or "default"),
-            owner_user_id=user_id,
-            slot_id=claim.slot_id,
-            expected_revisions={obj.uri: claim.current.revision, slot_uri: int(slot_metadata.get("revision", 0))},
-            operations=(
-                PlannedMemoryOperation(
-                    updated_claim_obj,
-                    claim.current.revision,
-                    json.dumps(
-                        {
-                            "claim_id": claim.claim_id,
-                            "current": revision.to_dict(),
-                            "revisions": [item.to_dict() for item in updated_claim.revisions],
-                        },
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    ),
-                ),
-                PlannedMemoryOperation(
-                    updated_slot_obj,
-                    int(slot_metadata.get("revision", 0)),
-                    json.dumps(
-                        {
-                            "slot_id": slot.slot_id,
-                            "claim_ids": list(slot.claim_ids),
-                            "active_claim_id": slot.active_claim_id,
-                            "revision": slot.revision,
-                        },
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    ),
-                ),
-            ),
-            evidence_refs=(evidence,),
-            policy_version="explicit_forget_v1",
-            schema_version="canonical_memory_v1",
-            proposal_ids=(event_id,),
-            proposal_fingerprints=(revision.proposal_fingerprint,),
+            episode_id=event_id,
         )
+        for operation in operations:
+            payload = operation.payload.get("context_object")
+            if isinstance(payload, dict) and payload.get("uri") == obj.uri:
+                payload["relations"] = [relation.to_dict() for relation in obj.relations]
         diff = self.committer.commit(
             user_id,
-            plan.to_context_operations(
-                user_id=user_id,
-                tenant_id=str(obj.tenant_id or "default"),
-                episode_id=event_id,
-            ),
+            operations,
         )
         self.memory_projection_worker.process_pending()
         return {"uri": obj.uri, "status": "COMMITTED", "memory_state": state, "diff_id": diff.diff_id}
@@ -582,14 +554,16 @@ class MemoryOSClient:
     def archive_search(self, query: str, *, user_id: str, limit: int = 20) -> list[dict[str, Any]]:
         results = []
         needle = query.lower()
-        for manifest_path in Path(self.root).glob("tenants/*/users/*/sessions/history/**/commit_manifest.json"):
+        for head_path in Path(self.root).glob("tenants/*/users/*/sessions/history/**/commit_head.json"):
             try:
-                manifest = __import__("json").loads(manifest_path.read_text(encoding="utf-8"))
+                head = json.loads(head_path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 continue
-            if manifest.get("user_id") != user_id:
+            if head.get("user_id") != user_id:
                 continue
-            archive = self.session_archive_store.read_archive(str(manifest["archive_uri"]))
+            archive = self.session_archive_store.read_archive(
+                str(head["archive_uri"]), tenant_id=str(head.get("tenant_id") or "default")
+            )
             text = "\n".join(str(item.get("content", item.get("text", ""))) for item in archive.messages)
             if needle in text.lower():
                 results.append(
@@ -770,6 +744,30 @@ class MemoryOSClient:
 
 def _stable_session_commit_task_id(payload: dict[str, Any]) -> str:
     return f"session_commit_{stable_hash(payload, length=32)}"
+
+
+def _explicit_field_evidence(
+    identity_fields: Any,
+    value_fields: Any,
+    evidence_refs: tuple[EvidenceRef, ...],
+) -> dict[str, tuple[EvidenceRef, ...]]:
+    """Declare evidence for the SDK's own fully materialized remember/forget event."""
+
+    bindings = {
+        **{f"identity.{key}": evidence_refs for key in identity_fields},
+        **{f"value.{key}": evidence_refs for key in value_fields},
+        "semantic.speech_act": evidence_refs,
+        "semantic.commitment": evidence_refs,
+        "semantic.temporal_scope": evidence_refs,
+        "semantic.relation_to_existing": evidence_refs,
+        "transition": evidence_refs,
+    }
+    return bind_field_evidence(
+        identity_fields,
+        value_fields,
+        evidence_refs,
+        bindings=bindings,
+    )
 
 
 def _supported_kwargs(function: Any, kwargs: dict[str, Any]) -> dict[str, Any]:

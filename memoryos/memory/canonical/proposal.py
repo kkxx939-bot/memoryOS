@@ -10,6 +10,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from memoryos.core.ids import stable_hash
+from memoryos.memory.canonical.event import immutable_snapshot
 from memoryos.memory.canonical.scope import ScopeRef
 
 if TYPE_CHECKING:
@@ -35,6 +36,8 @@ class SpeechAct(str, Enum):
     CORRECTION = "CORRECTION"
     RETRACTION = "RETRACTION"
     REJECTION = "REJECTION"
+    UNKNOWN = "UNKNOWN"
+    SCHEMA_MISMATCH = "SCHEMA_MISMATCH"
 
 
 class Commitment(str, Enum):
@@ -44,6 +47,8 @@ class Commitment(str, Enum):
     EXPLORATORY = "EXPLORATORY"
     INTENDED = "INTENDED"
     CONFIRMED = "CONFIRMED"
+    UNKNOWN = "UNKNOWN"
+    SCHEMA_MISMATCH = "SCHEMA_MISMATCH"
 
 
 class TemporalScope(str, Enum):
@@ -53,6 +58,8 @@ class TemporalScope(str, Enum):
     CURRENT = "CURRENT"
     FUTURE = "FUTURE"
     UNSPECIFIED = "UNSPECIFIED"
+    UNKNOWN = "UNKNOWN"
+    SCHEMA_MISMATCH = "SCHEMA_MISMATCH"
 
 
 class SemanticRelation(str, Enum):
@@ -65,6 +72,9 @@ class SemanticRelation(str, Enum):
     CONTRADICTS = "CONTRADICTS"
     CORRECTS = "CORRECTS"
     SUPERSEDES = "SUPERSEDES"
+    UNKNOWN = "UNKNOWN"
+    AMBIGUOUS = "AMBIGUOUS"
+    SCHEMA_MISMATCH = "SCHEMA_MISMATCH"
 
 
 @dataclass(frozen=True)
@@ -85,6 +95,25 @@ class NormalizedSemanticAssessment:
     commitment: Commitment
     temporal_scope: TemporalScope
     relation_to_existing: SemanticRelation
+
+    @property
+    def schema_safe(self) -> bool:
+        return (
+            self.speech_act not in {SpeechAct.UNKNOWN, SpeechAct.SCHEMA_MISMATCH}
+            and self.commitment not in {Commitment.UNKNOWN, Commitment.SCHEMA_MISMATCH}
+            and self.temporal_scope not in {TemporalScope.UNKNOWN, TemporalScope.SCHEMA_MISMATCH}
+            and self.relation_to_existing
+            not in {SemanticRelation.UNKNOWN, SemanticRelation.AMBIGUOUS, SemanticRelation.SCHEMA_MISMATCH}
+        )
+
+    @property
+    def schema_errors(self) -> tuple[str, ...]:
+        errors = []
+        for field_name in ("speech_act", "commitment", "temporal_scope", "relation_to_existing"):
+            value = getattr(self, field_name)
+            if str(value.value) in {"UNKNOWN", "AMBIGUOUS", "SCHEMA_MISMATCH"}:
+                errors.append(f"semantic_{field_name}_{str(value.value).lower()}")
+        return tuple(errors)
 
     def to_dict(self) -> dict[str, str]:
         return {
@@ -114,20 +143,20 @@ class MemorySemanticProposal:
     related_slot_ids: tuple[str, ...] = ()
     related_claim_ids: tuple[str, ...] = ()
     model_id: str | None = None
-    prompt_version: str = "memory_semantic_proposal_v1"
+    prompt_version: str = "memory_semantic_proposal_v2"
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.proposal_id or not self.memory_type:
             raise ValueError("proposal_id and memory_type are required")
-        object.__setattr__(self, "identity_fields", MappingProxyType(dict(self.identity_fields)))
-        object.__setattr__(self, "value_fields", MappingProxyType(dict(self.value_fields)))
+        object.__setattr__(self, "identity_fields", immutable_snapshot(dict(self.identity_fields)))
+        object.__setattr__(self, "value_fields", immutable_snapshot(dict(self.value_fields)))
         object.__setattr__(
             self,
             "field_evidence_refs",
             MappingProxyType({str(key): tuple(refs) for key, refs in dict(self.field_evidence_refs).items()}),
         )
-        object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
+        object.__setattr__(self, "metadata", immutable_snapshot(dict(self.metadata)))
         try:
             confidence = float(self.confidence)
         except (TypeError, ValueError) as exc:
@@ -140,12 +169,16 @@ class MemorySemanticProposal:
 
     @property
     def fingerprint(self) -> str:
-        semantic = self.semantic.to_dict() if isinstance(self.semantic, NormalizedSemanticAssessment) else {
-            "speech_act": self.semantic.speech_act,
-            "commitment": self.semantic.commitment,
-            "temporal_scope": self.semantic.temporal_scope,
-            "relation_to_existing": self.semantic.relation_to_existing,
-        }
+        semantic = (
+            self.semantic.to_dict()
+            if isinstance(self.semantic, NormalizedSemanticAssessment)
+            else {
+                "speech_act": self.semantic.speech_act,
+                "commitment": self.semantic.commitment,
+                "temporal_scope": self.semantic.temporal_scope,
+                "relation_to_existing": self.semantic.relation_to_existing,
+            }
+        )
         return stable_hash(
             [
                 self.memory_type,
@@ -155,9 +188,25 @@ class MemorySemanticProposal:
                 self.epistemic_status.value,
                 sorted(scope.key for scope in self.suggested_scope_refs),
                 sorted(self.all_related_memory_ids),
-                sorted((ref.event_id, ref.content_hash, ref.span_start, ref.span_end) for ref in self.evidence_refs),
+                sorted(
+                    (
+                        ref.event_id,
+                        ref.content_hash,
+                        ref.span_start if ref.span_start is not None else -1,
+                        ref.span_end if ref.span_end is not None else -1,
+                    )
+                    for ref in self.evidence_refs
+                ),
                 {
-                    key: sorted((ref.event_id, ref.content_hash, ref.span_start, ref.span_end) for ref in refs)
+                    key: sorted(
+                        (
+                            ref.event_id,
+                            ref.content_hash,
+                            ref.span_start if ref.span_start is not None else -1,
+                            ref.span_end if ref.span_end is not None else -1,
+                        )
+                        for ref in refs
+                    )
                     for key, refs in self.field_evidence_refs.items()
                 },
             ],

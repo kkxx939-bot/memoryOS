@@ -9,7 +9,6 @@ from memoryos.connect import ConnectMetadata
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_relation import ContextRelation
 from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.model.context_uri import ContextURI
 from memoryos.prediction.model.prediction_request import PredictionRequest
 from memoryos.skill.tool_registry import ToolRegistry
 
@@ -30,8 +29,19 @@ def _seed_client(tmp_path, handler):
     anchor_uri = "memoryos://user/u1/memories/anchors/hot"
     resource_uri = "memoryos://resources/ac"
     skill_uri = "memoryos://skills/ac"
-    client.context_db.seed_object(ContextObject(uri=anchor_uri, context_type=ContextType.MEMORY, title="hot anchor", owner_user_id="u1"), content="hot anchor")
-    client.context_db.seed_object(ContextObject(uri=resource_uri, context_type=ContextType.RESOURCE, title="AC", metadata={"available": True, "device_id": "ac", "temperature": 24}), content="available")
+    client.context_db.seed_object(
+        ContextObject(uri=anchor_uri, context_type=ContextType.MEMORY, title="hot anchor", owner_user_id="u1"),
+        content="hot anchor",
+    )
+    client.context_db.seed_object(
+        ContextObject(
+            uri=resource_uri,
+            context_type=ContextType.RESOURCE,
+            title="AC",
+            metadata={"available": True, "device_id": "ac", "temperature": 24},
+        ),
+        content="available",
+    )
     client.context_db.seed_object(
         ContextObject(
             uri=skill_uri,
@@ -69,7 +79,14 @@ def _seed_client(tmp_path, handler):
         ("requires_resource", resource_uri),
         ("requires_skill", skill_uri),
     ):
-        client.context_db.add_relation(ContextRelation(source_uri=policy.uri, relation_type=relation_type, target_uri=target_uri, metadata={"owner_user_id": "u1"}))
+        client.context_db.add_relation(
+            ContextRelation(
+                source_uri=policy.uri,
+                relation_type=relation_type,
+                target_uri=target_uri,
+                metadata={"owner_user_id": "u1"},
+            )
+        )
     request = PredictionRequest(
         user_id="u1",
         episode_id="ep-execute",
@@ -87,12 +104,14 @@ def test_execute_success_writes_action_result_and_rewards_policy(tmp_path) -> No
     result = client.process_observation(request, archive_session=True, async_commit=True)
 
     assert result.prediction_result.decision.mode == "execute"
-    archive_dir = ContextURI.parse("memoryos://user/u1/sessions/history/ep-execute").to_source_path(tmp_path)
-    action_result = json.loads((archive_dir / "action_results.jsonl").read_text(encoding="utf-8").splitlines()[0])["action_result"]
-    observation = json.loads((archive_dir / "observations.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    archived = client.session_archive_store.read_archive("memoryos://user/u1/sessions/history/ep-execute")
+    action_result = archived.action_results[0]["action_result"]
+    observation = archived.observations[0]
     assert action_result["status"] == "success"
     assert observation["episode_id"] == request.episode_id
-    behavior_cases = [obj for obj in client.source_store.list_objects() if obj.context_type == ContextType.BEHAVIOR_CASE]
+    behavior_cases = [
+        obj for obj in client.source_store.list_objects() if obj.context_type == ContextType.BEHAVIOR_CASE
+    ]
     assert behavior_cases[0].metadata["feedback_type"] == "execution_success"
     assert behavior_cases[0].metadata["reward"] == 1.0
     assert client.source_store.read_object(policy.uri).metadata["success_count"] == 1
@@ -106,10 +125,12 @@ def test_execute_failure_writes_failed_action_result_and_penalizes_policy(tmp_pa
 
     client.process_observation(request, archive_session=True, async_commit=True)
 
-    archive_dir = ContextURI.parse("memoryos://user/u1/sessions/history/ep-execute").to_source_path(tmp_path)
-    action_result = json.loads((archive_dir / "action_results.jsonl").read_text(encoding="utf-8").splitlines()[0])["action_result"]
+    archived = client.session_archive_store.read_archive("memoryos://user/u1/sessions/history/ep-execute")
+    action_result = archived.action_results[0]["action_result"]
     assert action_result["status"] == "failed"
-    behavior_cases = [obj for obj in client.source_store.list_objects() if obj.context_type == ContextType.BEHAVIOR_CASE]
+    behavior_cases = [
+        obj for obj in client.source_store.list_objects() if obj.context_type == ContextType.BEHAVIOR_CASE
+    ]
     assert behavior_cases[0].metadata["feedback_type"] == "execution_failure"
     assert behavior_cases[0].metadata["reward"] == -1.0
     assert behavior_cases[0].metadata["observation"]["episode_id"] == request.episode_id
@@ -123,6 +144,6 @@ def test_missing_required_skill_keeps_policy_gate_from_execute(tmp_path) -> None
     result = client.process_observation(request, archive_session=True, async_commit=True)
 
     assert result.prediction_result.decision.mode == "ask_user"
-    archive_dir = ContextURI.parse("memoryos://user/u1/sessions/history/ep-execute").to_source_path(tmp_path)
-    action_result = json.loads((archive_dir / "action_results.jsonl").read_text(encoding="utf-8").splitlines()[0])["action_result"]
+    archived = client.session_archive_store.read_archive("memoryos://user/u1/sessions/history/ep-execute")
+    action_result = archived.action_results[0]["action_result"]
     assert action_result["status"] == "skipped"

@@ -11,8 +11,6 @@ class OperationAction(str, Enum):
     DELETE = "delete"
     SUPERSEDE = "supersede"
     MERGE = "merge"
-    CONFIRM = "confirm"
-    REJECT = "reject"
     REWARD = "reward"
     PENALIZE = "penalize"
     COOLDOWN = "cooldown"

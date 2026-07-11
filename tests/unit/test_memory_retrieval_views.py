@@ -33,7 +33,7 @@ def _commit_memory(db: ContextDB, memory: Memory) -> str:
     return memory.uri
 
 
-def test_retrieval_view_default_scope_cross_adapter(tmp_path) -> None:
+def test_policy_derivative_is_not_returned_as_canonical_current_memory(tmp_path) -> None:
     db = _db(tmp_path)
     _commit_memory(
         db,
@@ -60,37 +60,11 @@ def test_retrieval_view_default_scope_cross_adapter(tmp_path) -> None:
         adapter_id="openclaw",
     )
 
-    assert [hit["uri"] for hit in hits] == ["memoryos://user/u1/memories/rules/r1"]
-
-
-def test_agent_private_not_cross_adapter(tmp_path) -> None:
-    db = _db(tmp_path)
-    _commit_memory(
-        db,
-        Memory(
-            uri="memoryos://user/u1/memories/private/p1",
-            user_id="u1",
-            title="Codex private",
-            content="Codex scratchpad implementation note.",
-            kind=MemoryKind.EXPLICIT,
-            memory_type="agent_experience",
-            retrieval_views=["agent:codex:private"],
-            admission={"decision": "accept", "private": True},
-            source={"adapter_id": "codex"},
-            merge_key="private:1",
-        ),
-    )
-
-    hits = ContextAssembler(db).search(
-        "scratchpad",
-        user_id="u1",
-        context_type=ContextType.MEMORY,
-        search_scope="default",
-        project_id="memoryOS",
-        adapter_id="openclaw",
-    )
-
     assert hits == []
+
+
+def test_memory_model_has_no_direct_authoritative_kind() -> None:
+    assert {kind.value for kind in MemoryKind} == {"anchor_memory", "memory_candidate", "policy_memory"}
 
 
 def test_no_project_id_does_not_leak_all_project_rules(tmp_path) -> None:
@@ -162,15 +136,15 @@ def test_pending_candidate_not_shared_by_default(tmp_path) -> None:
 def test_source_view_scan_excludes_inactive_lifecycle_before_scoring_and_limit(tmp_path) -> None:  # noqa: ANN001
     db = _db(tmp_path)
     for index in range(20):
-        memory = Memory(
-            uri=f"memoryos://user/u1/memories/rules/inactive-{index}",
+        memory = MemoryCandidate(
+            uri=f"memoryos://user/u1/memories/candidates/inactive-{index}",
             user_id="u1",
             title=f"inactive matching rule {index}",
             content="target phrase",
-            kind=MemoryKind.POLICY,
+            kind=MemoryKind.CANDIDATE,
             memory_type="project_rule",
             retrieval_views=["project:memoryOS:rules"],
-            admission={"decision": "accept"},
+            admission={"decision": "pending"},
             merge_key=f"inactive-{index}",
         )
         uri = _commit_memory(db, memory)
@@ -179,15 +153,15 @@ def test_source_view_scan_excludes_inactive_lifecycle_before_scoring_and_limit(t
         db.source_store.write_object(obj, content=memory.content)
     active_uri = _commit_memory(
         db,
-        Memory(
-            uri="memoryos://user/u1/memories/rules/active-target",
+        MemoryCandidate(
+            uri="memoryos://user/u1/memories/candidates/active-target",
             user_id="u1",
             title="active target",
             content="target phrase",
-            kind=MemoryKind.POLICY,
+            kind=MemoryKind.CANDIDATE,
             memory_type="project_rule",
             retrieval_views=["project:memoryOS:rules"],
-            admission={"decision": "accept"},
+            admission={"decision": "pending"},
             merge_key="active-target",
         ),
     )
@@ -195,7 +169,7 @@ def test_source_view_scan_excludes_inactive_lifecycle_before_scoring_and_limit(t
         "target phrase",
         user_id="u1",
         context_type=ContextType.MEMORY,
-        search_scope="default",
+        search_scope="candidates",
         project_id="memoryOS",
         limit=1,
     )
@@ -206,15 +180,15 @@ def test_source_view_scan_filters_tenant_before_limit(tmp_path) -> None:  # noqa
     db = _db(tmp_path)
     other_uri = _commit_memory(
         db,
-        Memory(
-            uri="memoryos://user/u1/memories/rules/other-tenant",
+        MemoryCandidate(
+            uri="memoryos://user/u1/memories/candidates/other-tenant",
             user_id="u1",
             title="target target target",
             content="target phrase",
-            kind=MemoryKind.POLICY,
+            kind=MemoryKind.CANDIDATE,
             memory_type="project_rule",
             retrieval_views=["project:memoryOS:rules"],
-            admission={"decision": "accept"},
+            admission={"decision": "pending"},
             merge_key="other-tenant",
         ),
     )
@@ -223,15 +197,15 @@ def test_source_view_scan_filters_tenant_before_limit(tmp_path) -> None:  # noqa
     db.source_store.write_object(other, content="target phrase")
     target_uri = _commit_memory(
         db,
-        Memory(
-            uri="memoryos://user/u1/memories/rules/default-tenant",
+        MemoryCandidate(
+            uri="memoryos://user/u1/memories/candidates/default-tenant",
             user_id="u1",
             title="target",
             content="target phrase",
-            kind=MemoryKind.POLICY,
+            kind=MemoryKind.CANDIDATE,
             memory_type="project_rule",
             retrieval_views=["project:memoryOS:rules"],
-            admission={"decision": "accept"},
+            admission={"decision": "pending"},
             merge_key="default-tenant",
         ),
     )
@@ -239,7 +213,7 @@ def test_source_view_scan_filters_tenant_before_limit(tmp_path) -> None:  # noqa
         "target",
         user_id="u1",
         context_type=ContextType.MEMORY,
-        search_scope="default",
+        search_scope="candidates",
         project_id="memoryOS",
         tenant_id="default",
         limit=1,
@@ -247,66 +221,40 @@ def test_source_view_scan_filters_tenant_before_limit(tmp_path) -> None:  # noqa
     assert [item["uri"] for item in hits] == [target_uri]
 
 
-def test_candidate_confirm_reject_promote(tmp_path) -> None:
-    db = _db(tmp_path)
+def test_candidate_has_no_direct_confirm_or_promote_bypass() -> None:
     updater = MemoryUpdater()
-    uri = _commit_memory(
-        db,
-        MemoryCandidate(
-            uri="memoryos://user/u1/memories/candidates/c1",
-            user_id="u1",
-            title="Candidate preference",
-            content="User prefers source-confirmed reports.",
-            kind=MemoryKind.CANDIDATE,
-            memory_type="preference",
-            retrieval_views=["user:u1:preferences"],
-            admission={"decision": "pending", "reason": "needs_review"},
-            merge_key="candidate:pref",
-        ),
-    )
 
-    db.commit_operation(updater.confirm_candidate(user_id="u1", candidate_uri=uri))
-    confirmed = ContextAssembler(db).search(
-        "source-confirmed",
-        user_id="u1",
-        context_type=ContextType.MEMORY,
-        search_scope="default",
-        adapter_id="codex",
-    )
-    db.commit_operation(updater.reject_candidate(user_id="u1", candidate_uri=uri, reason="bad"))
-    rejected = ContextAssembler(db).search(
-        "source-confirmed",
-        user_id="u1",
-        context_type=ContextType.MEMORY,
-        search_scope="default",
-        adapter_id="codex",
-    )
-
-    assert [hit["uri"] for hit in confirmed] == [uri]
-    assert rejected == []
+    assert not hasattr(updater, "confirm_candidate")
+    assert not hasattr(updater, "promote_candidate")
 
 
 def test_embedding_provider_noop_fallback(tmp_path) -> None:
     db = _db(tmp_path)
     _commit_memory(
         db,
-        Memory(
-            uri="memoryos://user/u1/memories/preferences/p1",
+        MemoryCandidate(
+            uri="memoryos://user/u1/memories/candidates/p1",
             user_id="u1",
             title="Review preference",
             content="User prefers concise review findings.",
-            kind=MemoryKind.EXPLICIT,
+            kind=MemoryKind.CANDIDATE,
             memory_type="preference",
             retrieval_views=["user:u1:preferences"],
-            admission={"decision": "accept"},
+            admission={"decision": "pending"},
             merge_key="pref:review",
         ),
     )
 
-    hits = ContextAssembler(db).search("concise review", user_id="u1", context_type=ContextType.MEMORY, limit=5)
+    hits = ContextAssembler(db).search(
+        "concise review",
+        user_id="u1",
+        context_type=ContextType.MEMORY,
+        search_scope="candidates",
+        limit=5,
+    )
 
     assert hits
-    assert hits[0]["uri"] == "memoryos://user/u1/memories/preferences/p1"
+    assert hits[0]["uri"] == "memoryos://user/u1/memories/candidates/p1"
 
 
 def test_fake_embedding_provider_interface_called(tmp_path) -> None:
@@ -314,11 +262,11 @@ def test_fake_embedding_provider_interface_called(tmp_path) -> None:
     uri = _commit_memory(
         db,
         Memory(
-            uri="memoryos://user/u1/memories/preferences/p1",
+            uri="memoryos://user/u1/memories/policies/vector-p1",
             user_id="u1",
             title="Vector preference",
             content="User prefers vector-ready tests.",
-            kind=MemoryKind.EXPLICIT,
+            kind=MemoryKind.POLICY,
             memory_type="preference",
             retrieval_views=["user:u1:preferences"],
             admission={"decision": "accept"},
@@ -340,7 +288,9 @@ def test_fake_embedding_provider_interface_called(tmp_path) -> None:
     provider = FakeEmbeddingProvider()
     vector_store = InMemoryVectorStore()
     vector_store.upsert_vector(uri, [1.0, 0.0], metadata={"owner_user_id": "u1", "context_type": "memory"})
-    search = HybridSearch(db.index_store, vector_store=vector_store, embedding_provider=provider, source_store=db.source_store)
+    search = HybridSearch(
+        db.index_store, vector_store=vector_store, embedding_provider=provider, source_store=db.source_store
+    )
 
     hits = search.search("anything", filters={"owner_user_id": "u1"}, context_type=ContextType.MEMORY, limit=5)
 
@@ -352,29 +302,29 @@ def test_fake_reranker_can_reorder_results(tmp_path) -> None:
     db = _db(tmp_path)
     _commit_memory(
         db,
-        Memory(
-            uri="memoryos://user/u1/memories/preferences/a",
+        MemoryCandidate(
+            uri="memoryos://user/u1/memories/candidates/a",
             user_id="u1",
             title="A",
             content="review",
-            kind=MemoryKind.EXPLICIT,
+            kind=MemoryKind.CANDIDATE,
             memory_type="preference",
             retrieval_views=["user:u1:preferences"],
-            admission={"decision": "accept"},
+            admission={"decision": "pending"},
             merge_key="a",
         ),
     )
     _commit_memory(
         db,
-        Memory(
-            uri="memoryos://user/u1/memories/preferences/b",
+        MemoryCandidate(
+            uri="memoryos://user/u1/memories/candidates/b",
             user_id="u1",
             title="B",
             content="review",
-            kind=MemoryKind.EXPLICIT,
+            kind=MemoryKind.CANDIDATE,
             memory_type="preference",
             retrieval_views=["user:u1:preferences"],
-            admission={"decision": "accept"},
+            admission={"decision": "pending"},
             merge_key="b",
         ),
     )
@@ -388,10 +338,16 @@ def test_fake_reranker_can_reorder_results(tmp_path) -> None:
             return list(reversed(items))
 
     reranker = ReverseReranker()
-    hits = ContextAssembler(db, reranker=reranker).search("review", user_id="u1", context_type=ContextType.MEMORY, limit=2)
+    hits = ContextAssembler(db, reranker=reranker).search(
+        "review",
+        user_id="u1",
+        context_type=ContextType.MEMORY,
+        search_scope="candidates",
+        limit=2,
+    )
 
     assert reranker.called is True
     assert [hit["uri"] for hit in hits] == [
-        "memoryos://user/u1/memories/preferences/b",
-        "memoryos://user/u1/memories/preferences/a",
+        "memoryos://user/u1/memories/candidates/b",
+        "memoryos://user/u1/memories/candidates/a",
     ]

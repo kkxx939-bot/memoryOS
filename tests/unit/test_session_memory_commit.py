@@ -30,9 +30,9 @@ def test_codex_tool_result_not_written_as_shared_memory() -> None:
     planner = MemoryCommitPlanner()
     operations = planner.plan(archive)
 
-    assert operations == []
-    assert planner.last_group.archive_only
-    assert not planner.last_group.accepted
+    assert operations.operations == ()
+    assert "ordinary_tool_result" in operations.context.salience_reasons
+    assert "unconfirmed_tool_output" in operations.context.salience_reasons
 
 
 def test_project_rule_shared_across_agent_views_metadata() -> None:
@@ -40,11 +40,16 @@ def test_project_rule_shared_across_agent_views_metadata() -> None:
         user_id="u1",
         session_id="s1",
         archive_uri="memoryos://user/u1/sessions/history/s1",
-        messages=[{"role": "user", "content": "Project rule: MemoryOS must keep raw tool output out of shared long-term memory."}],
+        messages=[
+            {
+                "role": "user",
+                "content": "Project rule: MemoryOS must keep raw tool output out of shared long-term memory.",
+            }
+        ],
         metadata={"project_id": "memoryos", "connect": {"adapter_id": "codex"}},
     )
 
-    operation = MemoryCommitPlanner().plan(archive)[0]
+    operation = MemoryCommitPlanner().plan(archive).operations[0]
     metadata = operation.payload["context_object"]["metadata"]
 
     assert operation.payload["source_adapter_id"] == "codex"
@@ -64,7 +69,7 @@ def test_committed_memory_context_object_keeps_schema_metadata(tmp_path) -> None
         messages=[{"role": "user", "content": "I prefer findings first during code reviews."}],
         metadata={"connect": {"adapter_id": "codex"}},
     )
-    operation = MemoryCommitPlanner().plan(archive)[0]
+    operation = MemoryCommitPlanner().plan(archive).operations[0]
     SessionArchiveStore(tmp_path).write_sync_archive(archive)
 
     committer.commit("u1", [operation])
@@ -91,7 +96,9 @@ def test_session_commit_uses_schema_memory_commit_planner(tmp_path) -> None:
     )
 
     service.async_commit(archive)
-    payload = json.loads((tmp_path / "tenants/default/users/u1/sessions/history/s1/memory_diff.json").read_text(encoding="utf-8"))
+    payload = json.loads(
+        (tmp_path / "tenants/default/users/u1/sessions/history/s1/memory_diff.json").read_text(encoding="utf-8")
+    )
     operation = payload["operations"][0]
     metadata = operation["payload"]["context_object"]["metadata"]
 
@@ -116,6 +123,6 @@ def test_behavior_action_policy_not_modified_by_memory_pipeline() -> None:
     behavior_ops = BehaviorCommitPlanner().plan(archive)
     action_ops = ActionPolicyCommitPlanner().plan(archive)
 
-    assert memory_ops
+    assert memory_ops.operations
     assert behavior_ops == []
     assert action_ops == []

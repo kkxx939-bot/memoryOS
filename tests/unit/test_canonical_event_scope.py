@@ -4,7 +4,13 @@ import pytest
 
 from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.memory.canonical import EpisodeSalienceGate, SessionArchiveEpisodeAdapter
-from memoryos.memory.canonical.scope import MemoryScope, ScopeRef, ScopeSelector, VisibilityPolicy
+from memoryos.memory.canonical.scope import (
+    MemoryScope,
+    ScopeRef,
+    ScopeResolutionSource,
+    ScopeSelector,
+    VisibilityPolicy,
+)
 
 
 def test_coding_project_is_normalized_to_workspace_scope() -> None:
@@ -17,7 +23,9 @@ def test_coding_project_is_normalized_to_workspace_scope() -> None:
             metadata={"project_id": "repo:memoryos", "connect": {"adapter_id": "codex"}},
         )
     )
-    assert episode.origin.primary_scope == ScopeRef("memoryos", "workspace", "repo:memoryos")
+    assert episode.origin.primary_scope is not None
+    assert episode.origin.primary_scope.key == ScopeRef("memoryos", "workspace", "repo:memoryos").key
+    assert episode.origin.primary_scope.source == ScopeResolutionSource.ORIGIN
     assert {scope.kind for scope in episode.legal_scope_candidates()} >= {"principal", "workspace", "episode"}
 
 

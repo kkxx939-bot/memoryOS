@@ -25,20 +25,20 @@ class RecoveryService:
             return RecoveryResult(recovered_count=0, operation_ids=[])
         recovered: list[str] = []
         canonical_by_transaction: dict[str, list] = {}
-        legacy_entries = []
+        regular_entries = []
         for entry in entries:
             if entry.operation.payload.get("canonical_memory") is True:
                 transaction_id = str(entry.operation.payload.get("transaction_id", ""))
                 canonical_by_transaction.setdefault(transaction_id, []).append(entry)
             else:
-                legacy_entries.append(entry)
+                regular_entries.append(entry)
         for transaction_entries in canonical_by_transaction.values():
             try:
                 recovered.extend(self.committer.resume_canonical_batch(user_id, transaction_entries))
             except (FileNotFoundError, IsADirectoryError, NotADirectoryError) as exc:
                 for entry in transaction_entries:
                     self._record_failure(user_id, entry, exc)
-        for entry in legacy_entries:
+        for entry in regular_entries:
             operation = entry.operation
             try:
                 if self.committer.resume(user_id, operation, entry.phase):

@@ -1,4 +1,4 @@
-"""规范记忆使用的证据片段。"""
+"""Build immutable evidence episodes from archived session rows."""
 
 from __future__ import annotations
 
@@ -9,26 +9,32 @@ from typing import Any
 
 from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.memory.canonical.event import ActorRef, EventEnvelope, OriginContext, SubjectRef
-from memoryos.memory.canonical.scope import ScopeRef, scope_from_external
+from memoryos.memory.canonical.scope import ScopeRef, ScopeResolutionSource, scope_from_external
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
-def _parse_time(value: Any) -> datetime:
+def _parse_time(value: Any, *, fallback: datetime = _EPOCH) -> tuple[datetime, bool, bool]:
+    """Return UTC time plus inferred/invalid flags without wall-clock fallback."""
+
     if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        inferred = value.tzinfo is None
+        parsed = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc), inferred, False
     text = str(value or "").strip().replace("Z", "+00:00")
     if text:
         try:
             parsed = datetime.fromisoformat(text)
-            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+            inferred = parsed.tzinfo is None
+            resolved = parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+            return resolved.astimezone(timezone.utc), inferred, False
         except ValueError:
-            pass
-    return datetime.now(timezone.utc)
+            return fallback, True, True
+    return fallback, True, False
 
 
 @dataclass(frozen=True)
 class EvidenceEpisode:
-    """负责 EvidenceEpisode 这部分逻辑。"""
-
     episode_id: str
     tenant_id: str
     events: tuple[EventEnvelope, ...]
@@ -50,6 +56,13 @@ class EvidenceEpisode:
         event_ids = [event.event_id for event in self.events]
         if len(event_ids) != len(set(event_ids)):
             raise ValueError("evidence episode event IDs must be unique")
+        ordered = tuple(sorted(self.events, key=self.sort_key))
+        if ordered != self.events:
+            object.__setattr__(self, "events", ordered)
+
+    @staticmethod
+    def sort_key(event: EventEnvelope) -> tuple[datetime, datetime, int, str]:
+        return (event.occurred_at, event.ingested_at or event.occurred_at, event.sequence, event.event_id)
 
     @property
     def event_ids(self) -> frozenset[str]:
@@ -63,7 +76,13 @@ class EvidenceEpisode:
             scope_from_external("episode", self.episode_id),
             *self.origin.scope_refs,
             *(
-                scope_from_external(subject.kind, subject.id)
+                scope_from_external(
+                    subject.kind,
+                    subject.id,
+                    confidence=0.5 if subject.inferred else 1.0,
+                    source=ScopeResolutionSource.INFERRED if subject.inferred else ScopeResolutionSource.EVENT,
+                    inferred=subject.inferred,
+                )
                 for subject in self.subjects
                 if subject.kind in {"person", "user", "principal", "robot", "device", "asset"}
             ),
@@ -72,11 +91,7 @@ class EvidenceEpisode:
 
 
 class SessionArchiveEpisodeAdapter:
-    """负责 SessionArchiveEpisodeAdapter 这部分逻辑。"""
-
     def adapt(self, archive: SessionArchive) -> EvidenceEpisode:
-        """处理 adapt 这一步。"""
-
         metadata = dict(archive.metadata or {})
         boundary_scope = dict(metadata.get("scope", {}) or {})
         tenant_id = str(metadata.get("tenant_id") or boundary_scope.get("tenant_id") or "default")
@@ -84,10 +99,15 @@ class SessionArchiveEpisodeAdapter:
         subjects = self._subjects(archive, metadata)
         rows = list(self._rows(archive))
         if not rows:
-            rows = [("session", {"id": f"{archive.session_id}:empty", "content": f"Session {archive.session_id}"})]
+            rows = [("session", {"id": f"{archive.session_id}:empty", "content": f"Session {archive.session_id}"}, 0)]
         events = tuple(
-            self._event(archive, tenant_id, origin, subjects, category, row, index)
-            for index, (category, row) in enumerate(rows)
+            sorted(
+                (
+                    self._event(archive, tenant_id, origin, subjects, category, row, source_index)
+                    for category, row, source_index in rows
+                ),
+                key=EvidenceEpisode.sort_key,
+            )
         )
         times = [event.occurred_at for event in events]
         source_uris = tuple(
@@ -117,7 +137,12 @@ class SessionArchiveEpisodeAdapter:
         project_id = self._project_id(metadata, connect)
         primary_scope = self._scope(origin_payload.get("primary_scope"))
         if primary_scope is None and project_id:
-            primary_scope = scope_from_external("project", project_id)
+            primary_scope = scope_from_external(
+                "project",
+                project_id,
+                source=ScopeResolutionSource.ORIGIN,
+                inferred=False,
+            )
         qualifiers = tuple(
             scope
             for scope in (self._scope(item) for item in origin_payload.get("qualifiers", []) or [])
@@ -143,22 +168,22 @@ class SessionArchiveEpisodeAdapter:
         subjects = []
         for item in raw:
             if isinstance(item, Mapping) and item.get("kind") and item.get("id"):
-                subjects.append(SubjectRef(str(item["kind"]), str(item["id"])))
+                subjects.append(SubjectRef(str(item["kind"]), str(item["id"]), inferred=bool(item.get("inferred"))))
         if not subjects:
-            subjects.append(SubjectRef("person", archive.user_id))
+            subjects.append(SubjectRef("person", archive.user_id, inferred=True))
         return tuple(dict.fromkeys(subjects))
 
-    def _rows(self, archive: SessionArchive) -> Iterable[tuple[str, dict[str, Any]]]:
-        for row in archive.messages:
-            yield "message", dict(row)
-        for row in archive.observations:
-            yield "observation", dict(row)
-        for row in archive.tool_results:
-            yield "tool_result", dict(row)
-        for row in archive.action_results:
-            yield "action_result", dict(row)
-        for row in archive.feedback:
-            yield "feedback", dict(row)
+    def _rows(self, archive: SessionArchive) -> Iterable[tuple[str, dict[str, Any], int]]:
+        collections = (
+            ("message", archive.messages),
+            ("observation", archive.observations),
+            ("tool_result", archive.tool_results),
+            ("action_result", archive.action_results),
+            ("feedback", archive.feedback),
+        )
+        for category, rows in collections:
+            for source_index, row in enumerate(rows):
+                yield category, dict(row), source_index
 
     def _event(
         self,
@@ -168,24 +193,72 @@ class SessionArchiveEpisodeAdapter:
         subjects: tuple[SubjectRef, ...],
         category: str,
         row: dict[str, Any],
-        index: int,
+        source_index: int,
     ) -> EventEnvelope:
-        role = str(row.get("role") or ("tool" if category == "tool_result" else "system")).lower()
+        explicit_role = bool(str(row.get("role") or "").strip())
+        default_role = "tool" if category == "tool_result" else "user" if category == "message" else "system"
+        role = str(row.get("role") or default_role).lower()
         actor_kind = (
             role if role in {"user", "assistant", "tool", "system", "robot", "sensor", "service"} else "service"
         )
+        explicit_actor = bool(str(row.get("actor_id") or "").strip())
         actor_id = str(row.get("actor_id") or (archive.user_id if actor_kind == "user" else origin.adapter_id))
-        event_id = str(row.get("event_id") or row.get("id") or row.get("message_id") or f"{category}:{index}")
+        event_id = str(row.get("event_id") or row.get("id") or row.get("message_id") or f"{category}:{source_index}")
         event_type = str(row.get("event_type") or category).upper()
         status = str(row.get("status") or row.get("result_status") or "").casefold()
         if category == "tool_result" and status in {"failed", "error", "timeout"}:
             event_type = "TOOL_FAILURE"
         elif category == "tool_result" and status in {"recovered", "retry_succeeded"}:
             event_type = "TOOL_RECOVERY"
+
+        archive_ingested, archive_ingested_inferred, archive_ingested_invalid = _parse_time(archive.created_at)
+        ingested_raw = row.get("ingested_at")
+        ingested_at, ingested_inferred, ingested_invalid = _parse_time(
+            ingested_raw,
+            fallback=archive_ingested,
+        )
+        if ingested_raw in (None, ""):
+            ingested_inferred = True
+        occurred_raw = row.get("occurred_at") or row.get("created_at")
+        occurred_at, occurred_inferred, occurred_invalid = _parse_time(occurred_raw, fallback=ingested_at)
+        raw_sequence = row.get("sequence", row.get("source_sequence"))
+        sequence_inferred = raw_sequence is None
+        try:
+            sequence = source_index if raw_sequence is None else int(raw_sequence)
+            sequence_invalid = False
+        except (TypeError, ValueError):
+            sequence = source_index
+            sequence_inferred = True
+            sequence_invalid = True
+
+        event_subjects = self._event_subjects(row, subjects)
+        inferred_fields = []
+        if not explicit_role:
+            inferred_fields.append("actor.role")
+        if not explicit_actor:
+            inferred_fields.append("actor.id")
+        if any(subject.inferred for subject in event_subjects):
+            inferred_fields.append("subjects")
+        if occurred_inferred:
+            inferred_fields.append("occurred_at")
+        if ingested_inferred or archive_ingested_inferred:
+            inferred_fields.append("ingested_at")
+        if sequence_inferred:
+            inferred_fields.append("sequence")
         event_metadata = {
             **dict(row.get("metadata", {}) or {}),
             "archive_uri": archive.archive_uri,
             "category": category,
+            "inferred_fields": inferred_fields,
+            "invalid_fields": [
+                field_name
+                for field_name, invalid in (
+                    ("occurred_at", occurred_invalid),
+                    ("ingested_at", ingested_invalid or archive_ingested_invalid),
+                    ("sequence", sequence_invalid),
+                )
+                if invalid
+            ],
         }
         for key in ("salient", "memory_types", "canonical_memory_uris"):
             if key in row:
@@ -194,15 +267,37 @@ class SessionArchiveEpisodeAdapter:
             event_id=event_id,
             event_type=event_type,
             tenant_id=tenant_id,
-            actor=ActorRef(actor_kind, actor_id),
-            subjects=subjects,
+            actor=ActorRef(
+                actor_kind,
+                actor_id,
+                role=role,
+                id_inferred=not explicit_actor,
+                role_inferred=not explicit_role,
+            ),
+            subjects=event_subjects,
             origin=origin,
             episode_id=archive.session_id,
             session_id=archive.session_id,
-            occurred_at=_parse_time(row.get("occurred_at") or row.get("created_at") or archive.created_at),
+            occurred_at=occurred_at,
+            ingested_at=ingested_at,
+            sequence=sequence,
+            occurred_at_inferred=occurred_inferred,
+            ingested_at_inferred=ingested_inferred or archive_ingested_inferred,
+            sequence_inferred=sequence_inferred,
             content=row,
             metadata=event_metadata,
         )
+
+    def _event_subjects(self, row: Mapping[str, Any], defaults: tuple[SubjectRef, ...]) -> tuple[SubjectRef, ...]:
+        raw = row.get("subjects")
+        if not isinstance(raw, list):
+            return defaults
+        explicit = tuple(
+            SubjectRef(str(item["kind"]), str(item["id"]), inferred=bool(item.get("inferred")))
+            for item in raw
+            if isinstance(item, Mapping) and item.get("kind") and item.get("id")
+        )
+        return explicit or defaults
 
     def _scope(self, payload: Any) -> ScopeRef | None:
         if not isinstance(payload, Mapping) or not payload.get("kind") or not payload.get("id"):
@@ -212,7 +307,11 @@ class SessionArchiveEpisodeAdapter:
             str(payload["id"]),
             namespace=str(payload.get("namespace") or "memoryos"),
             parent_id=str(payload["parent_id"]) if payload.get("parent_id") else None,
+            parent_path=tuple(str(item) for item in payload.get("parent_path", []) or []),
             attributes=dict(payload.get("attributes", {}) or {}),
+            confidence=payload.get("confidence", 1.0),
+            source=str(payload.get("source") or ScopeResolutionSource.EXPLICIT.value),
+            inferred=bool(payload.get("inferred", False)),
         )
 
     def _project_id(self, metadata: dict[str, Any], connect: dict[str, Any]) -> str:

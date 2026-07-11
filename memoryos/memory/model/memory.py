@@ -13,10 +13,8 @@ from memoryos.core.time import utc_now
 
 
 class MemoryKind(str, Enum):
-    EXPLICIT = "explicit_memory"
     ANCHOR = "anchor_memory"
     CANDIDATE = "memory_candidate"
-    CONFIRMED_INFERRED = "confirmed_inferred_memory"
     POLICY = "policy_memory"
 
 
@@ -38,7 +36,7 @@ class Memory:
     merge_key: str = ""
     fields: dict[str, Any] = field(default_factory=dict)
     source: dict[str, Any] = field(default_factory=dict)
-    memory_schema_version: str = "memory_schema_v1"
+    memory_schema_version: str = "memory_schema_v2"
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
 

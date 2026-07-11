@@ -17,7 +17,6 @@ class ConflictType(str, Enum):
 
     DUPLICATE = "duplicate"
     DELETE_OVERRIDES_UPDATE = "delete_overrides_update"
-    EXPLICIT_MEMORY_OVERRIDES_CANDIDATE = "explicit_memory_overrides_candidate"
     POLICY_MEMORY_CONSTRAINS_ACTION = "policy_memory_constrains_action"
     DISABLED_POLICY_BLOCKS_REWARD = "disabled_policy_blocks_reward"
     SUPERSEDE_REQUIRES_TARGET = "supersede_requires_target"
@@ -57,13 +56,24 @@ def operation_memory_metadata(operation: ContextOperation) -> MemoryOperationMet
     values = dict(current.get("value_fields", {}) or {})
     semantic_memory_type = str(operation.payload.get("memory_type") or metadata.get("memory_type") or "")
     storage_memory_kind = str(metadata.get("memory_kind") or operation.payload.get("memory_kind") or "")
-    claim_state = str(metadata.get("state") or metadata.get("claim_state") or operation.payload.get("claim_state") or "")
-    canonical_rule_type = str(
-        metadata.get("canonical_rule_type") or values.get("rule_type") or operation.payload.get("canonical_rule_type") or ""
+    claim_state = str(
+        metadata.get("state") or metadata.get("claim_state") or operation.payload.get("claim_state") or ""
     )
-    structured_value = str(values.get("canonical_value") or values.get("value") or operation.payload.get("rule_value") or "")
+    canonical_rule_type = str(
+        metadata.get("canonical_rule_type")
+        or values.get("rule_type")
+        or operation.payload.get("canonical_rule_type")
+        or ""
+    )
+    structured_value = str(
+        values.get("canonical_value") or values.get("value") or operation.payload.get("rule_value") or ""
+    )
     related_action = str(
-        metadata.get("related_action") or values.get("related_action") or operation.payload.get("related_action") or operation.payload.get("action") or ""
+        metadata.get("related_action")
+        or values.get("related_action")
+        or operation.payload.get("related_action")
+        or operation.payload.get("action")
+        or ""
     )
     constrained = metadata.get("constrains_policy_uris") or operation.payload.get("constrains_policy_uris") or []
     return MemoryOperationMetadata(
@@ -143,11 +153,6 @@ class ConflictResolver:
     def _resolve_group(
         self, operations: list[ContextOperation]
     ) -> tuple[list[ContextOperation], list[ContextOperation], ConflictType | None, str]:
-        explicit, candidate = self._explicit_and_candidate(operations)
-        if explicit and candidate:
-            candidate.status = OperationStatus.REJECTED
-            keep = [op for op in operations if op is not candidate]
-            return keep, [candidate], ConflictType.EXPLICIT_MEMORY_OVERRIDES_CANDIDATE, "explicit memory overrides memory candidate"
         unique: list[ContextOperation] = []
         seen_actions: set[str] = set()
         duplicates: list[ContextOperation] = []
@@ -159,8 +164,15 @@ class ConflictResolver:
             unique.append(operation)
         if any(op.action == OperationAction.DELETE for op in unique):
             delete = [op for op in unique if op.action == OperationAction.DELETE][-1]
-            return [delete], [op for op in unique if op is not delete] + duplicates, ConflictType.DELETE_OVERRIDES_UPDATE, "delete overrides target mutations"
-        if any(op.action == OperationAction.SUPERSEDE for op in unique) and any(op.action == OperationAction.UPDATE for op in unique):
+            return (
+                [delete],
+                [op for op in unique if op is not delete] + duplicates,
+                ConflictType.DELETE_OVERRIDES_UPDATE,
+                "delete overrides target mutations",
+            )
+        if any(op.action == OperationAction.SUPERSEDE for op in unique) and any(
+            op.action == OperationAction.UPDATE for op in unique
+        ):
             supersede = [op for op in unique if op.action == OperationAction.SUPERSEDE][-1]
             for update in [op for op in unique if op.action == OperationAction.UPDATE]:
                 supersede.payload = {**update.payload, **supersede.payload}
@@ -170,7 +182,17 @@ class ConflictResolver:
             return keep, dropped + duplicates, None, "supersede merged update payload"
         if any(op.action == OperationAction.DISABLE for op in unique):
             disable = [op for op in unique if op.action == OperationAction.DISABLE][-1]
-            keep = [op for op in unique if op.action in {OperationAction.REWARD, OperationAction.PENALIZE, OperationAction.COOLDOWN, OperationAction.SUPPRESS}]
+            keep = [
+                op
+                for op in unique
+                if op.action
+                in {
+                    OperationAction.REWARD,
+                    OperationAction.PENALIZE,
+                    OperationAction.COOLDOWN,
+                    OperationAction.SUPPRESS,
+                }
+            ]
             rejected = [op for op in unique if op not in [disable, *keep]]
             return [*keep, disable], rejected + duplicates, None, "disable preserved with policy-affecting operations"
         reward_ops = [op for op in unique if op.action == OperationAction.REWARD]
@@ -179,31 +201,23 @@ class ConflictResolver:
             merged = self._merge_reward_penalty(reward_ops[-1], penalty_ops[-1])
             dropped = [op for op in reward_ops + penalty_ops if op is not merged]
             keep = [op for op in unique if op.action not in {OperationAction.REWARD, OperationAction.PENALIZE}]
-            return [*keep, merged], dropped + duplicates, ConflictType.REWARD_PENALTY_MERGE, "reward and penalty merged by feedback strength"
-        if any(op.action == OperationAction.REJECT for op in unique) and any(op.action == OperationAction.CONFIRM for op in unique):
-            confirm = [op for op in unique if op.action == OperationAction.CONFIRM][-1]
-            rejected = [op for op in unique if op is not confirm]
-            return [confirm], rejected + duplicates, None, "confirm supersedes candidate reject"
-        if any(op.action == OperationAction.SUPPRESS for op in unique) and any(op.action == OperationAction.REWARD for op in unique):
+            return (
+                [*keep, merged],
+                dropped + duplicates,
+                ConflictType.REWARD_PENALTY_MERGE,
+                "reward and penalty merged by feedback strength",
+            )
+        if any(op.action == OperationAction.SUPPRESS for op in unique) and any(
+            op.action == OperationAction.REWARD for op in unique
+        ):
             suppress = [op for op in unique if op.action == OperationAction.SUPPRESS][-1]
             rejected = [op for op in unique if op is not suppress]
             return [suppress], rejected + duplicates, None, "suppress supersedes reward"
         return unique, duplicates, ConflictType.DUPLICATE if duplicates else None, "duplicates rejected"
 
-    def _explicit_and_candidate(self, operations: list[ContextOperation]) -> tuple[ContextOperation | None, ContextOperation | None]:
-        explicit = None
-        candidate = None
-        for operation in operations:
-            if operation.context_type != ContextType.MEMORY:
-                continue
-            metadata = operation_memory_metadata(operation)
-            if metadata.storage_memory_kind in {"explicit_memory", "policy_memory"}:
-                explicit = operation
-            if metadata.storage_memory_kind == "memory_candidate":
-                candidate = operation
-        return explicit, candidate
-
-    def _apply_policy_memory_constraints(self, operations: list[ContextOperation]) -> tuple[list[ContextOperation], list[dict]]:
+    def _apply_policy_memory_constraints(
+        self, operations: list[ContextOperation]
+    ) -> tuple[list[ContextOperation], list[dict]]:
         conflicts: list[dict] = []
         policy_memories = []
         for operation in operations:
@@ -234,7 +248,11 @@ class ConflictResolver:
                     continue
                 if metadata.related_action and str(operation.payload.get("action") or "") != metadata.related_action:
                     continue
-                operation.payload = {**operation.payload, "auto_execute_allowed": False, "status": "disabled_auto_execute"}
+                operation.payload = {
+                    **operation.payload,
+                    "auto_execute_allowed": False,
+                    "status": "disabled_auto_execute",
+                }
             conflicts.append(
                 {
                     "type": ConflictType.POLICY_MEMORY_CONSTRAINS_ACTION.value,
@@ -249,7 +267,10 @@ class ConflictResolver:
     def _protect_disabled_auto_execute_reward(self, operation: ContextOperation) -> None:
         if operation.action != OperationAction.REWARD:
             return
-        if operation.payload.get("current_status") == "disabled_auto_execute" or operation.payload.get("auto_execute_allowed") is False:
+        if (
+            operation.payload.get("current_status") == "disabled_auto_execute"
+            or operation.payload.get("auto_execute_allowed") is False
+        ):
             operation.payload = {
                 **operation.payload,
                 "auto_execute_allowed": False,
@@ -257,8 +278,22 @@ class ConflictResolver:
             }
 
     def _merge_reward_penalty(self, reward: ContextOperation, penalty: ContextOperation) -> ContextOperation:
-        reward_strength = abs(float(reward.payload.get("feedback_strength", reward.payload.get("reward", reward.payload.get("reward_value", 0.0))) or 0.0))
-        penalty_strength = abs(float(penalty.payload.get("feedback_strength", penalty.payload.get("penalty", penalty.payload.get("reward_value", 0.0))) or 0.0))
+        reward_strength = abs(
+            float(
+                reward.payload.get(
+                    "feedback_strength", reward.payload.get("reward", reward.payload.get("reward_value", 0.0))
+                )
+                or 0.0
+            )
+        )
+        penalty_strength = abs(
+            float(
+                penalty.payload.get(
+                    "feedback_strength", penalty.payload.get("penalty", penalty.payload.get("reward_value", 0.0))
+                )
+                or 0.0
+            )
+        )
         if penalty.payload.get("explicit_rule") or penalty_strength >= reward_strength:
             penalty.payload = {**reward.payload, **penalty.payload, "merged_from_reward": reward.operation_id}
             return penalty

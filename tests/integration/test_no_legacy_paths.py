@@ -35,3 +35,29 @@ def test_legacy_paths_and_imports_do_not_return() -> None:
     assert " ".join(["Personal", "Memory", "OS"]) not in readme
     assert "第一阶段只解决记忆" not in readme
     assert "".join(["Episode", "Processor"]) not in readme
+
+
+def test_memory_v2_has_no_v1_execution_or_compatibility_surface() -> None:
+    import memoryos.memory.canonical as canonical
+    from memoryos.contextdb.session.planning import MemoryPlanningResult
+    from memoryos.contextdb.session.session_archive import SessionArchiveStore
+
+    root = Path(__file__).resolve().parents[2]
+    removed_exports = (
+        "IDENTITY_ALGORITHM_V1",
+        "IdentityAliasOperation",
+        "IdentityMigrationRequired",
+        "LegacyIdentityCandidate",
+        "LegacyCandidateProposalAdapter",
+    )
+    assert all(not hasattr(canonical, name) for name in removed_exports)
+    assert not hasattr(SessionArchiveStore, "migrate_legacy_archive")
+    assert not hasattr(MemoryPlanningResult, "to_list")
+    assert not hasattr(MemoryPlanningResult, "__getitem__")
+    removed_files = (
+        root / "memoryos" / "memory" / "merge.py",
+        root / "memoryos" / "memory" / "extraction" / "llm_memory_extractor.py",
+        root / "memoryos" / "memory" / "extraction" / "rule_memory_extractor.py",
+        root / "memoryos" / "memory" / "update" / "__init__.py",
+    )
+    assert all(not path.exists() for path in removed_files)

@@ -130,6 +130,9 @@ class HybridSearch:
         context_type: ContextType | None,
     ) -> dict | None:
         metadata = dict(metadata or {})
+        projected_revision = metadata.get("projection_source_revision")
+        if projected_revision is None:
+            projected_revision = metadata.get("source_revision")
         title = str(metadata.get("title", ""))
         hit_type = str(metadata.get("context_type", ""))
         owner_user_id = metadata.get("owner_user_id")
@@ -149,6 +152,15 @@ class HybridSearch:
                 tenant_id = obj.tenant_id or "default"
                 lifecycle_state = obj.lifecycle_state.value
                 metadata = {**obj.metadata, **metadata}
+                canonical_revision = dict(obj.metadata or {}).get("revision")
+                if (
+                    projected_revision is not None
+                    and canonical_revision is not None
+                    and int(projected_revision) != int(canonical_revision)
+                ):
+                    return None
+        if projected_revision is not None:
+            metadata["projection_source_revision"] = int(projected_revision)
         if context_type is not None and hit_type != context_type.value:
             return None
         if filters.get("context_type") and hit_type != filters["context_type"]:
@@ -189,9 +201,13 @@ class HybridSearch:
         project_id = str(scope.get("project_id") or fields.get("project_id") or "")
         if filters.get("project_id"):
             memory_type = str(metadata.get("memory_type") or "")
-            if memory_type in {"project_rule", "project_decision", "agent_experience"} and project_id != str(filters["project_id"]):
+            if memory_type in {"project_rule", "project_decision", "agent_experience"} and project_id != str(
+                filters["project_id"]
+            ):
                 return None
-        if filters.get("adapter_id") and str(connect.get("adapter_id") or metadata.get("source_adapter_id") or "") != str(filters["adapter_id"]):
+        if filters.get("adapter_id") and str(
+            connect.get("adapter_id") or metadata.get("source_adapter_id") or ""
+        ) != str(filters["adapter_id"]):
             return None
         if admission.get("decision") in {"pending", "restricted", "archive_only", "reject"}:
             return None

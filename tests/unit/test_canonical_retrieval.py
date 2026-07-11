@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
+import pytest
+
+from memoryos.contextdb.context_db import ContextDB
 from memoryos.contextdb.model.context_relation import ContextRelation
+from memoryos.contextdb.model.context_type import ContextType
+from memoryos.contextdb.retrieval.context_assembler import ContextAssembler
 from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
 from memoryos.contextdb.store.local_stores import (
     FileSystemSourceStore,
@@ -18,30 +24,42 @@ from memoryos.memory.canonical import (
     EvidenceRef,
     MemoryClaim,
     MemoryRevision,
+    MemorySlot,
+    ScopeRef,
     TransitionProfile,
 )
+from memoryos.memory.canonical.projection_state import ProjectionRecordStore
+from memoryos.memory.canonical.retrieval import CanonicalInvariantViolation
 from memoryos.providers.embedding import HashingEmbeddingProvider
 
 
 def _scope(*refs, tenant_id: str = "t1", principals=()):  # noqa: ANN001, ANN202
+    scope_refs = [
+        {
+            "namespace": "memoryos",
+            "kind": kind,
+            "id": identifier,
+            "parent_id": None,
+            "attributes": {},
+            "confidence": 1.0,
+            "source": "explicit",
+            "inferred": False,
+        }
+        for kind, identifier in refs
+    ]
     return {
-        "applicability": {
-            "all_of": [
-                {
-                    "namespace": "memoryos",
-                    "kind": kind,
-                    "id": identifier,
-                    "parent_id": None,
-                    "attributes": {},
-                }
-                for kind, identifier in refs
-            ]
-        },
+        "canonical_subject": scope_refs[0],
+        "applicability": {"all_of": scope_refs},
         "visibility": {
             "tenant_id": tenant_id,
             "allowed_principal_ids": list(principals),
             "allowed_service_ids": [],
             "private": bool(principals),
+        },
+        "authority": {
+            "principal_ids": list(principals or ("u1",)),
+            "service_ids": [],
+            "inferred": False,
         },
         "origin_refs": [],
     }
@@ -69,11 +87,137 @@ def _write_claim(
         relation="UNRELATED",
         epistemic_status="EXPLICIT",
     )
-    claim = MemoryClaim(claim_id, uri, f"{claim_id}-slot", value, profile, (revision,))
+    subject = ScopeRef.from_dict(scope["canonical_subject"])
+    claim = MemoryClaim(
+        claim_id,
+        uri,
+        f"{claim_id}-slot",
+        value,
+        profile,
+        (revision,),
+        canonical_subject_key=subject.key,
+    )
     obj = claim.to_context_object(tenant_id="t1", owner_user_id=owner_user_id, memory_type=memory_type, scope=scope)
+    applicability = dict(scope.get("applicability", {}) or {})
+    scope_keys = tuple(
+        f"{item.get('namespace', 'memoryos')}:{item.get('kind')}:{item.get('id')}"
+        for item in applicability.get("all_of", []) or []
+    )
+    slot_uri = uri.rsplit("/claims/", 1)[0]
+    slot = MemorySlot(
+        slot_id=f"{claim_id}-slot",
+        uri=slot_uri,
+        memory_type=memory_type,
+        identity_fields={"test_identity": claim_id},
+        scope_keys=scope_keys,
+        claim_ids=(claim_id,),
+        active_claim_id=claim_id if state == "ACTIVE" else None,
+        revision=1,
+        canonical_subject_key=subject.key,
+        canonical_subject=subject,
+    )
+    source.write_object(
+        slot.to_context_object(
+            tenant_id="t1",
+            owner_user_id=owner_user_id,
+            scope=scope,
+        ),
+        content=json.dumps({"slot_id": slot.slot_id}),
+    )
     source.write_object(obj, content=json.dumps({"value": value, "state": state}))
     projector.project(uri)
     return uri
+
+
+def _write_two_revision_claim(
+    source,
+    projector,
+    *,
+    old_value: str,
+    new_value: str,
+    project_current: bool = True,
+):  # noqa: ANN001, ANN202
+    claim_id = "revisioned"
+    slot_id = "revisioned-slot"
+    slot_uri = "memoryos://user/u1/memories/canonical/slots/revisioned-slot"
+    claim_uri = f"{slot_uri}/claims/{claim_id}"
+    scope = _scope(("workspace", "memoryos"))
+    subject = ScopeRef.from_dict(scope["canonical_subject"])
+    revision_one = MemoryRevision(
+        revision=1,
+        state="ACTIVE",
+        value_fields={"canonical_value": old_value},
+        evidence_refs=(EvidenceRef("e1", None, "hash-1"),),
+        proposal_id="p1",
+        relation="UNRELATED",
+        epistemic_status="EXPLICIT",
+    )
+    claim_one = MemoryClaim(
+        claim_id,
+        claim_uri,
+        slot_id,
+        old_value,
+        TransitionProfile.AUTHORITATIVE_STATE,
+        (revision_one,),
+        canonical_subject_key=subject.key,
+    )
+    slot_one = MemorySlot(
+        slot_id=slot_id,
+        uri=slot_uri,
+        memory_type="project_decision",
+        identity_fields={"decision_topic": "revision test"},
+        scope_keys=("memoryos:workspace:memoryos",),
+        claim_ids=(claim_id,),
+        active_claim_id=claim_id,
+        revision=1,
+        canonical_subject_key=subject.key,
+        canonical_subject=subject,
+    )
+    source.write_object(slot_one.to_context_object(tenant_id="t1", owner_user_id="u1", scope=scope))
+    source.write_object(
+        claim_one.to_context_object(
+            tenant_id="t1",
+            owner_user_id="u1",
+            memory_type="project_decision",
+            scope=scope,
+        ),
+        content=old_value,
+    )
+    projector.project(claim_uri, 1)
+
+    revision_two = MemoryRevision(
+        revision=2,
+        state="ACTIVE",
+        value_fields={"canonical_value": new_value},
+        evidence_refs=(EvidenceRef("e2", None, "hash-2"),),
+        proposal_id="p2",
+        relation="CORRECTS",
+        epistemic_status="EXPLICIT",
+        previous_revision=1,
+    )
+    claim_two = MemoryClaim(
+        claim_id,
+        claim_uri,
+        slot_id,
+        new_value,
+        TransitionProfile.AUTHORITATIVE_STATE,
+        (replace(revision_one, valid_to=revision_two.valid_from), revision_two),
+        canonical_subject_key=subject.key,
+    )
+    slot_two = replace(slot_one, revision=2)
+    source.write_object(slot_two.to_context_object(tenant_id="t1", owner_user_id="u1", scope=scope))
+    source.write_object(
+        claim_two.to_context_object(
+            tenant_id="t1",
+            owner_user_id="u1",
+            memory_type="project_decision",
+            scope=scope,
+        ),
+        content=new_value,
+    )
+    if project_current:
+        projector.project(claim_uri, 2)
+    return claim_uri, slot_uri
 
 
 def test_retrieval_distinguishes_current_options_history_visibility_and_scope(tmp_path) -> None:  # noqa: ANN001
@@ -132,7 +276,7 @@ def test_retrieval_distinguishes_current_options_history_visibility_and_scope(tm
     assert [item["uri"] for item in current] == [active]
     options = retriever.search(query(intent=CanonicalQueryIntent.OPTIONS))
     assert {item["uri"] for item in options} == {proposed}
-    history = retriever.search(query(states=("SUPERSEDED",)))
+    history = retriever.search(query(states=("SUPERSEDED",), intent=CanonicalQueryIntent.HISTORY))
     assert [item["uri"] for item in history] == [superseded]
     assert history[0]["memory_category"] == "history"
     assert retriever.search(query(tenant_id="other", intent=CanonicalQueryIntent.OPTIONS)) == []
@@ -277,6 +421,7 @@ def test_canonical_retrieval_supports_exact_vector_and_relation_expansion(tmp_pa
     )
     hybrid = HybridSearch(index, vector_store=vectors, embedding_provider=embedding, source_store=source)
     retriever = CanonicalMemoryRetriever(source, index, relations, hybrid_search=hybrid)
+
     def query(
         text: str,
         *,
@@ -293,12 +438,332 @@ def test_canonical_retrieval_supports_exact_vector_and_relation_expansion(tmp_pa
             limit=10,
         )
 
-    exact = retriever.search(
-        query("no lexical match", claim_uris=(sqlite,), intent=CanonicalQueryIntent.CURRENT)
-    )
+    exact = retriever.search(query("no lexical match", claim_uris=(sqlite,), intent=CanonicalQueryIntent.CURRENT))
     assert exact[0]["uri"] == sqlite
     vector = retriever.search(query("durable local database", intent=CanonicalQueryIntent.CURRENT))
     assert any(item["uri"] == sqlite for item in vector)
     expanded = CanonicalMemoryRetriever(source, index, relations).search(query("postgresql"))
     assert {item["uri"] for item in expanded} >= {postgres, cockroach}
     assert any(item["retrieval_source"] == "canonical_relation_expansion" for item in expanded)
+
+
+def test_stale_index_vector_and_projection_hits_are_filtered_by_canonical_revision(tmp_path) -> None:  # noqa: ANN001
+    source = FileSystemSourceStore(tmp_path)
+    index = InMemoryIndexStore()
+    vectors = InMemoryVectorStore()
+    embedding = HashingEmbeddingProvider()
+    projector = CanonicalMemoryProjector(
+        source,
+        index,
+        tmp_path,
+        vector_store=vectors,
+        embedding_provider=embedding,
+    )
+    claim_uri, _slot_uri = _write_two_revision_claim(
+        source,
+        projector,
+        old_value="legacy-only-token",
+        new_value="current-only-token",
+        project_current=False,
+    )
+    hybrid = HybridSearch(index, vector_store=vectors, embedding_provider=embedding, source_store=source)
+    retriever = CanonicalMemoryRetriever(source, index, hybrid_search=hybrid)
+    query = CanonicalMemoryQuery(
+        text="legacy-only-token",
+        tenant_id="t1",
+        principal_id="u1",
+        applicability_scope_keys=("memoryos:workspace:memoryos",),
+        intent=CanonicalQueryIntent.CURRENT,
+    )
+
+    assert retriever.search(query) == []
+    exact = retriever.search(replace(query, text="", claim_uris=(claim_uri,)))
+    assert len(exact) == 1
+    assert exact[0]["revision"] == 2
+    assert exact[0]["text"] == "current-only-token"
+    assert exact[0]["layer_texts"] == {}
+
+    projector.project(claim_uri, 2)
+    current = retriever.search(replace(query, text="current-only-token"))
+    assert [item["uri"] for item in current] == [claim_uri]
+    assert current[0]["projection_revision"] == 2
+
+
+def test_history_expands_old_revision_while_current_returns_only_slot_current(tmp_path) -> None:  # noqa: ANN001
+    source = FileSystemSourceStore(tmp_path)
+    index = InMemoryIndexStore()
+    projector = CanonicalMemoryProjector(source, index, tmp_path)
+    claim_uri, _slot_uri = _write_two_revision_claim(
+        source,
+        projector,
+        old_value="historical sqlite choice",
+        new_value="current postgres choice",
+    )
+    retriever = CanonicalMemoryRetriever(source, index)
+    base = CanonicalMemoryQuery(
+        text="",
+        tenant_id="t1",
+        principal_id="u1",
+        applicability_scope_keys=("memoryos:workspace:memoryos",),
+        claim_uris=(claim_uri,),
+    )
+
+    current = retriever.search(replace(base, intent=CanonicalQueryIntent.CURRENT))
+    history = retriever.search(replace(base, intent=CanonicalQueryIntent.HISTORY))
+
+    assert [(item["revision"], item["memory_state"]) for item in current] == [(2, "ACTIVE")]
+    assert [(item["revision"], item["memory_state"]) for item in history] == [(1, "ACTIVE")]
+    assert history[0]["revision_uri"].endswith("#revision-1")
+    assert "historical sqlite choice" in history[0]["text"]
+    assert history[0]["layer_revisions"] == {"L0": 1, "L1": 1, "L2": 1}
+
+
+def test_late_historical_transaction_does_not_replace_effective_current_projection(tmp_path) -> None:  # noqa: ANN001
+    source = FileSystemSourceStore(tmp_path)
+    index = InMemoryIndexStore()
+    projector = CanonicalMemoryProjector(source, index, tmp_path)
+    scope = _scope(("workspace", "memoryos"))
+    subject = ScopeRef.from_dict(scope["canonical_subject"])
+    slot_uri = "memoryos://user/u1/memories/canonical/slots/late-history"
+    claim_uri = f"{slot_uri}/claims/late-history"
+    current_revision = MemoryRevision(
+        revision=1,
+        state="ACTIVE",
+        value_fields={"canonical_value": "current effective rule"},
+        evidence_refs=(EvidenceRef("current", None, "current-hash"),),
+        proposal_id="current",
+        relation="UNRELATED",
+        epistemic_status="EXPLICIT",
+        valid_from="2026-01-02T00:00:00+00:00",
+    )
+    late_history = MemoryRevision(
+        revision=2,
+        state="ACTIVE",
+        value_fields={"canonical_value": "older historical rule"},
+        evidence_refs=(EvidenceRef("late", None, "late-hash"),),
+        proposal_id="late",
+        relation="SUPPLEMENTS",
+        epistemic_status="EXPLICIT",
+        qualifiers={"non_current_historical": True},
+        previous_revision=1,
+        valid_from="2025-12-01T00:00:00+00:00",
+        transaction_time="2026-07-11T00:00:00+00:00",
+    )
+    claim = MemoryClaim(
+        "late-history",
+        claim_uri,
+        "late-history",
+        "current effective rule",
+        TransitionProfile.AUTHORITATIVE_STATE,
+        (current_revision, late_history),
+        canonical_subject_key=subject.key,
+    )
+    slot = MemorySlot(
+        slot_id="late-history",
+        uri=slot_uri,
+        memory_type="project_rule",
+        identity_fields={"rule_topic": "late history"},
+        scope_keys=("memoryos:workspace:memoryos",),
+        claim_ids=("late-history",),
+        active_claim_id="late-history",
+        revision=2,
+        canonical_subject_key=subject.key,
+        canonical_subject=subject,
+    )
+    source.write_object(slot.to_context_object(tenant_id="t1", owner_user_id="u1", scope=scope))
+    source.write_object(
+        claim.to_context_object(
+            tenant_id="t1",
+            owner_user_id="u1",
+            memory_type="project_rule",
+            scope=scope,
+        )
+    )
+    projector.project(claim_uri, 2)
+    retriever = CanonicalMemoryRetriever(source, index)
+    query = CanonicalMemoryQuery(
+        text="",
+        tenant_id="t1",
+        principal_id="u1",
+        applicability_scope_keys=("memoryos:workspace:memoryos",),
+        claim_uris=(claim_uri,),
+    )
+
+    current = retriever.search(replace(query, intent=CanonicalQueryIntent.CURRENT))
+    history = retriever.search(replace(query, intent=CanonicalQueryIntent.HISTORY))
+
+    assert current[0]["revision"] == 1
+    assert current[0]["source_revision"] == 2
+    assert current[0]["projection_record"]["current_claim_revision"] == 1
+    assert "current effective rule" in current[0]["text"]
+    assert [(item["revision"], item["text"]) for item in history] == [(2, "older historical rule")]
+
+
+def test_multiple_active_claims_raise_invariant_violation_instead_of_returning_first(tmp_path) -> None:  # noqa: ANN001
+    source = FileSystemSourceStore(tmp_path)
+    index = InMemoryIndexStore()
+    scope = _scope(("workspace", "memoryos"))
+    subject = ScopeRef.from_dict(scope["canonical_subject"])
+    slot_uri = "memoryos://user/u1/memories/canonical/slots/broken"
+    claims = []
+    for claim_id, value in (("c1", "sqlite"), ("c2", "postgres")):
+        revision = MemoryRevision(
+            revision=1,
+            state="ACTIVE",
+            value_fields={"canonical_value": value},
+            evidence_refs=(EvidenceRef(f"e-{claim_id}", None, f"h-{claim_id}"),),
+            proposal_id=f"p-{claim_id}",
+            relation="ALTERNATIVE",
+            epistemic_status="EXPLICIT",
+        )
+        claim = MemoryClaim(
+            claim_id,
+            f"{slot_uri}/claims/{claim_id}",
+            "broken",
+            value,
+            TransitionProfile.AUTHORITATIVE_STATE,
+            (revision,),
+            canonical_subject_key=subject.key,
+        )
+        claims.append(claim)
+        source.write_object(
+            claim.to_context_object(
+                tenant_id="t1",
+                owner_user_id="u1",
+                memory_type="project_decision",
+                scope=scope,
+            ),
+            content=value,
+        )
+    slot = MemorySlot(
+        slot_id="broken",
+        uri=slot_uri,
+        memory_type="project_decision",
+        identity_fields={"decision_topic": "database"},
+        scope_keys=("memoryos:workspace:memoryos",),
+        claim_ids=("c1", "c2"),
+        active_claim_id="c1",
+        revision=1,
+        canonical_subject_key=subject.key,
+        canonical_subject=subject,
+    )
+    source.write_object(slot.to_context_object(tenant_id="t1", owner_user_id="u1", scope=scope))
+
+    with pytest.raises(CanonicalInvariantViolation, match="multiple ACTIVE claims"):
+        CanonicalMemoryRetriever(source, index).search(
+            CanonicalMemoryQuery(
+                text="",
+                tenant_id="t1",
+                principal_id="u1",
+                applicability_scope_keys=("memoryos:workspace:memoryos",),
+            )
+        )
+
+
+def test_mixed_revision_layer_refs_are_rejected_by_retrieval_and_assembly(tmp_path) -> None:  # noqa: ANN001
+    source = FileSystemSourceStore(tmp_path)
+    index = InMemoryIndexStore()
+    relations = InMemoryRelationStore()
+    projector = CanonicalMemoryProjector(source, index, tmp_path)
+    claim_uri, _slot_uri = _write_two_revision_claim(
+        source,
+        projector,
+        old_value="old layer content",
+        new_value="new canonical content",
+    )
+    records = ProjectionRecordStore(tmp_path)
+    old = records.load(claim_uri, 1)
+    current = records.load_current(claim_uri, source_revision=2)
+    assert old is not None and current is not None
+    records.save(replace(current, l0_uri=old.l0_uri))
+
+    retriever = CanonicalMemoryRetriever(source, index, relations)
+    query = CanonicalMemoryQuery(
+        text="",
+        tenant_id="t1",
+        principal_id="u1",
+        applicability_scope_keys=("memoryos:workspace:memoryos",),
+        claim_uris=(claim_uri,),
+    )
+    result = retriever.search(query)
+    assert len(result) == 1
+    assert result[0]["layer_texts"] == {}
+    assert result[0]["text"] == "new canonical content"
+
+    assembler = ContextAssembler(ContextDB(source, index, relations))
+    assembled = assembler.assemble(
+        "canonical",
+        user_id="u1",
+        tenant_id="t1",
+        project_id="memoryos",
+        context_types=[ContextType.MEMORY],
+        claim_uris=[claim_uri],
+        query_intent="CURRENT",
+        token_budget=200,
+    )
+    assert "new canonical content" in assembled["packed_context"]
+    assert "old layer content" not in assembled["packed_context"]
+
+
+def test_canonical_results_still_obey_connect_and_authority_filters(tmp_path) -> None:  # noqa: ANN001
+    source = FileSystemSourceStore(tmp_path)
+    index = InMemoryIndexStore()
+    relations = InMemoryRelationStore()
+    projector = CanonicalMemoryProjector(source, index, tmp_path)
+    claim_uri = _write_claim(
+        source,
+        projector,
+        claim_id="connect-filtered",
+        value="workspace canonical rule",
+        state="ACTIVE",
+        memory_type="project_rule",
+        scope=_scope(("workspace", "memoryos")),
+    )
+    claim = source.read_object(claim_uri)
+    claim.metadata = {
+        **claim.metadata,
+        "connect": {
+            "connect_type": "agent",
+            "adapter_id": "codex",
+            "run_mode": "context_reduction",
+            "world_domain": "software",
+            "source_kind": "transcript",
+        },
+        "retrieval_views": ["project:memoryos:rules"],
+        "authority": {"tenant_id": "t1", "allowed_principal_ids": ["u1"]},
+        "asserted_by": "u1",
+    }
+    source.write_object(claim, content="workspace canonical rule")
+    assembler = ContextAssembler(ContextDB(source, index, relations))
+
+    allowed = assembler.search(
+        "canonical rule",
+        user_id="u1",
+        tenant_id="t1",
+        project_id="memoryos",
+        context_type=ContextType.MEMORY,
+        connect_filters={"run_mode": "context_reduction"},
+    )
+    blocked_connect = assembler.search(
+        "canonical rule",
+        user_id="u1",
+        tenant_id="t1",
+        project_id="memoryos",
+        context_type=ContextType.MEMORY,
+        connect_filters={"run_mode": "action_capable"},
+    )
+    invalid_authority = source.read_object(claim_uri)
+    invalid_authority.metadata = {**invalid_authority.metadata, "asserted_by": "u2"}
+    source.write_object(invalid_authority, content="workspace canonical rule")
+    blocked_authority = CanonicalMemoryRetriever(source, index).search(
+        CanonicalMemoryQuery(
+            text="canonical rule",
+            tenant_id="t1",
+            principal_id="u1",
+            applicability_scope_keys=("memoryos:workspace:memoryos",),
+        )
+    )
+
+    assert [item["uri"] for item in allowed] == [claim_uri]
+    assert blocked_connect == []
+    assert blocked_authority == []

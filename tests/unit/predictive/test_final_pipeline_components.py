@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import tempfile
 import unittest
 
@@ -15,8 +14,6 @@ from memoryos.connect import ConnectMetadata
 from memoryos.contextdb.session import SessionArchive, SessionArchiveStore, SessionCommitService
 from memoryos.contextdb.store import FileSystemSourceStore, InMemoryIndexStore, InMemoryQueueStore
 from memoryos.contextdb.store.vector_store import InMemoryVectorStore
-from memoryos.memory.extraction.llm_memory_extractor import LLMMemoryExtractor
-from memoryos.memory.extraction.rule_memory_extractor import RuleMemoryExtractor
 from memoryos.operations.commit import OperationCommitter, RedoLog
 from memoryos.operations.model import ContextOperation, OperationAction
 from memoryos.prediction.model import PredictionRequest
@@ -26,51 +23,12 @@ from memoryos.workers.semantic_worker import SemanticWorker
 from memoryos.workers.session_commit_worker import SessionCommitWorker
 
 
-class StaticProvider:
-    provider_name = "static"
-    model = "static-test"
-
-    def __init__(self, text: str) -> None:
-        self.text = text
-
-    def complete(self, request):  # noqa: ANN001
-        return self.text
-
-    def health_check(self) -> dict:
-        return {"ok": True}
-
-
 class FinalPipelineComponentsTest(unittest.TestCase):
-    def test_rule_and_llm_extractors_emit_context_operations_with_pending_and_rejected(self) -> None:
-        archive = SessionArchive(
-            user_id="gulf",
-            session_id="s1",
-            archive_uri="memoryos://user/gulf/sessions/history/s1",
-            messages=[{"content": "记住：以后别自动开空调"}],
-        )
-        rule_result = RuleMemoryExtractor().extract(archive)
-        self.assertEqual(rule_result.accepted[0].context_type.value, "memory")
-
-        payload = {
-            "operations": [
-                {"action": "update", "title": "needs target", "text": "x", "confidence": 0.8},
-                {"action": "add", "title": "bad confidence", "text": "x", "confidence": "bad"},
-                {"action": "add", "title": "secret", "text": "password=123", "confidence": 0.9},
-            ]
-        }
-        result = LLMMemoryExtractor(StaticProvider(json.dumps(payload))).parse_response(
-            json.dumps(payload),
-            user_id="gulf",
-            session_id="s1",
-        )
-        self.assertEqual(len(result.pending), 2)
-        self.assertEqual(len(result.rejected), 1)
-        bad = LLMMemoryExtractor(StaticProvider("bad")).parse_response("bad", user_id="gulf")
-        self.assertEqual(len(bad.rejected), 1)
-
     def test_behavior_extractor_api_and_mcp_use_prediction_engine_without_memory_write(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            observation = Observation(user_id="gulf", raw_text="hot room", location="home", environment={"temperature": 30})
+            observation = Observation(
+                user_id="gulf", raw_text="hot room", location="home", environment={"temperature": 30}
+            )
             case = BehaviorExtractor().extract_case(observation, selected_action="turn_on_ac")
             self.assertEqual(case.scene_key, observation.scene_key)
             policy = ActionPolicy(
@@ -95,7 +53,9 @@ class FinalPipelineComponentsTest(unittest.TestCase):
             self.assertEqual(result.memory_operations, [])
             http_result = handle("POST /predict", client, {"request": request.__dict__, "policies": [policy.to_dict()]})
             self.assertEqual(http_result["memory_operations"], [])
-            mcp_result = MemoryOSMCPServer(client).call_tool("memoryos_predict", {"request": request.__dict__, "policies": [policy.to_dict()]})
+            mcp_result = MemoryOSMCPServer(client).call_tool(
+                "memoryos_predict", {"request": request.__dict__, "policies": [policy.to_dict()]}
+            )
             self.assertEqual(mcp_result["error"]["code"], "PERMISSION_DENIED")
             enabled_mcp = MemoryOSMCPServer(
                 client,
@@ -107,8 +67,13 @@ class FinalPipelineComponentsTest(unittest.TestCase):
                     enable_action_tools=True,
                 ),
             )
-            action_request = {**request.__dict__, "connect_metadata": ConnectMetadata.action_capable_embodied("reachy_mini").to_dict()}
-            allowed_mcp_result = enabled_mcp.call_tool("memoryos_predict", {"request": action_request, "policies": [policy.to_dict()]})
+            action_request = {
+                **request.__dict__,
+                "connect_metadata": ConnectMetadata.action_capable_embodied("reachy_mini").to_dict(),
+            }
+            allowed_mcp_result = enabled_mcp.call_tool(
+                "memoryos_predict", {"request": action_request, "policies": [policy.to_dict()]}
+            )
             self.assertEqual(allowed_mcp_result["prediction"]["episode_id"], "ep")
 
     def test_workers_process_semantic_embedding_session_and_recovery(self) -> None:
@@ -126,7 +91,9 @@ class FinalPipelineComponentsTest(unittest.TestCase):
             queue.enqueue(QueueJob(job_id="embedding1", queue_name="embedding", action="embed", target_uri=obj_uri))
             vector = InMemoryVectorStore()
             self.assertEqual(EmbeddingWorker(source, queue, vector).process_pending()["processed"], ["embedding1"])
-            archive = SessionArchive(user_id="gulf", session_id="s1", archive_uri="memoryos://user/gulf/sessions/history/s1")
+            archive = SessionArchive(
+                user_id="gulf", session_id="s1", archive_uri="memoryos://user/gulf/sessions/history/s1"
+            )
             service = SessionCommitService(SessionArchiveStore(tmp), queue, allow_plan_only=True)
             self.assertTrue(SessionCommitWorker(service).process_archive(archive)["done"])
 
@@ -141,7 +108,9 @@ class FinalPipelineComponentsTest(unittest.TestCase):
             )
             RedoLog(tmp).begin(op)
             recovered = RecoveryWorker(
-                __import__("memoryos.contextdb.transaction", fromlist=["RecoveryService"]).RecoveryService(RedoLog(tmp), committer)
+                __import__("memoryos.contextdb.transaction", fromlist=["RecoveryService"]).RecoveryService(
+                    RedoLog(tmp), committer
+                )
             ).process_pending("gulf")
             self.assertEqual(recovered["recovered_count"], 1)
 

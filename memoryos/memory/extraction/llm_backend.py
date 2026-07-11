@@ -86,7 +86,13 @@ class MemoryExtractionPromptBuilder:
                     "event_id": event.event_id,
                     "event_type": event.event_type,
                     "actor": event.actor.to_dict(),
+                    "subjects": [subject.to_dict() for subject in event.subjects],
+                    "event_digest": event.digest,
                     "content_hash": EvidenceRef.from_event(event).content_hash,
+                    "content_path": event.content_path,
+                    "occurred_at": event.occurred_at.isoformat(),
+                    "ingested_at": (event.ingested_at or event.occurred_at).isoformat(),
+                    "sequence": event.sequence,
                     "text": event.text(),
                 }
                 for event in episode.events
@@ -103,7 +109,8 @@ class MemoryExtractionPromptBuilder:
             f"Allowed epistemic_status values: {', '.join(item.value for item in EpistemicStatus)}. "
             "Use identity_fields and value_fields separately. Include speech_act, commitment, temporal_scope, "
             "relation_to_existing, epistemic_status, evidence_refs, and field_evidence_refs. "
-            "Bind every identity field, value field, semantic.speech_act, semantic.temporal_scope, and transition "
+            "Bind every identity field, value field, semantic.speech_act, semantic.commitment, "
+            "semantic.temporal_scope, semantic.relation_to_existing, and transition "
             "to evidence in field_evidence_refs. Use only suggested_scope_refs selected from legal scopes. "
             "Use related_slot_ids and related_claim_ids only for identities present in EXISTING_MEMORIES. "
             "Do not output operations or target URIs. Do not output tenant IDs, visibility policy, revisions, DELETE, or scope moves.\n"
@@ -180,7 +187,7 @@ class LLMMemoryExtractorBackend:
         prompt_builder: MemoryExtractionPromptBuilder | None = None,
         parser: _MemoryExtractionJsonParser | None = None,
         model_id: str | None = None,
-        extractor_version: str = "llm_semantic_extractor_v1",
+        extractor_version: str = "llm_semantic_extractor_v2",
     ) -> None:
         self.provider = provider
         self.prompt_builder = prompt_builder or MemoryExtractionPromptBuilder()
@@ -252,8 +259,10 @@ class LLMMemoryExtractorBackend:
                 or not isinstance(semantic, dict)
             ):
                 raise ValueError(f"candidate[{index}] semantic fields must be objects")
-            if not identity_fields or not value_fields or not any(
-                value is not None and value != "" for value in value_fields.values()
+            if (
+                not identity_fields
+                or not value_fields
+                or not any(value is not None and value != "" for value in value_fields.values())
             ):
                 raise ValueError(f"candidate[{index}] requires non-empty identity_fields and value_fields")
             unknown_semantic = set(semantic) - self._SEMANTIC_FIELDS
@@ -301,7 +310,9 @@ class LLMMemoryExtractorBackend:
                 raise ValueError(f"candidate[{index}] source_role does not match referenced evidence")
             speech = str(semantic.get("speech_act", "")).casefold()
             commitment = str(semantic.get("commitment", "")).casefold()
-            if (speech in {"confirmation", "correction"} or commitment in {"confirmed", "committed"}) and not evidence_refs:
+            if (
+                speech in {"confirmation", "correction"} or commitment in {"confirmed", "committed"}
+            ) and not evidence_refs:
                 raise ValueError(f"candidate[{index}] authoritative semantics require evidence_refs")
             proposals.append(
                 MemorySemanticProposal(
@@ -329,6 +340,7 @@ class LLMMemoryExtractorBackend:
                         "source_role": actual_source_role,
                         "source_adapter_id": adapter_id_from_archive(archive),
                         "source_session_id": archive.session_id,
+                        "source_connect": dict(archive.metadata.get("connect", {}) or {}),
                     },
                 )
             )
@@ -353,14 +365,8 @@ class LLMMemoryExtractorBackend:
             raise ValueError(f"candidate[{index}] {field_name} must contain only non-empty strings")
         return tuple(payload)
 
-    def _source_role(
-        self, evidence_refs: tuple[EvidenceRef, ...], episode: EvidenceEpisode
-    ) -> str:
-        roles = {
-            event.actor.kind
-            for ref in evidence_refs
-            if (event := episode.event(ref.event_id)) is not None
-        }
+    def _source_role(self, evidence_refs: tuple[EvidenceRef, ...], episode: EvidenceEpisode) -> str:
+        roles = {event.actor.kind for ref in evidence_refs if (event := episode.event(ref.event_id)) is not None}
         if roles == {"user"}:
             return "user"
         if "tool" in roles or "sensor" in roles or "robot" in roles:
@@ -376,7 +382,16 @@ class LLMMemoryExtractorBackend:
         for item in payload:
             if not isinstance(item, dict) or not item.get("event_id"):
                 raise ValueError("each evidence_ref requires event_id")
-            unknown = set(item) - {"event_id", "content_hash", "span_start", "span_end", "quoted_text_hash"}
+            unknown = set(item) - {
+                "event_id",
+                "event_digest",
+                "content_hash",
+                "content_path",
+                "span_start",
+                "span_end",
+                "quoted_text",
+                "quoted_text_hash",
+            }
             if unknown:
                 raise ValueError(f"evidence_ref contains unknown fields: {','.join(sorted(unknown))}")
             event = episode.event(str(item["event_id"]))
@@ -387,30 +402,28 @@ class LLMMemoryExtractorBackend:
             text = event.text()
             if (span_start is None) != (span_end is None):
                 raise ValueError(f"evidence_ref has an incomplete span: {item['event_id']}")
-            if span_start is not None and span_end is not None and (
-                span_start < 0 or span_end <= span_start or span_end > len(text)
+            if (
+                span_start is not None
+                and span_end is not None
+                and (span_start < 0 or span_end <= span_start or span_end > len(text))
             ):
                 raise ValueError(f"evidence_ref span is invalid: {item['event_id']}")
             derived = EvidenceRef.from_event(
                 event,
                 source_uri=episode.source_uris[0] if episode.source_uris else None,
+                content_path=str(item.get("content_path") or event.content_path),
                 span_start=span_start,
                 span_end=span_end,
             )
+            if item.get("event_digest") and str(item["event_digest"]) != derived.event_digest:
+                raise ValueError(f"evidence_ref event_digest mismatch: {item['event_id']}")
             if item.get("content_hash") and str(item["content_hash"]) != derived.content_hash:
                 raise ValueError(f"evidence_ref content_hash mismatch: {item['event_id']}")
+            if item.get("quoted_text") is not None and str(item["quoted_text"]) != derived.quoted_text:
+                raise ValueError(f"evidence_ref quoted_text mismatch: {item['event_id']}")
             if item.get("quoted_text_hash") and str(item["quoted_text_hash"]) != derived.quoted_text_hash:
                 raise ValueError(f"evidence_ref quoted_text_hash mismatch: {item['event_id']}")
-            refs.append(
-                EvidenceRef(
-                    event_id=derived.event_id,
-                    source_uri=derived.source_uri,
-                    content_hash=str(item.get("content_hash") or derived.content_hash),
-                    span_start=derived.span_start,
-                    span_end=derived.span_end,
-                    quoted_text_hash=str(item.get("quoted_text_hash") or derived.quoted_text_hash or "") or None,
-                )
-            )
+            refs.append(derived)
         return tuple(refs)
 
     def _field_evidence_refs(
@@ -429,7 +442,9 @@ class LLMMemoryExtractorBackend:
             *[f"identity.{key}" for key in identity_fields],
             *[f"value.{key}" for key in value_fields],
             "semantic.speech_act",
+            "semantic.commitment",
             "semantic.temporal_scope",
+            "semantic.relation_to_existing",
             "transition",
         }
         if set(payload) != required:

@@ -1,15 +1,18 @@
-"""记忆系统里的事务。"""
+"""Immutable canonical memory transaction planning."""
 
 from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass
+from types import MappingProxyType
 
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_relation import ContextRelation
 from memoryos.core.ids import stable_hash
 from memoryos.memory.canonical.evidence import EvidenceRef
+from memoryos.memory.canonical.identity import IDENTITY_ALGORITHM_V2
 from memoryos.memory.canonical.proposal import MemorySemanticProposal
 from memoryos.memory.canonical.scope import MemoryScope
 from memoryos.memory.canonical.transition import MemoryStateTransition, MemoryTransitionPolicy
@@ -18,23 +21,28 @@ from memoryos.operations.model.operation_action import OperationAction
 
 
 class RevisionConflictError(RuntimeError):
-    """预期 Revision 已过期时抛出这个异常。"""
-
-    pass
+    """Raised when a planned revision no longer matches canonical state."""
 
 
 @dataclass(frozen=True)
 class PlannedMemoryOperation:
-    """负责 PlannedMemoryOperation 这部分逻辑。"""
-
     context_object: ContextObject
     expected_revision: int
     content: str
 
+    def __post_init__(self) -> None:
+        if self.expected_revision < 0:
+            raise ValueError("expected revision cannot be negative")
+        object.__setattr__(self, "context_object", deepcopy(self.context_object))
+        object.__setattr__(self, "content", str(self.content))
+
+    def context_object_copy(self) -> ContextObject:
+        return deepcopy(self.context_object)
+
 
 @dataclass(frozen=True)
 class MemoryTransactionPlan:
-    """描述一次原子、可重试的规范记忆变更。"""
+    """A stable, replayable snapshot of one canonical Slot transaction."""
 
     transaction_id: str
     idempotency_key: str
@@ -48,17 +56,39 @@ class MemoryTransactionPlan:
     schema_version: str
     proposal_ids: tuple[str, ...]
     proposal_fingerprints: tuple[str, ...]
+    identity_algorithm_version: str = IDENTITY_ALGORITHM_V2
+    canonical_subject_key: str = ""
+    commit_group_id: str = ""
+    planning_task_id: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "expected_revisions",
+            MappingProxyType({str(uri): int(revision) for uri, revision in sorted(self.expected_revisions.items())}),
+        )
+        object.__setattr__(self, "operations", tuple(self.operations))
+        object.__setattr__(self, "evidence_refs", tuple(self.evidence_refs))
+        object.__setattr__(self, "proposal_ids", tuple(self.proposal_ids))
+        object.__setattr__(self, "proposal_fingerprints", tuple(self.proposal_fingerprints))
+        if not self.commit_group_id:
+            object.__setattr__(self, "commit_group_id", f"commit_group_{self.idempotency_key}")
+        if not self.planning_task_id:
+            object.__setattr__(
+                self, "planning_task_id", self.proposal_ids[0] if self.proposal_ids else self.transaction_id
+            )
 
     def to_context_operations(self, *, user_id: str, tenant_id: str, episode_id: str) -> list[ContextOperation]:
-        """把一个事务计划展开成同一事务信封里的 ContextOperation。"""
-
         results = []
         for planned in self.operations:
-            obj = planned.context_object
+            obj = planned.context_object_copy()
             obj.metadata = {
                 **dict(obj.metadata or {}),
                 "canonical_transaction_id": self.transaction_id,
                 "canonical_idempotency_key": self.idempotency_key,
+                "identity_algorithm_version": self.identity_algorithm_version,
+                "canonical_subject": self.canonical_subject_key,
+                "commit_group_id": self.commit_group_id,
             }
             operation_id = f"op_{stable_hash([self.idempotency_key, obj.uri], length=32)}"
             metadata = dict(obj.metadata or {})
@@ -75,7 +105,12 @@ class MemoryTransactionPlan:
                         "canonical_memory": True,
                         "transaction_id": self.transaction_id,
                         "idempotency_key": self.idempotency_key,
+                        "commit_group_id": self.commit_group_id,
+                        "planning_task_id": self.planning_task_id,
+                        "identity_algorithm_version": self.identity_algorithm_version,
+                        "canonical_subject": self.canonical_subject_key,
                         "expected_revision": planned.expected_revision,
+                        "expected_revisions": dict(self.expected_revisions),
                         "slot_id": str(metadata.get("slot_id") or self.slot_id),
                         "claim_id": str(metadata.get("claim_id") or ""),
                         "policy_version": self.policy_version,
@@ -92,9 +127,9 @@ class MemoryTransactionPlan:
 
 
 class MemoryTransactionPlanner:
-    """只生成事务计划，不直接写存储。"""
+    """Build plans only; all writes remain in OperationCommitter."""
 
-    SCHEMA_VERSION = "canonical_memory_v1"
+    SCHEMA_VERSION = "canonical_memory_v2"
 
     def build(
         self,
@@ -105,15 +140,30 @@ class MemoryTransactionPlanner:
         tenant_id: str,
         owner_user_id: str,
         episode_id: str,
+        commit_group_id: str = "",
+        planning_task_id: str = "",
     ) -> MemoryTransactionPlan:
-        """根据输入组装结果对象。"""
-
         scope_payload = memory_scope.to_dict()
+        # Identity resolution canonicalizes aliases, case, and hierarchy.  The
+        # persisted subject must be that exact object; retaining the
+        # pre-resolution payload can make its key disagree with the Slot key.
+        if transition.slot.canonical_subject is not None:
+            scope_payload["canonical_subject"] = transition.slot.canonical_subject.to_dict()
         changed = set(transition.changed_claim_ids)
         planned: list[PlannedMemoryOperation] = []
+        identity_version = transition.slot.identity_algorithm_version
+        canonical_subject = transition.slot.canonical_subject_key
         if not changed:
             idempotency_key = stable_hash(
-                [tenant_id, owner_user_id, episode_id, proposal.fingerprint, "no_change"],
+                [
+                    tenant_id,
+                    episode_id,
+                    proposal.fingerprint,
+                    transition.slot.slot_id,
+                    identity_version,
+                    canonical_subject,
+                    "no_change",
+                ],
                 length=40,
             )
             return MemoryTransactionPlan(
@@ -129,6 +179,10 @@ class MemoryTransactionPlanner:
                 schema_version=self.SCHEMA_VERSION,
                 proposal_ids=(proposal.proposal_id,),
                 proposal_fingerprints=(proposal.fingerprint,),
+                identity_algorithm_version=identity_version,
+                canonical_subject_key=canonical_subject,
+                commit_group_id=commit_group_id,
+                planning_task_id=planning_task_id or proposal.proposal_id,
             )
         for claim in transition.claims:
             if claim.claim_id not in changed:
@@ -142,7 +196,8 @@ class MemoryTransactionPlanner:
             related_uris = {
                 existing.uri
                 for existing in transition.claims
-                if existing.claim_id in proposal.all_related_memory_ids or existing.uri in proposal.all_related_memory_ids
+                if existing.claim_id in proposal.all_related_memory_ids
+                or existing.uri in proposal.all_related_memory_ids
             }
             obj.relations.extend(
                 ContextRelation(
@@ -164,6 +219,7 @@ class MemoryTransactionPlanner:
                             "claim_id": claim.claim_id,
                             "canonical_value": claim.canonical_value,
                             "current": claim.current.to_dict(),
+                            "latest_revision": claim.latest_revision.revision,
                             "revisions": [revision.to_dict() for revision in claim.revisions],
                         },
                         ensure_ascii=False,
@@ -172,7 +228,9 @@ class MemoryTransactionPlanner:
                 )
             )
         slot_obj = transition.slot.to_context_object(
-            tenant_id=tenant_id, owner_user_id=owner_user_id, scope=scope_payload
+            tenant_id=tenant_id,
+            owner_user_id=owner_user_id,
+            scope=scope_payload,
         )
         planned.append(
             PlannedMemoryOperation(
@@ -181,6 +239,8 @@ class MemoryTransactionPlanner:
                 content=json.dumps(
                     {
                         "slot_id": transition.slot.slot_id,
+                        "identity_algorithm_version": identity_version,
+                        "canonical_subject": canonical_subject,
                         "identity_fields": dict(transition.slot.identity_fields),
                         "claim_ids": list(transition.slot.claim_ids),
                         "active_claim_id": transition.slot.active_claim_id,
@@ -194,12 +254,14 @@ class MemoryTransactionPlanner:
         idempotency_key = stable_hash(
             [
                 tenant_id,
-                owner_user_id,
                 episode_id,
                 proposal.fingerprint,
                 transition.slot.slot_id,
                 transition.slot.revision,
+                identity_version,
+                canonical_subject,
                 sorted(transition.changed_claim_ids),
+                sorted(transition.expected_revisions.items()),
             ],
             length=40,
         )
@@ -216,4 +278,8 @@ class MemoryTransactionPlanner:
             schema_version=self.SCHEMA_VERSION,
             proposal_ids=(proposal.proposal_id,),
             proposal_fingerprints=(proposal.fingerprint,),
+            identity_algorithm_version=identity_version,
+            canonical_subject_key=canonical_subject,
+            commit_group_id=commit_group_id,
+            planning_task_id=planning_task_id or proposal.proposal_id,
         )

@@ -16,8 +16,12 @@ from memoryos.memory.view import adapter_id_from_archive, project_id_from_archiv
 
 PROFILE_RE = re.compile(r"(?i)(^i am\b|i work\b|我是|我在|负责人|长期从事)")
 EVENT_RE = re.compile(r"(?i)(completed|implemented|fixed|released|verified|完成|修复|发布|已验证|已实现)")
-AGENT_EXPERIENCE_RE = re.compile(r"(?i)(reusable|lesson|pattern|approach|outcome|verified|implemented|fixed|经验|可复用|做法|结果|验证)")
-ENTITY_RE = re.compile(r"(?i)(project|tool|product|organization|person|device|concept|项目|工具|产品|组织|人物|设备|概念)[：:\s]+([\w./@-]+)")
+AGENT_EXPERIENCE_RE = re.compile(
+    r"(?i)(reusable|lesson|pattern|approach|outcome|verified|implemented|fixed|经验|可复用|做法|结果|验证)"
+)
+ENTITY_RE = re.compile(
+    r"(?i)(project|tool|product|organization|person|device|concept|项目|工具|产品|组织|人物|设备|概念)[：:\s]+([\w./@-]+)"
+)
 REMEMBER_MARKERS = ("记住：", "记住:", "remember:", "Remember:")
 
 
@@ -63,6 +67,12 @@ class RuleFallbackExtractor(MemoryExtractorBackend):
                 )
         for index, tool_result in enumerate(archive.tool_results):
             content = json.dumps(tool_result, ensure_ascii=False, sort_keys=True)
+            evidence_id = str(
+                tool_result.get("event_id")
+                or tool_result.get("id")
+                or tool_result.get("message_id")
+                or f"tool_result:{index}"
+            )
             candidates.append(
                 self._candidate(
                     MemoryType.EVENT,
@@ -73,7 +83,7 @@ class RuleFallbackExtractor(MemoryExtractorBackend):
                     role="tool",
                     adapter_id=adapter_id,
                     session_id=archive.session_id,
-                    evidence_id=f"tool_result:{index}",
+                    evidence_id=evidence_id,
                     reason="tool_results_are_archive_evidence_only",
                 )
             )
@@ -95,7 +105,11 @@ class RuleFallbackExtractor(MemoryExtractorBackend):
         proposal_kinds = self._signal_kinds(normalized, allow_hypothetical_proposals=True)
         candidates: list[MemoryCandidateDraft] = []
         if role in {"assistant", "agent"}:
-            if MemoryType.AGENT_EXPERIENCE in schema_types and AGENT_EXPERIENCE_RE.search(text) and EVENT_RE.search(text):
+            if (
+                MemoryType.AGENT_EXPERIENCE in schema_types
+                and AGENT_EXPERIENCE_RE.search(text)
+                and EVENT_RE.search(text)
+            ):
                 candidates.append(
                     self._candidate(
                         MemoryType.AGENT_EXPERIENCE,
@@ -203,11 +217,16 @@ class RuleFallbackExtractor(MemoryExtractorBackend):
                     reason="profile_fallback_hint",
                 )
             )
-        if MemoryType.EVENT in schema_types and EVENT_RE.search(normalized) and not signal_kinds & {
-            EvidenceSignalKind.CONFIRMATION,
-            EvidenceSignalKind.PROPOSAL,
-            EvidenceSignalKind.EVALUATION,
-        }:
+        if (
+            MemoryType.EVENT in schema_types
+            and EVENT_RE.search(normalized)
+            and not signal_kinds
+            & {
+                EvidenceSignalKind.CONFIRMATION,
+                EvidenceSignalKind.PROPOSAL,
+                EvidenceSignalKind.EVALUATION,
+            }
+        ):
             candidates.append(
                 self._candidate(
                     MemoryType.EVENT,
@@ -344,7 +363,10 @@ class RuleFallbackExtractor(MemoryExtractorBackend):
             (r"(?i)(source[- ]only|source code|源码).*(audit|审计)|(?:audit|审计).*(source|源码)", "source_audit"),
             (r"(?i)(operationcommitter|write path|写入链路|提交链路)", "canonical_write_path"),
             (r"(?i)(l0|l1|l2|uri tree|uri trees|uri 树|路径树)", "context_layer_uri"),
-            (r"(?i)(pytest|ruff|test|lint).*(merge|commit|合并|提交)|(?:merge|commit|合并|提交).*(pytest|ruff|test|lint)", "pre_merge_verification"),
+            (
+                r"(?i)(pytest|ruff|test|lint).*(merge|commit|合并|提交)|(?:merge|commit|合并|提交).*(pytest|ruff|test|lint)",
+                "pre_merge_verification",
+            ),
             (r"(?i)(raw tool output|tool output|原始工具输出)", "raw_tool_output_retention"),
             (r"(?i)(schema metadata|模式元数据|结构化元数据)", "memory_schema_metadata"),
             (r"(?i)(auto(?:matic)? execution|自动执行)", "automatic_execution"),
@@ -354,7 +376,10 @@ class RuleFallbackExtractor(MemoryExtractorBackend):
     def _preference_dimension(self, text: str) -> str:
         patterns = (
             (r"(?i)(code review|reviews?|代码审查)", "code_review_style"),
-            (r"(?i)(concise|findings? first|output|response|answer|final report|简洁|输出|回答|报告)", "response_style"),
+            (
+                r"(?i)(concise|findings? first|output|response|answer|final report|简洁|输出|回答|报告)",
+                "response_style",
+            ),
             (r"(?i)(temperature|degrees?|\d+\s*度|温度)", "temperature"),
             (r"(?i)(air conditioner|air conditioning|direct airflow|空调|直吹)", "climate_comfort"),
             (r"(?i)(room|environment|房间|环境)", "environment_preference"),
@@ -372,9 +397,7 @@ class RuleFallbackExtractor(MemoryExtractorBackend):
     def _evaluation_without_candidate(self, text: str) -> bool:
         return EvidenceSignalKind.EVALUATION in self._signal_kinds(text) and not self._database_value(text)
 
-    def _signal_kinds(
-        self, text: str, *, allow_hypothetical_proposals: bool = False
-    ) -> set[EvidenceSignalKind]:
+    def _signal_kinds(self, text: str, *, allow_hypothetical_proposals: bool = False) -> set[EvidenceSignalKind]:
         return {
             match.kind
             for match in self.signal_matcher.match(text)

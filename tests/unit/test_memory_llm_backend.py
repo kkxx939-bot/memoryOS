@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from typing import Any, cast
 
 import pytest
 
@@ -11,7 +10,6 @@ from memoryos.memory.canonical import MemorySemanticProposal, SessionArchiveEpis
 from memoryos.memory.canonical.prefetch import PrefetchedMemory
 from memoryos.memory.extraction import FakeMemoryModelProvider, LLMMemoryExtractorBackend
 from memoryos.memory.extraction.llm_backend import MemoryExtractionPromptBuilder
-from memoryos.memory.extraction.llm_memory_extractor import LLMMemoryExtractor
 from memoryos.memory.schema import AdmissionDecision, MemoryTypeRegistry
 
 
@@ -31,7 +29,9 @@ def _field_evidence(identity_fields: dict, value_fields: dict, event_id: str) ->
         **{f"identity.{key}": ref for key in identity_fields},
         **{f"value.{key}": ref for key in value_fields},
         "semantic.speech_act": ref,
+        "semantic.commitment": ref,
         "semantic.temporal_scope": ref,
+        "semantic.relation_to_existing": ref,
         "transition": ref,
     }
 
@@ -70,14 +70,12 @@ def test_fake_llm_extractor_backend_outputs_semantic_proposals() -> None:
 
     operations = MemoryCommitPlanner(extractor=backend).plan(archive)
 
-    assert operations[0].payload["admission"]["decision"] == AdmissionDecision.ACCEPT.value
+    assert operations.operations[0].payload["admission"]["decision"] == AdmissionDecision.ACCEPT.value
 
 
 def test_public_llm_extract_returns_only_semantic_proposals() -> None:
     candidate = _semantic_candidate()
-    backend = LLMMemoryExtractorBackend(
-        FakeMemoryModelProvider(json.dumps({"candidates": [candidate]}))
-    )
+    backend = LLMMemoryExtractorBackend(FakeMemoryModelProvider(json.dumps({"candidates": [candidate]})))
 
     extracted = backend.extract(
         _archive("I confirm my answers preference: concise answers."),
@@ -101,7 +99,9 @@ def test_llm_backend_cannot_bypass_admission() -> None:
                     "memory_type": "preference",
                     "proposal_id": "p-raw",
                     "identity_fields": {"subject": "pytest", "dimension": "failure"},
-                    "value_fields": {"canonical_value": "pytest failed\nTraceback (most recent call last):\nAssertionError"},
+                    "value_fields": {
+                        "canonical_value": "pytest failed\nTraceback (most recent call last):\nAssertionError"
+                    },
                     "semantic": {"speech_act": "observation", "commitment": "weak", "temporal_scope": "past"},
                     "epistemic_status": "EXPLICIT",
                     "suggested_scope_refs": [],
@@ -141,19 +141,28 @@ def test_llm_backend_cannot_bypass_admission() -> None:
         session_id="s1",
         archive_uri="memoryos://user/u1/sessions/history/s1",
         messages=[
-            {"id": "m1", "role": "user", "content": "pytest failure: pytest failed\nTraceback (most recent call last):\nAssertionError"},
+            {
+                "id": "m1",
+                "role": "user",
+                "content": "pytest failure: pytest failed\nTraceback (most recent call last):\nAssertionError",
+            },
             {"id": "m2", "role": "user", "content": "My preference is api_key=sk-test secret"},
         ],
         metadata={"connect": {"adapter_id": "codex"}},
     )
     operations = planner.plan(archive)
 
-    assert operations == []
-    assert {result.decision.value for result in planner.last_canonical_results} == {"ARCHIVE_ONLY", "RESTRICTED"}
+    assert operations.operations == ()
+    assert "privacy_or_sensitivity_risk" in operations.context.salience_reasons
+    assert operations.context.proposal_outcomes == ()
 
 
 def test_llm_backend_rejects_illegal_memory_type() -> None:
-    backend = LLMMemoryExtractorBackend(FakeMemoryModelProvider('{"candidates":[{"memory_type":"tool_log","content":"x","fields":{},"source_role":"user"}]}'))
+    backend = LLMMemoryExtractorBackend(
+        FakeMemoryModelProvider(
+            '{"candidates":[{"memory_type":"tool_log","content":"x","fields":{},"source_role":"user"}]}'
+        )
+    )
 
     with pytest.raises(ValueError):
         backend.extract(_archive(), MemoryTypeRegistry().list())
@@ -204,16 +213,13 @@ def test_semantic_llm_backend_rejects_unknown_evidence_scope_duplicate_ids_and_b
     episode = SessionArchiveEpisodeAdapter().adapt(archive)
     cases = [
         [_semantic_candidate(evidence_refs=[{"event_id": "missing"}])],
+        [_semantic_candidate(evidence_refs=[{"event_id": "m1", "event_digest": "bad"}])],
         [_semantic_candidate(evidence_refs=[{"event_id": "m1", "content_hash": "bad"}])],
         [
             _semantic_candidate(),
             _semantic_candidate(),
         ],
-        [
-            _semantic_candidate(
-                suggested_scope_refs=[{"namespace": "memoryos", "kind": "workspace", "id": "forged"}]
-            )
-        ],
+        [_semantic_candidate(suggested_scope_refs=[{"namespace": "memoryos", "kind": "workspace", "id": "forged"}])],
         [_semantic_candidate(suggested_scope_refs=["forged"])],
         [_semantic_candidate(related_claim_ids="not-a-list")],
         [_semantic_candidate(evidence_refs=[])],
@@ -245,7 +251,7 @@ def test_semantic_llm_backend_rejects_unknown_response_envelope_fields() -> None
         )
 
 
-def test_llm_source_role_spoof_is_rejected_and_legacy_direct_operation_backend_is_rejected(tmp_path) -> None:  # noqa: ANN001
+def test_llm_source_role_spoof_is_rejected() -> None:
     archive = SessionArchive(
         user_id="u1",
         session_id="s1",
@@ -263,14 +269,6 @@ def test_llm_source_role_spoof_is_rejected_and_legacy_direct_operation_backend_i
             MemoryTypeRegistry().list(),
             existing_memories=(),
             episode=episode,
-        )
-
-    from memoryos.api.sdk.client import MemoryOSClient
-
-    with pytest.raises(TypeError, match="semantic candidate/proposal backend"):
-        MemoryOSClient(
-            str(tmp_path),
-            memory_extractor=cast(Any, LLMMemoryExtractor(cast(Any, FakeMemoryModelProvider("{}")))),
         )
 
 

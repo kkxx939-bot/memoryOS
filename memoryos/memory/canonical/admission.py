@@ -10,11 +10,14 @@ from enum import Enum
 from memoryos.adapters.agent_hooks.sanitizer import ENV_SECRET_RE, INLINE_SECRET_RE, PRIVATE_KEY_RE, SECRET_KEY_RE
 from memoryos.memory.canonical.episode import EvidenceEpisode
 from memoryos.memory.canonical.evidence import ProposalValidationResult
-from memoryos.memory.canonical.proposal import EpistemicStatus
-from memoryos.memory.canonical.scope import MemoryScope
+from memoryos.memory.canonical.proposal import EpistemicStatus, NormalizedSemanticAssessment
+from memoryos.memory.canonical.scope import HIERARCHICAL_SCOPE_KINDS, MemoryScope
+from memoryos.memory.canonical.semantic import MemorySemanticNormalizer
 from memoryos.memory.schema import MemoryType, MemoryTypeRegistry
 
-_PRIVATE_PROCESS_RE = re.compile(r"(?i)\b(chain of thought|scratchpad|internal reasoning|agent private|内部推理|草稿)\b")
+_PRIVATE_PROCESS_RE = re.compile(
+    r"(?i)\b(chain of thought|scratchpad|internal reasoning|agent private|内部推理|草稿)\b"
+)
 
 
 class ProposalAdmissionDecision(str, Enum):
@@ -67,7 +70,37 @@ class ProposalAdmissionGate:
         if not suggested.issubset(legal):
             return ProposalAdmissionResult(ProposalAdmissionDecision.REJECT, "illegal_scope_suggestion")
         if not validation.valid:
-            return ProposalAdmissionResult(ProposalAdmissionDecision.PENDING, ",".join(validation.errors))
+            prefix = (
+                "PENDING_MISSING_EVIDENCE"
+                if any(
+                    error == "missing_evidence" or error.startswith(("missing_field_evidence:", "unknown_event:"))
+                    for error in validation.errors
+                )
+                else "validation_failed"
+            )
+            return ProposalAdmissionResult(
+                ProposalAdmissionDecision.PENDING,
+                f"{prefix}:{','.join(validation.errors)}",
+            )
+        normalized_semantic = (
+            proposal.semantic
+            if isinstance(proposal.semantic, NormalizedSemanticAssessment)
+            else MemorySemanticNormalizer().normalize(proposal).semantic
+        )
+        if not isinstance(normalized_semantic, NormalizedSemanticAssessment):
+            return ProposalAdmissionResult(ProposalAdmissionDecision.PENDING, "semantic_not_normalized")
+        if not normalized_semantic.schema_safe:
+            return ProposalAdmissionResult(
+                ProposalAdmissionDecision.PENDING,
+                "semantic_schema_pending:" + ",".join(normalized_semantic.schema_errors),
+            )
+        subject = memory_scope.canonical_subject
+        if subject is None:
+            return ProposalAdmissionResult(ProposalAdmissionDecision.PENDING, "canonical_subject_missing")
+        if subject.kind in HIERARCHICAL_SCOPE_KINDS and not subject.parent_path:
+            return ProposalAdmissionResult(ProposalAdmissionDecision.PENDING, "scope_hierarchy_missing")
+        if subject.inferred or memory_scope.authority.inferred:
+            return ProposalAdmissionResult(ProposalAdmissionDecision.PENDING, "scope_authority_inferred")
         text = json.dumps(
             {"identity_fields": dict(proposal.identity_fields), "value_fields": dict(proposal.value_fields)},
             ensure_ascii=False,

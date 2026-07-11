@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import replace
 
 import pytest
 
 from memoryos.contextdb.session.planners.memory_commit_planner import MemoryCommitPlanner
+from memoryos.contextdb.session.planning import PlanningContext, ProposalPlanningInput
 from memoryos.contextdb.session.session_archive import SessionArchiveStore
 from memoryos.contextdb.session.session_commit import SessionCommitService
 from memoryos.contextdb.session.session_model import SessionArchive
@@ -40,6 +42,23 @@ from memoryos.memory.canonical import (
 )
 from memoryos.memory.canonical.reconcile import MemorySemanticReconciler
 from memoryos.operations.commit.operation_committer import OperationCommitter
+
+
+def _explicit_bindings(
+    identity_fields: Mapping[str, object],
+    value_fields: Mapping[str, object],
+    evidence_refs: tuple[EvidenceRef, ...],
+) -> dict[str, tuple[EvidenceRef, ...]]:
+    bindings = {
+        **{f"identity.{key}": evidence_refs for key in identity_fields},
+        **{f"value.{key}": evidence_refs for key in value_fields},
+        "semantic.speech_act": evidence_refs,
+        "semantic.commitment": evidence_refs,
+        "semantic.temporal_scope": evidence_refs,
+        "semantic.relation_to_existing": evidence_refs,
+        "transition": evidence_refs,
+    }
+    return bind_field_evidence(identity_fields, value_fields, evidence_refs, bindings=bindings)
 
 
 class FailingSecondWriteSource(FileSystemSourceStore):
@@ -107,18 +126,18 @@ def _setup(tmp_path):  # noqa: ANN001, ANN202
         queue_store=queue,
     )
     archive = SessionArchive(
-            user_id="u1",
-            session_id="s1",
-            archive_uri="memoryos://user/u1/sessions/history/s1",
-            messages=[
-                {
-                    "id": "m1",
-                    "role": "user",
-                    "content": "The primary storage backend is SQLite. PostgreSQL can be evaluated later.",
-                }
-            ],
-            metadata={"tenant_id": "t1", "project_id": "memoryos"},
-        )
+        user_id="u1",
+        session_id="s1",
+        archive_uri="memoryos://user/u1/sessions/history/s1",
+        messages=[
+            {
+                "id": "m1",
+                "role": "user",
+                "content": "The primary storage backend is SQLite. PostgreSQL can be evaluated later.",
+            }
+        ],
+        metadata={"tenant_id": "t1", "project_id": "memoryos"},
+    )
     SessionArchiveStore(tmp_path, tenant_id="t1").write_sync_archive(archive)
     episode = SessionArchiveEpisodeAdapter().adapt(archive)
     assert episode.origin.primary_scope is not None
@@ -152,9 +171,10 @@ def _proposal(episode, proposal_id: str, value: str, speech: str, commitment: st
             suggested_scope_refs=(episode.origin.primary_scope,),
             related_memory_ids=(),
             evidence_refs=evidence_refs,
-            field_evidence_refs=bind_field_evidence(identity_fields, value_fields, evidence_refs),
+            field_evidence_refs=_explicit_bindings(identity_fields, value_fields, evidence_refs),
             confidence=0.95,
             extractor_version="fake",
+            metadata={"transition_evidence_validated": True},
         )
     )
 
@@ -259,26 +279,15 @@ def test_canonical_batch_rolls_back_all_source_and_relations_on_mid_batch_failur
 
 def test_canonical_preflight_rejects_evidence_archive_tampering_before_any_write(tmp_path) -> None:  # noqa: ANN001
     source, _index, _queue, _relations, committer, episode, scope = _setup(tmp_path)
-    archive = SessionArchive(
-        user_id="u1",
-        session_id=episode.episode_id,
-        archive_uri="memoryos://user/u1/sessions/history/s1",
-        messages=[{"id": "m1", "role": "user", "content": episode.events[0].text()}],
-        metadata={"tenant_id": "t1", "project_id": "memoryos"},
-    )
-    archive_store = SessionArchiveStore(tmp_path)
-    directory = archive_store.write_sync_archive(archive)
     proposal = _proposal(episode, "p-evidence", "SQLite", "confirmation", "confirmed")
-    proposal = replace(
-        proposal,
-        evidence_refs=(EvidenceRef.from_event(episode.events[0], source_uri=archive.archive_uri),),
-    )
     _identity, _, plan = _plan(source, episode, scope, proposal)
-    (directory / "messages.jsonl").write_text(
-        json.dumps({"id": "m1", "role": "user", "content": "tampered"}) + "\n",
-        encoding="utf-8",
+    event_path = next(
+        (tmp_path / "tenants" / "t1" / "users" / "u1" / "sessions" / "history" / "s1" / "evidence" / "events").glob(
+            "*.json"
+        )
     )
-    with pytest.raises(ValueError, match="content hash no longer matches"):
+    event_path.write_text('{"tampered":true}', encoding="utf-8")
+    with pytest.raises(ValueError, match="immutable event digest mismatch"):
         committer.commit(
             "u1",
             plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=episode.episode_id),
@@ -308,6 +317,25 @@ def test_canonical_preflight_rejects_owner_mismatch_and_outbox_prepare_failure_w
     assert not [obj for obj in source.list_objects() if obj.metadata.get("canonical_kind")]
 
 
+def test_canonical_preflight_rejects_v1_identity_and_redirect_payload(tmp_path) -> None:  # noqa: ANN001
+    source, _index, _queue, _relations, committer, episode, scope = _setup(tmp_path)
+    proposal = _proposal(episode, "p-v2-only", "SQLite", "confirmation", "confirmed")
+    _identity, _, plan = _plan(source, episode, scope, proposal)
+    operations = plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=episode.episode_id)
+
+    wrong_version = deepcopy(operations)
+    wrong_version[0].payload["identity_algorithm_version"] = "identity_v1"
+    with pytest.raises(ValueError, match="requires Identity V2"):
+        committer.commit("u1", wrong_version)
+
+    redirects = deepcopy(operations)
+    for operation in redirects:
+        operation.payload["identity_alias_operations"] = []
+    with pytest.raises(ValueError, match="cannot contain redirects"):
+        committer.commit("u1", redirects)
+    assert not [obj for obj in source.list_objects() if obj.metadata.get("canonical_kind")]
+
+
 def test_committed_outbox_is_dispatched_after_initial_queue_outage(tmp_path) -> None:  # noqa: ANN001
     source = FileSystemSourceStore(tmp_path)
     index = InMemoryIndexStore()
@@ -322,7 +350,7 @@ def test_committed_outbox_is_dispatched_after_initial_queue_outage(tmp_path) -> 
             archive_uri="memoryos://user/u1/sessions/history/s1",
             messages=[{"id": "m1", "role": "user", "content": "The storage backend is confirmed as SQLite."}],
             metadata={"tenant_id": "t1", "project_id": "memoryos"},
-        )
+        ),
     )
     assert episode.origin.primary_scope is not None
     scope = MemoryScope(
@@ -386,7 +414,7 @@ def test_prepared_outbox_and_redo_recover_complete_transaction_after_crash(tmp_p
             archive_uri="memoryos://user/u1/sessions/history/s1",
             messages=[{"id": "m1", "role": "user", "content": "The primary storage backend is SQLite."}],
             metadata={"tenant_id": "t1", "project_id": "memoryos"},
-        )
+        ),
     )
     assert episode.origin.primary_scope is not None
     scope = MemoryScope(
@@ -403,9 +431,7 @@ def test_prepared_outbox_and_redo_recover_complete_transaction_after_crash(tmp_p
     recovery = RecoveryService(committer.redo, committer).recover("u1")
     assert set(recovery.operation_ids) == {operation.operation_id for operation in operations}
     slot, claims = CanonicalMemoryRepository(source).load(identity)
-    assert slot is not None and {claim.canonical_value: claim.current.state for claim in claims} == {
-        "sqlite": "ACTIVE"
-    }
+    assert slot is not None and {claim.canonical_value: claim.current.state for claim in claims} == {"sqlite": "ACTIVE"}
     outbox = next((tmp_path / "system" / "outbox").glob("*.json"))
     assert json.loads(outbox.read_text(encoding="utf-8"))["status"] == "committed"
 
@@ -416,9 +442,7 @@ def test_session_commit_revision_conflict_rereads_and_reconciles_same_proposal(t
         user_id="u1",
         session_id="s2",
         archive_uri="memoryos://user/u1/sessions/history/s2",
-        messages=[
-            {"id": "m1", "role": "user", "content": "PostgreSQL is a future primary storage backend option."}
-        ],
+        messages=[{"id": "m1", "role": "user", "content": "PostgreSQL is a future primary storage backend option."}],
         metadata={"tenant_id": "t1", "project_id": "memoryos"},
     )
     postgres_episode = _persisted_episode(tmp_path, postgres_archive)
@@ -438,14 +462,29 @@ def test_session_commit_revision_conflict_rereads_and_reconciles_same_proposal(t
     )
 
     planner = MemoryCommitPlanner(source_store=source, index_store=index, relation_store=relations)
-    planner.last_canonical_inputs = [(postgres, [])]
+    planning_context = PlanningContext(
+        planning_id="postgres-stale-plan",
+        task_id=postgres_archive.task_id,
+        archive_digest=postgres_archive.archive_digest,
+        manifest_digest=postgres_archive.manifest_digest,
+        episode_id=postgres_episode.episode_id,
+        session_id=postgres_archive.session_id,
+        tenant_id="t1",
+        proposal_inputs=(ProposalPlanningInput(postgres),),
+        prefetch_snapshot=(),
+        planned_against_revisions=tuple(sorted(stale_plan.expected_revisions.items())),
+        staged_objects=(),
+        scope_candidates=tuple(scope_ref.key for scope_ref in postgres_episode.legal_scope_candidates()),
+        evidence_references=postgres.evidence_refs,
+        operation_group_identity=f"commit_group_{postgres_archive.task_id}",
+    )
     service = SessionCommitService(
         SessionArchiveStore(tmp_path),
         queue,
         committer=committer,
         memory_planner=planner,
     )
-    service._commit_memory_with_reconcile_retry(postgres_archive, stale_operations)
+    service._commit_memory_with_reconcile_retry(postgres_archive, stale_operations, planning_context)
     _slot, claims = CanonicalMemoryRepository(source).load(identity)
     assert {claim.canonical_value: claim.current.state for claim in claims} == {
         "sqlite": "ACTIVE",
@@ -473,7 +512,7 @@ def test_uncommitted_partial_switch_is_invisible_until_transaction_recovery(tmp_
                 }
             ],
             metadata={"tenant_id": "t1", "project_id": "memoryos"},
-        )
+        ),
     )
     assert episode.origin.primary_scope is not None
     scope = MemoryScope(

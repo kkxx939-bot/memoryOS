@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import replace
 
 import pytest
 
 from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.memory.canonical import (
+    CandidateProposalAdapter,
+    CanonicalMemoryFormationService,
     Commitment,
     EpistemicStatus,
     EvidenceRef,
@@ -26,6 +29,24 @@ from memoryos.memory.canonical import (
     VisibilityPolicy,
     bind_field_evidence,
 )
+from memoryos.memory.schema import MemoryCandidateDraft, MemoryType
+
+
+def _explicit_bindings(
+    identity_fields: Mapping[str, object],
+    value_fields: Mapping[str, object],
+    evidence_refs: tuple[EvidenceRef, ...],
+) -> dict[str, tuple[EvidenceRef, ...]]:
+    bindings = {
+        **{f"identity.{key}": evidence_refs for key in identity_fields},
+        **{f"value.{key}": evidence_refs for key in value_fields},
+        "semantic.speech_act": evidence_refs,
+        "semantic.commitment": evidence_refs,
+        "semantic.temporal_scope": evidence_refs,
+        "semantic.relation_to_existing": evidence_refs,
+        "transition": evidence_refs,
+    }
+    return bind_field_evidence(identity_fields, value_fields, evidence_refs, bindings=bindings)
 
 
 def _episode():  # noqa: ANN202
@@ -43,11 +64,7 @@ def _episode():  # noqa: ANN202
 def _bind(proposal: MemorySemanticProposal) -> MemorySemanticProposal:
     return replace(
         proposal,
-        field_evidence_refs=bind_field_evidence(
-            proposal.identity_fields,
-            proposal.value_fields,
-            proposal.evidence_refs,
-        ),
+        field_evidence_refs=_explicit_bindings(proposal.identity_fields, proposal.value_fields, proposal.evidence_refs),
     )
 
 
@@ -68,7 +85,7 @@ def _proposal(episode=None):  # noqa: ANN001, ANN202
         suggested_scope_refs=(episode.origin.primary_scope,),
         related_memory_ids=(),
         evidence_refs=evidence_refs,
-        field_evidence_refs=bind_field_evidence(identity_fields, value_fields, evidence_refs),
+        field_evidence_refs=_explicit_bindings(identity_fields, value_fields, evidence_refs),
         confidence=0.9,
         extractor_version="fake-v1",
         model_id="fake",
@@ -112,7 +129,7 @@ def test_field_evidence_cannot_borrow_support_from_an_unbound_event() -> None:
     second = EvidenceRef.from_event(episode.events[1], source_uri=episode.source_uris[0])
     identity_fields = {"decision_topic": "storage"}
     value_fields = {"canonical_value": "SQLite"}
-    bindings = bind_field_evidence(identity_fields, value_fields, (first,))
+    bindings = _explicit_bindings(identity_fields, value_fields, (first,))
     proposal = MemorySemanticProposal(
         proposal_id="p-bound-fields",
         memory_type="project_decision",
@@ -153,6 +170,48 @@ def test_unknown_event_is_rejected() -> None:
     assert not result.valid and "unknown_event:missing" in result.errors
 
 
+def test_missing_candidate_source_never_falls_back_to_first_episode_event() -> None:
+    archive = SessionArchive(
+        user_id="u1",
+        session_id="missing-source",
+        archive_uri="memoryos://user/u1/sessions/history/missing-source",
+        messages=[{"id": "first", "role": "user", "content": "SQLite remains active."}],
+        metadata={"tenant_id": "t1", "project_id": "memoryos"},
+    )
+    episode = SessionArchiveEpisodeAdapter().adapt(archive)
+    candidate = MemoryCandidateDraft(
+        memory_type=MemoryType.PROJECT_DECISION,
+        title="PostgreSQL",
+        content="PostgreSQL is now active.",
+        fields={
+            "decision_topic": "storage_backend",
+            "canonical_value": "PostgreSQL",
+            "project_id": "memoryos",
+        },
+        confidence=0.99,
+        source_role="user",
+        source_adapter_id="codex",
+        source_session_id=archive.session_id,
+        source_message_ids=["does-not-exist"],
+        merge_key="storage-backend",
+    )
+
+    proposal = CandidateProposalAdapter().adapt(candidate, episode, archive)
+    validation = ProposalEvidenceValidator().validate(proposal, episode)
+    formed = CanonicalMemoryFormationService(None).plan(
+        proposal,
+        archive=archive,
+        episode=episode,
+    )
+
+    assert proposal.evidence_refs == ()
+    assert all(refs == () for refs in proposal.field_evidence_refs.values())
+    assert not validation.valid
+    assert "missing_evidence" in validation.errors
+    assert formed.decision == ProposalAdmissionDecision.PENDING
+    assert formed.operations == ()
+
+
 def test_semantic_aliases_normalize_to_finite_enums() -> None:
     normalized = MemorySemanticNormalizer().normalize(_proposal())
     assert normalized.semantic.speech_act == SpeechAct.PROPOSAL
@@ -184,6 +243,7 @@ def test_admission_rejects_llm_scope_outside_legal_candidates_and_cross_tenant_v
         applicability=ScopeSelector((episode.origin.primary_scope,)),
         visibility=VisibilityPolicy("t1"),
         origin_refs=episode.origin.scope_refs,
+        canonical_subject=episode.origin.primary_scope,
     )
     assert (
         ProposalAdmissionGate()
@@ -214,25 +274,28 @@ def test_direct_semantic_proposal_with_secret_is_restricted() -> None:
     identity_fields = {"subject": "OPENAI_API_KEY", "dimension": "secret"}
     value_fields = {"preference": "OPENAI_API_KEY=sk-secret"}
     evidence_refs = (EvidenceRef.from_event(episode.events[0], source_uri=episode.source_uris[0]),)
-    proposal = _bind(MemorySemanticProposal(
-        proposal_id="secret-proposal",
-        memory_type="preference",
-        identity_fields=identity_fields,
-        value_fields=value_fields,
-        semantic=SemanticAssessment("confirmation", "confirmed", "current", "unrelated"),
-        epistemic_status=EpistemicStatus.EXPLICIT,
-        suggested_scope_refs=(episode.origin.primary_scope,),
-        related_memory_ids=(),
-        evidence_refs=evidence_refs,
-        field_evidence_refs=bind_field_evidence(identity_fields, value_fields, evidence_refs),
-        confidence=0.99,
-        extractor_version="fake",
-    ))
+    proposal = _bind(
+        MemorySemanticProposal(
+            proposal_id="secret-proposal",
+            memory_type="preference",
+            identity_fields=identity_fields,
+            value_fields=value_fields,
+            semantic=SemanticAssessment("confirmation", "confirmed", "current", "unrelated"),
+            epistemic_status=EpistemicStatus.EXPLICIT,
+            suggested_scope_refs=(episode.origin.primary_scope,),
+            related_memory_ids=(),
+            evidence_refs=evidence_refs,
+            field_evidence_refs=_explicit_bindings(identity_fields, value_fields, evidence_refs),
+            confidence=0.99,
+            extractor_version="fake",
+        )
+    )
     validation = ProposalEvidenceValidator().validate(proposal, episode)
     scope = MemoryScope(
         ScopeSelector((episode.origin.primary_scope,)),
         VisibilityPolicy("t1"),
         episode.origin.scope_refs,
+        canonical_subject=episode.origin.primary_scope,
     )
     result = ProposalAdmissionGate().evaluate(validation, episode=episode, memory_scope=scope, source_role="user")
     assert result.decision == ProposalAdmissionDecision.RESTRICTED
@@ -249,12 +312,32 @@ def test_direct_semantic_proposal_with_secret_is_restricted() -> None:
         ("PostgreSQL is unconfirmed.", EvidenceSignalKind.NEGATION, {"negated": True}),
         ("I have not confirmed PostgreSQL.", EvidenceSignalKind.CONFIRMATION, {"negated": True}),
         ("如果以后决定采用 PostgreSQL，需要重新压测。", EvidenceSignalKind.CONFIRMATION, {"hypothetical": True}),
-        ("If we decide to adopt PostgreSQL later, rerun tests.", EvidenceSignalKind.CONFIRMATION, {"hypothetical": True}),
-        ("不要把“可以考虑”理解成“确认采用”。", EvidenceSignalKind.CONFIRMATION, {"quoted": True, "metalinguistic": True}),
+        (
+            "If we decide to adopt PostgreSQL later, rerun tests.",
+            EvidenceSignalKind.CONFIRMATION,
+            {"hypothetical": True},
+        ),
+        (
+            "不要把“可以考虑”理解成“确认采用”。",
+            EvidenceSignalKind.CONFIRMATION,
+            {"quoted": True, "metalinguistic": True},
+        ),
         ("“必须使用 Redis”只是文档中的反例。", EvidenceSignalKind.CONSTRAINT, {"quoted": True, "metalinguistic": True}),
-        ("Codex 建议正式改成 PostgreSQL，但我没有同意。", EvidenceSignalKind.CONFIRMATION, {"negated": True, "metalinguistic": True}),
-        ("The agent recommended adopting PostgreSQL, but the user did not approve.", EvidenceSignalKind.PROPOSAL, {"metalinguistic": True}),
-        ('The phrase "must use Redis" is only an example.', EvidenceSignalKind.CONSTRAINT, {"quoted": True, "metalinguistic": True}),
+        (
+            "Codex 建议正式改成 PostgreSQL，但我没有同意。",
+            EvidenceSignalKind.CONFIRMATION,
+            {"negated": True, "metalinguistic": True},
+        ),
+        (
+            "The agent recommended adopting PostgreSQL, but the user did not approve.",
+            EvidenceSignalKind.PROPOSAL,
+            {"metalinguistic": True},
+        ),
+        (
+            'The phrase "must use Redis" is only an example.',
+            EvidenceSignalKind.CONSTRAINT,
+            {"quoted": True, "metalinguistic": True},
+        ),
     ],
 )
 def test_typed_evidence_signal_counterexamples(text: str, kind: EvidenceSignalKind, flags: dict[str, bool]) -> None:
@@ -274,19 +357,21 @@ def test_preference_signal_cannot_support_project_decision_confirmation() -> Non
         )
     )
     assert episode.origin.primary_scope is not None
-    proposal = _bind(MemorySemanticProposal(
-        proposal_id="p-like-as-decision",
-        memory_type="project_decision",
-        identity_fields={"decision_topic": "PostgreSQL"},
-        value_fields={"canonical_value": "PostgreSQL"},
-        semantic=SemanticAssessment("confirmation", "confirmed", "current", "unrelated"),
-        epistemic_status=EpistemicStatus.EXPLICIT,
-        suggested_scope_refs=(episode.origin.primary_scope,),
-        related_memory_ids=(),
-        evidence_refs=(EvidenceRef.from_event(episode.events[0]),),
-        confidence=0.99,
-        extractor_version="test",
-    ))
+    proposal = _bind(
+        MemorySemanticProposal(
+            proposal_id="p-like-as-decision",
+            memory_type="project_decision",
+            identity_fields={"decision_topic": "PostgreSQL"},
+            value_fields={"canonical_value": "PostgreSQL"},
+            semantic=SemanticAssessment("confirmation", "confirmed", "current", "unrelated"),
+            epistemic_status=EpistemicStatus.EXPLICIT,
+            suggested_scope_refs=(episode.origin.primary_scope,),
+            related_memory_ids=(),
+            evidence_refs=(EvidenceRef.from_event(episode.events[0]),),
+            confidence=0.99,
+            extractor_version="test",
+        )
+    )
     validation = ProposalEvidenceValidator().validate(proposal, episode)
     assert not validation.valid
     assert "semantic_confirmation_unsupported" in validation.errors
@@ -309,19 +394,21 @@ def test_attributed_agent_recommendation_cannot_support_user_confirmation() -> N
         )
     )
     assert episode.origin.primary_scope is not None
-    proposal = _bind(MemorySemanticProposal(
-        proposal_id="p-attributed",
-        memory_type="project_decision",
-        identity_fields={"decision_topic": "PostgreSQL"},
-        value_fields={"canonical_value": "PostgreSQL"},
-        semantic=SemanticAssessment("confirmation", "confirmed", "current", "unrelated"),
-        epistemic_status=EpistemicStatus.EXPLICIT,
-        suggested_scope_refs=(episode.origin.primary_scope,),
-        related_memory_ids=(),
-        evidence_refs=(EvidenceRef.from_event(episode.events[0]),),
-        confidence=0.99,
-        extractor_version="test",
-    ))
+    proposal = _bind(
+        MemorySemanticProposal(
+            proposal_id="p-attributed",
+            memory_type="project_decision",
+            identity_fields={"decision_topic": "PostgreSQL"},
+            value_fields={"canonical_value": "PostgreSQL"},
+            semantic=SemanticAssessment("confirmation", "confirmed", "current", "unrelated"),
+            epistemic_status=EpistemicStatus.EXPLICIT,
+            suggested_scope_refs=(episode.origin.primary_scope,),
+            related_memory_ids=(),
+            evidence_refs=(EvidenceRef.from_event(episode.events[0]),),
+            confidence=0.99,
+            extractor_version="test",
+        )
+    )
     validation = ProposalEvidenceValidator().validate(proposal, episode)
     assert not validation.valid
     assert "semantic_confirmation_unsupported" in validation.errors
@@ -338,19 +425,21 @@ def test_future_temporal_scope_requires_evidence() -> None:
         )
     )
     assert episode.origin.primary_scope is not None
-    proposal = _bind(MemorySemanticProposal(
-        proposal_id="p-invented-time",
-        memory_type="project_decision",
-        identity_fields={"decision_topic": "PostgreSQL"},
-        value_fields={"canonical_value": "PostgreSQL"},
-        semantic=SemanticAssessment("proposal", "exploratory", "future", "alternative"),
-        epistemic_status=EpistemicStatus.EXPLICIT,
-        suggested_scope_refs=(episode.origin.primary_scope,),
-        related_memory_ids=(),
-        evidence_refs=(EvidenceRef.from_event(episode.events[0], source_uri=episode.source_uris[0]),),
-        confidence=0.99,
-        extractor_version="test",
-    ))
+    proposal = _bind(
+        MemorySemanticProposal(
+            proposal_id="p-invented-time",
+            memory_type="project_decision",
+            identity_fields={"decision_topic": "PostgreSQL"},
+            value_fields={"canonical_value": "PostgreSQL"},
+            semantic=SemanticAssessment("proposal", "exploratory", "future", "alternative"),
+            epistemic_status=EpistemicStatus.EXPLICIT,
+            suggested_scope_refs=(episode.origin.primary_scope,),
+            related_memory_ids=(),
+            evidence_refs=(EvidenceRef.from_event(episode.events[0], source_uri=episode.source_uris[0]),),
+            confidence=0.99,
+            extractor_version="test",
+        )
+    )
     validation = ProposalEvidenceValidator().validate(proposal, episode)
     assert not validation.valid
     assert "temporal_scope_unsupported" in validation.errors

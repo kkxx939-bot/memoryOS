@@ -2,8 +2,6 @@
 
 from memoryos.memory.admission import MemoryAdmissionGate
 from memoryos.memory.extraction import (
-    ExtractionResult,
-    MemoryExtractor,
     MemoryExtractorBackend,
     RuleFallbackExtractor,
 )
@@ -21,14 +19,12 @@ from memoryos.memory.service import MemoryUpdater
 
 __all__ = [
     "AdmissionDecision",
-    "ExtractionResult",
     "Memory",
     "MemoryAnchor",
     "MemoryAdmissionGate",
     "MemoryCandidateDraft",
     "MemoryCandidate",
     "MemoryCoolingPolicy",
-    "MemoryExtractor",
     "MemoryExtractorBackend",
     "MemoryKind",
     "MemoryOperationGroup",

@@ -26,6 +26,10 @@ class SessionArchive:
     metadata: dict[str, Any] = field(default_factory=dict)
     task_id: str = field(default_factory=lambda: new_id("session_commit"))
     created_at: str = field(default_factory=utc_now)
+    schema_version: str = "session_archive_v2"
+    archive_digest: str = ""
+    manifest_digest: str = ""
+    manifest_uri: str = ""
 
     def manifest(self) -> dict:
         return {
@@ -34,18 +38,17 @@ class SessionArchive:
             "session_id": self.session_id,
             "archive_uri": self.archive_uri,
             "created_at": self.created_at,
+            "schema_version": self.schema_version,
+            "archive_digest": self.archive_digest,
+            "manifest_digest": self.manifest_digest,
+            "manifest_uri": self.manifest_uri,
             "metadata": self.metadata,
             "phase": "sync_archive",
             "files": [
-                "messages.jsonl",
-                "observations.jsonl",
-                "predictions.jsonl",
-                "action_results.jsonl",
-                "feedback.jsonl",
-                "used_contexts.json",
-                "used_skills.json",
-                "tool_results.jsonl",
-                "commit_manifest.json",
+                "commit_head.json",
+                "evidence/events/",
+                "evidence/objects/",
+                "evidence/manifests/",
             ],
         }
 
@@ -66,3 +69,6 @@ class SessionCommitResult:
     status: str
     done: bool = False
     state: SessionCommitState = SessionCommitState.QUEUED
+    commit_group_id: str = ""
+    canonical_committed: bool = False
+    commit_group_status: dict[str, Any] = field(default_factory=dict)

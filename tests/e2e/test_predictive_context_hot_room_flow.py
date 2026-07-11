@@ -61,7 +61,12 @@ def test_predictive_context_hot_room_flow_uses_production_entrypoint(tmp_path) -
     pattern_obj = pattern.to_context_object()
     client.context_db.seed_object(pattern_obj, content="hot room home user_present turn_on_ac behavior pattern")
 
-    resource = ContextObject(uri=resource_uri, context_type=ContextType.RESOURCE, title="Living room AC", metadata={"available": True, "device_id": "living-room-ac", "temperature": 24})
+    resource = ContextObject(
+        uri=resource_uri,
+        context_type=ContextType.RESOURCE,
+        title="Living room AC",
+        metadata={"available": True, "device_id": "living-room-ac", "temperature": 24},
+    )
     skill = ContextObject(
         uri=skill_uri,
         context_type=ContextType.SKILL,
@@ -127,9 +132,12 @@ def test_predictive_context_hot_room_flow_uses_production_entrypoint(tmp_path) -
     assert prediction.action_context.packed_context["load_plan"]
     assert "dropped_contexts" in prediction.action_context.packed_context
 
-    archive_dir = ContextURI.parse("memoryos://user/u1/sessions/history/ep-hot-room-production").to_source_path(tmp_path)
-    assert (archive_dir / "observations.jsonl").exists()
-    action_result = json.loads((archive_dir / "action_results.jsonl").read_text(encoding="utf-8").splitlines()[0])["action_result"]
+    archive_dir = ContextURI.parse("memoryos://user/u1/sessions/history/ep-hot-room-production").to_source_path(
+        tmp_path
+    )
+    archived = client.session_archive_store.read_archive("memoryos://user/u1/sessions/history/ep-hot-room-production")
+    assert archived.observations
+    action_result = archived.action_results[0]["action_result"]
     assert action_result["status"] == "success"
     assert action_result["tool_name"] == "ac.turn_on"
     for filename in ("memory_diff.json", "behavior_diff.json", "action_policy_diff.json", "context_diff.json"):

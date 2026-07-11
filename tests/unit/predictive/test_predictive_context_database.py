@@ -11,8 +11,8 @@ from memoryos.behavior.update import BehaviorLifecycleService, OpportunityAwareD
 from memoryos.contextdb.model import ContextObject, ContextType
 from memoryos.contextdb.session import SessionArchive, SessionArchiveStore, SessionCommitService
 from memoryos.contextdb.store import FileSystemSourceStore, InMemoryIndexStore, InMemoryQueueStore
+from memoryos.memory.lifecycle.memory_cooling import MemoryCoolingPolicy
 from memoryos.memory.model import MemoryAnchor
-from memoryos.memory.update.memory_cooling import MemoryCoolingPolicy
 from memoryos.operations.model import OperationAction
 from memoryos.prediction.model import ActionContext, PredictionLedger, PredictionRequest
 from memoryos.prediction.pipeline import PolicyGate, PredictionEngine
@@ -67,7 +67,9 @@ class PredictiveContextDatabaseTest(unittest.TestCase):
         )
         no_opportunity = OpportunityAwareDecay().evaluate(pattern, [])
         self.assertEqual(no_opportunity.opportunity_state, "no_opportunity")
-        hot_obs = Observation(user_id="gulf", location="home", signals=["action_executed"], environment={"temperature": 30})
+        hot_obs = Observation(
+            user_id="gulf", location="home", signals=["action_executed"], environment={"temperature": 30}
+        )
         activated = OpportunityAwareDecay().evaluate(pattern, [hot_obs])
         self.assertEqual(activated.opportunity_state, "opportunity_activated")
 

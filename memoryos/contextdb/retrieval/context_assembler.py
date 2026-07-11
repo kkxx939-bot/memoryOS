@@ -95,10 +95,10 @@ class ContextAssembler:
                 adapter_id=adapter_id,
                 tenant_id=tenant_id,
             )
-            legacy = self._rerank(query, self._filter_connect(results, connect_filters))[:requested_limit]
+            recalled = self._rerank(query, self._filter_connect(results, connect_filters))[:requested_limit]
             return self._merge_canonical(
                 query,
-                legacy,
+                recalled,
                 user_id=user_id,
                 parsed_type=parsed_type,
                 requested_limit=requested_limit,
@@ -109,7 +109,8 @@ class ContextAssembler:
                 memory_types=memory_types,
                 claim_uris=claim_uris,
                 slot_uris=slot_uris,
-                query_intent=query_intent,
+                query_intent=query_intent or ("OPTIONS" if search_scope == "candidates" else None),
+                connect_filters=connect_filters,
             )
         search_limit = max(requested_limit * 5, 50) if connect_filters and requested_limit else requested_limit
         allowed_source_uris = self._allowed_source_uris(
@@ -147,10 +148,10 @@ class ContextAssembler:
             hits = self.context_db.search(query, **_supported_search_kwargs(self.context_db.search, search_kwargs))
         results = [self._hit_payload(hit) for hit in hits]
         scoped = self._filter_project(results, project_id)
-        legacy = self._rerank(query, self._filter_connect(scoped, connect_filters))[:requested_limit]
+        recalled = self._rerank(query, self._filter_connect(scoped, connect_filters))[:requested_limit]
         return self._merge_canonical(
             query,
-            legacy,
+            recalled,
             user_id=user_id,
             parsed_type=parsed_type,
             requested_limit=requested_limit,
@@ -161,7 +162,8 @@ class ContextAssembler:
             memory_types=memory_types,
             claim_uris=claim_uris,
             slot_uris=slot_uris,
-            query_intent=query_intent,
+            query_intent=query_intent or ("OPTIONS" if search_scope == "candidates" else None),
+            connect_filters=connect_filters,
         )
 
     def _allowed_source_uris(
@@ -343,7 +345,7 @@ class ContextAssembler:
     def _merge_canonical(
         self,
         query: str,
-        legacy: list[dict[str, Any]],
+        recalled: list[dict[str, Any]],
         *,
         user_id: str | None,
         parsed_type: ContextType | None,
@@ -356,15 +358,17 @@ class ContextAssembler:
         claim_uris: Sequence[str] | None,
         slot_uris: Sequence[str] | None,
         query_intent: str | None,
+        connect_filters: dict[str, Any] | None,
     ) -> list[dict[str, Any]]:
         if requested_limit <= 0 or parsed_type not in {None, ContextType.MEMORY} or self.canonical_retriever is None:
-            return legacy[:requested_limit]
+            return recalled[:requested_limit]
         scope_keys = list(applicability_scope_keys or [])
         if user_id:
             scope_keys.append(f"memoryos:principal:{user_id}")
         if project_id:
             scope_keys.append(f"memoryos:workspace:{project_id}")
         intent = CanonicalQueryIntent(str(query_intent).upper()) if query_intent else None
+        canonical_limit = max(requested_limit * 5, 50) if connect_filters else requested_limit
         canonical = self.canonical_retriever.search(
             CanonicalMemoryQuery(
                 text=query,
@@ -376,32 +380,28 @@ class ContextAssembler:
                 claim_uris=tuple(str(item) for item in (claim_uris or [])),
                 slot_uris=tuple(str(item) for item in (slot_uris or [])),
                 intent=intent,
-                limit=requested_limit,
+                limit=canonical_limit,
             )
         )
-        legacy = [
-            self._normalize_legacy_memory(item)
-            for item in legacy
-            if not dict(item.get("metadata", {}) or {}).get("canonical_kind")
-        ]
-        return self._dedupe([*canonical, *legacy])[:requested_limit]
+        non_memory = [item for item in recalled if str(item.get("context_type")) != ContextType.MEMORY.value]
+        candidates = []
+        if intent == CanonicalQueryIntent.OPTIONS:
+            candidates = [
+                self._normalize_candidate_memory(item)
+                for item in recalled
+                if str(item.get("context_type")) == ContextType.MEMORY.value
+                and dict(item.get("metadata", {}) or {}).get("memory_kind") == "memory_candidate"
+                and dict(dict(item.get("metadata", {}) or {}).get("admission", {}) or {}).get("decision") == "pending"
+            ]
+        authorized = self._filter_connect([*canonical, *candidates, *non_memory], connect_filters)
+        return self._dedupe(authorized)[:requested_limit]
 
-    def _normalize_legacy_memory(self, item: dict[str, Any]) -> dict[str, Any]:
-        metadata = dict(item.get("metadata", {}) or {})
-        admission = dict(metadata.get("admission", {}) or {})
-        lifecycle = str(metadata.get("lifecycle_state", "active")).casefold()
-        decision = str(admission.get("decision", "accept")).casefold()
-        if decision == "pending":
-            state, category = "PENDING", "candidate"
-        elif lifecycle in {"obsolete", "archived", "deleted"}:
-            state, category = "ARCHIVED", "history"
-        else:
-            state, category = "ACTIVE", "current"
+    def _normalize_candidate_memory(self, item: dict[str, Any]) -> dict[str, Any]:
         return {
             **item,
-            "memory_state": str(item.get("memory_state") or state),
-            "memory_category": str(item.get("memory_category") or category),
-            "retrieval_source": str(item.get("retrieval_source") or "legacy_normalized"),
+            "memory_state": "PENDING",
+            "memory_category": "candidate",
+            "retrieval_source": str(item.get("retrieval_source") or "candidate"),
         }
 
     def _search_memory_views(
@@ -543,7 +543,7 @@ class ContextAssembler:
                 payload["text"] = str(obj.metadata.get("summary", obj.title))
             payload["layer_texts"] = self._layer_texts(obj)
         except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
-            pass
+            return payload
         return payload
 
     def _context_type(self, context_type: object | None) -> ContextType | None:
@@ -593,10 +593,10 @@ class ContextAssembler:
         seen: set[str] = set()
         deduped = []
         for item in sorted(contexts, key=lambda row: float(row.get("score", 0.0)), reverse=True):
-            uri = str(item.get("uri", ""))
-            if uri in seen:
+            identity = str(item.get("retrieval_identity") or item.get("revision_uri") or item.get("uri", ""))
+            if identity in seen:
                 continue
-            seen.add(uri)
+            seen.add(identity)
             deduped.append(item)
         return deduped
 
@@ -623,8 +623,28 @@ class ContextAssembler:
 
     def _select_layer(self, item: dict[str, Any], query: str, max_tokens: int) -> dict[str, str]:
         layers = dict(item.get("layer_texts", {}) or {})
+        metadata = dict(item.get("metadata", {}) or {})
+        if metadata.get("canonical_kind") == "claim":
+            expected_revision = int(item.get("source_revision") or item.get("revision") or metadata.get("revision", 0))
+            layer_revisions = dict(item.get("layer_revisions", {}) or {})
+            projection = dict(item.get("projection_record", {}) or {})
+            consistent = bool(
+                projection
+                and projection.get("status") == "completed"
+                and int(projection.get("source_revision", 0)) == expected_revision
+                and int(projection.get("projection_revision", 0)) == expected_revision
+                and layers
+                and set(layer_revisions) == set(layers)
+                and all(int(revision) == expected_revision for revision in layer_revisions.values())
+            )
+            if not consistent:
+                layers = {}
         l2 = str(layers.get("L2") or self._context_text(item))
-        candidates = [("L2", l2, "full_content")]
+        primary_layer = (
+            "L2" if layers.get("L2") else ("canonical" if metadata.get("canonical_kind") == "claim" else "L2")
+        )
+        primary_reason = "full_content" if primary_layer == "L2" else "canonical_projection_unavailable"
+        candidates = [(primary_layer, l2, primary_reason)]
         if layers.get("L1"):
             candidates.append(("L1", str(layers["L1"]), "l2_over_budget"))
         if layers.get("L0"):

@@ -7,7 +7,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-MEMORY_SCHEMA_VERSION = "memory_schema_v1"
+MEMORY_SCHEMA_VERSION = "memory_schema_v2"
+MEMORY_IDENTITY_SCHEMA_VERSION = "memory_identity_schema_v2"
 
 
 def _validated_confidence(value: Any) -> float:
@@ -46,6 +47,22 @@ class FieldMergeMode(str, Enum):
     IMMUTABLE = "immutable"
 
 
+COMMON_PROVENANCE_FIELDS = (
+    "asserted_by",
+    "author",
+    "source_role",
+    "source_adapter_id",
+    "source_session_id",
+    "evidence_source",
+    "extractor_version",
+    "model_id",
+    "prompt_version",
+)
+COMMON_DISPLAY_FIELDS = ("title", "display_name", "summary", "details", "rationale", "reason", "aliases")
+PROFILE_DISPLAY_FIELDS = ("title", "display_name", "details", "rationale", "reason", "aliases")
+COMMON_APPLICABILITY_FIELDS = ("scope", "project_id", "workspace_id", "applies_to", "visibility")
+
+
 @dataclass(frozen=True)
 class MemoryTypeSchema:
     memory_type: MemoryType
@@ -59,6 +76,25 @@ class MemoryTypeSchema:
     allow_tool_source: bool = False
     share_default: bool = True
     field_merge_rules: dict[str, FieldMergeMode] = field(default_factory=dict)
+    identity_schema_version: str = MEMORY_IDENTITY_SCHEMA_VERSION
+    slot_identity_fields: tuple[str, ...] = ()
+    claim_identity_fields: tuple[str, ...] = ()
+    provenance_fields: tuple[str, ...] = ()
+    display_fields: tuple[str, ...] = ()
+    applicability_fields: tuple[str, ...] = ()
+
+    def claim_identity_keys(self, value_fields: dict[str, Any]) -> tuple[str, ...]:
+        """Return all schema-declared semantic claim keys deterministically.
+
+        ``*`` means every value field except fields explicitly classified as
+        provenance, display metadata, or applicability.  This prevents new
+        semantic qualifiers from being silently ignored by identity.
+        """
+
+        if self.claim_identity_fields and "*" not in self.claim_identity_fields:
+            return tuple(field_name for field_name in self.claim_identity_fields if field_name in value_fields)
+        excluded = {*self.provenance_fields, *self.display_fields, *self.applicability_fields}
+        return tuple(sorted(field_name for field_name in value_fields if field_name not in excluded))
 
 
 class MemoryTypeRegistry:
@@ -90,6 +126,11 @@ class MemoryTypeRegistry:
                     "stability": FieldMergeMode.REPLACE,
                     "evidence": FieldMergeMode.APPEND_UNIQUE,
                 },
+                slot_identity_fields=("attribute_key",),
+                claim_identity_fields=("*",),
+                provenance_fields=COMMON_PROVENANCE_FIELDS,
+                display_fields=PROFILE_DISPLAY_FIELDS,
+                applicability_fields=COMMON_APPLICABILITY_FIELDS,
             ),
             MemoryTypeSchema(
                 memory_type=MemoryType.PREFERENCE,
@@ -105,6 +146,11 @@ class MemoryTypeRegistry:
                     "content": FieldMergeMode.PATCH_TEXT,
                     "evidence": FieldMergeMode.APPEND_UNIQUE,
                 },
+                slot_identity_fields=("subject", "dimension"),
+                claim_identity_fields=("*",),
+                provenance_fields=COMMON_PROVENANCE_FIELDS,
+                display_fields=COMMON_DISPLAY_FIELDS,
+                applicability_fields=COMMON_APPLICABILITY_FIELDS,
             ),
             MemoryTypeSchema(
                 memory_type=MemoryType.ENTITY,
@@ -120,6 +166,11 @@ class MemoryTypeRegistry:
                     "summary": FieldMergeMode.PATCH_TEXT,
                     "details": FieldMergeMode.PATCH_TEXT,
                 },
+                slot_identity_fields=("entity_type", "canonical_entity_id"),
+                claim_identity_fields=("*",),
+                provenance_fields=COMMON_PROVENANCE_FIELDS,
+                display_fields=COMMON_DISPLAY_FIELDS,
+                applicability_fields=COMMON_APPLICABILITY_FIELDS,
             ),
             MemoryTypeSchema(
                 memory_type=MemoryType.EVENT,
@@ -134,6 +185,11 @@ class MemoryTypeRegistry:
                     "occurred_at": FieldMergeMode.IMMUTABLE,
                     "details": FieldMergeMode.PATCH_TEXT,
                 },
+                slot_identity_fields=("event_key",),
+                claim_identity_fields=("*",),
+                provenance_fields=COMMON_PROVENANCE_FIELDS,
+                display_fields=COMMON_DISPLAY_FIELDS,
+                applicability_fields=COMMON_APPLICABILITY_FIELDS,
             ),
             MemoryTypeSchema(
                 memory_type=MemoryType.PROJECT_RULE,
@@ -148,6 +204,11 @@ class MemoryTypeRegistry:
                     "constraints": FieldMergeMode.APPEND_UNIQUE,
                     "project_id": FieldMergeMode.IMMUTABLE,
                 },
+                slot_identity_fields=("rule_topic",),
+                claim_identity_fields=("*",),
+                provenance_fields=COMMON_PROVENANCE_FIELDS,
+                display_fields=COMMON_DISPLAY_FIELDS,
+                applicability_fields=COMMON_APPLICABILITY_FIELDS,
             ),
             MemoryTypeSchema(
                 memory_type=MemoryType.PROJECT_DECISION,
@@ -162,6 +223,11 @@ class MemoryTypeRegistry:
                     "status": FieldMergeMode.REPLACE,
                     "project_id": FieldMergeMode.IMMUTABLE,
                 },
+                slot_identity_fields=("decision_topic",),
+                claim_identity_fields=("*",),
+                provenance_fields=COMMON_PROVENANCE_FIELDS,
+                display_fields=COMMON_DISPLAY_FIELDS,
+                applicability_fields=COMMON_APPLICABILITY_FIELDS,
             ),
             MemoryTypeSchema(
                 memory_type=MemoryType.AGENT_EXPERIENCE,
@@ -178,6 +244,11 @@ class MemoryTypeRegistry:
                     "outcome": FieldMergeMode.PATCH_TEXT,
                     "evidence": FieldMergeMode.APPEND_UNIQUE,
                 },
+                slot_identity_fields=("task_pattern", "environment_signature"),
+                claim_identity_fields=("*",),
+                provenance_fields=COMMON_PROVENANCE_FIELDS,
+                display_fields=COMMON_DISPLAY_FIELDS,
+                applicability_fields=COMMON_APPLICABILITY_FIELDS,
             ),
         ]
 

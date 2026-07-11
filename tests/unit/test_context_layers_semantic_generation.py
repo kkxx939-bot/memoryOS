@@ -49,7 +49,7 @@ def test_memory_structured_l0_l1_and_empty_fallback() -> None:
         user_id="u1",
         title="hot preference",
         content="User prefers AC in hot rooms.",
-        kind=MemoryKind.EXPLICIT,
+        kind=MemoryKind.POLICY,
     ).to_context_object()
 
     assert "hot preference" in generate_l0_for_object(memory, "")

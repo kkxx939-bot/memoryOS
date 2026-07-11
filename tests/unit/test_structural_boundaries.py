@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib
 import subprocess
 import sys
 from pathlib import Path
@@ -18,16 +17,16 @@ def test_client_initializes_with_runtime_container(tmp_path) -> None:
     assert container.context_db is not None
 
 
-def test_memory_new_and_legacy_paths_import() -> None:
-    from memoryos.memory.lifecycle import MemoryCoolingPolicy as NewCoolingPolicy
-    from memoryos.memory.service import MemoryUpdater as NewMemoryUpdater
-    from memoryos.memory.update import MemoryCoolingPolicy as LegacyCoolingPolicy
-    from memoryos.memory.update import MemoryUpdater as LegacyMemoryUpdater
+def test_memory_has_single_lifecycle_and_service_paths() -> None:
+    from memoryos.memory.lifecycle import MemoryCoolingPolicy
+    from memoryos.memory.service import MemoryUpdater
 
-    assert LegacyCoolingPolicy is NewCoolingPolicy
-    assert LegacyMemoryUpdater is NewMemoryUpdater
-    assert importlib.import_module("memoryos.memory.update.memory_cooling")
-    assert importlib.import_module("memoryos.memory.update.memory_updater")
+    root = Path(__file__).resolve().parents[2]
+    assert MemoryCoolingPolicy.__name__ == "MemoryCoolingPolicy"
+    assert MemoryUpdater.__name__ == "MemoryUpdater"
+    assert not (root / "memoryos" / "memory" / "update" / "__init__.py").exists()
+    assert not (root / "memoryos" / "memory" / "update" / "memory_cooling.py").exists()
+    assert not (root / "memoryos" / "memory" / "update" / "memory_updater.py").exists()
 
 
 def test_contextdb_boundary_imports() -> None:

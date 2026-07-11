@@ -15,14 +15,41 @@ class SessionCommitWorker:
         return {"task_id": result.task_id, "status": result.status, "done": result.done}
 
     def process_pending(self, *, batch_size: int = 10, lease_seconds: int = 60, max_retries: int = 3) -> dict:
-        committed = failed = dead_letter = 0
+        committed = failed = dead_letter = recovered = 0
+        self.service.commit_group_store.recover_expired_consumers()
+        for group in self.service.commit_group_store.pending()[:batch_size]:
+            try:
+                archive = self.service.archive_store.read_archive_at_manifest(
+                    group.archive_uri,
+                    group.manifest_digest,
+                    tenant_id=group.tenant_id,
+                )
+                result = self.service.async_commit(archive)
+                recovered += int(result.done)
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                failed += 1
         jobs = self.service.queue_store.lease("session_commit", limit=batch_size, lease_seconds=lease_seconds)
         for job in jobs:
             try:
-                archive = self.service.archive_store.read_archive(job.target_uri)
-                self.process_archive(archive)
-                self.service.queue_store.ack(job.job_id)
-                committed += 1
+                archive = self.service.archive_store.read_archive(
+                    job.target_uri,
+                    tenant_id=str(job.payload.get("tenant_id") or "default"),
+                    manifest_digest=str(job.payload.get("manifest_digest") or "") or None,
+                )
+                result = self.service.async_commit(archive)
+                if result.done:
+                    self.service.queue_store.ack(job.job_id)
+                    committed += 1
+                else:
+                    retryable = self._result_retryable(result.commit_group_status)
+                    status = self._retry(
+                        job.job_id,
+                        RuntimeError(result.status),
+                        max_retries=max_retries,
+                        retryable=retryable,
+                    )
+                    dead_letter += int(status == "dead_letter")
+                    failed += 1
             except (ValueError, KeyError, TypeError) as exc:
                 status = self._retry(job.job_id, exc, max_retries=max_retries, retryable=False)
                 dead_letter += int(status == "dead_letter")
@@ -31,7 +58,23 @@ class SessionCommitWorker:
                 status = self._retry(job.job_id, exc, max_retries=max_retries, retryable=True)
                 dead_letter += int(status == "dead_letter")
                 failed += 1
-        return {"claimed": len(jobs), "committed": committed, "failed": failed, "dead_letter": dead_letter}
+        return {
+            "claimed": len(jobs),
+            "committed": committed,
+            "failed": failed,
+            "dead_letter": dead_letter,
+            "recovered": recovered,
+        }
+
+    def _result_retryable(self, payload: dict) -> bool:  # noqa: ANN001
+        if not payload:
+            return True
+        if payload.get("canonical_status") != "completed":
+            return bool(payload.get("canonical_retryable", True))
+        return any(
+            item.get("status") != "completed" and item.get("retryable", True)
+            for item in dict(payload.get("consumers", {}) or {}).values()
+        )
 
     def _retry(self, job_id: str, exc: Exception, *, max_retries: int, retryable: bool) -> str:
         retry = getattr(self.service.queue_store, "retry", None)

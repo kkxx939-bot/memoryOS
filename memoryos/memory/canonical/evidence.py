@@ -10,7 +10,7 @@ from enum import Enum
 from typing import Any
 
 from memoryos.memory.canonical.episode import EvidenceEpisode
-from memoryos.memory.canonical.event import EventEnvelope
+from memoryos.memory.canonical.event import EventEnvelope, canonical_json
 from memoryos.memory.canonical.proposal import EpistemicStatus, MemorySemanticProposal
 
 
@@ -135,7 +135,7 @@ class EvidenceSignalMatcher:
     _ATTRIBUTED_RE = re.compile(
         r"(?i)(?:codex|agent|assistant|模型|助手).{0,24}(?:said|says|recommended|recommend|说|建议)"
     )
-    _QUOTE_PAIRS = (("\"", "\""), ("'", "'"), ("“", "”"), ("‘", "’"))
+    _QUOTE_PAIRS = (('"', '"'), ("'", "'"), ("“", "”"), ("‘", "’"))
 
     def match(self, text: str) -> tuple[EvidenceSignalMatch, ...]:
         """处理 match 这一步。"""
@@ -163,9 +163,7 @@ class EvidenceSignalMatcher:
                             ),
                             hypothetical=bool(self._HYPOTHETICAL_RE.search(before)),
                             quoted=self._quoted(text, start, end),
-                            metalinguistic=bool(
-                                self._META_RE.search(sentence) or self._ATTRIBUTED_RE.search(sentence)
-                            ),
+                            metalinguistic=bool(self._META_RE.search(sentence) or self._ATTRIBUTED_RE.search(sentence)),
                             confidence=0.95 if not explicitly_negative else 0.99,
                         )
                     )
@@ -179,7 +177,9 @@ class EvidenceSignalMatcher:
 
     def _sentence(self, text: str, start: int, end: int) -> str:
         left = max(text.rfind(mark, 0, start) for mark in ("。", "！", "？", ".", "!", "?", "\n")) + 1
-        positions = [position for mark in ("。", "！", "？", ".", "!", "?", "\n") if (position := text.find(mark, end)) >= 0]
+        positions = [
+            position for mark in ("。", "！", "？", ".", "!", "?", "\n") if (position := text.find(mark, end)) >= 0
+        ]
         right = min(positions) if positions else len(text)
         return text[left:right]
 
@@ -196,7 +196,7 @@ class EvidenceSignalMatcher:
 
 @dataclass(frozen=True)
 class EvidenceRef:
-    """指向原始事件或其中一段经过哈希校验的文本。"""
+    """A verifiable reference to an immutable event or one exact field span."""
 
     event_id: str
     source_uri: str | None
@@ -204,6 +204,25 @@ class EvidenceRef:
     span_start: int | None = None
     span_end: int | None = None
     quoted_text_hash: str | None = None
+    event_digest: str | None = None
+    event_schema_version: str | None = None
+    tenant_id: str | None = None
+    episode_id: str | None = None
+    actor_id: str | None = None
+    actor_kind: str | None = None
+    actor_role: str | None = None
+    actor_id_inferred: bool | None = None
+    actor_role_inferred: bool | None = None
+    subject_refs: tuple[str, ...] = ()
+    content_path: str | None = None
+    quoted_text: str | None = None
+    occurred_at: str | None = None
+    ingested_at: str | None = None
+    sequence: int | None = None
+    evidence_strength: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "subject_refs", tuple(str(item) for item in self.subject_refs))
 
     @classmethod
     def from_event(
@@ -211,15 +230,30 @@ class EvidenceRef:
         event: EventEnvelope,
         *,
         source_uri: str | None = None,
+        content_path: str | None = None,
         span_start: int | None = None,
         span_end: int | None = None,
     ) -> EvidenceRef:
-        """从原始事件生成带内容哈希和可选文本片段的 EvidenceRef。"""
+        """Build a strong V2 reference exclusively from the immutable envelope."""
 
-        text = event.text()
+        path = content_path or event.content_path
+        text = event.text(path)
         quoted_hash = None
+        quoted_text = None
+        if (span_start is None) != (span_end is None):
+            raise ValueError("evidence span requires both start and end")
         if span_start is not None and span_end is not None:
-            quoted_hash = evidence_hash(text[span_start:span_end])
+            if span_start < 0 or span_end <= span_start or span_end > len(text):
+                raise ValueError("evidence span is outside the selected content")
+            quoted_text = text[span_start:span_end]
+            quoted_hash = evidence_hash(quoted_text)
+        inferred = (
+            event.actor.inferred
+            or any(subject.inferred for subject in event.subjects)
+            or event.occurred_at_inferred
+            or event.ingested_at_inferred
+            or event.sequence_inferred
+        )
         return cls(
             event_id=event.event_id,
             source_uri=source_uri,
@@ -227,6 +261,22 @@ class EvidenceRef:
             span_start=span_start,
             span_end=span_end,
             quoted_text_hash=quoted_hash,
+            event_digest=event.digest,
+            event_schema_version=event.schema_version,
+            tenant_id=event.tenant_id,
+            episode_id=event.episode_id,
+            actor_id=event.actor.id,
+            actor_kind=event.actor.kind,
+            actor_role=event.actor.role,
+            actor_id_inferred=event.actor.id_inferred,
+            actor_role_inferred=event.actor.role_inferred,
+            subject_refs=tuple(canonical_json(subject.to_dict()) for subject in event.subjects),
+            content_path=path,
+            quoted_text=quoted_text,
+            occurred_at=event.occurred_at.isoformat(),
+            ingested_at=(event.ingested_at or event.occurred_at).isoformat(),
+            sequence=event.sequence,
+            evidence_strength="INFERRED" if inferred else "EXPLICIT",
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -237,6 +287,22 @@ class EvidenceRef:
             "span_start": self.span_start,
             "span_end": self.span_end,
             "quoted_text_hash": self.quoted_text_hash,
+            "event_digest": self.event_digest,
+            "event_schema_version": self.event_schema_version,
+            "tenant_id": self.tenant_id,
+            "episode_id": self.episode_id,
+            "actor_id": self.actor_id,
+            "actor_kind": self.actor_kind,
+            "actor_role": self.actor_role,
+            "actor_id_inferred": self.actor_id_inferred,
+            "actor_role_inferred": self.actor_role_inferred,
+            "subject_refs": list(self.subject_refs),
+            "content_path": self.content_path,
+            "quoted_text": self.quoted_text,
+            "occurred_at": self.occurred_at,
+            "ingested_at": self.ingested_at,
+            "sequence": self.sequence,
+            "evidence_strength": self.evidence_strength,
         }
 
 
@@ -244,16 +310,36 @@ def bind_field_evidence(
     identity_fields: Mapping[str, Any],
     value_fields: Mapping[str, Any],
     evidence_refs: tuple[EvidenceRef, ...],
+    *,
+    bindings: Mapping[str, tuple[EvidenceRef, ...]] | None = None,
 ) -> dict[str, tuple[EvidenceRef, ...]]:
-    """给原子提案里的身份、值和状态依据分别绑定证据。"""
+    """Validate an explicit field-to-evidence map.
 
-    return {
+    Proposal-level evidence is deliberately not copied to every semantic field.
+    Callers that cannot identify field evidence must leave the binding empty so
+    admission fails closed.
+    """
+
+    defaults = {
         **{f"identity.{key}": evidence_refs for key in identity_fields},
         **{f"value.{key}": evidence_refs for key in value_fields},
         "semantic.speech_act": evidence_refs,
+        "semantic.commitment": evidence_refs,
         "semantic.temporal_scope": evidence_refs,
+        "semantic.relation_to_existing": evidence_refs,
         "transition": evidence_refs,
     }
+    if bindings is None:
+        raise ValueError("field evidence bindings require explicit field bindings")
+    missing = set(defaults) - set(bindings)
+    unknown = set(bindings) - set(defaults)
+    if missing or unknown:
+        details = [
+            *(f"missing:{key}" for key in sorted(missing)),
+            *(f"unknown:{key}" for key in sorted(unknown)),
+        ]
+        raise ValueError(f"field evidence bindings mismatch: {','.join(details)}")
+    return {key: tuple(bindings[key]) for key in defaults}
 
 
 @dataclass(frozen=True)
@@ -279,6 +365,7 @@ class ProposalEvidenceValidator:
         evidence_texts: list[str] = []
         evidence_text_by_ref: dict[EvidenceRef, str] = {}
         evidence_actor_kinds: list[str] = []
+        evidence_actor_roles: list[str] = []
         if not proposal.evidence_refs:
             errors.append("missing_evidence")
         for ref in proposal.evidence_refs:
@@ -286,8 +373,17 @@ class ProposalEvidenceValidator:
             if event is None:
                 errors.append(f"unknown_event:{ref.event_id}")
                 continue
-            text = event.text()
+            reference_errors = self._reference_errors(ref, event, episode)
+            if reference_errors:
+                errors.extend(reference_errors)
+                continue
+            try:
+                text = event.text(ref.content_path)
+            except ValueError:
+                errors.append(f"content_path_mismatch:{ref.event_id}")
+                continue
             evidence_actor_kinds.append(event.actor.kind)
+            evidence_actor_roles.append(str(event.actor.role or event.actor.kind))
             if evidence_hash(text) != ref.content_hash:
                 errors.append(f"content_hash_mismatch:{ref.event_id}")
                 continue
@@ -300,9 +396,15 @@ class ProposalEvidenceValidator:
                     errors.append(f"invalid_span:{ref.event_id}")
                     continue
                 selected = text[ref.span_start : ref.span_end]
-                if ref.quoted_text_hash and evidence_hash(selected) != ref.quoted_text_hash:
+                if not ref.quoted_text_hash or evidence_hash(selected) != ref.quoted_text_hash:
                     errors.append(f"quoted_text_hash_mismatch:{ref.event_id}")
                     continue
+                if ref.quoted_text is None or selected != ref.quoted_text:
+                    errors.append(f"quoted_text_mismatch:{ref.event_id}")
+                    continue
+            elif ref.quoted_text_hash is not None or ref.quoted_text is not None:
+                errors.append(f"unexpected_quote_without_span:{ref.event_id}")
+                continue
             evidence_texts.append(selected)
             evidence_text_by_ref[ref] = selected
 
@@ -313,15 +415,158 @@ class ProposalEvidenceValidator:
             hardened = replace(proposal, epistemic_status=EpistemicStatus.INFERRED)
             errors.append("unsupported_core_fields")
         semantic_errors = self._semantic_errors(proposal, evidence_actor_kinds, evidence_text_by_ref)
+        declared_role = str(proposal.metadata.get("source_role") or "").strip().casefold()
+        declared_role = "assistant" if declared_role == "agent" else declared_role
+        actual_roles = {"assistant" if role == "agent" else role for role in evidence_actor_roles}
+        if declared_role and declared_role not in actual_roles:
+            semantic_errors.append("source_role_evidence_mismatch")
         if semantic_errors and hardened.epistemic_status == EpistemicStatus.EXPLICIT:
             hardened = replace(hardened, epistemic_status=EpistemicStatus.INFERRED)
         errors.extend(semantic_errors)
+        metadata = dict(hardened.metadata)
+        metadata["transition_evidence_validated"] = bool(
+            proposal.field_evidence_refs.get("transition") and not semantic_errors
+        )
+        metadata["semantic_relation_evidence_validated"] = self._relation_evidence_supported(
+            proposal,
+            evidence_text_by_ref,
+        )
+        hardened = replace(hardened, metadata=metadata)
         return ProposalValidationResult(
             valid=not errors,
             proposal=hardened,
             errors=tuple(dict.fromkeys(errors)),
             unsupported_fields=tuple(unsupported),
         )
+
+    def _relation_evidence_supported(
+        self,
+        proposal: MemorySemanticProposal,
+        evidence_text_by_ref: Mapping[EvidenceRef, str],
+    ) -> bool:
+        relation = (
+            str(
+                getattr(
+                    proposal.semantic.relation_to_existing,
+                    "value",
+                    proposal.semantic.relation_to_existing,
+                )
+            )
+            .strip()
+            .casefold()
+        )
+        refs = tuple(proposal.field_evidence_refs.get("semantic.relation_to_existing", ()))
+        texts = [evidence_text_by_ref[ref] for ref in refs if ref in evidence_text_by_ref]
+        if not refs or len(texts) != len(refs):
+            return False
+        text = "\n".join(texts)
+        related = bool(proposal.all_related_memory_ids)
+        usable_signals = tuple(
+            match
+            for item in texts
+            for match in self.signal_matcher.match(item)
+            if not (match.negated or match.hypothetical or match.quoted or match.metalinguistic)
+        )
+        if relation in {"unrelated", "duplicate"}:
+            return not related
+        if relation == "alternative":
+            return any(
+                match.kind in {EvidenceSignalKind.PROPOSAL, EvidenceSignalKind.EVALUATION} for match in usable_signals
+            ) or bool(re.search(r"(?i)(\balternative\b|\boption\b|候选|备选|可选)", text))
+        if relation == "contradicts":
+            return related and bool(
+                re.search(
+                    r"(?i)(\bcontradict|\bconflict|\binstead\b|\brather\s+than\b|\bnot\b.{0,32}\bbut\b|冲突|矛盾|而不是|改为)",
+                    text,
+                )
+            )
+        if relation == "supplements":
+            return (related or proposal.memory_type == "agent_experience") and bool(
+                re.search(r"(?i)(\balso\b|\badditionally\b|\bsupplement|\bin\s+addition\b|同时|补充|此外)", text)
+            )
+        if relation in {"corrects", "supersedes"}:
+            return related and (
+                any(
+                    match.kind in {EvidenceSignalKind.CONFIRMATION, EvidenceSignalKind.RETRACTION}
+                    for match in usable_signals
+                )
+                or bool(re.search(r"(?i)(\bcorrect|\bsupersed|\breplace|纠正|更正|取代|改为)", text))
+            )
+        return False
+
+    def _reference_errors(
+        self,
+        ref: EvidenceRef,
+        event: EventEnvelope,
+        episode: EvidenceEpisode,
+    ) -> list[str]:
+        errors = []
+        required = {
+            "event_digest": ref.event_digest,
+            "event_schema_version": ref.event_schema_version,
+            "tenant_id": ref.tenant_id,
+            "episode_id": ref.episode_id,
+            "actor_id": ref.actor_id,
+            "actor_kind": ref.actor_kind,
+            "actor_role": ref.actor_role,
+            "actor_id_inferred": ref.actor_id_inferred,
+            "actor_role_inferred": ref.actor_role_inferred,
+            "content_path": ref.content_path,
+            "occurred_at": ref.occurred_at,
+            "ingested_at": ref.ingested_at,
+            "sequence": ref.sequence,
+            "evidence_strength": ref.evidence_strength,
+        }
+        for name, value in required.items():
+            if value is None or value == "":
+                errors.append(f"missing_{name}:{ref.event_id}")
+        if errors:
+            return errors
+        if ref.event_digest != event.digest:
+            errors.append(f"event_digest_mismatch:{ref.event_id}")
+        if ref.event_schema_version != event.schema_version:
+            errors.append(f"event_schema_mismatch:{ref.event_id}")
+        if ref.tenant_id != event.tenant_id or ref.tenant_id != episode.tenant_id:
+            errors.append(f"tenant_mismatch:{ref.event_id}")
+        if ref.episode_id != event.episode_id or ref.episode_id != episode.episode_id:
+            errors.append(f"episode_mismatch:{ref.event_id}")
+        if ref.actor_id != event.actor.id:
+            errors.append(f"actor_id_mismatch:{ref.event_id}")
+        if ref.actor_kind != event.actor.kind:
+            errors.append(f"actor_kind_mismatch:{ref.event_id}")
+        if ref.actor_role != event.actor.role:
+            errors.append(f"actor_role_mismatch:{ref.event_id}")
+        if ref.actor_id_inferred is not None and ref.actor_id_inferred != event.actor.id_inferred:
+            errors.append(f"actor_id_inference_mismatch:{ref.event_id}")
+        if ref.actor_role_inferred is not None and ref.actor_role_inferred != event.actor.role_inferred:
+            errors.append(f"actor_role_inference_mismatch:{ref.event_id}")
+        if ref.occurred_at != event.occurred_at.isoformat():
+            errors.append(f"occurred_at_mismatch:{ref.event_id}")
+        if ref.ingested_at != (event.ingested_at or event.occurred_at).isoformat():
+            errors.append(f"ingested_at_mismatch:{ref.event_id}")
+        if ref.sequence != event.sequence:
+            errors.append(f"sequence_mismatch:{ref.event_id}")
+        expected_strength = (
+            "INFERRED"
+            if (
+                event.actor.inferred
+                or any(subject.inferred for subject in event.subjects)
+                or event.occurred_at_inferred
+                or event.ingested_at_inferred
+                or event.sequence_inferred
+            )
+            else "EXPLICIT"
+        )
+        if ref.evidence_strength != expected_strength:
+            errors.append(f"evidence_strength_mismatch:{ref.event_id}")
+        expected_subjects = tuple(canonical_json(subject.to_dict()) for subject in event.subjects)
+        if not ref.subject_refs:
+            errors.append(f"missing_subject_refs:{ref.event_id}")
+        elif ref.subject_refs != expected_subjects:
+            errors.append(f"subject_mismatch:{ref.event_id}")
+        if ref.source_uri and (not episode.source_uris or ref.source_uri != episode.source_uris[0]):
+            errors.append(f"source_uri_mismatch:{ref.event_id}")
+        return errors
 
     def _semantic_errors(
         self,
@@ -338,8 +583,15 @@ class ProposalEvidenceValidator:
         speech = str(getattr(semantic.speech_act, "value", semantic.speech_act)).casefold()
         commitment = str(getattr(semantic.commitment, "value", semantic.commitment)).casefold()
         temporal_scope = str(getattr(semantic.temporal_scope, "value", semantic.temporal_scope)).casefold()
-        semantic_refs = tuple(proposal.field_evidence_refs.get("transition", ())) or tuple(
-            proposal.field_evidence_refs.get("semantic.speech_act", ())
+        semantic_refs = tuple(
+            dict.fromkeys(
+                (
+                    *proposal.field_evidence_refs.get("transition", ()),
+                    *proposal.field_evidence_refs.get("semantic.speech_act", ()),
+                    *proposal.field_evidence_refs.get("semantic.commitment", ()),
+                    *proposal.field_evidence_refs.get("semantic.relation_to_existing", ()),
+                )
+            )
         )
         semantic_texts = [evidence_text_by_ref[ref] for ref in semantic_refs if ref in evidence_text_by_ref]
         matches = tuple(match for text in semantic_texts for match in self.signal_matcher.match(text))
@@ -403,7 +655,9 @@ class ProposalEvidenceValidator:
             *[f"identity.{key}" for key in proposal.identity_fields],
             *[f"value.{key}" for key in proposal.value_fields],
             "semantic.speech_act",
+            "semantic.commitment",
             "semantic.temporal_scope",
+            "semantic.relation_to_existing",
             "transition",
         }
         errors = []

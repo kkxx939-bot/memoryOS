@@ -1,8 +1,11 @@
-"""记忆系统里的语义。"""
+"""Fail-closed semantic normalization."""
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import replace
+from enum import Enum
+from typing import TypeVar
 
 from memoryos.memory.canonical.proposal import (
     Commitment,
@@ -13,9 +16,13 @@ from memoryos.memory.canonical.proposal import (
     TemporalScope,
 )
 
+SemanticEnum = TypeVar("SemanticEnum", bound=Enum)
+
 
 class MemorySemanticNormalizer:
-    """负责 MemorySemanticNormalizer 这部分逻辑。"""
+    """Normalize only explicit, versioned aliases; preserve all uncertainty."""
+
+    VERSION = "memory_semantic_alias_v2"
 
     _SPEECH = {
         "observation": SpeechAct.OBSERVATION,
@@ -30,6 +37,8 @@ class MemorySemanticNormalizer:
         "correction": SpeechAct.CORRECTION,
         "retraction": SpeechAct.RETRACTION,
         "rejection": SpeechAct.REJECTION,
+        "unknown": SpeechAct.UNKNOWN,
+        "schema_mismatch": SpeechAct.SCHEMA_MISMATCH,
     }
     _COMMITMENT = {
         "weak": Commitment.WEAK,
@@ -42,6 +51,8 @@ class MemorySemanticNormalizer:
         "plan": Commitment.INTENDED,
         "confirmed": Commitment.CONFIRMED,
         "committed": Commitment.CONFIRMED,
+        "unknown": Commitment.UNKNOWN,
+        "schema_mismatch": Commitment.SCHEMA_MISMATCH,
     }
     _TEMPORAL = {item.value.lower(): item for item in TemporalScope}
     _RELATION = {item.value.lower(): item for item in SemanticRelation}
@@ -50,19 +61,51 @@ class MemorySemanticNormalizer:
     )
 
     def normalize(self, proposal: MemorySemanticProposal) -> MemorySemanticProposal:
-        """处理 normalize 这一步。"""
-
         semantic = proposal.semantic
         if isinstance(semantic, NormalizedSemanticAssessment):
-            return proposal
+            metadata = {
+                **dict(proposal.metadata),
+                "semantic_normalization_version": self.VERSION,
+                "semantic_normalization_errors": list(semantic.schema_errors),
+            }
+            return replace(proposal, metadata=metadata)
         normalized = NormalizedSemanticAssessment(
-            speech_act=self._map(self._SPEECH, semantic.speech_act, SpeechAct.OBSERVATION),
-            commitment=self._map(self._COMMITMENT, semantic.commitment, Commitment.WEAK),
-            temporal_scope=self._map(self._TEMPORAL, semantic.temporal_scope, TemporalScope.UNSPECIFIED),
-            relation_to_existing=self._map(self._RELATION, semantic.relation_to_existing, SemanticRelation.UNRELATED),
+            speech_act=self._map(self._SPEECH, semantic.speech_act, SpeechAct.UNKNOWN, SpeechAct.SCHEMA_MISMATCH),
+            commitment=self._map(
+                self._COMMITMENT,
+                semantic.commitment,
+                Commitment.UNKNOWN,
+                Commitment.SCHEMA_MISMATCH,
+            ),
+            temporal_scope=self._map(
+                self._TEMPORAL,
+                semantic.temporal_scope,
+                TemporalScope.UNKNOWN,
+                TemporalScope.SCHEMA_MISMATCH,
+            ),
+            relation_to_existing=self._map(
+                self._RELATION,
+                semantic.relation_to_existing,
+                SemanticRelation.UNKNOWN,
+                SemanticRelation.SCHEMA_MISMATCH,
+            ),
         )
-        return replace(proposal, semantic=normalized)
+        metadata = {
+            **dict(proposal.metadata),
+            "semantic_normalization_version": self.VERSION,
+            "semantic_normalization_errors": list(normalized.schema_errors),
+        }
+        return replace(proposal, semantic=normalized, metadata=metadata)
 
-    def _map(self, mapping, value: str, default):  # noqa: ANN001, ANN202
-        normalized = str(value).strip().lower().replace("-", "_").replace(" ", "_")
-        return mapping.get(normalized, default)
+    def _map(
+        self,
+        mapping: Mapping[str, SemanticEnum],
+        value: str,
+        unknown: SemanticEnum,
+        mismatch: SemanticEnum,
+    ) -> SemanticEnum:
+        raw = value.value if isinstance(value, Enum) else value
+        normalized = str(raw or "").strip().lower().replace("-", "_").replace(" ", "_")
+        if not normalized:
+            return unknown
+        return mapping.get(normalized, mismatch)
