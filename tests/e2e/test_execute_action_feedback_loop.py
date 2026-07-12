@@ -30,7 +30,16 @@ def _seed_client(tmp_path, handler):
     resource_uri = "memoryos://resources/ac"
     skill_uri = "memoryos://skills/ac"
     client.context_db.seed_object(
-        ContextObject(uri=anchor_uri, context_type=ContextType.MEMORY, title="hot anchor", owner_user_id="u1"),
+        ContextObject(
+            uri=anchor_uri,
+            context_type=ContextType.MEMORY,
+            title="hot anchor",
+            owner_user_id="u1",
+            metadata={
+                "memory_kind": "anchor_memory",
+                "admission": {"decision": "accept"},
+            },
+        ),
         content="hot anchor",
     )
     client.context_db.seed_object(

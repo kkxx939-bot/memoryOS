@@ -203,6 +203,11 @@ class SessionArchiveStore:
         directory = self._dir(archive_uri, tenant_id=tenant_id)
         return (directory / "commit_head.json").exists()
 
+    def archive_tenant(self, archive: SessionArchive) -> str:
+        """Resolve the tenant path used by both archive writes and idempotent reads."""
+
+        return self._archive_tenant(archive)
+
     def read_event(
         self,
         archive_uri: str,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -9,19 +10,32 @@ from memoryos.api.sdk.client import MemoryOSClient
 from memoryos.connect import ConnectMetadata
 from memoryos.contextdb.session.planners.memory_commit_planner import MemoryCommitPlanner
 from memoryos.contextdb.session.session_model import SessionArchive
+from memoryos.memory.canonical import CandidateProposalAdapter, MemorySemanticProposal, SessionArchiveEpisodeAdapter
+from memoryos.memory.extraction import FakeMemoryModelProvider, LLMMemoryExtractorBackend
 from memoryos.memory.schema import MemoryCandidateDraft, MemoryType, MemoryTypeSchema
 from memoryos.workers.session_commit_worker import SessionCommitWorker
 
 
 class BarrierExtractor:
+    semantic_proposal_backend = True
+    llm_semantic_backend = True
+
     def __init__(self, barrier: threading.Barrier) -> None:
         self.barrier = barrier
 
     def extract(
         self,
         archive: SessionArchive,
-        schemas: Sequence[MemoryTypeSchema],  # noqa: ARG002
-    ) -> list[MemoryCandidateDraft]:
+        schemas: Sequence[MemoryTypeSchema],
+    ) -> list[MemorySemanticProposal]:
+        return self.extract_with_context(
+            archive,
+            schemas,
+            existing_memories=(),
+            episode=SessionArchiveEpisodeAdapter().adapt(archive),
+        )
+
+    def _drafts(self, archive: SessionArchive) -> list[MemoryCandidateDraft]:
         self.barrier.wait(timeout=5)
         message = archive.messages[0]
         project_id = str(archive.metadata["project_id"])
@@ -43,6 +57,10 @@ class BarrierExtractor:
                 merge_key=f"rule:{archive.session_id}",
             )
         ]
+
+    def extract_with_context(self, archive, schemas, *, existing_memories, episode):  # noqa: ANN001, ANN201, ARG002
+        adapter = CandidateProposalAdapter()
+        return [adapter.adapt(candidate, episode, archive) for candidate in self._drafts(archive)]
 
 
 def _archive(name: str) -> SessionArchive:
@@ -111,7 +129,52 @@ def test_one_planner_is_request_isolated_across_asyncio_tasks() -> None:
 
 
 def test_commit_group_restart_retries_only_failed_projection_consumer(tmp_path, monkeypatch) -> None:  # noqa: ANN001
-    client = MemoryOSClient(str(tmp_path))
+    text = "I confirm the primary storage backend continues to use SQLite."
+    atomic = {"event_id": "m1", "span_start": 0, "span_end": len(text)}
+    semantic = {
+        "speech_act": "confirmation",
+        "commitment": "confirmed",
+        "temporal_scope": "current",
+        "relation_to_existing": "unrelated",
+        "utterance_mode": "assertion",
+        "attribution": "source_actor",
+        "durability": "durable",
+        "modal_force": "none",
+        "atomicity": "atomic",
+    }
+    identity = {"decision_topic": "primary storage backend"}
+    values = {"canonical_value": "SQLite"}
+    response = json.dumps(
+        {
+            "candidates": [
+                {
+                    "proposal_id": "p-consumer-recovery",
+                    "memory_type": "project_decision",
+                    "identity_fields": identity,
+                    "value_fields": values,
+                    "semantic": semantic,
+                    "epistemic_status": "EXPLICIT",
+                    "suggested_scope_refs": [
+                        {"namespace": "memoryos", "kind": "workspace", "id": "memoryos"}
+                    ],
+                    "evidence_refs": [atomic],
+                    "atomic_evidence_ref": atomic,
+                    "field_evidence_refs": {
+                        **{f"identity.{key}": [atomic] for key in identity},
+                        **{f"value.{key}": [atomic] for key in values},
+                        **{f"semantic.{key}": [atomic] for key in semantic},
+                        "transition": [atomic],
+                    },
+                    "confidence": 0.99,
+                    "source_role": "user",
+                }
+            ]
+        }
+    )
+    client = MemoryOSClient(
+        str(tmp_path),
+        memory_extractor=LLMMemoryExtractorBackend(FakeMemoryModelProvider(response)),
+    )
     projection_calls = 0
 
     def fail_projection(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
@@ -129,7 +192,7 @@ def test_commit_group_restart_retries_only_failed_projection_consumer(tmp_path, 
                 "id": "m1",
                 "role": "user",
                 "actor_id": "u1",
-                "content": "这个项目继续使用 SQLite。",
+                "content": text,
             }
         ],
         connect_metadata=ConnectMetadata.default_agent("codex").to_dict(),

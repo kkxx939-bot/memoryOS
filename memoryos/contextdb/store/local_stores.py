@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import uuid
 from pathlib import Path
@@ -103,7 +104,7 @@ class InMemoryIndexStore:
 
     def search(self, query: str, filters: dict | None = None, limit: int = 10) -> list[IndexHit]:
         filters = filters or {}
-        terms = [term.lower() for term in str(query).split() if term.strip()]
+        terms = self._lexical_terms(query)
         hits = []
         for obj, content in self.rows.values():
             if "allowed_uris" in filters and obj.uri not in set(filters.get("allowed_uris", []) or []):
@@ -123,6 +124,14 @@ class InMemoryIndexStore:
             if filters.get("context_type") and obj.context_type.value != filters["context_type"]:
                 continue
             metadata = dict(obj.metadata or {})
+            admission = dict(metadata.get("admission", {}) or {})
+            if filters.get("admission_status") is None and admission.get("decision") in {
+                "pending",
+                "restricted",
+                "archive_only",
+                "reject",
+            }:
+                continue
             if filters.get("project_id"):
                 scope = dict(metadata.get("scope", {}) or {})
                 fields = dict(metadata.get("fields", {}) or {})
@@ -144,7 +153,7 @@ class InMemoryIndexStore:
                 expected = filters.get(field)
                 if expected is None:
                     continue
-                values = set(expected) if isinstance(expected, (list, tuple, set, frozenset)) else {expected}
+                values = set(expected) if isinstance(expected, list | tuple | set | frozenset) else {expected}
                 actual = {
                     "adapter_id": metadata.get("source_adapter_id") or dict(metadata.get("connect", {}) or {}).get("adapter_id"),
                     "admission_status": dict(metadata.get("admission", {}) or {}).get("decision"),
@@ -168,14 +177,49 @@ class InMemoryIndexStore:
                 }
                 if not actual_scopes.issubset(required_scopes):
                     continue
-            text = " ".join([obj.title, content, json.dumps(obj.metadata, ensure_ascii=False)]).lower()
-            score = sum(1.0 for term in terms if term in text)
-            if not terms:
-                score = 0.1
-            if score > 0:
-                hits.append(IndexHit(uri=obj.uri, score=score, context_type=obj.context_type.value, title=obj.title))
+            text = " ".join([obj.title, content, json.dumps(obj.metadata, ensure_ascii=False)]).casefold()
+            lexical_matches = sum(1 for term in terms if term in text)
+            lexical = lexical_matches / len(terms) if terms else 0.0
+            identity = 1.0 if any(
+                str(metadata.get(field, "")) == str(query).strip()
+                for field in {"scene_key", "action", "memory_anchor_uri"}
+            ) else 0.0
+            base_relevance = max(lexical, identity)
+            if base_relevance <= 0:
+                continue
+            hotness = (obj.hotness + obj.semantic_hotness + obj.behavior_support_hotness) / 3.0
+            score = max(float(lexical_matches), identity) + 0.05 * hotness
+            hit_metadata = {
+                "retrieval_scores": {
+                    "lexical": lexical,
+                    "vector": 0.0,
+                    "identity": identity,
+                    "base_relevance": base_relevance,
+                    "hotness": hotness,
+                    "score": score,
+                },
+            }
+            hits.append(
+                IndexHit(
+                    uri=obj.uri,
+                    score=score,
+                    context_type=obj.context_type.value,
+                    title=obj.title,
+                    metadata=hit_metadata,
+                )
+            )
         hits.sort(key=lambda hit: hit.score, reverse=True)
         return hits[:limit]
+
+    def _lexical_terms(self, query: str) -> tuple[str, ...]:
+        normalized = str(query).casefold()
+        terms = re.findall(r"[a-z0-9_]+", normalized)
+        for sequence in re.findall(r"[\u4e00-\u9fff]+", normalized):
+            if len(sequence) == 1:
+                terms.append(sequence)
+            else:
+                terms.extend(sequence[index : index + 2] for index in range(len(sequence) - 1))
+        return tuple(dict.fromkeys(term for term in terms if term))
 
 
 class InMemoryRelationStore:

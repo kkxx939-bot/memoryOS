@@ -10,6 +10,7 @@ from memoryos.contextdb.resource.resource_importer import ResourceImporter
 from memoryos.contextdb.skill.skill_model import Skill
 from memoryos.contextdb.skill.skill_registry import SkillRegistry
 from memoryos.contextdb.store.local_stores import FileSystemSourceStore, InMemoryIndexStore, InMemoryRelationStore
+from memoryos.memory.model.memory import MemoryAnchor
 from memoryos.operations.commit.operation_committer import OperationCommitter
 from memoryos.operations.model.context_operation import ContextOperation
 from memoryos.operations.model.operation_action import OperationAction
@@ -41,6 +42,16 @@ def test_resource_and_skill_required_by_action_policy_gate_execution(tmp_path) -
         confidence=0.9,
         required_resource_uris=[resource_uri],
         required_skill_uris=[skill_uri],
+    )
+    source.write_object(
+        MemoryAnchor(
+            uri=policy.memory_anchor_uri,
+            user_id="u1",
+            title="hot anchor",
+            content="verified hot-room behavior anchor",
+            anchor_key="hot",
+        ).to_context_object(),
+        content="verified hot-room behavior anchor",
     )
     committer.commit(
         "u1",
@@ -93,6 +104,16 @@ def test_direct_request_resource_and_skill_are_archived_and_learned_by_action_po
         action_distribution=[{"action": "turn_on_ac", "count": 1}],
     )
     client.context_db.seed_object(pattern.to_context_object(), content="hot_room turn_on_ac behavior")
+    client.context_db.seed_object(
+        MemoryAnchor(
+            uri=anchor_uri,
+            user_id="u1",
+            title="hot room anchor",
+            content="verified hot-room behavior anchor",
+            anchor_key=scene_key,
+        ).to_context_object(),
+        content="verified hot-room behavior anchor",
+    )
     policy = ActionPolicy(
         user_id="u1",
         scene_key=scene_key,
@@ -187,6 +208,16 @@ def test_registered_persistent_skill_is_executable_by_default(tmp_path) -> None:
         confidence=0.95,
         required_resource_uris=[resource_uri],
         required_skill_uris=[skill_uri],
+    )
+    client.context_db.seed_object(
+        MemoryAnchor(
+            uri=policy.memory_anchor_uri,
+            user_id="u1",
+            title="hot anchor",
+            content="verified hot-room behavior anchor",
+            anchor_key="hot",
+        ).to_context_object(),
+        content="verified hot-room behavior anchor",
     )
     client.committer.commit(
         "u1",

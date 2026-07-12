@@ -22,7 +22,7 @@ except ImportError:  # pragma: no cover
 
 
 def _as_int(value: object) -> int:
-    if isinstance(value, (bool, int, float, str)):
+    if isinstance(value, bool | int | float | str):
         return int(value)
     raise ValueError("projection revision must be an integer")
 

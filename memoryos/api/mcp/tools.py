@@ -50,6 +50,9 @@ class MCPToolRouter:
                         title=str(args.get("title") or ""),
                         memory_type=str(args.get("memory_type") or "project_decision"),
                         project_id=str(args.get("project_id") or ""),
+                        constraint_polarity=str(args.get("constraint_polarity") or ""),
+                        condition=str(args.get("condition") or ""),
+                        exception=str(args.get("exception") or ""),
                         connect_metadata=metadata,
                     )
                 )

@@ -178,6 +178,8 @@ class ContextAssembler:
     ) -> tuple[str, ...] | None:
         source_store = getattr(self.context_db, "source_store", None)
         if source_store is None:
+            if user_id is None and context_type not in {ContextType.RESOURCE, ContextType.SKILL}:
+                return ()
             return None
         available_scopes = set(str(item) for item in applicability_scope_keys or [])
         if user_id:
@@ -186,15 +188,24 @@ class ContextAssembler:
             available_scopes.add(f"memoryos:workspace:{project_id}")
         allowed = []
         for obj in source_store.list_objects():
-            if obj.lifecycle_state != LifecycleState.ACTIVE:
+            metadata = dict(obj.metadata or {})
+            reviewable_pending = bool(
+                include_candidates
+                and metadata.get("canonical_kind") == "pending_proposal"
+                and obj.lifecycle_state
+                in {LifecycleState.PENDING, LifecycleState.RETRYABLE, LifecycleState.CONFIRMED}
+            )
+            if obj.lifecycle_state != LifecycleState.ACTIVE and not reviewable_pending:
                 continue
             if str(obj.tenant_id or "default") != tenant_id:
                 continue
-            if user_id is not None and obj.owner_user_id != user_id:
+            if user_id is None:
+                if obj.context_type not in {ContextType.RESOURCE, ContextType.SKILL} or obj.owner_user_id:
+                    continue
+            elif obj.owner_user_id != user_id:
                 continue
             if context_type is not None and obj.context_type != context_type:
                 continue
-            metadata = dict(obj.metadata or {})
             admission = dict(metadata.get("admission", {}) or {})
             if admission.get("decision") in {"restricted", "archive_only", "reject"}:
                 continue
@@ -360,7 +371,12 @@ class ContextAssembler:
         query_intent: str | None,
         connect_filters: dict[str, Any] | None,
     ) -> list[dict[str, Any]]:
-        if requested_limit <= 0 or parsed_type not in {None, ContextType.MEMORY} or self.canonical_retriever is None:
+        if (
+            requested_limit <= 0
+            or user_id is None
+            or parsed_type not in {None, ContextType.MEMORY}
+            or self.canonical_retriever is None
+        ):
             return recalled[:requested_limit]
         scope_keys = list(applicability_scope_keys or [])
         if user_id:
@@ -390,7 +406,10 @@ class ContextAssembler:
                 self._normalize_candidate_memory(item)
                 for item in recalled
                 if str(item.get("context_type")) == ContextType.MEMORY.value
-                and dict(item.get("metadata", {}) or {}).get("memory_kind") == "memory_candidate"
+                and (
+                    dict(item.get("metadata", {}) or {}).get("memory_kind") == "memory_candidate"
+                    or dict(item.get("metadata", {}) or {}).get("canonical_kind") == "pending_proposal"
+                )
                 and dict(dict(item.get("metadata", {}) or {}).get("admission", {}) or {}).get("decision") == "pending"
             ]
         authorized = self._filter_connect([*canonical, *candidates, *non_memory], connect_filters)
@@ -449,9 +468,15 @@ class ContextAssembler:
                 continue
             if str(obj.tenant_id or "default") != tenant_id:
                 continue
-            if obj.lifecycle_state != LifecycleState.ACTIVE:
-                continue
             metadata = dict(obj.metadata or {})
+            reviewable_pending = bool(
+                plan.include_candidates
+                and metadata.get("canonical_kind") == "pending_proposal"
+                and obj.lifecycle_state
+                in {LifecycleState.PENDING, LifecycleState.RETRYABLE, LifecycleState.CONFIRMED}
+            )
+            if obj.lifecycle_state != LifecycleState.ACTIVE and not reviewable_pending:
+                continue
             if metadata.get("canonical_kind") == "claim" and metadata.get("state") != "ACTIVE":
                 continue
             if user_id is not None and obj.owner_user_id != user_id:
@@ -647,10 +672,15 @@ class ContextAssembler:
         candidates = [(primary_layer, l2, primary_reason)]
         if layers.get("L1"):
             candidates.append(("L1", str(layers["L1"]), "l2_over_budget"))
-        if layers.get("L0"):
-            candidates.append(("L0", str(layers["L0"]), "l1_over_budget"))
         excerpt = self._query_excerpt(l2, query, max_tokens)
+        l0 = str(layers.get("L0") or "")
+        query_terms = [term.casefold() for term in query.split() if term]
+        l0_matches_query = bool(query_terms) and any(term in l0.casefold() for term in query_terms)
+        if l0 and l0_matches_query:
+            candidates.append(("L0", l0, "l1_over_budget"))
         candidates.append(("excerpt", excerpt, "abstract_over_budget"))
+        if l0 and not l0_matches_query:
+            candidates.append(("L0", l0, "query_excerpt_over_budget"))
         for layer, content, reason in candidates:
             if self._estimate_tokens(content) <= max_tokens:
                 return {"layer": layer, "content": content, "reason": reason}

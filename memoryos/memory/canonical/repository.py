@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from memoryos.contextdb.store.source_store import SourceStore
 from memoryos.memory.canonical.identity import IDENTITY_ALGORITHM_V2, ResolvedMemoryIdentity
+from memoryos.memory.canonical.proposal import PendingMemoryProposal
 from memoryos.memory.canonical.scope import ScopeRef
 from memoryos.memory.canonical.state import (
     CanonicalMemoryInvariantError,
@@ -72,6 +73,44 @@ class CanonicalMemoryRepository:
         claims = tuple(claims_list)
         slot.validate_claims(claims)
         return slot, claims
+
+    def load_pending(
+        self,
+        uri: str,
+        *,
+        tenant_id: str | None = None,
+        owner_user_id: str | None = None,
+    ) -> PendingMemoryProposal:
+        obj = self.source_store.read_object(uri)
+        record = PendingMemoryProposal.from_context_object(obj)
+        if tenant_id is not None and str(obj.tenant_id or "default") != str(tenant_id):
+            raise PermissionError("pending proposal tenant does not match the requested tenant")
+        if owner_user_id is not None and str(obj.owner_user_id or "") != str(owner_user_id):
+            raise PermissionError("pending proposal owner does not match the requested owner")
+        return record
+
+    def list_pending(
+        self,
+        *,
+        tenant_id: str,
+        owner_user_id: str,
+        lifecycle_states: tuple[str, ...] = (),
+    ) -> tuple[PendingMemoryProposal, ...]:
+        requested = {str(item).casefold() for item in lifecycle_states}
+        records: list[PendingMemoryProposal] = []
+        for obj in self.source_store.list_objects():
+            metadata = dict(obj.metadata or {})
+            if metadata.get("canonical_kind") != "pending_proposal":
+                continue
+            if str(obj.tenant_id or "default") != str(tenant_id) or str(obj.owner_user_id or "") != str(
+                owner_user_id
+            ):
+                continue
+            record = PendingMemoryProposal.from_context_object(obj)
+            if requested and record.lifecycle_state.value.casefold() not in requested:
+                continue
+            records.append(record)
+        return tuple(sorted(records, key=lambda item: (item.created_at, item.uri)))
 
     def _load_claim(self, slot: MemorySlot, claim_id: str) -> MemoryClaim:
         uri = f"{slot.uri}/claims/{claim_id}"

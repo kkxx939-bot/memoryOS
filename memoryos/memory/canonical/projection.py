@@ -320,6 +320,7 @@ class CanonicalMemoryProjector:
         memory_type = str(metadata.get("memory_type", "memory"))
         l0 = f"{value} [{state}]"
         qualifiers = dict(revision.get("qualifiers", {}) or {})
+        display_fields = dict(metadata.get("display_fields", {}) or {})
         l1_lines = [
             f"# {value}",
             f"- type: {memory_type}",
@@ -329,6 +330,16 @@ class CanonicalMemoryProjector:
             f"- epistemic: {revision.get('epistemic_status', '')}",
             f"- relation: {revision.get('relation', '')}",
         ]
+        display_text = next(
+            (
+                str(display_fields[name])
+                for name in ("display_text", "summary", "decision", "rule", "rationale", "details", "reason")
+                if display_fields.get(name)
+            ),
+            "",
+        )
+        if display_text:
+            l1_lines.append(f"- display: {display_text}")
         if qualifiers:
             l1_lines.append(f"- qualifiers: {json.dumps(qualifiers, ensure_ascii=False, sort_keys=True)}")
         l1 = "\n".join(l1_lines)
@@ -341,6 +352,8 @@ class CanonicalMemoryProjector:
                 "current_claim_revision": revision.get("revision", source_revision),
                 "canonical_value": value,
                 "revision": revision,
+                "display_fields": display_fields,
+                "display_field_evidence_refs": dict(metadata.get("display_field_evidence_refs", {}) or {}),
             },
             ensure_ascii=False,
             indent=2,

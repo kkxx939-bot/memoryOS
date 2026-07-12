@@ -143,11 +143,44 @@ class MemoryOSASGI:
                 title=str(payload.get("title") or ""),
                 memory_type=str(payload.get("memory_type") or "project_decision"),
                 project_id=str(payload.get("project_id") or ""),
+                constraint_polarity=str(payload.get("constraint_polarity") or ""),
+                condition=str(payload.get("condition") or ""),
+                exception=str(payload.get("exception") or ""),
                 connect_metadata=payload.get("connect_metadata"),
             )
         if method == "POST" and path == "/v1/memories/forget":
             return self.client.forget(
                 user_id=_required_str(payload, "user_id", path), uri=_required_str(payload, "uri", path)
+            )
+        if method == "GET" and path == "/v1/memories/pending":
+            query = parse_qs(scope.get("query_string", b"").decode())
+            lifecycle_states = [
+                item
+                for value in query.get("lifecycle_state", [])
+                for item in str(value).split(",")
+                if item
+            ]
+            return {
+                "results": self.client.list_pending(
+                    user_id=str(query.get("user_id", [""])[0]),
+                    tenant_id=str(query.get("tenant_id", ["default"])[0]),
+                    lifecycle_states=lifecycle_states,
+                )
+            }
+        if method == "POST" and path == "/v1/memories/pending/review":
+            return self.client.review_pending(
+                user_id=_required_str(payload, "user_id", path),
+                pending_uri=_required_str(payload, "pending_uri", path),
+                decision=_required_str(payload, "decision", path),
+                expected_lifecycle_revision=int(payload.get("expected_lifecycle_revision", 0) or 0),
+                expected_proposal_fingerprint=_required_str(
+                    payload,
+                    "expected_proposal_fingerprint",
+                    path,
+                ),
+                command_id=_required_str(payload, "command_id", path),
+                tenant_id=str(payload.get("tenant_id") or "default"),
+                reason=str(payload.get("reason") or ""),
             )
         if method == "GET" and path == "/v1/context/read":
             query = parse_qs(scope.get("query_string", b"").decode())

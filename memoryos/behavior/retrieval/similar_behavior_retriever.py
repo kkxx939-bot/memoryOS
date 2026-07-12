@@ -90,6 +90,8 @@ class SimilarBehaviorRetriever:
         weight: float,
         namespace: str,
     ) -> list[dict]:
+        if context_type == ContextType.MEMORY and self.source_store is None:
+            return []
         if self.hybrid_search is not None:
             hybrid_hits = self.hybrid_search.search(
                 query,
@@ -116,9 +118,34 @@ class SimilarBehaviorRetriever:
                 limit=limit,
             )
             items = [self._hit_item(hit, source="index_fallback", weight=weight) for hit in index_hits]
+        if self.source_store is not None:
+            items = [
+                item
+                for item in items
+                if self._source_allows_hit(str(item.get("uri", "")), context_type, user_id)
+            ]
         for item in items:
             trace.setdefault(str(item["uri"]), {"source": item.get("source", "index_fallback"), "context_type": context_type.value})
         return items
+
+    def _source_allows_hit(self, uri: str, context_type: ContextType, user_id: str) -> bool:
+        if self.source_store is None or not uri:
+            return False
+        try:
+            obj = self.source_store.read_object(uri)
+        except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+            return False
+        if obj.context_type != context_type:
+            return False
+        if obj.owner_user_id != user_id:
+            return False
+        if obj.context_type == ContextType.MEMORY:
+            return self._is_active_authoritative_memory(obj)
+        return obj.lifecycle_state not in {
+            LifecycleState.DELETED,
+            LifecycleState.OBSOLETE,
+            LifecycleState.ARCHIVED,
+        }
 
     def _relation_results(self, uri: str, user_id: str, trace: dict[str, dict]) -> dict[str, list[dict]]:
         result: dict[str, list[dict]] = {"memory_anchors": [], "policy_refs": [], "cases": []}
@@ -128,8 +155,10 @@ class SimilarBehaviorRetriever:
             if relation.relation_type not in self.relation_types:
                 continue
             target = relation.target_uri if relation.source_uri == uri else relation.source_uri
-            item = self._object_item(target, relation_type=relation.relation_type)
+            item = self._object_item(target, relation_type=relation.relation_type, user_id=user_id)
             if item is None:
+                if self.source_store is not None or relation.relation_type in {"anchored_by", "constrained_by"}:
+                    continue
                 item = {
                     "uri": target,
                     "title": relation.metadata.get("summary", target.rsplit("/", 1)[-1]),
@@ -157,14 +186,18 @@ class SimilarBehaviorRetriever:
             "metadata": dict(hit.metadata),
         }
 
-    def _object_item(self, uri: str, relation_type: str) -> dict | None:
+    def _object_item(self, uri: str, relation_type: str, user_id: str) -> dict | None:
         if self.source_store is None:
             return None
         try:
             obj = self.source_store.read_object(uri)
         except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
             return None
+        if obj.owner_user_id != user_id:
+            return None
         if obj.lifecycle_state in {LifecycleState.DELETED, LifecycleState.OBSOLETE, LifecycleState.ARCHIVED}:
+            return None
+        if obj.context_type == ContextType.MEMORY and not self._is_active_authoritative_memory(obj):
             return None
         return {
             "uri": obj.uri,
@@ -175,6 +208,29 @@ class SimilarBehaviorRetriever:
             "relation_type": relation_type,
             "metadata": dict(obj.metadata),
         }
+
+    def _is_active_authoritative_memory(self, obj) -> bool:  # noqa: ANN001
+        if obj.lifecycle_state != LifecycleState.ACTIVE:
+            return False
+        metadata = dict(obj.metadata or {})
+        admission = dict(metadata.get("admission", {}) or {})
+        if admission.get("decision") in {"pending", "restricted", "archive_only", "reject"}:
+            return False
+        if metadata.get("memory_kind") == "memory_candidate":
+            return False
+        canonical_kind = str(metadata.get("canonical_kind") or "")
+        if canonical_kind == "pending_proposal":
+            return False
+        if canonical_kind and canonical_kind != "claim":
+            return False
+        claim_state = str(metadata.get("state") or metadata.get("claim_state") or "")
+        if claim_state and claim_state != "ACTIVE":
+            return False
+        if canonical_kind == "claim":
+            authority = dict(dict(metadata.get("scope", {}) or {}).get("authority", {}) or {})
+            if not authority or bool(authority.get("inferred", False)):
+                return False
+        return True
 
     def _representative_cases(self, cases: list[dict]) -> list[dict]:
         deduped = self._dedupe(cases)

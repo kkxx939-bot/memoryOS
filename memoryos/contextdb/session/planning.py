@@ -16,6 +16,7 @@ class ProposalPlanningInput:
 
     proposal: MemorySemanticProposal
     retrieval_views: tuple[str, ...] = ()
+    forced_pending_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,8 @@ class ProposalPlanningOutcome:
     proposal_id: str
     decision: str
     reason: str
+    candidate_index: int | None = None
+    security_flags: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -62,6 +65,7 @@ class PlanningContext:
     operation_group_identity: str
     admission_summary: tuple[tuple[str, int], ...] = ()
     proposal_outcomes: tuple[ProposalPlanningOutcome, ...] = ()
+    extraction_security_flags: tuple[str, ...] = ()
     salience_fingerprint: str = ""
     salience_reasons: tuple[str, ...] = ()
 

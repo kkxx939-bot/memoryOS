@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import sqlite3
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.store.source_store import IndexHit
@@ -25,11 +28,11 @@ class SQLiteIndexStore:
 
         metadata_json = json.dumps(obj.metadata, ensure_ascii=False)
         metadata_text = " ".join(str(value) for value in obj.metadata.values())
-        scope = dict(obj.metadata.get("scope", {}) or {})
-        fields = dict(obj.metadata.get("fields", {}) or {})
-        connect = dict(obj.metadata.get("connect", {}) or {})
-        admission = dict(obj.metadata.get("admission", {}) or {})
-        applicability = dict(scope.get("applicability", {}) or {})
+        scope = self._mapping(obj.metadata.get("scope", {}))
+        fields = self._mapping(obj.metadata.get("fields", {}))
+        connect = self._mapping(obj.metadata.get("connect", {}))
+        admission = self._mapping(obj.metadata.get("admission", {}))
+        applicability = self._mapping(scope.get("applicability", {}))
         scope_keys = [
             f"{item.get('namespace', 'memoryos')}:{item.get('kind')}:{item.get('id')}"
             for item in applicability.get("all_of", []) or []
@@ -149,7 +152,7 @@ class SQLiteIndexStore:
             value = filters.get(field)
             if value is None:
                 continue
-            values = list(value) if isinstance(value, (list, tuple, set, frozenset)) else [value]
+            values = list(value) if isinstance(value, list | tuple | set | frozenset) else [value]
             sql += f" AND c.{field} IN ({','.join('?' for _ in values)})"
             params.extend(str(item) for item in values)
         if filters.get("project_id") is not None:
@@ -195,7 +198,22 @@ class SQLiteIndexStore:
                 rows = conn.execute(sql, [match_query, *params, limit]).fetchall()
             except sqlite3.OperationalError:
                 return []
-        return [self._hit_from_row(row, lexical=max(0.0, -float(row["rank"]))) for row in rows]
+        hits = []
+        for row in rows:
+            haystack = " ".join([row["fts_title"], row["fts_content"], row["metadata_text"]])
+            lexical = self._lexical_relevance(
+                query,
+                haystack,
+            )
+            if lexical > 0:
+                hits.append(
+                    self._hit_from_row(
+                        row,
+                        lexical=lexical,
+                        lexical_rank=self._lexical_match_count(query, haystack),
+                    )
+                )
+        return hits
 
     def _search_metadata_exact(self, query: str, filters: dict, limit: int) -> list[IndexHit]:
         value = str(query).strip()
@@ -209,41 +227,143 @@ class SQLiteIndexStore:
             rows = conn.execute(sql, [*params, like, like]).fetchall()
         exact_fields = {"scene_key", "action", "memory_anchor_uri"}
         for row in rows:
-            metadata = json.loads(row["metadata_json"] or "{}")
+            metadata = self._mapping(json.loads(row["metadata_json"] or "{}"))
             if any(str(metadata.get(field, "")) == value for field in exact_fields):
-                hits.append(self._hit_from_row(row, lexical=10.0))
+                hits.append(self._hit_from_row(row, identity=1.0, identity_rank=10.0))
         hits.sort(key=lambda hit: hit.score, reverse=True)
         return hits[:limit]
 
     def _search_contains(self, query: str, filters: dict, limit: int) -> list[IndexHit]:
-        terms = [term.lower() for term in str(query).split() if term.strip()]
         filter_sql, params = self._base_filter_sql(filters)
         sql = f"SELECT c.*, f.title AS fts_title, f.content_text AS fts_content, f.metadata_text FROM contexts c JOIN contexts_fts f ON c.uri = f.uri WHERE 1=1 {filter_sql}"
         hits: list[IndexHit] = []
         with self._connect() as conn:
             for row in conn.execute(sql, params):
                 haystack = " ".join([row["fts_title"], row["fts_content"], row["metadata_text"]]).lower()
-                lexical = sum(1.0 for term in terms if term in haystack)
-                if not terms:
-                    lexical = 0.1
-                score = self._score(row, lexical)
-                if score <= 0:
+                lexical = self._lexical_relevance(query, haystack)
+                if lexical <= 0:
                     continue
-                hits.append(self._hit_from_row(row, lexical=lexical))
+                hits.append(
+                    self._hit_from_row(
+                        row,
+                        lexical=lexical,
+                        lexical_rank=self._lexical_match_count(query, haystack),
+                    )
+                )
         hits.sort(key=lambda hit: hit.score, reverse=True)
         return hits[:limit]
 
-    def _hit_from_row(self, row: sqlite3.Row, lexical: float) -> IndexHit:
+    def _hit_from_row(
+        self,
+        row: sqlite3.Row,
+        lexical: float = 0.0,
+        lexical_rank: float | None = None,
+        vector: float = 0.0,
+        identity: float = 0.0,
+        identity_rank: float | None = None,
+    ) -> IndexHit:
+        metadata = self._mapping(json.loads(row["metadata_json"] or "{}"))
+        metadata["retrieval_scores"] = self._score_components(
+            row,
+            lexical=lexical,
+            lexical_rank=lexical_rank,
+            vector=vector,
+            identity=identity,
+            identity_rank=identity_rank,
+        )
         return IndexHit(
             uri=row["uri"],
-            score=self._score(row, lexical),
+            score=float(metadata["retrieval_scores"]["score"]),
             context_type=row["context_type"],
             title=row["title"],
-            metadata=json.loads(row["metadata_json"] or "{}"),
+            metadata=metadata,
         )
 
-    def _score(self, row: sqlite3.Row, lexical: float) -> float:
-        return lexical + float(row["hotness"]) + float(row["semantic_hotness"]) + float(row["behavior_support_hotness"])
+    def _score_components(
+        self,
+        row: sqlite3.Row,
+        *,
+        lexical: float = 0.0,
+        lexical_rank: float | None = None,
+        vector: float = 0.0,
+        identity: float = 0.0,
+        identity_rank: float | None = None,
+    ) -> dict[str, float]:
+        lexical = self._bounded(lexical)
+        vector = self._bounded(vector)
+        identity = self._bounded(identity)
+        base_relevance = max(lexical, vector, identity)
+        hotness = (
+            self._bounded(row["hotness"])
+            + self._bounded(row["semantic_hotness"])
+            + self._bounded(row["behavior_support_hotness"])
+        ) / 3.0
+        # Hotness is deliberately a small tie-breaker after a real relevance
+        # signal. It can never turn a zero-relevance row into a hit.
+        ranking_relevance = max(
+            self._finite_rank(lexical_rank if lexical_rank is not None else lexical),
+            vector,
+            self._finite_rank(identity_rank if identity_rank is not None else identity),
+        )
+        score = ranking_relevance + (0.05 * hotness if base_relevance > 0 else 0.0)
+        return {
+            "lexical": lexical,
+            "vector": vector,
+            "identity": identity,
+            "base_relevance": base_relevance,
+            "hotness": hotness,
+            "score": score,
+        }
+
+    def _lexical_relevance(self, query: str, haystack: str) -> float:
+        terms = self._lexical_terms(query)
+        if not terms:
+            return 0.0
+        normalized = str(haystack).casefold()
+        matched = sum(1 for term in terms if term in normalized)
+        return matched / len(terms)
+
+    def _lexical_match_count(self, query: str, haystack: str) -> float:
+        terms = self._lexical_terms(query)
+        if not terms:
+            return 0.0
+        normalized = str(haystack).casefold()
+        return float(sum(1 for term in terms if term in normalized))
+
+    def _lexical_terms(self, query: str) -> tuple[str, ...]:
+        normalized = str(query).casefold()
+        terms = re.findall(r"[a-z0-9_]+", normalized)
+        for sequence in re.findall(r"[\u4e00-\u9fff]+", normalized):
+            if len(sequence) == 1:
+                terms.append(sequence)
+            else:
+                terms.extend(sequence[index : index + 2] for index in range(len(sequence) - 1))
+        return tuple(dict.fromkeys(term for term in terms if term))
+
+    def _bounded(self, value: Any) -> float:
+        if isinstance(value, bool):
+            return 0.0
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(number):
+            return 0.0
+        return max(0.0, min(1.0, number))
+
+    def _finite_rank(self, value: Any) -> float:
+        if isinstance(value, bool):
+            return 0.0
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(number) or number < 0:
+            return 0.0
+        return number
+
+    def _mapping(self, value: Any) -> dict[str, Any]:
+        return dict(value) if isinstance(value, Mapping) else {}
 
     def _match_query(self, query: str) -> str:
         terms = re.findall(r"[\w\u4e00-\u9fff]+", str(query), flags=re.UNICODE)

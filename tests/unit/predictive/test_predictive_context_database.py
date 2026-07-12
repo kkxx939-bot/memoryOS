@@ -125,10 +125,47 @@ class PredictiveContextDatabaseTest(unittest.TestCase):
             confidence=0.9,
             q_value=0.9,
         )
-        candidate = ActionPolicyRanker().rank([policy])[0]
-        action_context = ActionContext(user_id="gulf", candidate_actions=[candidate.action], packed_context={})
+        candidate = ActionPolicyRanker().rank(
+            [policy],
+            verified_memory_anchor_uris={policy.memory_anchor_uri},
+        )[0]
+        action_context = ActionContext(
+            user_id="gulf",
+            candidate_actions=[candidate.action],
+            packed_context={
+                "slices": {
+                    "memory_anchor": {
+                        "items": [
+                            {
+                                "uri": policy.memory_anchor_uri,
+                                "context_type": "memory",
+                                "verified_exact_anchor": True,
+                            }
+                        ]
+                    }
+                }
+            },
+        )
         decision = PolicyGate().evaluate(candidate, action_context, action_policy=policy, prediction_confidence=0.8)
         self.assertEqual(decision.mode, "execute")
+
+    def test_ranker_anchor_match_defaults_closed_and_requires_verified_exact_uri(self) -> None:
+        policy = ActionPolicy(
+            user_id="gulf",
+            scene_key="hot",
+            action="turn_on_ac",
+            memory_anchor_uri="memoryos://user/gulf/memories/anchors/hot",
+        )
+
+        unverified = ActionPolicyRanker().rank([policy])[0]
+        verified = ActionPolicyRanker().rank(
+            [policy],
+            verified_memory_anchor_uris={policy.memory_anchor_uri},
+        )[0]
+
+        self.assertEqual(unverified.features["memory_anchor_match"], 0.0)
+        self.assertEqual(verified.features["memory_anchor_match"], 1.0)
+        self.assertGreater(verified.score, unverified.score)
 
     def test_prediction_engine_records_ledger_and_does_not_write_memory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -161,6 +198,75 @@ class PredictiveContextDatabaseTest(unittest.TestCase):
             )
             self.assertEqual(result.memory_operations, [])
             self.assertTrue(result.decision.mode in {"execute", "ask_user"})
+
+    def test_prediction_engine_propagates_verified_exact_anchor_to_rank_and_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = FileSystemSourceStore(tmp)
+            index = InMemoryIndexStore()
+            anchor = MemoryAnchor(
+                uri="memoryos://user/gulf/memories/anchors/hot",
+                user_id="gulf",
+                title="hot anchor",
+                content="verified hot-room anchor",
+                anchor_key="hot",
+            )
+            source.write_object(anchor.to_context_object(), content=anchor.content)
+            policy = ActionPolicy(
+                user_id="gulf",
+                scene_key="hot",
+                action="turn_on_ac",
+                memory_anchor_uri=anchor.uri,
+                auto_execute_allowed=True,
+                q_value=1.0,
+                confidence=1.0,
+                reward_score=10.0,
+            )
+
+            result = PredictionEngine(
+                index,
+                PredictionLedger(tmp),
+                source_store=source,
+            ).process(
+                PredictionRequest(
+                    user_id="gulf",
+                    episode_id="verified-anchor",
+                    observation={"scene_key": "hot", "raw_text": "room is hot"},
+                    available_actions=["turn_on_ac", "ask_user", "do_nothing"],
+                ),
+                policies=[policy],
+            )
+
+            self.assertEqual(result.candidates[0].features["memory_anchor_match"], 1.0)
+            anchor_items = result.action_context.packed_context["slices"]["memory_anchor"]["items"]
+            self.assertEqual([item["uri"] for item in anchor_items], [anchor.uri])
+            self.assertIs(anchor_items[0]["verified_exact_anchor"], True)
+            self.assertEqual(result.decision.mode, "execute")
+
+    def test_prediction_engine_rejects_caller_supplied_cross_user_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            foreign = ActionPolicy(
+                user_id="other-user",
+                scene_key="hot",
+                action="turn_on_ac",
+                memory_anchor_uri="memoryos://user/other-user/memories/anchors/hot",
+                auto_execute_allowed=True,
+                q_value=1.0,
+                confidence=1.0,
+                reward_score=10.0,
+            )
+
+            result = PredictionEngine(InMemoryIndexStore(), PredictionLedger(tmp)).process(
+                PredictionRequest(
+                    user_id="gulf",
+                    episode_id="cross-user-policy",
+                    observation={"scene_key": "hot", "raw_text": "room is hot"},
+                    available_actions=["turn_on_ac", "ask_user", "do_nothing"],
+                ),
+                policies=[foreign],
+            )
+
+            self.assertEqual(result.candidates, [])
+            self.assertEqual(result.decision.mode, "do_nothing")
 
     def test_session_commit_two_phase_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

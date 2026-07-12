@@ -62,6 +62,36 @@ class OperationCommitterTargetResolverTest(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 source.read_object(replacement.uri)
 
+    def test_explicit_cross_user_delete_stays_rejected_and_has_no_source_side_effect(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = FileSystemSourceStore(tmp)
+            index = InMemoryIndexStore()
+            uri = "memoryos://user/u2/memories/profile/occupation"
+            target = ContextObject(
+                uri=uri,
+                context_type=ContextType.MEMORY,
+                title="u2 occupation",
+                owner_user_id="u2",
+            )
+            source.write_object(target, content="engineer")
+            index.upsert_index(target, content="engineer")
+            operation = ContextOperation(
+                user_id="u1",
+                context_type=ContextType.MEMORY,
+                action=OperationAction.DELETE,
+                target_uri=uri,
+                payload={"tenant_id": "default", "memory_type": "profile"},
+            )
+
+            diff = OperationCommitter(source, index, tmp).commit("u1", [operation])
+
+            self.assertEqual(diff.operations, [])
+            self.assertEqual(diff.pending_operations, [])
+            self.assertEqual([item.operation_id for item in diff.rejected_operations], [operation.operation_id])
+            self.assertEqual(diff.rejected_operations[0].status, OperationStatus.REJECTED)
+            self.assertEqual(source.read_object(uri).lifecycle_state, LifecycleState.ACTIVE)
+            self.assertEqual(source.read_content(uri), "engineer")
+
 
 if __name__ == "__main__":
     unittest.main()

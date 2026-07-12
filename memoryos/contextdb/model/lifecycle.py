@@ -9,6 +9,8 @@ class LifecycleState(str, Enum):
     CANDIDATE = "candidate"
     RESOLVED = "resolved"
     PENDING = "pending"
+    CONFIRMED = "confirmed"
+    RETRYABLE = "retryable"
     COMMITTED = "committed"
     ACTIVE = "active"
     COLD = "cold"
@@ -16,3 +18,4 @@ class LifecycleState(str, Enum):
     OBSOLETE = "obsolete"
     DELETED = "deleted"
     REJECTED = "rejected"
+    EXPIRED = "expired"

@@ -5,15 +5,18 @@ from __future__ import annotations
 import json
 import os
 import uuid
+from contextlib import ExitStack
 from pathlib import Path
 
 from memoryos.action_policy.model.action_policy import ActionPolicy
 from memoryos.action_policy.model.reward_signal import PenaltySignal, RewardSignal
 from memoryos.action_policy.update.action_policy_updater import ActionPolicyUpdater
 from memoryos.contextdb.layers.layer_refresher import LayerRefresher
+from memoryos.contextdb.model.context_layer import ContextLayers
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_relation import ContextRelation
 from memoryos.contextdb.model.context_type import ContextType
+from memoryos.contextdb.model.context_uri import ContextURI
 from memoryos.contextdb.model.lifecycle import LifecycleState
 from memoryos.contextdb.session.session_archive import SessionArchiveStore
 from memoryos.contextdb.store.local_stores import InMemoryLockStore
@@ -26,10 +29,12 @@ from memoryos.contextdb.store.source_store import (
     SourceStore,
 )
 from memoryos.contextdb.transaction.path_lock import PathLock
+from memoryos.core.ids import stable_hash
 from memoryos.core.time import utc_now
 from memoryos.memory.canonical.event import canonical_json, resolve_content_path
 from memoryos.memory.canonical.evidence import evidence_hash
-from memoryos.memory.canonical.identity import IDENTITY_ALGORITHM_V2
+from memoryos.memory.canonical.identity import IDENTITY_ALGORITHM_V2, canonical_text
+from memoryos.memory.canonical.proposal import PENDING_PROPOSAL_TRANSITIONS, PendingMemoryProposal
 from memoryos.memory.canonical.scope import ScopeRef
 from memoryos.memory.canonical.transaction import RevisionConflictError
 from memoryos.operations.commit.audit_writer import AuditWriter
@@ -64,7 +69,7 @@ class OperationCommitter:
         self.root = Path(root)
         self.coalescer = OperationCoalescer()
         self.conflicts = ConflictResolver()
-        self.target_resolver = target_resolver or TargetResolver(index_store)
+        self.target_resolver = target_resolver or TargetResolver(index_store, source_store=source_store)
         self.redo = RedoLog(root)
         self.diff_writer = DiffWriter(root)
         self.audit = AuditWriter(root)
@@ -76,83 +81,216 @@ class OperationCommitter:
 
         canonical = [operation for operation in operations if operation.payload.get("canonical_memory") is True]
         if canonical:
-            diffs = []
+            diffs: list[ContextDiff] = []
             regular = [operation for operation in operations if operation.payload.get("canonical_memory") is not True]
-            if regular:
-                diffs.append(self.commit(user_id, regular))
             grouped: dict[str, list[ContextOperation]] = {}
             for operation in canonical:
                 transaction_id = str(operation.payload.get("transaction_id", ""))
                 grouped.setdefault(transaction_id, []).append(operation)
-            diffs.extend(
-                self._commit_canonical_batch(user_id, transaction_operations)
-                for transaction_operations in grouped.values()
+            # Validate deterministic regular effects and pending lifecycle CAS
+            # before the first canonical group can write. Resolution links are
+            # intentionally checked only after their canonical Claims commit.
+            self._preflight_regular_operations(
+                regular,
+                validate_resolution_links=False,
+                validate_target_state=False,
             )
-            return ContextDiff(
-                user_id=user_id,
-                operations=[operation for diff in diffs for operation in diff.operations],
-                pending_operations=[operation for diff in diffs for operation in diff.pending_operations],
-                rejected_operations=[operation for diff in diffs for operation in diff.rejected_operations],
-            )
+            self._preflight_canonical_groups(user_id, list(grouped.values()))
+            try:
+                for transaction_operations in grouped.values():
+                    diffs.append(self._commit_canonical_batch(user_id, transaction_operations))
+                # Pending/legacy operations are intentionally deferred until
+                # every canonical transaction has committed. Keep this inside
+                # the same conflict boundary so a regular lifecycle CAS
+                # failure still reports the canonical side effects.
+                if regular:
+                    diffs.append(self.commit(user_id, regular))
+            except RevisionConflictError as exc:
+                partials = [*diffs]
+                if exc.committed_diff is not None:
+                    partials.append(exc.committed_diff)
+                partial = self._combine_diffs(user_id, partials) if partials else None
+                raise RevisionConflictError(str(exc), committed_diff=partial) from exc
+            return self._combine_diffs(user_id, diffs)
         resolved_operations: list[ContextOperation] = []
         pending: list[ContextOperation] = []
+        target_rejected: list[ContextOperation] = []
         for operation in operations:
             result = self.target_resolver.resolve(operation, user_id=user_id)
             if result.resolved:
                 resolved_operations.append(result.operation)
+            elif result.operation.status == OperationStatus.REJECTED:
+                target_rejected.append(result.operation)
             else:
                 result.operation.status = OperationStatus.PENDING
                 pending.append(result.operation)
         conflict_result = self.conflicts.resolve(self._coalesce_non_policy_operations(resolved_operations))
         for operation in conflict_result.rejected:
             operation.status = OperationStatus.REJECTED
-        committed = []
+        committed: list[ContextOperation] = []
         pending_redo = {entry.operation_id: entry for entry in self.redo.pending_entries()}
-        for operation in conflict_result.accepted:
-            if operation.status == OperationStatus.PENDING:
-                pending.append(operation)
-                continue
-            lock_key = operation.target_uri or f"{operation.user_id}:{operation.operation_id}"
-            with self.path_lock.acquire(lock_key):
-                marker = self._operation_marker(operation.operation_id)
-                if marker.exists():
-                    self._validate_operation_marker(marker, operation)
-                    operation.status = OperationStatus.COMMITTED
-                    committed.append(operation)
+        self._preflight_regular_operations(conflict_result.accepted)
+        try:
+            for operation in conflict_result.accepted:
+                if operation.status == OperationStatus.PENDING:
+                    pending.append(operation)
                     continue
-                pending_entry = pending_redo.get(operation.operation_id)
-                if pending_entry is not None and pending_entry.phase not in {"started", "begin"}:
-                    self.resume(user_id, pending_entry.operation, pending_entry.phase)
+                lock_key = operation.target_uri or f"{operation.user_id}:{operation.operation_id}"
+                with self.path_lock.acquire(lock_key):
+                    marker = self._operation_marker(operation.operation_id)
                     if marker.exists():
-                        self._validate_operation_marker(marker, operation)
+                        persisted = self._validate_operation_marker(marker, operation)
                         operation.status = OperationStatus.COMMITTED
-                        committed.append(operation)
+                        committed.append(persisted)
                         continue
-                self.redo.begin(operation, phase="started")
-                self._apply_source(operation)
-                self.redo.advance(operation, phase="source_written")
-                self._apply_index(operation)
-                self.redo.advance(operation, phase="index_written")
-                self.audit.record(user_id, "context_operation_committed", operation.to_dict())
-                self.redo.advance(operation, phase="audit_written")
-                operation.status = OperationStatus.COMMITTED
-            committed.append(operation)
+                    pending_entry = pending_redo.get(operation.operation_id)
+                    if pending_entry is not None and pending_entry.phase not in {"started", "begin"}:
+                        self.resume(user_id, pending_entry.operation, pending_entry.phase)
+                        if marker.exists():
+                            persisted = self._validate_operation_marker(marker, operation)
+                            operation.status = OperationStatus.COMMITTED
+                            committed.append(persisted)
+                            continue
+                    self._validate_pending_lifecycle_cas(operation)
+                    self.redo.begin(operation, phase="started")
+                    self._apply_source(operation)
+                    self.redo.advance(operation, phase="source_written")
+                    self._apply_index(operation)
+                    self.redo.advance(operation, phase="index_written")
+                    self.audit.record(user_id, "context_operation_committed", operation.to_dict())
+                    self.redo.advance(operation, phase="audit_written")
+                    operation.status = OperationStatus.COMMITTED
+                committed.append(operation)
+        except RevisionConflictError as exc:
+            regular_partials: list[ContextDiff] = []
+            if committed or pending or target_rejected or conflict_result.rejected:
+                regular_partials.append(
+                    self._finalize_regular_diff(
+                        user_id,
+                        committed,
+                        pending,
+                        target_rejected,
+                        conflict_result.rejected,
+                    )
+                )
+            if exc.committed_diff is not None:
+                regular_partials.append(exc.committed_diff)
+            committed_diff = self._combine_diffs(user_id, regular_partials) if regular_partials else None
+            raise RevisionConflictError(str(exc), committed_diff=committed_diff) from exc
+        return self._finalize_regular_diff(
+            user_id,
+            committed,
+            pending,
+            target_rejected,
+            conflict_result.rejected,
+        )
+
+    def _finalize_regular_diff(
+        self,
+        user_id: str,
+        committed: list[ContextOperation],
+        pending: list[ContextOperation],
+        target_rejected: list[ContextOperation],
+        conflict_rejected: list[ContextOperation],
+    ) -> ContextDiff:
+        diff_members = [*committed, *pending, *target_rejected, *conflict_rejected]
+        diff_key = stable_hash(
+            sorted((operation.operation_id, operation.status.value) for operation in diff_members),
+            length=32,
+        )
         diff = ContextDiff(
             user_id=user_id,
             operations=committed,
             pending_operations=pending,
-            rejected_operations=conflict_result.rejected,
+            rejected_operations=[*target_rejected, *conflict_rejected],
+            diff_id=f"diff_{diff_key}",
+            created_at=min((operation.created_at for operation in diff_members if operation.created_at), default=utc_now()),
         )
-        self.diff_writer.write(diff)
+        diff_path = self.root / "system" / "diffs" / f"{diff.diff_id}.json"
+        if diff_path.exists():
+            persisted = self._diff_from_payload(json.loads(diff_path.read_text(encoding="utf-8")))
+            requested_ids = {
+                "operations": [item.operation_id for item in diff.operations],
+                "pending_operations": [item.operation_id for item in diff.pending_operations],
+                "rejected_operations": [item.operation_id for item in diff.rejected_operations],
+            }
+            persisted_ids = {
+                "operations": [item.operation_id for item in persisted.operations],
+                "pending_operations": [item.operation_id for item in persisted.pending_operations],
+                "rejected_operations": [item.operation_id for item in persisted.rejected_operations],
+            }
+            if requested_ids != persisted_ids:
+                raise ValueError("regular diff id conflicts with a different operation set")
+            persisted_by_id = {item.operation_id: item for item in persisted.operations}
+            if any(
+                self._operation_effect_fingerprint(operation)
+                != self._operation_effect_fingerprint(persisted_by_id[operation.operation_id])
+                for operation in diff.operations
+            ):
+                raise ValueError("regular diff conflicts with a different persisted effect")
+            diff = persisted
+        else:
+            self.diff_writer.write(diff)
         for operation in committed:
             self._write_operation_marker(operation)
             self.redo.advance(operation, phase="diff_written")
             self.redo.commit(operation.operation_id)
         return diff
 
+    def _combine_diffs(self, user_id: str, diffs: list[ContextDiff]) -> ContextDiff:
+        if len(diffs) == 1:
+            return diffs[0]
+
+        def unique(kind: str) -> list[ContextOperation]:
+            by_id: dict[str, ContextOperation] = {}
+            for diff in diffs:
+                for operation in getattr(diff, kind):
+                    by_id.setdefault(operation.operation_id, operation)
+            return list(by_id.values())
+
+        effect_members = sorted(
+            (
+                kind,
+                operation.operation_id,
+                operation.status.value,
+                self._operation_effect_fingerprint(operation),
+            )
+            for kind in ("operations", "pending_operations", "rejected_operations")
+            for operation in unique(kind)
+        )
+        combined = ContextDiff(
+            user_id=user_id,
+            operations=unique("operations"),
+            pending_operations=unique("pending_operations"),
+            rejected_operations=unique("rejected_operations"),
+            diff_id=f"diff_commit_group_{stable_hash([user_id, canonical_json(effect_members)], length=32)}",
+            created_at=min((diff.created_at for diff in diffs if diff.created_at), default=utc_now()),
+        )
+        path = self.root / "system" / "diffs" / f"{combined.diff_id}.json"
+        if not path.exists():
+            self.diff_writer.write(combined)
+            return combined
+        persisted = self._diff_from_payload(json.loads(path.read_text(encoding="utf-8")))
+        for kind in ("operations", "pending_operations", "rejected_operations"):
+            requested = {item.operation_id: item for item in getattr(combined, kind)}
+            stored = {item.operation_id: item for item in getattr(persisted, kind)}
+            if requested.keys() != stored.keys() or any(
+                self._operation_effect_fingerprint(operation)
+                != self._operation_effect_fingerprint(stored[operation_id])
+                for operation_id, operation in requested.items()
+            ):
+                raise ValueError("combined diff id conflicts with a different operation effect")
+        return persisted
+
+    def combine_committed_diffs(self, user_id: str, diffs: list[ContextDiff]) -> ContextDiff:
+        """Persist and return one stable diff for already committed effect groups."""
+
+        return self._combine_diffs(user_id, diffs)
+
     def _commit_canonical_batch(self, user_id: str, operations: list[ContextOperation]) -> ContextDiff:
         if not operations:
             return ContextDiff(user_id=user_id)
+        self._validate_canonical_envelope(user_id, operations)
         transaction_ids = {str(operation.payload.get("transaction_id", "")) for operation in operations}
         idempotency_keys = {str(operation.payload.get("idempotency_key", "")) for operation in operations}
         if len(transaction_ids) != 1 or "" in transaction_ids or len(idempotency_keys) != 1 or "" in idempotency_keys:
@@ -161,8 +299,9 @@ class OperationCommitter:
         idempotency_key = next(iter(idempotency_keys))
         completed = self._transaction_marker(idempotency_key)
         if completed.exists():
-            self._finalize_canonical_outbox(transaction_id, idempotency_key, operations)
-            return self._diff_from_payload(json.loads(completed.read_text(encoding="utf-8")))
+            diff = self._validate_transaction_marker(completed, operations)
+            self._finalize_canonical_outbox(transaction_id, idempotency_key, diff.operations)
+            return diff
 
         slot_uri = next(
             (
@@ -173,10 +312,21 @@ class OperationCommitter:
             ),
             transaction_id,
         )
-        with self.path_lock.acquire(f"canonical:{slot_uri}"):
+        lock_keys = {
+            f"canonical:{slot_uri}",
+            *(
+                str(operation.target_uri)
+                for operation in operations
+                if operation.payload.get("canonical_pending_resolution") is True and operation.target_uri
+            ),
+        }
+        with ExitStack() as locks:
+            for lock_key in sorted(lock_keys):
+                locks.enter_context(self.path_lock.acquire(lock_key))
             if completed.exists():
-                self._finalize_canonical_outbox(transaction_id, idempotency_key, operations)
-                return self._diff_from_payload(json.loads(completed.read_text(encoding="utf-8")))
+                diff = self._validate_transaction_marker(completed, operations)
+                self._finalize_canonical_outbox(transaction_id, idempotency_key, diff.operations)
+                return diff
             self._preflight_canonical_revisions(operations)
             self._validate_authoritative_batch(operations)
             backups = self._capture_canonical_state(operations)
@@ -227,7 +377,7 @@ class OperationCommitter:
                 diff_id=f"diff_{transaction_id}",
             )
             self.diff_writer.write(diff)
-            self._write_transaction_marker(completed, diff)
+            self._write_transaction_marker(completed, diff, committed)
             self.audit.record(
                 user_id,
                 "canonical_memory_transaction_committed",
@@ -238,6 +388,645 @@ class OperationCommitter:
                 self.redo.commit(operation.operation_id)
             return diff
 
+    def _preflight_canonical_groups(
+        self,
+        user_id: str,
+        groups: list[list[ContextOperation]],
+    ) -> None:
+        """Validate every group before the first group can create a side effect."""
+
+        virtual_revisions: dict[str, int] = {}
+        idempotency_transactions: dict[str, str] = {}
+        for operations in groups:
+            if not operations:
+                continue
+            self._validate_canonical_envelope(user_id, operations)
+            transaction_ids = {str(operation.payload.get("transaction_id", "")) for operation in operations}
+            idempotency_keys = {str(operation.payload.get("idempotency_key", "")) for operation in operations}
+            if (
+                len(transaction_ids) != 1
+                or "" in transaction_ids
+                or len(idempotency_keys) != 1
+                or "" in idempotency_keys
+            ):
+                raise ValueError("canonical batch requires one transaction_id and idempotency_key")
+            transaction_id = next(iter(transaction_ids))
+            idempotency_key = next(iter(idempotency_keys))
+            existing_transaction = idempotency_transactions.setdefault(idempotency_key, transaction_id)
+            if existing_transaction != transaction_id:
+                raise ValueError("canonical idempotency key cannot identify multiple transactions")
+            self._canonical_transaction_request_fingerprint(operations)
+            self._canonical_transaction_effect_fingerprint(operations)
+            marker = self._transaction_marker(idempotency_key)
+            if marker.exists():
+                self._validate_transaction_marker(marker, operations)
+                continue
+            for operation in operations:
+                if operation.payload.get("canonical_pending_resolution") is True:
+                    self._validate_pending_lifecycle_cas(operation, validate_resolution_links=False)
+            self._validate_pending_resolution_batch(operations)
+            self._preflight_canonical_revisions(operations, check_revisions=False)
+            self._validate_authoritative_batch(operations)
+            for operation in operations:
+                if operation.payload.get("canonical_pending_resolution") is True:
+                    continue
+                object_payload = operation.payload.get("context_object")
+                assert isinstance(object_payload, dict)
+                uri = str(object_payload["uri"])
+                if uri not in virtual_revisions:
+                    try:
+                        current = self.source_store.read_object(uri)
+                        virtual_revisions[uri] = int(dict(current.metadata or {}).get("revision", 0))
+                    except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+                        virtual_revisions[uri] = 0
+                expected = int(operation.payload.get("expected_revision", 0))
+                if virtual_revisions[uri] != expected:
+                    raise RevisionConflictError(
+                        f"revision conflict for {uri}: expected {expected}, actual {virtual_revisions[uri]}"
+                    )
+                virtual_revisions[uri] = int(dict(object_payload.get("metadata", {}) or {}).get("revision", 0))
+
+    def _validate_canonical_envelope(self, user_id: str, operations: list[ContextOperation]) -> None:
+        """Validate immutable ownership boundaries before any marker fast path."""
+
+        if not user_id:
+            raise ValueError("canonical commit requires a user_id")
+        for operation in operations:
+            if operation.user_id != user_id:
+                raise ValueError("canonical operation user does not match commit user")
+            object_payload = operation.payload.get("context_object")
+            if not isinstance(object_payload, dict):
+                raise ValueError("canonical operation requires context_object")
+            obj = ContextObject.from_dict(object_payload)
+            target_uri = str(operation.target_uri or "")
+            if not target_uri or target_uri != obj.uri:
+                raise ValueError("canonical target_uri does not match context_object URI")
+            parsed = ContextURI.parse(obj.uri)
+            if obj.owner_user_id != user_id:
+                raise ValueError("canonical context object tenant or owner does not match commit user")
+            if operation.context_type != ContextType.MEMORY or obj.context_type != operation.context_type:
+                raise ValueError("canonical context type must be memory and match its operation")
+            operation_tenant = str(operation.payload.get("tenant_id") or "default")
+            object_tenant = str(obj.tenant_id or "default")
+            if object_tenant != operation_tenant:
+                raise ValueError("canonical context object tenant does not match operation tenant")
+            metadata = dict(obj.metadata or {})
+            if operation.payload.get("canonical_pending_resolution") is True:
+                if (
+                    operation.action != OperationAction.UPDATE
+                    or operation.payload.get("pending_lifecycle_resolution") is not True
+                    or operation.payload.get("pending_lifecycle_transition") is not True
+                    or metadata.get("canonical_kind") != "pending_proposal"
+                    or obj.schema_version != PendingMemoryProposal.SCHEMA_VERSION
+                ):
+                    raise ValueError("canonical pending resolution envelope is invalid")
+                continue
+            scope = dict(metadata.get("scope", {}) or {})
+            subject_payload = scope.get("canonical_subject")
+            if not isinstance(subject_payload, dict):
+                raise ValueError("canonical target URI requires a canonical subject")
+            subject = ScopeRef.from_dict(subject_payload)
+            expected_storage_owner = (
+                user_id
+                if subject.kind == "principal" and canonical_text(subject.id) == canonical_text(user_id)
+                else f"subject_{stable_hash([operation_tenant, subject.key], length=20)}"
+            )
+            if parsed.authority != "user" or parsed.user_id != expected_storage_owner:
+                raise ValueError("canonical target URI owner does not match canonical subject boundary")
+            visibility = dict(scope.get("visibility", {}) or {})
+            if str(visibility.get("tenant_id") or "default") != operation_tenant:
+                raise ValueError("canonical visibility scope crosses the operation tenant")
+            principals = {
+                str(item) for item in dict(scope.get("authority", {}) or {}).get("principal_ids", []) or []
+            }
+            if principals and user_id not in principals:
+                raise ValueError("canonical assertion scope does not authorize the commit user")
+            if int(operation.payload.get("expected_revision", 0) or 0) > 0:
+                self._validate_existing_canonical_boundary(obj)
+
+    def _validate_existing_canonical_boundary(self, desired: ContextObject) -> None:
+        try:
+            current = self.source_store.read_object(desired.uri)
+        except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+            return
+        desired_metadata = dict(desired.metadata or {})
+        current_metadata = dict(current.metadata or {})
+        if (
+            current.owner_user_id != desired.owner_user_id
+            or str(current.tenant_id or "default") != str(desired.tenant_id or "default")
+            or current.context_type != desired.context_type
+        ):
+            raise ValueError("canonical UPDATE cannot change owner, tenant, or context type")
+        for field_name in (
+            "canonical_kind",
+            "memory_type",
+            "slot_id",
+            "canonical_subject",
+            "identity_algorithm_version",
+        ):
+            if current_metadata.get(field_name) != desired_metadata.get(field_name):
+                raise ValueError(f"canonical UPDATE cannot change immutable boundary: {field_name}")
+        current_scope = dict(current_metadata.get("scope", {}) or {})
+        desired_scope = dict(desired_metadata.get("scope", {}) or {})
+        boundary_fields = ("canonical_subject", "applicability", "visibility")
+        if canonical_json({key: current_scope.get(key) for key in boundary_fields}) != canonical_json(
+            {key: desired_scope.get(key) for key in boundary_fields}
+        ):
+            raise ValueError("canonical UPDATE cannot weaken or change its scope")
+        current_authority = dict(current_scope.get("authority", {}) or {})
+        desired_authority = dict(desired_scope.get("authority", {}) or {})
+        current_principals = {str(item) for item in current_authority.get("principal_ids", []) or []}
+        desired_principals = {str(item) for item in desired_authority.get("principal_ids", []) or []}
+        current_services = {str(item) for item in current_authority.get("service_ids", []) or []}
+        desired_services = {str(item) for item in desired_authority.get("service_ids", []) or []}
+        if (
+            bool(desired_authority.get("inferred", False))
+            or (current_principals and not desired_principals.issubset(current_principals))
+            or (current_services and not desired_services.issubset(current_services))
+        ):
+            raise ValueError("canonical UPDATE cannot weaken or broaden assertion authority")
+
+    def _preflight_regular_operations(
+        self,
+        operations: list[ContextOperation],
+        *,
+        validate_resolution_links: bool = True,
+        validate_target_state: bool = True,
+    ) -> None:
+        """Parse every deterministic effect before any regular write occurs."""
+
+        for operation in operations:
+            if operation.payload.get("canonical_memory") is True or operation.status == OperationStatus.PENDING:
+                continue
+            marker = self._operation_marker(operation.operation_id)
+            if marker.exists():
+                self._validate_operation_marker(marker, operation)
+                continue
+            trusted_inflight = self._trusted_inflight_regular_object_effect(operation)
+            self._validate_regular_operation_effect(
+                trusted_inflight or operation,
+                validate_target_state=validate_target_state,
+                allow_existing_add=trusted_inflight is not None,
+            )
+            if trusted_inflight is not None:
+                continue
+            self._validate_pending_lifecycle_cas(
+                operation,
+                validate_resolution_links=validate_resolution_links,
+            )
+
+    def _validate_regular_operation_effect(
+        self,
+        operation: ContextOperation,
+        *,
+        validate_target_state: bool,
+        allow_existing_add: bool = False,
+    ) -> None:
+        if not isinstance(operation.payload, dict):
+            raise ValueError("regular operation payload must be an object")
+        # All records written to redo, audit, diff, and the idempotency marker
+        # must be serializable before the first SourceStore mutation.
+        canonical_json(operation.to_dict())
+        object_actions = {OperationAction.ADD, OperationAction.UPDATE, OperationAction.MERGE}
+        desired_obj: ContextObject | None = None
+        if operation.action in object_actions:
+            object_payload = operation.payload.get("context_object")
+            if not isinstance(object_payload, dict):
+                raise ValueError(f"{operation.action.value} operation requires context_object")
+            try:
+                desired_obj = ContextObject.from_dict(object_payload)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("regular operation context_object is invalid") from exc
+            if desired_obj.context_type != operation.context_type:
+                raise ValueError("regular operation context_object type mismatch")
+            if operation.target_uri and desired_obj.uri != operation.target_uri:
+                raise ValueError("regular operation target_uri does not match context_object URI")
+        elif operation.action == OperationAction.SUPERSEDE:
+            object_payload = operation.payload.get("context_object")
+            if not isinstance(object_payload, dict):
+                raise ValueError("supersede operation requires context_object")
+            try:
+                desired_obj = ContextObject.from_dict(object_payload)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("supersede replacement context_object is invalid") from exc
+            if desired_obj.context_type != operation.context_type:
+                raise ValueError("supersede replacement context type mismatch")
+            if validate_target_state and not operation.target_uri:
+                raise ValueError("supersede operation requires an existing target URI")
+
+        policy_actions = {
+            OperationAction.REWARD,
+            OperationAction.PENALIZE,
+            OperationAction.COOLDOWN,
+            OperationAction.SUPPRESS,
+            OperationAction.DISABLE,
+        }
+        if operation.action == OperationAction.REWARD:
+            RewardSignal.from_payload(operation.payload)
+        elif operation.action == OperationAction.PENALIZE:
+            PenaltySignal.from_payload(operation.payload)
+        elif operation.action == OperationAction.COOLDOWN:
+            cooldown_until = operation.payload.get("cooldown_until")
+            if cooldown_until is not None and not isinstance(cooldown_until, str):
+                raise ValueError("cooldown_until must be a string or null")
+
+        target_actions = {
+            OperationAction.UPDATE,
+            OperationAction.MERGE,
+            OperationAction.DELETE,
+            OperationAction.ARCHIVE,
+            OperationAction.COMPRESS,
+            OperationAction.REFRESH_LAYERS,
+            OperationAction.REINDEX,
+            OperationAction.SUPERSEDE,
+            *policy_actions,
+        }
+        current_target: ContextObject | None = None
+        if operation.target_uri:
+            try:
+                current_target = self.source_store.read_object(operation.target_uri)
+            except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+                current_target = None
+        self._validate_regular_canonical_boundary(
+            operation,
+            current_target,
+            desired_obj,
+            allow_existing_add=allow_existing_add,
+        )
+        if validate_target_state and operation.action in target_actions:
+            if not operation.target_uri:
+                raise ValueError(f"{operation.action.value} operation requires a target URI")
+            target = self.source_store.read_object(operation.target_uri)
+            if target.context_type != operation.context_type:
+                raise ValueError("regular operation target context type mismatch")
+            if operation.action in policy_actions and operation.context_type == ContextType.ACTION_POLICY:
+                self._read_action_policy(operation.target_uri)
+
+    def _validate_regular_canonical_boundary(
+        self,
+        operation: ContextOperation,
+        current: ContextObject | None,
+        desired: ContextObject | None,
+        *,
+        allow_existing_add: bool,
+    ) -> None:
+        """Keep canonical Slot/Claim and pending objects on their formal paths."""
+
+        def canonical_slot_or_claim(obj: ContextObject | None) -> bool:
+            if obj is None:
+                return False
+            kind = str(dict(obj.metadata or {}).get("canonical_kind") or "")
+            return (
+                kind in {"slot", "claim"}
+                or obj.schema_version == "canonical_memory_v2"
+                or "/memories/canonical/" in obj.uri
+            )
+
+        def pending_proposal(obj: ContextObject | None) -> bool:
+            if obj is None:
+                return False
+            metadata = dict(obj.metadata or {})
+            return (
+                metadata.get("canonical_kind") == "pending_proposal"
+                or obj.schema_version == PendingMemoryProposal.SCHEMA_VERSION
+                or "/memories/pending/" in obj.uri
+            )
+
+        if canonical_slot_or_claim(current) or canonical_slot_or_claim(desired):
+            raise ValueError("canonical Slot and Claim mutations require a canonical transaction")
+
+        current_pending = pending_proposal(current)
+        desired_pending = pending_proposal(desired)
+        lifecycle_transition = operation.payload.get("pending_lifecycle_transition") is True
+        declares_pending = (
+            operation.payload.get("canonical_pending_proposal") is True
+            or lifecycle_transition
+            or desired_pending
+        )
+        if operation.action == OperationAction.ADD:
+            if lifecycle_transition:
+                raise ValueError("pending proposal creation cannot declare a lifecycle transition")
+            if declares_pending:
+                if current is not None and not allow_existing_add:
+                    raise ValueError("pending proposal ADD cannot overwrite an existing object")
+                if desired is None or not desired_pending:
+                    raise ValueError("pending proposal ADD requires a canonical pending object")
+                pending = PendingMemoryProposal.from_context_object(desired)
+                if (
+                    pending.lifecycle_state != LifecycleState.PENDING
+                    or pending.lifecycle_revision != 1
+                    or pending.retry_count != 0
+                    or pending.lifecycle_history
+                ):
+                    raise ValueError("pending proposal ADD must create the initial PENDING lifecycle revision")
+                expected = PendingMemoryProposal.create(
+                    pending.proposal,
+                    pending.scope,
+                    tenant_id=str(desired.tenant_id or "default"),
+                    owner_user_id=str(desired.owner_user_id or ""),
+                    source_role=pending.source_role,
+                    pending_reason_code=pending.pending_reason_code,
+                    request_identity=pending.request_identity,
+                    related_existing_memory_ids=pending.related_existing_memory_ids,
+                    retrieval_views=pending.retrieval_views,
+                    created_at=pending.created_at,
+                )
+                expected_obj = pending.to_context_object(
+                    tenant_id=str(desired.tenant_id or "default"),
+                    owner_user_id=str(desired.owner_user_id or ""),
+                )
+                if (
+                    operation.payload.get("canonical_pending_proposal") is not True
+                    or desired.owner_user_id != operation.user_id
+                    or operation.payload.get("tenant_id") != str(desired.tenant_id or "default")
+                    or operation.payload.get("memory_type") != pending.proposal.memory_type
+                    or pending.uri != expected.uri
+                    or operation.target_uri != pending.uri
+                    or operation.payload.get("content") != pending.content()
+                    or operation.payload.get("pending_proposal_id") != pending.proposal_id
+                    or operation.payload.get("schema_version") != PendingMemoryProposal.SCHEMA_VERSION
+                    or canonical_json(desired.to_dict()) != canonical_json(expected_obj.to_dict())
+                ):
+                    raise ValueError("pending proposal ADD identity or content is invalid")
+            return
+        if current_pending:
+            if operation.action != OperationAction.UPDATE or not lifecycle_transition or not desired_pending:
+                raise ValueError("pending proposal mutations require a legal lifecycle UPDATE")
+            return
+        if declares_pending:
+            raise ValueError("pending lifecycle flags cannot target a non-pending object")
+
+    def _trusted_inflight_regular_object_effect(self, operation: ContextOperation) -> ContextOperation | None:
+        if operation.action not in {OperationAction.ADD, OperationAction.UPDATE, OperationAction.MERGE}:
+            return None
+        matches = [
+            entry
+            for entry in self.redo.pending_entries()
+            if entry.operation_id == operation.operation_id
+            and entry.phase in {"source_written", "index_written", "audit_written", "diff_written"}
+        ]
+        if not matches:
+            return None
+        if len(matches) != 1:
+            raise ValueError("regular operation has ambiguous redo state")
+        persisted = matches[0].operation
+        requested = operation
+        if requested.target_uri is None and persisted.target_uri is not None:
+            requested = ContextOperation.from_dict(operation.to_dict())
+            requested.target_uri = persisted.target_uri
+        if self._operation_effect_fingerprint(persisted) != self._operation_effect_fingerprint(requested):
+            raise ValueError("regular redo operation conflicts with the requested effect")
+        if not requested.target_uri:
+            raise ValueError("regular redo operation is missing its persisted target")
+        current = self.source_store.read_object(requested.target_uri)
+        expected_payload = self._normalized_regular_object_effect(requested)
+        if not isinstance(expected_payload, dict) or canonical_json(current.to_dict()) != canonical_json(expected_payload):
+            raise ValueError("regular redo SourceStore effect does not match its operation")
+        expected_content = str(requested.payload.get("content", ""))
+        if expected_content or requested.action == OperationAction.ADD:
+            try:
+                actual_content = self.source_store.read_content(current.layers.l2_uri or current.uri)
+            except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+                actual_content = ""
+            if actual_content != expected_content:
+                raise ValueError("regular redo SourceStore content does not match its operation")
+        return requested
+
+    def _validate_pending_lifecycle_cas(
+        self,
+        operation: ContextOperation,
+        *,
+        validate_resolution_links: bool = True,
+    ) -> None:
+        if operation.payload.get("pending_lifecycle_transition") is not True:
+            return
+        if operation.action != OperationAction.UPDATE or operation.context_type != ContextType.MEMORY:
+            raise ValueError("pending lifecycle transition must be a memory UPDATE")
+        target_uri = str(operation.target_uri or "")
+        if not target_uri:
+            raise ValueError("pending lifecycle transition requires a target URI")
+        current_obj = self.source_store.read_object(target_uri)
+        current = PendingMemoryProposal.from_context_object(current_obj)
+        expected_state = str(operation.payload.get("expected_pending_lifecycle_state") or "")
+        expected_revision = int(operation.payload.get("expected_pending_lifecycle_revision", 0) or 0)
+        expected_updated_at = str(operation.payload.get("expected_pending_updated_at") or "")
+        if (
+            not expected_state
+            or expected_revision < 1
+            or not expected_updated_at
+            or current.lifecycle_state.value != expected_state
+            or current.lifecycle_revision != expected_revision
+            or current.updated_at != expected_updated_at
+        ):
+            raise RevisionConflictError(
+                "pending proposal lifecycle conflict: "
+                f"expected {expected_state}@{expected_revision}, "
+                f"actual {current.lifecycle_state.value}@{current.lifecycle_revision}"
+            )
+        desired_payload = operation.payload.get("context_object")
+        if not isinstance(desired_payload, dict):
+            raise ValueError("pending lifecycle transition requires context_object")
+        desired_obj = ContextObject.from_dict(desired_payload)
+        desired = PendingMemoryProposal.from_context_object(desired_obj)
+        if (
+            current_obj.uri != target_uri
+            or current_obj.context_type != ContextType.MEMORY
+            or current_obj.owner_user_id != operation.user_id
+            or desired_obj.owner_user_id != current_obj.owner_user_id
+            or str(desired_obj.tenant_id or "default") != str(current_obj.tenant_id or "default")
+            or desired_obj.context_type != current_obj.context_type
+        ):
+            raise ValueError("pending lifecycle transition cannot change owner, tenant, URI, or context type")
+        if current_obj.lifecycle_state != current.lifecycle_state or desired_obj.lifecycle_state != desired.lifecycle_state:
+            raise ValueError("pending lifecycle object and payload state disagree")
+        expected_current_obj = current.to_context_object(
+            tenant_id=str(current_obj.tenant_id or "default"),
+            owner_user_id=str(current_obj.owner_user_id or ""),
+        )
+        expected_desired_obj = desired.to_context_object(
+            tenant_id=str(current_obj.tenant_id or "default"),
+            owner_user_id=str(current_obj.owner_user_id or ""),
+        )
+        if canonical_json(current_obj.to_dict()) != canonical_json(expected_current_obj.to_dict()):
+            raise ValueError("stored pending proposal object is internally inconsistent")
+        if canonical_json(desired_obj.to_dict()) != canonical_json(expected_desired_obj.to_dict()):
+            raise ValueError("pending lifecycle context_object is internally inconsistent")
+        try:
+            current_content = self.source_store.read_content(current_obj.layers.l2_uri or current_obj.uri)
+        except (FileNotFoundError, IsADirectoryError, NotADirectoryError) as exc:
+            raise ValueError("stored pending proposal content is missing") from exc
+        if current_content != current.content():
+            raise ValueError("stored pending proposal content does not match its object")
+        if operation.payload.get("content") != desired.content():
+            raise ValueError("pending lifecycle content does not match its desired object")
+        if desired.uri != current.uri or desired.lifecycle_revision != current.lifecycle_revision + 1:
+            raise ValueError("pending lifecycle transition must advance exactly one lifecycle revision")
+        mutable_fields = {
+            "lifecycle_state",
+            "retry_count",
+            "lifecycle_revision",
+            "lifecycle_history",
+            "updated_at",
+        }
+        current_core = {key: value for key, value in current.to_payload().items() if key not in mutable_fields}
+        desired_core = {key: value for key, value in desired.to_payload().items() if key not in mutable_fields}
+        if canonical_json(current_core) != canonical_json(desired_core):
+            raise ValueError("pending lifecycle transition cannot rewrite proposal content or scope")
+
+        retry_delta = desired.retry_count - current.retry_count
+        if retry_delta not in {0, 1}:
+            raise ValueError("pending lifecycle retry count must stay stable or increment once")
+        if desired.lifecycle_state == current.lifecycle_state:
+            if desired.lifecycle_state != LifecycleState.RETRYABLE or retry_delta != 1:
+                raise ValueError("pending lifecycle transition cannot silently retain the current state")
+        elif desired.lifecycle_state not in PENDING_PROPOSAL_TRANSITIONS.get(current.lifecycle_state, frozenset()):
+            raise ValueError(
+                "illegal pending proposal lifecycle transition: "
+                f"{current.lifecycle_state.value}->{desired.lifecycle_state.value}"
+            )
+        if len(desired.lifecycle_history) != len(current.lifecycle_history) + 1 or canonical_json(
+            desired.lifecycle_history[:-1]
+        ) != canonical_json(current.lifecycle_history):
+            raise ValueError("pending lifecycle history must append exactly one transition")
+        expected_history = {
+            "from": current.lifecycle_state.value,
+            "to": desired.lifecycle_state.value,
+            "from_revision": current.lifecycle_revision,
+            "to_revision": desired.lifecycle_revision,
+            "reason": str(operation.payload.get("pending_lifecycle_reason") or ""),
+            "updated_at": desired.updated_at,
+        }
+        if canonical_json(desired.lifecycle_history[-1]) != canonical_json(expected_history):
+            raise ValueError("pending lifecycle history does not match the requested transition")
+
+        expected_fields = {
+            "canonical_pending_proposal": True,
+            "pending_proposal_id": desired.proposal_id,
+            "pending_lifecycle_state": desired.lifecycle_state.value,
+            "pending_lifecycle_revision": desired.lifecycle_revision,
+            "memory_type": desired.proposal.memory_type,
+            "schema_version": PendingMemoryProposal.SCHEMA_VERSION,
+            "tenant_id": str(current_obj.tenant_id or "default"),
+        }
+        if any(operation.payload.get(key) != value for key, value in expected_fields.items()):
+            raise ValueError("pending lifecycle operation envelope disagrees with its desired proposal")
+        resolution_flag = operation.payload.get("pending_lifecycle_resolution")
+        if not isinstance(resolution_flag, bool) or resolution_flag != (
+            desired.lifecycle_state == LifecycleState.RESOLVED
+        ):
+            raise ValueError("pending lifecycle resolution flag disagrees with the desired state")
+        resolution_keys = operation.payload.get("resolution_idempotency_keys", [])
+        resolved_claims = operation.payload.get("resolved_claim_uris", [])
+        if not isinstance(resolution_keys, list | tuple) or not isinstance(resolved_claims, list | tuple):
+            raise ValueError("pending lifecycle resolution links must be lists")
+        if not resolution_flag and (resolution_keys or resolved_claims):
+            raise ValueError("non-RESOLVED pending transition cannot carry canonical resolution links")
+        if resolution_flag and (not resolution_keys or not resolved_claims):
+            raise ValueError("RESOLVED pending transition requires canonical resolution links")
+        if resolution_flag and validate_resolution_links:
+            self._validate_pending_resolution_commit(operation, current)
+
+    def _validate_pending_resolution_commit(
+        self,
+        operation: ContextOperation,
+        pending: PendingMemoryProposal,
+    ) -> None:
+        keys = tuple(
+            dict.fromkeys(str(item) for item in operation.payload.get("resolution_idempotency_keys", []) or [] if item)
+        )
+        claim_uris = tuple(
+            dict.fromkeys(str(item) for item in operation.payload.get("resolved_claim_uris", []) or [] if item)
+        )
+        if not keys or not claim_uris:
+            raise ValueError("RESOLVED pending transition requires committed canonical Claim links")
+        committed_claims_by_key: dict[str, set[str]] = {}
+        for key in keys:
+            marker = self._transaction_marker(key)
+            if not marker.exists():
+                raise RevisionConflictError("pending proposal cannot resolve before its canonical transaction commits")
+            diff = self._transaction_marker_diff(marker)
+            committed_claims_by_key[key] = {
+                str(payload.get("uri"))
+                for marker_operation in diff.operations
+                if marker_operation.payload.get("idempotency_key") == key
+                and isinstance((payload := marker_operation.payload.get("context_object")), dict)
+                and dict(payload.get("metadata", {}) or {}).get("canonical_kind") == "claim"
+            }
+        operation_tenant = str(operation.payload.get("tenant_id") or "default")
+        for uri in claim_uris:
+            claim = self.source_store.read_object(uri)
+            metadata = dict(claim.metadata or {})
+            linked_key = str(metadata.get("canonical_idempotency_key") or "")
+            if (
+                claim.lifecycle_state != LifecycleState.ACTIVE
+                or metadata.get("canonical_kind") != "claim"
+                or metadata.get("state") != "ACTIVE"
+                or claim.owner_user_id != operation.user_id
+                or str(claim.tenant_id or "default") != operation_tenant
+                or str(metadata.get("memory_type") or "") != pending.proposal.memory_type
+                or linked_key not in keys
+                or uri not in committed_claims_by_key.get(linked_key, set())
+            ):
+                raise RevisionConflictError("pending proposal resolution Claim is not the linked committed ACTIVE Claim")
+
+    def _validate_pending_resolution_batch(self, operations: list[ContextOperation]) -> None:
+        resolutions = [
+            operation
+            for operation in operations
+            if operation.payload.get("canonical_pending_resolution") is True
+        ]
+        if not resolutions:
+            return
+        if len(resolutions) != 1:
+            raise ValueError("canonical transaction can resolve exactly one pending proposal")
+        resolution = resolutions[0]
+        keys = {
+            str(item)
+            for item in resolution.payload.get("resolution_idempotency_keys", []) or []
+            if item
+        }
+        transaction_keys = {
+            str(operation.payload.get("idempotency_key") or "")
+            for operation in operations
+        }
+        claim_uris = {
+            str(item)
+            for item in resolution.payload.get("resolved_claim_uris", []) or []
+            if item
+        }
+        active_claims = {
+            str(payload.get("uri") or ""): dict(payload.get("metadata", {}) or {})
+            for operation in operations
+            if operation is not resolution
+            and isinstance((payload := operation.payload.get("context_object")), dict)
+            and dict(payload.get("metadata", {}) or {}).get("canonical_kind") == "claim"
+            and dict(payload.get("metadata", {}) or {}).get("state") == "ACTIVE"
+        }
+        if (
+            len(transaction_keys) != 1
+            or "" in transaction_keys
+            or keys != transaction_keys
+            or not claim_uris
+            or not claim_uris.issubset(active_claims)
+        ):
+            raise ValueError("pending resolution must link ACTIVE Claims in the same canonical transaction")
+        resolution_tenant = str(resolution.payload.get("tenant_id") or "default")
+        resolution_memory_type = str(resolution.payload.get("memory_type") or "")
+        for uri in claim_uris:
+            claim_payload = next(
+                operation.payload["context_object"]
+                for operation in operations
+                if isinstance(operation.payload.get("context_object"), dict)
+                and str(operation.payload["context_object"].get("uri") or "") == uri
+            )
+            metadata = active_claims[uri]
+            if (
+                str(claim_payload.get("owner_user_id") or "") != resolution.user_id
+                or str(claim_payload.get("tenant_id") or "default") != resolution_tenant
+                or str(metadata.get("memory_type") or "") != resolution_memory_type
+            ):
+                raise ValueError("pending resolution Claim crosses owner, tenant, or memory type")
+
     def _finalize_canonical_outbox(
         self,
         transaction_id: str,
@@ -246,12 +1035,36 @@ class OperationCommitter:
         *,
         slot_uri: str | None = None,
     ) -> Path:
-        outbox_path = self._write_outbox_event(
-            transaction_id,
-            idempotency_key,
-            operations,
-            status="committed",
-        )
+        outbox_path = self.root / "system" / "outbox" / f"{transaction_id}.json"
+        outbox_complete = False
+        if outbox_path.exists():
+            try:
+                existing = json.loads(outbox_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError("canonical committed outbox is unreadable") from exc
+            if existing.get("status") == "committed":
+                existing_operations = [
+                    ContextOperation.from_dict(item)
+                    for item in existing.get("operations", []) or []
+                    if isinstance(item, dict)
+                ]
+                if (
+                    existing.get("transaction_id") != transaction_id
+                    or existing.get("idempotency_key") != idempotency_key
+                    or self._canonical_transaction_request_fingerprint(existing_operations)
+                    != self._canonical_transaction_request_fingerprint(operations)
+                    or self._canonical_transaction_effect_fingerprint(existing_operations)
+                    != self._canonical_transaction_effect_fingerprint(operations)
+                ):
+                    raise ValueError("canonical committed outbox conflicts with its transaction marker")
+                outbox_complete = True
+        if not outbox_complete:
+            outbox_path = self._write_outbox_event(
+                transaction_id,
+                idempotency_key,
+                operations,
+                status="committed",
+            )
         resolved_slot = slot_uri or next(
             (
                 str(payload.get("uri"))
@@ -264,7 +1077,12 @@ class OperationCommitter:
         self._enqueue_outbox(transaction_id, resolved_slot, outbox_path, operations)
         return outbox_path
 
-    def _preflight_canonical_revisions(self, operations: list[ContextOperation]) -> None:
+    def _preflight_canonical_revisions(
+        self,
+        operations: list[ContextOperation],
+        *,
+        check_revisions: bool = True,
+    ) -> None:
         tenants: set[str] = set()
         owners: set[str] = set()
         slot_ids: set[str] = set()
@@ -275,6 +1093,34 @@ class OperationCommitter:
                 raise ValueError("canonical operation requires a context_object URI")
             uri = str(object_payload["uri"])
             metadata = dict(object_payload.get("metadata", {}) or {})
+            if operation.payload.get("canonical_pending_resolution") is True:
+                if (
+                    object_payload.get("schema_version") != PendingMemoryProposal.SCHEMA_VERSION
+                    or operation.payload.get("schema_version") != PendingMemoryProposal.SCHEMA_VERSION
+                    or metadata.get("canonical_kind") != "pending_proposal"
+                ):
+                    raise ValueError("canonical pending resolution requires a pending proposal object")
+                object_tenant = str(object_payload.get("tenant_id") or "default")
+                operation_tenant = str(operation.payload.get("tenant_id") or "default")
+                object_owner = str(object_payload.get("owner_user_id") or operation.user_id)
+                if object_tenant != operation_tenant or object_owner != operation.user_id:
+                    raise ValueError("canonical pending resolution tenant or owner mismatch")
+                scope = dict(metadata.get("scope", {}) or {})
+                subject_payload = scope.get("canonical_subject")
+                if not isinstance(subject_payload, dict):
+                    raise ValueError("canonical pending resolution requires an explicit subject")
+                tenants.add(object_tenant)
+                owners.add(object_owner)
+                slot_ids.add(str(operation.payload.get("slot_id") or ""))
+                scope_payloads.add(json.dumps(scope, ensure_ascii=False, sort_keys=True))
+                if not operation.evidence or any(
+                    not item.get("event_id") or not item.get("content_hash") for item in operation.evidence
+                ):
+                    raise ValueError("canonical pending resolution requires durable evidence references")
+                self._validate_canonical_evidence(operation)
+                if check_revisions:
+                    self._validate_pending_lifecycle_cas(operation, validate_resolution_links=False)
+                continue
             if object_payload.get("schema_version") != "canonical_memory_v2":
                 raise ValueError("canonical operation requires canonical_memory_v2 object schema")
             if operation.payload.get("schema_version") != "canonical_memory_v2":
@@ -315,16 +1161,18 @@ class OperationCommitter:
             ):
                 raise ValueError("canonical operation requires durable evidence references")
             self._validate_canonical_evidence(operation)
-            expected = int(operation.payload.get("expected_revision", 0))
-            try:
-                current = self.source_store.read_object(uri)
-                actual = int(dict(current.metadata or {}).get("revision", 0))
-            except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
-                actual = 0
-            if actual != expected:
-                raise RevisionConflictError(f"revision conflict for {uri}: expected {expected}, actual {actual}")
+            if check_revisions:
+                expected = int(operation.payload.get("expected_revision", 0))
+                try:
+                    current = self.source_store.read_object(uri)
+                    actual = int(dict(current.metadata or {}).get("revision", 0))
+                except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+                    actual = 0
+                if actual != expected:
+                    raise RevisionConflictError(f"revision conflict for {uri}: expected {expected}, actual {actual}")
         if len(tenants) != 1 or len(slot_ids - {""}) != 1 or len(scope_payloads) != 1:
             raise ValueError("canonical transaction must preserve tenant, slot, and scope boundaries")
+        self._validate_pending_resolution_batch(operations)
 
     def _validate_canonical_evidence(self, operation: ContextOperation) -> None:
         store = SessionArchiveStore(
@@ -541,6 +1389,26 @@ class OperationCommitter:
             self._add_relation(obj.uri, "belongs_to_slot", slot_uri, relation_metadata)
             self._add_relation(slot_uri, "has_claim", obj.uri, relation_metadata)
 
+    def _validate_existing_canonical_effect(self, operation: ContextOperation) -> None:
+        payload = operation.payload.get("context_object")
+        if not isinstance(payload, dict):
+            raise ValueError("canonical operation requires context_object")
+        desired = ContextObject.from_dict(payload)
+        current = self.source_store.read_object(desired.uri)
+        if canonical_json(current.to_dict()) != canonical_json(desired.to_dict()):
+            raise RevisionConflictError(
+                f"canonical recovery found a divergent object at desired revision: {desired.uri}"
+            )
+        expected_content = str(operation.payload.get("content", ""))
+        try:
+            actual_content = self.source_store.read_content(current.layers.l2_uri or current.uri)
+        except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+            actual_content = ""
+        if actual_content != expected_content:
+            raise RevisionConflictError(
+                f"canonical recovery found divergent content at desired revision: {desired.uri}"
+            )
+
     def _write_outbox_event(
         self,
         transaction_id: str,
@@ -722,11 +1590,86 @@ class OperationCommitter:
     def _transaction_marker(self, idempotency_key: str) -> Path:
         return self.root / "system" / "transactions" / f"{idempotency_key}.json"
 
-    def _write_transaction_marker(self, path: Path, diff: ContextDiff) -> None:
+    def _write_transaction_marker(
+        self,
+        path: Path,
+        diff: ContextDiff,
+        operations: list[ContextOperation],
+    ) -> None:
+        if path.exists():
+            self._validate_transaction_marker(path, operations)
+            return
+        payload = {
+            "schema_version": "canonical_transaction_marker_v2",
+            "request_fingerprint": self._canonical_transaction_request_fingerprint(operations),
+            "effect_fingerprint": self._canonical_transaction_effect_fingerprint(operations),
+            "diff": diff.to_dict(),
+        }
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + f".{uuid.uuid4().hex}.tmp")
-        tmp.write_text(json.dumps(diff.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp, path)
+
+    def _validate_transaction_marker(
+        self,
+        path: Path,
+        operations: list[ContextOperation],
+    ) -> ContextDiff:
+        diff = self._transaction_marker_diff(path)
+        if (
+            self._canonical_transaction_request_fingerprint(diff.operations)
+            != self._canonical_transaction_request_fingerprint(operations)
+            or self._canonical_transaction_effect_fingerprint(diff.operations)
+            != self._canonical_transaction_effect_fingerprint(operations)
+        ):
+            raise ValueError("canonical idempotency marker conflicts with the requested transaction")
+        return diff
+
+    def _transaction_marker_diff(self, path: Path) -> ContextDiff:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("schema_version") != "canonical_transaction_marker_v2":
+            # Legacy transaction markers stored the full persisted diff. They
+            # are still safe to compare because the desired operation payloads
+            # are present in that record.
+            return self._diff_from_payload(payload)
+        diff_payload = payload.get("diff")
+        if not isinstance(diff_payload, dict):
+            raise ValueError("canonical transaction marker is missing its persisted diff")
+        diff = self._diff_from_payload(diff_payload)
+        if (
+            payload.get("request_fingerprint")
+            != self._canonical_transaction_request_fingerprint(diff.operations)
+            or payload.get("effect_fingerprint")
+            != self._canonical_transaction_effect_fingerprint(diff.operations)
+        ):
+            raise ValueError("canonical transaction marker integrity check failed")
+        return diff
+
+    def _canonical_transaction_request_fingerprint(self, operations: list[ContextOperation]) -> str:
+        normalized = []
+        for operation in sorted(operations, key=lambda item: item.operation_id):
+            payload = operation.to_dict()
+            payload.pop("status", None)
+            normalized.append(payload)
+        canonical_json(normalized)
+        return stable_hash(normalized, length=64)
+
+    def _canonical_transaction_effect_fingerprint(self, operations: list[ContextOperation]) -> str:
+        effects = []
+        for operation in sorted(operations, key=lambda item: item.operation_id):
+            effects.append(
+                {
+                    "operation_id": operation.operation_id,
+                    "user_id": operation.user_id,
+                    "context_type": operation.context_type.value,
+                    "action": operation.action.value,
+                    "target_uri": operation.target_uri,
+                    "context_object": operation.payload.get("context_object"),
+                    "content": operation.payload.get("content", ""),
+                }
+            )
+        canonical_json(effects)
+        return stable_hash(effects, length=64)
 
     def _diff_from_payload(self, payload: dict) -> ContextDiff:
         return ContextDiff(
@@ -823,6 +1766,9 @@ class OperationCommitter:
         if set(expected_operation_ids) != set(by_id):
             raise RuntimeError("canonical recovery outbox is missing transaction operations")
         ordered = [by_id[operation_id] for operation_id in expected_operation_ids]
+        self._validate_canonical_envelope(user_id, ordered)
+        self._preflight_canonical_revisions(ordered, check_revisions=False)
+        self._validate_authoritative_batch(ordered)
         slot_uri = next(
             (
                 str(payload.get("uri"))
@@ -832,40 +1778,73 @@ class OperationCommitter:
             ),
             transaction_id,
         )
-        with self.path_lock.acquire(f"canonical:{slot_uri}"):
+        lock_keys = {
+            f"canonical:{slot_uri}",
+            *(
+                str(operation.target_uri)
+                for operation in ordered
+                if operation.payload.get("canonical_pending_resolution") is True and operation.target_uri
+            ),
+        }
+        with ExitStack() as locks:
+            for lock_key in sorted(lock_keys):
+                locks.enter_context(self.path_lock.acquire(lock_key))
             marker = self._transaction_marker(idempotency_key)
             if marker.exists():
+                diff = self._validate_transaction_marker(marker, ordered)
                 self._finalize_canonical_outbox(
                     transaction_id,
                     idempotency_key,
-                    ordered,
+                    diff.operations,
                     slot_uri=slot_uri,
                 )
                 for operation in ordered:
                     self.redo.commit(operation.operation_id)
-                return [operation.operation_id for operation in ordered]
+                return [operation.operation_id for operation in diff.operations]
             for operation in ordered:
                 payload = operation.payload.get("context_object")
                 if not isinstance(payload, dict):
                     raise ValueError("canonical recovery requires context_object")
                 uri = str(payload["uri"])
+                if operation.payload.get("canonical_pending_resolution") is True:
+                    desired_obj = ContextObject.from_dict(payload)
+                    try:
+                        current = self.source_store.read_object(uri)
+                    except (FileNotFoundError, IsADirectoryError, NotADirectoryError) as exc:
+                        raise RevisionConflictError(
+                            "canonical recovery cannot find its pending resolution target"
+                        ) from exc
+                    if canonical_json(current.to_dict()) == canonical_json(desired_obj.to_dict()):
+                        self._validate_existing_canonical_effect(operation)
+                    else:
+                        self._validate_pending_lifecycle_cas(operation, validate_resolution_links=False)
+                        self._apply_canonical_source(operation)
+                    self.audit.record(
+                        user_id,
+                        "canonical_memory_operation_applied_during_recovery",
+                        operation.to_dict(),
+                    )
+                    operation.status = OperationStatus.COMMITTED
+                    continue
                 expected = int(operation.payload.get("expected_revision", 0))
-                desired = int(dict(payload.get("metadata", {}) or {}).get("revision", 0))
+                desired_revision = int(dict(payload.get("metadata", {}) or {}).get("revision", 0))
                 try:
                     actual = int(dict(self.source_store.read_object(uri).metadata or {}).get("revision", 0))
                 except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
                     actual = 0
                 if actual == expected:
                     self._apply_canonical_source(operation)
-                elif actual != desired:
+                elif actual == desired_revision:
+                    self._validate_existing_canonical_effect(operation)
+                else:
                     raise RevisionConflictError(
-                        f"canonical recovery conflict for {uri}: expected {expected} or {desired}, actual {actual}"
+                        f"canonical recovery conflict for {uri}: expected {expected} or {desired_revision}, actual {actual}"
                     )
                 self.audit.record(user_id, "canonical_memory_operation_applied_during_recovery", operation.to_dict())
                 operation.status = OperationStatus.COMMITTED
             diff = ContextDiff(user_id=user_id, operations=ordered, diff_id=f"diff_{transaction_id}")
             self.diff_writer.write(diff)
-            self._write_transaction_marker(marker, diff)
+            self._write_transaction_marker(marker, diff, ordered)
             self.audit.record(
                 user_id,
                 "canonical_memory_transaction_recovered",
@@ -909,13 +1888,18 @@ class OperationCommitter:
             return
         path = self._operation_marker(operation.operation_id)
         path.parent.mkdir(parents=True, exist_ok=True)
+        stored_operation = operation.to_dict()
+        stored_operation["status"] = OperationStatus.COMMITTED.value
         payload = {
+            "schema_version": "operation_idempotency_marker_v2",
             "operation_id": operation.operation_id,
             "action": operation.action.value,
             "context_type": operation.context_type.value,
             "target_uri": operation.target_uri,
             "commit_group_id": operation.payload.get("commit_group_id"),
             "commit_consumer": operation.payload.get("commit_consumer"),
+            "effect_fingerprint": self._operation_effect_fingerprint(operation),
+            "operation": stored_operation,
             "status": "committed",
         }
         if path.exists():
@@ -933,18 +1917,78 @@ class OperationCommitter:
         finally:
             tmp.unlink(missing_ok=True)
 
-    def _validate_operation_marker(self, path: Path, operation: ContextOperation) -> None:
+    def _validate_operation_marker(self, path: Path, operation: ContextOperation) -> ContextOperation:
         payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("schema_version") != "operation_idempotency_marker_v2":
+            raise ValueError("legacy operation marker cannot verify the persisted effect")
         expected = {
             "operation_id": operation.operation_id,
             "action": operation.action.value,
             "context_type": operation.context_type.value,
-            "target_uri": operation.target_uri,
             "commit_group_id": operation.payload.get("commit_group_id"),
             "commit_consumer": operation.payload.get("commit_consumer"),
         }
         if any(payload.get(key) != value for key, value in expected.items()):
             raise ValueError("operation idempotency marker conflicts with the requested operation")
+        stored_payload = payload.get("operation")
+        if not isinstance(stored_payload, dict):
+            raise ValueError("operation idempotency marker is missing its persisted operation")
+        stored = ContextOperation.from_dict(stored_payload)
+        if operation.target_uri not in {None, stored.target_uri} or payload.get("target_uri") != stored.target_uri:
+            raise ValueError("operation idempotency marker conflicts with the requested target")
+        requested = operation
+        if requested.target_uri is None and stored.target_uri is not None:
+            requested = ContextOperation.from_dict(operation.to_dict())
+            requested.target_uri = stored.target_uri
+        if (
+            payload.get("effect_fingerprint") != self._operation_effect_fingerprint(stored)
+            or payload.get("effect_fingerprint") != self._operation_effect_fingerprint(requested)
+        ):
+            raise ValueError("operation idempotency marker conflicts with the requested effect")
+        stored.status = OperationStatus.COMMITTED
+        return stored
+
+    def _operation_effect_fingerprint(self, operation: ContextOperation) -> str:
+        if operation.action in {OperationAction.ADD, OperationAction.UPDATE, OperationAction.MERGE}:
+            effect_payload = {
+                "context_object": self._normalized_regular_object_effect(operation),
+                "content": operation.payload.get("content", ""),
+            }
+        elif operation.action == OperationAction.SUPERSEDE:
+            effect_payload = {
+                "context_object": self._normalized_regular_object_effect(operation),
+                "content": operation.payload.get("content", ""),
+                "reason": operation.payload.get("reason", operation.payload.get("supersede_reason", "")),
+            }
+        else:
+            effect_payload = {
+                key: value
+                for key, value in operation.payload.items()
+                if key not in {"target_resolution_reason", "target_candidates"}
+            }
+        effect = {
+            "operation_id": operation.operation_id,
+            "user_id": operation.user_id,
+            "context_type": operation.context_type.value,
+            "action": operation.action.value,
+            "target_uri": operation.target_uri,
+            "effect_payload": effect_payload,
+        }
+        canonical_json(effect)
+        return stable_hash(effect, length=64)
+
+    def _normalized_regular_object_effect(self, operation: ContextOperation) -> object:
+        payload = operation.payload.get("context_object")
+        if not isinstance(payload, dict):
+            return payload
+        obj = ContextObject.from_dict(payload)
+        if operation.payload.get("content"):
+            obj.layers = ContextLayers(
+                l0_uri=f"{obj.uri}/.abstract.md",
+                l1_uri=f"{obj.uri}/.overview.md",
+                l2_uri=f"{obj.uri}/content.md",
+            )
+        return obj.to_dict()
 
     def _coalesce_non_policy_operations(self, operations: list[ContextOperation]) -> list[ContextOperation]:
         policy_actions = {

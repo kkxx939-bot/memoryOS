@@ -19,6 +19,7 @@ def test_action_context_builder_prefers_l1_falls_back_to_l0_and_records_layers(t
         context_type=ContextType.MEMORY,
         title="anchor",
         owner_user_id="u1",
+        metadata={"memory_kind": "anchor_memory"},
         layers=ContextLayers(l0_uri=f"{anchor_uri}/.abstract.md", l1_uri=f"{anchor_uri}/.overview.md", l2_uri=f"{anchor_uri}/content.md"),
     )
     source.write_object(anchor, content="L2")
@@ -62,6 +63,7 @@ def test_action_context_builder_loads_l2_only_for_strong_relevance_and_budget(tm
         context_type=ContextType.MEMORY,
         title="anchor",
         owner_user_id="u1",
+        metadata={"memory_kind": "anchor_memory"},
         layers=ContextLayers(l0_uri=f"{anchor_uri}/.abstract.md", l1_uri=f"{anchor_uri}/.overview.md", l2_uri=f"{anchor_uri}/content.md"),
     )
     source.write_object(anchor, content="L2")

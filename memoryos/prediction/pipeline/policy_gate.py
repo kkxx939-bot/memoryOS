@@ -43,6 +43,15 @@ class PolicyGate:
         return PolicyDecision(mode="do_nothing", allowed=True, action="do_nothing", reason="Candidate is not intervenable.")
 
     def _context_block(self, action_context: ActionContext, action_policy: ActionPolicy) -> PolicyDecision | None:
+        if action_context.user_id != action_policy.user_id:
+            return PolicyDecision(mode="blocked", allowed=False, action="do_nothing", reason="ActionPolicy owner mismatch.")
+        if action_policy.memory_anchor_uri and not self._has_verified_memory_anchor(action_context, action_policy):
+            return PolicyDecision(
+                mode="ask_user",
+                allowed=True,
+                action="ask_user",
+                reason="Declared memory anchor is unavailable or unverified.",
+            )
         memory_text = self._section_text(action_context, "memory_rules").lower()
         if any(token in memory_text for token in ("以后别自动", "不要自动", "禁止自动", "先问我", "no auto", "do not automatically")):
             return PolicyDecision(mode="ask_user", allowed=True, action="ask_user", reason="Policy memory blocks automatic execution.")
@@ -58,6 +67,18 @@ class PolicyGate:
         if any(token in recent_text for token in ("negative_feedback", "explicit_negative", "user_closed", "用户关闭", "负反馈")):
             return PolicyDecision(mode="ask_user", allowed=True, action="ask_user", reason="Recent negative feedback requires confirmation.")
         return None
+
+    def _has_verified_memory_anchor(
+        self,
+        action_context: ActionContext,
+        action_policy: ActionPolicy,
+    ) -> bool:
+        return any(
+            str(item.get("uri") or "") == action_policy.memory_anchor_uri
+            and item.get("verified_exact_anchor") is True
+            and str(item.get("context_type") or "") == "memory"
+            for item in self._section_items(action_context, "memory_anchor")
+        )
 
     def _section_items(self, action_context: ActionContext, section: str) -> list[dict]:
         return list(action_context.packed_context.get("slices", {}).get(section, {}).get("items", []))

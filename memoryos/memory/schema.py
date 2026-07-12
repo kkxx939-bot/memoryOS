@@ -58,9 +58,30 @@ COMMON_PROVENANCE_FIELDS = (
     "model_id",
     "prompt_version",
 )
-COMMON_DISPLAY_FIELDS = ("title", "display_name", "summary", "details", "rationale", "reason", "aliases")
-PROFILE_DISPLAY_FIELDS = ("title", "display_name", "details", "rationale", "reason", "aliases")
+COMMON_DISPLAY_FIELDS = (
+    "title",
+    "display_name",
+    "display_text",
+    "source_text",
+    "summary",
+    "details",
+    "rationale",
+    "reason",
+    "aliases",
+)
+PROFILE_DISPLAY_FIELDS = COMMON_DISPLAY_FIELDS
 COMMON_APPLICABILITY_FIELDS = ("scope", "project_id", "workspace_id", "applies_to", "visibility")
+COMMON_CLAIM_QUALIFIER_FIELDS = (
+    "environment",
+    "device",
+    "activity",
+    "valid_time",
+    "condition",
+    "conditions",
+    "exception",
+    "exceptions",
+    "applicability_qualifier",
+)
 
 
 @dataclass(frozen=True)
@@ -91,6 +112,17 @@ class MemoryTypeSchema:
         semantic qualifiers from being silently ignored by identity.
         """
 
+        if (
+            "canonical_value" in self.claim_identity_fields
+            and (
+                value_fields.get("canonical_value") is None
+                or value_fields.get("canonical_value") == ""
+            )
+        ):
+            # Applicability qualifiers refine a semantic value; they cannot be
+            # the value. Without a canonical core, two unrelated claims in the
+            # same environment/condition would collapse onto one identity.
+            return ()
         if self.claim_identity_fields and "*" not in self.claim_identity_fields:
             return tuple(field_name for field_name in self.claim_identity_fields if field_name in value_fields)
         excluded = {*self.provenance_fields, *self.display_fields, *self.applicability_fields}
@@ -127,7 +159,7 @@ class MemoryTypeRegistry:
                     "evidence": FieldMergeMode.APPEND_UNIQUE,
                 },
                 slot_identity_fields=("attribute_key",),
-                claim_identity_fields=("*",),
+                claim_identity_fields=("canonical_value", *COMMON_CLAIM_QUALIFIER_FIELDS),
                 provenance_fields=COMMON_PROVENANCE_FIELDS,
                 display_fields=PROFILE_DISPLAY_FIELDS,
                 applicability_fields=COMMON_APPLICABILITY_FIELDS,
@@ -147,7 +179,12 @@ class MemoryTypeRegistry:
                     "evidence": FieldMergeMode.APPEND_UNIQUE,
                 },
                 slot_identity_fields=("subject", "dimension"),
-                claim_identity_fields=("*",),
+                claim_identity_fields=(
+                    "canonical_value",
+                    "preference_value",
+                    "value",
+                    *COMMON_CLAIM_QUALIFIER_FIELDS,
+                ),
                 provenance_fields=COMMON_PROVENANCE_FIELDS,
                 display_fields=COMMON_DISPLAY_FIELDS,
                 applicability_fields=COMMON_APPLICABILITY_FIELDS,
@@ -167,7 +204,7 @@ class MemoryTypeRegistry:
                     "details": FieldMergeMode.PATCH_TEXT,
                 },
                 slot_identity_fields=("entity_type", "canonical_entity_id"),
-                claim_identity_fields=("*",),
+                claim_identity_fields=("canonical_value", "name", *COMMON_CLAIM_QUALIFIER_FIELDS),
                 provenance_fields=COMMON_PROVENANCE_FIELDS,
                 display_fields=COMMON_DISPLAY_FIELDS,
                 applicability_fields=COMMON_APPLICABILITY_FIELDS,
@@ -186,7 +223,12 @@ class MemoryTypeRegistry:
                     "details": FieldMergeMode.PATCH_TEXT,
                 },
                 slot_identity_fields=("event_key",),
-                claim_identity_fields=("*",),
+                claim_identity_fields=(
+                    "canonical_value",
+                    "outcome",
+                    "occurred_at",
+                    *COMMON_CLAIM_QUALIFIER_FIELDS,
+                ),
                 provenance_fields=COMMON_PROVENANCE_FIELDS,
                 display_fields=COMMON_DISPLAY_FIELDS,
                 applicability_fields=COMMON_APPLICABILITY_FIELDS,
@@ -205,7 +247,7 @@ class MemoryTypeRegistry:
                     "project_id": FieldMergeMode.IMMUTABLE,
                 },
                 slot_identity_fields=("rule_topic",),
-                claim_identity_fields=("*",),
+                claim_identity_fields=("canonical_value", "subject", *COMMON_CLAIM_QUALIFIER_FIELDS),
                 provenance_fields=COMMON_PROVENANCE_FIELDS,
                 display_fields=COMMON_DISPLAY_FIELDS,
                 applicability_fields=COMMON_APPLICABILITY_FIELDS,
@@ -224,7 +266,7 @@ class MemoryTypeRegistry:
                     "project_id": FieldMergeMode.IMMUTABLE,
                 },
                 slot_identity_fields=("decision_topic",),
-                claim_identity_fields=("*",),
+                claim_identity_fields=("canonical_value", *COMMON_CLAIM_QUALIFIER_FIELDS),
                 provenance_fields=COMMON_PROVENANCE_FIELDS,
                 display_fields=COMMON_DISPLAY_FIELDS,
                 applicability_fields=COMMON_APPLICABILITY_FIELDS,
@@ -245,7 +287,7 @@ class MemoryTypeRegistry:
                     "evidence": FieldMergeMode.APPEND_UNIQUE,
                 },
                 slot_identity_fields=("task_pattern", "environment_signature"),
-                claim_identity_fields=("*",),
+                claim_identity_fields=("canonical_value", "outcome", *COMMON_CLAIM_QUALIFIER_FIELDS),
                 provenance_fields=COMMON_PROVENANCE_FIELDS,
                 display_fields=COMMON_DISPLAY_FIELDS,
                 applicability_fields=COMMON_APPLICABILITY_FIELDS,

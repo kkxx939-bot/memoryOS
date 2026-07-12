@@ -7,6 +7,7 @@ from collections.abc import Callable
 from typing import Any
 
 from memoryos.contextdb.layers.layer_generator import l0_abstract, l1_overview
+from memoryos.contextdb.model.lifecycle import LifecycleState
 from memoryos.contextdb.session.commit_group import CommitGroupStatus, CommitGroupStore
 from memoryos.contextdb.session.planners import (
     ActionPolicyCommitPlanner,
@@ -81,7 +82,11 @@ class SessionCommitService:
                 )
             )
         return SessionCommitResult(
-            task_id=archive.task_id, archive_uri=archive.archive_uri, status="queued", state=SessionCommitState.QUEUED
+            task_id=archive.task_id,
+            archive_uri=archive.archive_uri,
+            status="queued",
+            state=SessionCommitState.QUEUED,
+            archive_committed=True,
         )
 
     def async_commit(self, archive: SessionArchive) -> SessionCommitResult:
@@ -271,15 +276,33 @@ class SessionCommitService:
         operations: list[ContextOperation],
         planning_context: PlanningContext | None = None,
     ) -> dict:
+        planned_operations = list(operations)
         try:
-            return self._commit_or_describe(archive.user_id, operations)
+            committed = self._commit_or_describe(archive.user_id, operations)
         except RevisionConflictError as exc:
+            partial_diff = exc.committed_diff
             if self.committer is not None:
                 self.committer.recover_pending_canonical(archive.user_id)
             if planning_context is None:
                 raise RevisionConflictError("revision conflict has no request-scoped PlanningContext") from exc
             replanned = self.memory_planner.replan(planning_context, archive)
-            return self._commit_or_describe(archive.user_id, list(replanned.operations))
+            planned_operations.extend(replanned.operations)
+            if self.committer is not None:
+                retried_diff = self.committer.commit(archive.user_id, list(replanned.operations))
+                combined_diff = self.committer.combine_committed_diffs(
+                    archive.user_id,
+                    [item for item in (partial_diff, retried_diff) if item is not None],
+                )
+                committed = self._diff_payload(combined_diff, status="committed")
+            else:
+                retried = self._commit_or_describe(archive.user_id, list(replanned.operations))
+                partial = (
+                    self._diff_payload(partial_diff, status="committed")
+                    if partial_diff is not None
+                    else None
+                )
+                committed = self._merge_diff_payloads(*(item for item in (partial, retried) if item is not None))
+        return self._memory_commit_metadata(committed, planned_operations)
 
     def _run_consumer(
         self,
@@ -426,6 +449,13 @@ class SessionCommitService:
         memory_diff: dict[str, Any],
     ) -> SessionCommitResult:
         pending = {"status": "pending", "operations": [], "operation_count": 0}
+        memory_diff = {
+            "archive_committed": True,
+            "canonical_active_operation_count": 0,
+            "pending_count": 0,
+            "pending_persisted": False,
+            **memory_diff,
+        }
         self.archive_store.write_async_outputs(
             archive.archive_uri,
             abstract=abstract,
@@ -442,7 +472,13 @@ class SessionCommitService:
 
     def _result(self, archive: SessionArchive, group: CommitGroupStatus) -> SessionCommitResult:
         failed_consumers = [name for name, item in group.consumers.items() if item.status == "failed"]
-        if group.complete:
+        memory_result = dict(group.canonical_result or {})
+        pending_count = int(memory_result.get("pending_count", 0) or 0)
+        active_count = int(memory_result.get("canonical_active_operation_count", 0) or 0)
+        pending_persisted = bool(memory_result.get("pending_persisted", False))
+        if group.complete and pending_count:
+            status = "done_with_pending"
+        elif group.complete:
             status = "done"
         elif group.canonical_status == "completed" and failed_consumers:
             status = "derived_failed"
@@ -461,6 +497,10 @@ class SessionCommitService:
             commit_group_id=group.group_id,
             canonical_committed=group.canonical_status == "completed",
             commit_group_status=group.to_dict(),
+            archive_committed=True,
+            canonical_active_operation_count=active_count,
+            pending_count=pending_count,
+            pending_persisted=pending_persisted,
         )
 
     def _tenant_id(self, archive: SessionArchive) -> str:
@@ -498,3 +538,101 @@ class SessionCommitService:
         payload["status"] = status
         payload["operation_count"] = len(diff.operations)
         return payload
+
+    def _merge_diff_payloads(self, *payloads: dict[str, Any]) -> dict[str, Any]:
+        merged: dict[str, Any] = {"status": "committed"}
+        for key in ("operations", "pending_operations", "rejected_operations"):
+            by_id: dict[str, dict[str, Any]] = {}
+            for payload in payloads:
+                for operation in payload.get(key, []) or []:
+                    if not isinstance(operation, dict):
+                        continue
+                    operation_id = str(operation.get("operation_id") or "")
+                    if operation_id:
+                        by_id.setdefault(operation_id, operation)
+            merged[key] = list(by_id.values())
+        merged["operation_count"] = len(merged["operations"])
+        return merged
+
+    def _memory_commit_metadata(
+        self,
+        payload: dict[str, Any],
+        planned_operations: list[ContextOperation],
+    ) -> dict[str, Any]:
+        planned_pending = {
+            str(operation.target_uri or operation.payload.get("pending_proposal_id") or operation.operation_id)
+            for operation in planned_operations
+            if operation.payload.get("canonical_pending_proposal") is True
+        }
+        committed_pending = {
+            str(operation.get("target_uri") or operation.get("payload", {}).get("pending_proposal_id") or "")
+            for operation in payload.get("operations", []) or []
+            if isinstance(operation, dict)
+            and operation.get("payload", {}).get("canonical_pending_proposal") is True
+        }
+        if self.committer is not None and planned_pending - committed_pending:
+            raise RuntimeError("canonical pending proposals were not durably committed")
+        outstanding_pending = self._outstanding_pending_uris(
+            planned_operations,
+            committed_pending,
+        )
+        active_operations = [
+            operation
+            for operation in payload.get("operations", []) or []
+            if isinstance(operation, dict)
+            and operation.get("payload", {}).get("canonical_memory") is True
+            and dict(
+                dict(operation.get("payload", {}).get("context_object", {}) or {}).get("metadata", {}) or {}
+            ).get("canonical_kind")
+            == "claim"
+            and dict(
+                dict(operation.get("payload", {}).get("context_object", {}) or {}).get("metadata", {}) or {}
+            ).get("state")
+            == "ACTIVE"
+        ]
+        return {
+            **payload,
+            "archive_committed": True,
+            "canonical_active_operation_count": len(active_operations),
+            "pending_count": len(outstanding_pending),
+            "pending_persisted": bool(outstanding_pending) and self.committer is not None,
+        }
+
+    def _outstanding_pending_uris(
+        self,
+        planned_operations: list[ContextOperation],
+        committed_pending: set[str],
+    ) -> set[str]:
+        outstanding_states = {
+            LifecycleState.PENDING.value,
+            LifecycleState.RETRYABLE.value,
+            LifecycleState.CONFIRMED.value,
+        }
+        if self.committer is not None:
+            outstanding: set[str] = set()
+            for uri in committed_pending:
+                try:
+                    obj = self.committer.source_store.read_object(uri)
+                except (FileNotFoundError, IsADirectoryError, NotADirectoryError) as exc:
+                    raise RuntimeError("committed pending proposal is missing from SourceStore") from exc
+                metadata = dict(obj.metadata or {})
+                if (
+                    metadata.get("canonical_kind") == "pending_proposal"
+                    and obj.lifecycle_state.value in outstanding_states
+                ):
+                    outstanding.add(uri)
+            return outstanding
+
+        planned_states: dict[str, str] = {}
+        for operation in planned_operations:
+            if operation.payload.get("canonical_pending_proposal") is not True:
+                continue
+            uri = str(operation.target_uri or operation.payload.get("pending_proposal_id") or operation.operation_id)
+            object_payload = operation.payload.get("context_object")
+            object_state = (
+                str(object_payload.get("lifecycle_state") or "")
+                if isinstance(object_payload, dict)
+                else ""
+            )
+            planned_states[uri] = str(operation.payload.get("pending_lifecycle_state") or object_state)
+        return {uri for uri, state in planned_states.items() if state in outstanding_states}

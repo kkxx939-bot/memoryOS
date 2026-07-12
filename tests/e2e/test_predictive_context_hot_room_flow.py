@@ -44,7 +44,11 @@ def test_predictive_context_hot_room_flow_uses_production_entrypoint(tmp_path) -
         context_type=ContextType.MEMORY,
         title="home comfort",
         owner_user_id="u1",
-        metadata={"summary": "User comfort memory anchor for hot room behavior."},
+        metadata={
+            "memory_kind": "anchor_memory",
+            "admission": {"decision": "accept"},
+            "summary": "User comfort memory anchor for hot room behavior.",
+        },
     )
     client.context_db.seed_object(anchor, content="User comfort memory anchor for hot room behavior.")
 

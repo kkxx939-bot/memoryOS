@@ -19,10 +19,14 @@ from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.contextdb.store import IndexStore, RelationStore, SourceStore
 from memoryos.contextdb.store.source_store import LockStore, QueueStore
 from memoryos.contextdb.store.vector_store import VectorStore
+from memoryos.contextdb.transaction.path_lock import PathLock
 from memoryos.core.ids import stable_hash
 from memoryos.memory.canonical import (
     IDENTITY_ALGORITHM_V2,
+    Atomicity,
+    Attribution,
     CanonicalMemoryRepository,
+    Durability,
     EpistemicStatus,
     EvidenceRef,
     MemoryScope,
@@ -31,8 +35,11 @@ from memoryos.memory.canonical import (
     MemorySemanticReconciler,
     MemoryTransactionPlanner,
     MemoryTransitionPolicy,
+    ModalForce,
+    ProposalEvidenceValidator,
     ResolvedMemoryIdentity,
     SemanticAssessment,
+    UtteranceMode,
     bind_field_evidence,
 )
 from memoryos.memory.extraction import MemoryExtractorBackend
@@ -321,33 +328,31 @@ class MemoryOSClient:
         title: str = "",
         memory_type: str = "project_decision",
         project_id: str = "",
+        constraint_polarity: str = "",
+        condition: str = "",
+        exception: str = "",
         connect_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """把显式记忆请求转成证据和提案，再走完整提交链。"""
+        """Commit a structured explicit-memory command through the canonical chain."""
 
         if not content.strip():
             raise ValueError("content is required")
         normalized_type = _normalize_explicit_memory_type(memory_type)
         retrieval_views = _explicit_retrieval_views(normalized_type, user_id=user_id, project_id=project_id)
         connect = self._parse_connect_metadata(connect_metadata).to_dict()
-        event_id = f"explicit_{stable_hash([user_id, project_id, normalized_type, title, content], length=32)}"
-        archive = SessionArchive(
-            user_id=user_id,
-            session_id=event_id,
-            archive_uri=f"memoryos://user/{user_id}/sessions/history/{event_id}",
-            messages=[
-                {
-                    "id": event_id,
-                    "role": "user",
-                    "event_type": "PREFERENCE" if normalized_type == MemoryType.PREFERENCE.value else "DECISION",
-                    "content": f"I confirm: {content}",
-                }
+        event_id = "explicit_" + stable_hash(
+            [
+                user_id,
+                project_id,
+                normalized_type,
+                title,
+                content,
+                constraint_polarity,
+                condition,
+                exception,
             ],
-            metadata={"connect": connect, "project_id": project_id},
+            length=32,
         )
-        self.session_archive_store.write_sync_archive(archive)
-        planner = self.session_commit_service.memory_planner
-        episode = planner.episode_adapter.adapt(archive)
         identity_fields = _explicit_identity_fields(
             normalized_type,
             title=title,
@@ -355,6 +360,51 @@ class MemoryOSClient:
             project_id=project_id,
             event_id=event_id,
         )
+        value_fields: dict[str, Any] = {"canonical_value": content}
+        modal_force = ModalForce.PREFER
+        if normalized_type == MemoryType.PROJECT_RULE.value:
+            modal_force = _explicit_rule_modal_force(
+                constraint_polarity,
+                has_condition=bool(condition.strip() or exception.strip()),
+            )
+            value_fields["constraint_polarity"] = modal_force.value
+            value_fields["rule"] = content
+            if condition.strip():
+                value_fields["condition"] = condition.strip()
+            if exception.strip():
+                value_fields["exception"] = exception.strip()
+        elif normalized_type != MemoryType.PREFERENCE.value:
+            modal_force = ModalForce.NONE
+        command_payload = {
+            "command": "REMEMBER_CANONICAL_VALUE",
+            "memory_type": normalized_type,
+            "identity_fields": identity_fields,
+            "value_fields": value_fields,
+        }
+        command_text = json.dumps(command_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        archive_uri = f"memoryos://user/{user_id}/sessions/history/{event_id}"
+        archive = SessionArchive(
+            user_id=user_id,
+            session_id=event_id,
+            archive_uri=archive_uri,
+            messages=[
+                {
+                    "id": event_id,
+                    "role": "user",
+                    "event_type": "EXPLICIT_MEMORY_COMMAND",
+                    "content": command_text,
+                }
+            ],
+            metadata={
+                "connect": connect,
+                "project_id": project_id,
+                "structured_memory_command": True,
+            },
+        )
+        archive = self._persist_structured_command_archive(archive)
+        connect = dict(archive.metadata.get("connect", {}) or {})
+        planner = self.session_commit_service.memory_planner
+        episode = planner.episode_adapter.adapt(archive)
         system_fields = tuple(identity_fields)
         suggested_scopes = tuple(
             scope
@@ -367,26 +417,47 @@ class MemoryOSClient:
                 and scope.kind == ("workspace" if project_id else "principal")
             )
         )
-        evidence_refs = (EvidenceRef.from_event(episode.events[0], source_uri=archive.archive_uri),)
-        value_fields = {"canonical_value": content}
+        event_text = episode.events[0].text()
+        evidence_refs = (
+            EvidenceRef.from_event(
+                episode.events[0],
+                source_uri=archive.archive_uri,
+                span_start=0,
+                span_end=len(event_text),
+            ),
+        )
         proposal = MemorySemanticProposal(
             proposal_id=f"proposal_{event_id}",
             memory_type=normalized_type,
             identity_fields=identity_fields,
             value_fields=value_fields,
-            semantic=SemanticAssessment("confirmation", "confirmed", "current", "unrelated"),
+            semantic=SemanticAssessment(
+                "confirmation",
+                "confirmed",
+                "current",
+                "unrelated",
+                UtteranceMode.ASSERTION.value,
+                Attribution.SOURCE_ACTOR.value,
+                Durability.DURABLE.value,
+                modal_force.value,
+                Atomicity.ATOMIC.value,
+            ),
             epistemic_status=EpistemicStatus.EXPLICIT,
             suggested_scope_refs=suggested_scopes,
             related_memory_ids=(),
             evidence_refs=evidence_refs,
             field_evidence_refs=_explicit_field_evidence(identity_fields, value_fields, evidence_refs),
             confidence=1.0,
-            extractor_version="explicit_remember_v2",
+            extractor_version="explicit_remember_v3",
+            prompt_version="explicit_remember_v3",
+            semantic_contract_version="v3",
+            atomic_evidence_ref=evidence_refs[0],
             metadata={
                 "source_role": "user",
                 "source_adapter_id": str(connect.get("adapter_id", "")),
                 "source_session_id": event_id,
                 "system_identity_fields": system_fields,
+                "effect_authority": "structured_explicit_command",
             },
         )
         formed = planner.formation.plan(
@@ -395,9 +466,33 @@ class MemoryOSClient:
             episode=episode,
             retrieval_views=retrieval_views,
         )
+        operations = list(formed.operations)
+        if formed.decision.value == "PENDING":
+            diff = self.committer.commit(user_id, operations) if operations else None
+            pending_uri = formed.pending_uri or next(
+                (
+                    str(operation.target_uri)
+                    for operation in operations
+                    if operation.payload.get("canonical_pending_proposal") is True
+                ),
+                "",
+            )
+            if not pending_uri:
+                raise RuntimeError("pending formation did not identify its durable proposal")
+            lifecycle_state = (formed.pending_lifecycle_state or "PENDING").upper()
+            pending_outstanding = lifecycle_state in {"PENDING", "CONFIRMED", "RETRYABLE"}
+            return {
+                "uri": pending_uri,
+                "status": lifecycle_state,
+                "lifecycle_revision": formed.pending_lifecycle_revision or 1,
+                "diff_id": diff.diff_id if diff is not None else "",
+                "pending_count": 1 if pending_outstanding else 0,
+                "pending_persisted": pending_outstanding,
+                "proposal_record_persisted": True,
+                "canonical_active_operation_count": 0,
+            }
         if formed.decision.value != "ACCEPT_FOR_RECONCILE":
             raise ValueError(f"explicit memory was not admitted: {formed.reason}")
-        operations = list(formed.operations)
         if not operations:
             existing = self.search_context(
                 content[:120],
@@ -441,6 +536,139 @@ class MemoryOSClient:
         self.context_db.commit_operation(operation)
         return {"uri": uri, "status": "COMMITTED", "lifecycle_state": LifecycleState.DELETED.value}
 
+    def list_pending(
+        self,
+        *,
+        user_id: str,
+        tenant_id: str = "default",
+        lifecycle_states: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        records = CanonicalMemoryRepository(self.source_store).list_pending(
+            tenant_id=tenant_id,
+            owner_user_id=user_id,
+            lifecycle_states=tuple(lifecycle_states or ()),
+        )
+        return [{"uri": record.uri, **record.to_payload()} for record in records]
+
+    def review_pending(
+        self,
+        *,
+        user_id: str,
+        pending_uri: str,
+        decision: str,
+        expected_lifecycle_revision: int,
+        expected_proposal_fingerprint: str,
+        command_id: str,
+        tenant_id: str = "default",
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Apply a user-owned structured review without accepting arbitrary operations or targets."""
+
+        if expected_lifecycle_revision < 1:
+            raise ValueError("expected_lifecycle_revision must be positive")
+        if not expected_proposal_fingerprint or not command_id:
+            raise ValueError("pending review requires proposal fingerprint and command_id")
+        repository = CanonicalMemoryRepository(self.source_store)
+        pending = repository.load_pending(
+            pending_uri,
+            tenant_id=tenant_id,
+            owner_user_id=user_id,
+        )
+        if (
+            pending.lifecycle_revision != expected_lifecycle_revision
+            or pending.proposal.fingerprint != expected_proposal_fingerprint
+        ):
+            raise ValueError("pending review expected revision or proposal fingerprint mismatch")
+        normalized_decision = str(decision or "").strip().upper()
+        formation = self.session_commit_service.memory_planner.formation
+        review_reason = f"structured_review:{command_id}:{reason}".rstrip(":")
+        terminal = {
+            "REJECT": LifecycleState.REJECTED,
+            "EXPIRE": LifecycleState.EXPIRED,
+            "RETRY": LifecycleState.RETRYABLE,
+            "CONFIRM": LifecycleState.CONFIRMED,
+        }
+        if normalized_decision in terminal:
+            operation = formation.plan_pending_lifecycle_transition(
+                pending_uri,
+                terminal[normalized_decision],
+                tenant_id=tenant_id,
+                owner_user_id=user_id,
+                commit_group_id=f"pending-review:{command_id}",
+                reason=review_reason,
+                retry_increment=normalized_decision == "RETRY",
+            )
+            diff = self.committer.commit(user_id, [operation])
+            updated = repository.load_pending(
+                pending_uri,
+                tenant_id=tenant_id,
+                owner_user_id=user_id,
+            )
+            return {
+                "uri": pending_uri,
+                "status": updated.lifecycle_state.value,
+                "lifecycle_revision": updated.lifecycle_revision,
+                "diff_id": diff.diff_id,
+            }
+        if normalized_decision != "CONFIRM_AND_APPLY":
+            raise ValueError("pending review decision must be CONFIRM, CONFIRM_AND_APPLY, REJECT, EXPIRE, or RETRY")
+        if pending.lifecycle_state in {LifecycleState.PENDING, LifecycleState.RETRYABLE}:
+            confirmation = formation.plan_pending_lifecycle_transition(
+                pending_uri,
+                LifecycleState.CONFIRMED,
+                tenant_id=tenant_id,
+                owner_user_id=user_id,
+                commit_group_id=f"pending-review:{command_id}",
+                reason=review_reason,
+            )
+            self.committer.commit(user_id, [confirmation])
+            pending = repository.load_pending(
+                pending_uri,
+                tenant_id=tenant_id,
+                owner_user_id=user_id,
+            )
+        elif pending.lifecycle_state != LifecycleState.CONFIRMED:
+            raise ValueError("only PENDING, RETRYABLE, or CONFIRMED proposals can be applied")
+        evidence = pending.proposal.atomic_evidence_ref or (
+            pending.proposal.evidence_refs[0] if pending.proposal.evidence_refs else None
+        )
+        if evidence is None or not evidence.source_uri:
+            raise ValueError("confirmed pending proposal has no durable source archive")
+        archive = self.session_archive_store.read_archive(evidence.source_uri, tenant_id=tenant_id)
+        episode = self.session_commit_service.memory_planner.episode_adapter.adapt(archive)
+        resolved = formation.plan_confirmed_pending_resolution(
+            pending_uri,
+            pending.proposal,
+            archive=archive,
+            episode=episode,
+            tenant_id=tenant_id,
+            owner_user_id=user_id,
+            commit_group_id=f"pending-resolution:{command_id}",
+            retrieval_views=list(pending.retrieval_views),
+            reason=review_reason,
+        )
+        diff = self.committer.commit(user_id, list(resolved.operations))
+        self.memory_projection_worker.process_pending()
+        final = repository.load_pending(
+            pending_uri,
+            tenant_id=tenant_id,
+            owner_user_id=user_id,
+        )
+        claim_uris = [
+            str(operation.target_uri)
+            for operation in resolved.operations
+            if isinstance((payload := operation.payload.get("context_object")), dict)
+            and dict(payload.get("metadata", {}) or {}).get("canonical_kind") == "claim"
+            and dict(payload.get("metadata", {}) or {}).get("state") == "ACTIVE"
+        ]
+        return {
+            "uri": pending_uri,
+            "status": final.lifecycle_state.value,
+            "lifecycle_revision": final.lifecycle_revision,
+            "resolved_claim_uris": claim_uris,
+            "diff_id": diff.diff_id,
+        }
+
     def _forget_canonical_claim(self, user_id: str, obj) -> dict[str, Any]:  # noqa: ANN001
         metadata = dict(obj.metadata or {})
         slot_uri = obj.uri.rsplit("/claims/", 1)[0]
@@ -469,6 +697,13 @@ class MemoryOSClient:
         if claim.current.state == state:
             return {"uri": obj.uri, "status": "COMMITTED", "memory_state": state, "diff_id": ""}
         event_id = f"forget:{stable_hash([user_id, obj.uri, claim.latest_revision.revision], length=24)}"
+        command_payload = {
+            "command": "RETRACT_CANONICAL_CLAIM",
+            "claim_id": claim.claim_id,
+            "claim_uri": obj.uri,
+            "memory_type": str(metadata["memory_type"]),
+        }
+        command_text = json.dumps(command_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         archive = SessionArchive(
             user_id=user_id,
             session_id=event_id,
@@ -477,52 +712,82 @@ class MemoryOSClient:
                 {
                     "id": event_id,
                     "role": "user",
-                    "event_type": "RETRACTION",
-                    "content": (
-                        f"I retract memory {obj.uri}: "
-                        f"{json.dumps(dict(claim.current.value_fields), ensure_ascii=False, sort_keys=True)}."
-                    ),
+                    "event_type": "EXPLICIT_MEMORY_COMMAND",
+                    "content": command_text,
                 }
             ],
-            metadata={"tenant_id": str(obj.tenant_id or "default")},
+            metadata={
+                "tenant_id": str(obj.tenant_id or "default"),
+                "structured_memory_command": True,
+            },
         )
-        self.session_archive_store.write_sync_archive(archive)
+        archive = self._persist_structured_command_archive(archive)
         episode = self.session_commit_service.memory_planner.episode_adapter.adapt(archive)
-        evidence = EvidenceRef.from_event(episode.events[0], source_uri=archive.archive_uri)
-        proposal = MemorySemanticNormalizer().normalize(
-            MemorySemanticProposal(
-                proposal_id=event_id,
-                memory_type=str(metadata["memory_type"]),
-                identity_fields=slot.identity_fields,
-                value_fields=claim.current.value_fields,
-                semantic=SemanticAssessment("retraction", "confirmed", "current", "corrects"),
-                epistemic_status=EpistemicStatus.EXPLICIT,
-                suggested_scope_refs=memory_scope.applicability.all_of,
-                related_memory_ids=(claim.claim_id,),
-                evidence_refs=(evidence,),
-                field_evidence_refs=_explicit_field_evidence(
-                    slot.identity_fields,
-                    claim.current.value_fields,
-                    (evidence,),
-                ),
-                confidence=1.0,
-                extractor_version="explicit_forget_v2",
-                prompt_version="explicit_forget_v2",
-                metadata={
-                    "source_role": "user",
-                    "source_session_id": event_id,
-                    "asserted_by": user_id,
-                    "system_identity_fields": list(slot.identity_fields),
-                },
-            )
+        event_text = episode.events[0].text()
+        evidence = EvidenceRef.from_event(
+            episode.events[0],
+            source_uri=archive.archive_uri,
+            span_start=0,
+            span_end=len(event_text),
         )
+        raw_proposal = MemorySemanticProposal(
+            proposal_id=event_id,
+            memory_type=str(metadata["memory_type"]),
+            identity_fields=slot.identity_fields,
+            value_fields=claim.current.value_fields,
+            semantic=SemanticAssessment(
+                "retraction",
+                "confirmed",
+                "current",
+                "corrects",
+                UtteranceMode.ASSERTION.value,
+                Attribution.SOURCE_ACTOR.value,
+                Durability.DURABLE.value,
+                ModalForce.NONE.value,
+                Atomicity.ATOMIC.value,
+            ),
+            epistemic_status=EpistemicStatus.EXPLICIT,
+            suggested_scope_refs=memory_scope.applicability.all_of,
+            related_memory_ids=(claim.claim_id,),
+            evidence_refs=(evidence,),
+            field_evidence_refs=_explicit_field_evidence(
+                slot.identity_fields,
+                claim.current.value_fields,
+                (evidence,),
+            ),
+            confidence=1.0,
+            extractor_version="explicit_forget_v3",
+            prompt_version="explicit_forget_v3",
+            semantic_contract_version="v3",
+            atomic_evidence_ref=evidence,
+            metadata={
+                "source_role": "user",
+                "source_session_id": event_id,
+                "asserted_by": user_id,
+                "system_identity_fields": list(slot.identity_fields),
+                "system_value_fields": list(claim.current.value_fields),
+                "effect_authority": "structured_explicit_command",
+            },
+        )
+        validated = ProposalEvidenceValidator().validate(raw_proposal, episode)
+        if not validated.valid:
+            raise ValueError(f"explicit forget evidence validation failed: {','.join(validated.errors)}")
+        proposal = MemorySemanticNormalizer().normalize(validated.proposal)
         reconciliation = MemorySemanticReconciler().reconcile(
             proposal,
             identity,
             slot=slot,
             claims=claims,
         )
-        transition = MemoryTransitionPolicy().apply(proposal, identity, reconciliation)
+        transition_policy = MemoryTransitionPolicy()
+        transition = transition_policy._apply_structured_retraction(
+            proposal,
+            identity,
+            reconciliation,
+            authorization_id=event_id,
+            owner_user_id=user_id,
+            tenant_id=str(obj.tenant_id or "default"),
+        )
         plan = MemoryTransactionPlanner().build(
             proposal,
             memory_scope,
@@ -546,6 +811,28 @@ class MemoryOSClient:
         )
         self.memory_projection_worker.process_pending()
         return {"uri": obj.uri, "status": "COMMITTED", "memory_state": state, "diff_id": diff.diff_id}
+
+    def _persist_structured_command_archive(self, archive: SessionArchive) -> SessionArchive:
+        """Create one immutable evidence archive for a stable structured command id."""
+
+        tenant_id = self.session_archive_store.archive_tenant(archive)
+        with PathLock(self.lock_store).acquire(f"structured-command:{tenant_id}:{archive.archive_uri}"):
+            if not self.session_archive_store.archive_exists(archive.archive_uri, tenant_id=tenant_id):
+                self.session_archive_store.write_sync_archive(archive)
+                return archive
+            persisted = self.session_archive_store.read_archive(archive.archive_uri, tenant_id=tenant_id)
+            stable_metadata = ("tenant_id", "project_id", "structured_memory_command")
+            if (
+                persisted.user_id != archive.user_id
+                or persisted.session_id != archive.session_id
+                or persisted.messages != archive.messages
+                or any(
+                    persisted.metadata.get(key) != archive.metadata.get(key)
+                    for key in stable_metadata
+                )
+            ):
+                raise ValueError("structured memory command archive identity conflict")
+            return persisted
 
     def archive_read(self, archive_uri: str) -> dict[str, Any]:
         archive = self.session_archive_store.read_archive(archive_uri)
@@ -582,8 +869,8 @@ class MemoryOSClient:
             "queue_store": "ready",
             "worker": "ready" if heartbeat.exists() else "stopped",
             "memory_extractor": "ready"
-            if self.session_commit_service.memory_planner.extractor.__class__.__name__ != "RuleFallbackExtractor"
-            else "fallback",
+            if self.session_commit_service.memory_planner.extractor is not None
+            else "disabled",
             "embedding": "ready" if self.embedding_provider else "disabled",
             "vector_store": "ready" if self.vector_store else "disabled",
             "reranker": "ready" if self.reranker else "disabled",
@@ -760,6 +1047,11 @@ def _explicit_field_evidence(
         "semantic.commitment": evidence_refs,
         "semantic.temporal_scope": evidence_refs,
         "semantic.relation_to_existing": evidence_refs,
+        "semantic.utterance_mode": evidence_refs,
+        "semantic.attribution": evidence_refs,
+        "semantic.durability": evidence_refs,
+        "semantic.modal_force": evidence_refs,
+        "semantic.atomicity": evidence_refs,
         "transition": evidence_refs,
     }
     return bind_field_evidence(
@@ -767,6 +1059,7 @@ def _explicit_field_evidence(
         value_fields,
         evidence_refs,
         bindings=bindings,
+        semantic_contract_version="v3",
     )
 
 
@@ -794,6 +1087,44 @@ def _scope_keys(scopes: list[dict[str, Any]] | None) -> list[str]:
 def _normalize_explicit_memory_type(memory_type: str) -> str:
     aliases = {"user_profile": MemoryType.PROFILE.value, "user_preference": MemoryType.PREFERENCE.value}
     return aliases.get(memory_type, memory_type)
+
+
+def _explicit_rule_modal_force(raw: str, *, has_condition: bool) -> ModalForce:
+    normalized = str(raw or "").strip().upper().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "REQUIRED": ModalForce.REQUIRE,
+        "FORBIDDEN": ModalForce.FORBID,
+        "ALLOWED": ModalForce.ALLOW,
+        "PREFERRED": ModalForce.PREFER,
+        "DISCOURAGED": ModalForce.DISCOURAGE,
+    }
+    try:
+        force = aliases.get(normalized)
+        if force is None:
+            force = ModalForce(normalized)
+    except ValueError as exc:
+        allowed = ", ".join(
+            item.value
+            for item in (
+                ModalForce.REQUIRE,
+                ModalForce.FORBID,
+                ModalForce.ALLOW,
+                ModalForce.PREFER,
+                ModalForce.DISCOURAGE,
+                ModalForce.CONDITIONAL_REQUIRE,
+                ModalForce.CONDITIONAL_FORBID,
+            )
+        )
+        raise ValueError(f"project_rule requires constraint_polarity in {{{allowed}}}") from exc
+    if has_condition and force == ModalForce.REQUIRE:
+        return ModalForce.CONDITIONAL_REQUIRE
+    if has_condition and force == ModalForce.FORBID:
+        return ModalForce.CONDITIONAL_FORBID
+    if has_condition and force not in {ModalForce.CONDITIONAL_REQUIRE, ModalForce.CONDITIONAL_FORBID}:
+        raise ValueError("project_rule condition or exception requires REQUIRE or FORBID polarity")
+    if not has_condition and force in {ModalForce.CONDITIONAL_REQUIRE, ModalForce.CONDITIONAL_FORBID}:
+        raise ValueError("conditional project_rule requires condition or exception")
+    return force
 
 
 def _explicit_retrieval_views(memory_type: str, *, user_id: str, project_id: str) -> list[str]:

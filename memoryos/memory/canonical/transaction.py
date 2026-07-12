@@ -23,6 +23,10 @@ from memoryos.operations.model.operation_action import OperationAction
 class RevisionConflictError(RuntimeError):
     """Raised when a planned revision no longer matches canonical state."""
 
+    def __init__(self, message: str, *, committed_diff=None) -> None:  # noqa: ANN001
+        self.committed_diff = committed_diff
+        super().__init__(message)
+
 
 @dataclass(frozen=True)
 class PlannedMemoryOperation:

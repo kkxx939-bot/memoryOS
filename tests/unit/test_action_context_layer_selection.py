@@ -24,6 +24,7 @@ class ActionContextLayerSelectionTest(unittest.TestCase):
                 context_type=ContextType.MEMORY,
                 title="anchor",
                 owner_user_id="u1",
+                metadata={"memory_kind": "anchor_memory"},
                 layers=ContextLayers(l0_uri=f"{anchor_uri}/.abstract.md", l1_uri=f"{anchor_uri}/.overview.md", l2_uri=f"{anchor_uri}/content.md"),
             )
             source.write_object(anchor, content="L2 should not be used")
@@ -48,7 +49,13 @@ class ActionContextLayerSelectionTest(unittest.TestCase):
             index = InMemoryIndexStore()
             relations = InMemoryRelationStore()
             anchor_uri = "memoryos://user/u1/memories/anchors/hot"
-            anchor = ContextObject(uri=anchor_uri, context_type=ContextType.MEMORY, title="anchor", owner_user_id="u1", metadata={"summary": "summary text"})
+            anchor = ContextObject(
+                uri=anchor_uri,
+                context_type=ContextType.MEMORY,
+                title="anchor",
+                owner_user_id="u1",
+                metadata={"memory_kind": "anchor_memory", "summary": "summary text"},
+            )
             source.write_object(anchor)
             policy = ActionPolicy(user_id="u1", scene_key="hot", action="turn_on_ac", memory_anchor_uri=anchor_uri)
             relations.add_relation(ContextRelation(source_uri=policy.uri, relation_type="anchored_by", target_uri=anchor_uri, metadata={"owner_user_id": "u1"}))

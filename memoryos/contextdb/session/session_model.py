@@ -72,3 +72,7 @@ class SessionCommitResult:
     commit_group_id: str = ""
     canonical_committed: bool = False
     commit_group_status: dict[str, Any] = field(default_factory=dict)
+    archive_committed: bool = False
+    canonical_active_operation_count: int = 0
+    pending_count: int = 0
+    pending_persisted: bool = False

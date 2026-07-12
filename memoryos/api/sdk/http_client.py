@@ -101,6 +101,25 @@ class HTTPMemoryOSClient:
     def forget(self, **kwargs: Any) -> dict[str, Any]:
         return self.request("POST", "/v1/memories/forget", kwargs)
 
+    def list_pending(
+        self,
+        *,
+        user_id: str,
+        tenant_id: str = "default",
+        lifecycle_states: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        query = urllib.parse.urlencode(
+            {
+                "user_id": user_id,
+                "tenant_id": tenant_id,
+                "lifecycle_state": ",".join(lifecycle_states or []),
+            }
+        )
+        return list(self.request("GET", f"/v1/memories/pending?{query}").get("results", []))
+
+    def review_pending(self, **kwargs: Any) -> dict[str, Any]:
+        return self.request("POST", "/v1/memories/pending/review", kwargs)
+
     def read(self, uri: str, *, layer: str = "L2") -> dict[str, Any]:
         query = urllib.parse.urlencode({"uri": uri, "layer": layer})
         return self.request("GET", f"/v1/context/read?{query}")

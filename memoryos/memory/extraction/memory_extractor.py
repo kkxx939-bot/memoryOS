@@ -7,12 +7,15 @@ from typing import Protocol
 
 from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.memory.canonical.proposal import MemorySemanticProposal
-from memoryos.memory.schema import MemoryCandidateDraft, MemoryTypeSchema
+from memoryos.memory.schema import MemoryTypeSchema
 
 
 class MemoryExtractorBackend(Protocol):
+    semantic_proposal_backend: bool
+    llm_semantic_backend: bool
+
     def extract(
         self,
         archive: SessionArchive,
         schemas: Sequence[MemoryTypeSchema],
-    ) -> Sequence[MemoryCandidateDraft | MemorySemanticProposal]: ...
+    ) -> Sequence[MemorySemanticProposal]: ...

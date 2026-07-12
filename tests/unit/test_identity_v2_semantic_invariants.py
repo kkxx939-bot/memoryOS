@@ -58,9 +58,20 @@ def _explicit_bindings(
         "semantic.commitment": evidence_refs,
         "semantic.temporal_scope": evidence_refs,
         "semantic.relation_to_existing": evidence_refs,
+        "semantic.utterance_mode": evidence_refs,
+        "semantic.attribution": evidence_refs,
+        "semantic.durability": evidence_refs,
+        "semantic.modal_force": evidence_refs,
+        "semantic.atomicity": evidence_refs,
         "transition": evidence_refs,
     }
-    return bind_field_evidence(identity_fields, value_fields, evidence_refs, bindings=bindings)
+    return bind_field_evidence(
+        identity_fields,
+        value_fields,
+        evidence_refs,
+        bindings=bindings,
+        semantic_contract_version="v3",
+    )
 
 
 def _episode():  # noqa: ANN202
@@ -88,24 +99,50 @@ def _proposal(
     proposal_id: str = "p1",
 ) -> MemorySemanticProposal:
     episode = _episode()
-    evidence = (EvidenceRef.from_event(episode.events[0], source_uri=episode.source_uris[0]),)
+    text = episode.events[0].text()
+    evidence = (
+        EvidenceRef.from_event(
+            episode.events[0],
+            source_uri=episode.source_uris[0],
+            span_start=0,
+            span_end=len(text),
+        ),
+    )
     identity = identity_fields or {"decision_topic": "storage"}
     values = {"canonical_value": value}
+    raw_semantic = semantic or SemanticAssessment("confirmation", "confirmed", "current", "unrelated")
+    v3_semantic = replace(
+        raw_semantic,
+        utterance_mode="assertion",
+        attribution="source_actor",
+        durability="durable",
+        modal_force="none",
+        atomicity="atomic",
+    )
     return MemorySemanticNormalizer().normalize(
         MemorySemanticProposal(
             proposal_id=proposal_id,
             memory_type="project_decision",
             identity_fields=identity,
             value_fields=values,
-            semantic=semantic or SemanticAssessment("confirmation", "confirmed", "current", "unrelated"),
+            semantic=v3_semantic,
             epistemic_status=EpistemicStatus.EXPLICIT,
             suggested_scope_refs=(ScopeRef("memoryos", "workspace", "workspace-a"),),
             related_memory_ids=(),
             evidence_refs=evidence,
             field_evidence_refs=_explicit_bindings(identity, values, evidence),
             confidence=0.99,
-            extractor_version="test",
-            metadata={"transition_evidence_validated": True, **dict(metadata or {})},
+            extractor_version="test_v3",
+            prompt_version="test_v3",
+            semantic_contract_version="v3",
+            atomic_evidence_ref=evidence[0],
+            metadata={
+                "source_role": "user",
+                "transition_evidence_validated": True,
+                "semantic_contract_validated": True,
+                "atomic_evidence_validated": True,
+                **dict(metadata or {}),
+            },
         )
     )
 
@@ -165,7 +202,7 @@ def test_same_asset_id_under_different_workspace_does_not_collide() -> None:
     assert first.slot_id != second.slot_id
 
 
-def test_claim_identity_uses_all_semantic_fields_and_is_dict_order_independent() -> None:
+def test_claim_identity_uses_core_value_and_applicability_not_arbitrary_metadata() -> None:
     scope = _scope(ScopeRef("memoryos", "workspace", "workspace-a"))
     resolver = StableMemoryIdentityResolver()
     first = _proposal(
@@ -177,14 +214,17 @@ def test_claim_identity_uses_all_semantic_fields_and_is_dict_order_independent()
         identity_fields={"decision_topic": {"level": "primary", "area": "storage"}},
         proposal_id="p2",
     )
-    qualified = replace(first, value_fields={**dict(first.value_fields), "semantic_qualifier": "local-only"})
+    metadata_only = replace(first, value_fields={**dict(first.value_fields), "semantic_qualifier": "local-only"})
+    qualified = replace(first, value_fields={**dict(first.value_fields), "environment": "local-only"})
 
     first_id = resolver.resolve(first, scope, tenant_id="t1", owner_user_id="u1")
     reordered_id = resolver.resolve(reordered, scope, tenant_id="t1", owner_user_id="u1")
+    metadata_only_id = resolver.resolve(metadata_only, scope, tenant_id="t1", owner_user_id="u1")
     qualified_id = resolver.resolve(qualified, scope, tenant_id="t1", owner_user_id="u1")
 
     assert first_id.slot_id == reordered_id.slot_id
     assert first_id.claim_id == reordered_id.claim_id
+    assert first_id.claim_id == metadata_only_id.claim_id
     assert first_id.claim_id != qualified_id.claim_id
 
 
@@ -293,7 +333,7 @@ def test_ambiguous_relation_never_becomes_alternative_or_changes_state() -> None
         MemoryTransitionPolicy().apply(ambiguous, identity, reconciled)
 
 
-def test_duplicate_is_noop_and_contradiction_preserves_current_history() -> None:
+def test_duplicate_is_noop_and_contradiction_requires_review_without_changing_current() -> None:
     scope = _scope(ScopeRef("memoryos", "workspace", "workspace-a"))
     initial = _proposal()
     _identity, _reconciled, first = _apply(initial, scope)
@@ -321,16 +361,23 @@ def test_duplicate_is_noop_and_contradiction_preserves_current_history() -> None
             "semantic_relation_evidence_validated": True,
         },
     )
-    _contradiction_identity, contradiction_reconciled, contradiction_transition = _apply(
+    contradiction_identity = StableMemoryIdentityResolver().resolve(
         contradiction,
         scope,
-        first.slot,
-        first.claims,
+        tenant_id="t1",
+        owner_user_id="u1",
+    )
+    contradiction_reconciled = MemorySemanticReconciler().reconcile(
+        contradiction,
+        contradiction_identity,
+        slot=first.slot,
+        claims=first.claims,
     )
     assert contradiction_reconciled.relation == SemanticRelation.CONTRADICTS
-    assert contradiction_transition.slot.active_claim_id == first.slot.active_claim_id
-    states = {claim.canonical_value: claim.current.state for claim in contradiction_transition.claims}
-    assert states == {"sqlite": "ACTIVE", "postgresql": "CONFLICTED"}
+    with pytest.raises(PendingSemanticReconciliation, match="nonfinal_relation_requires_review"):
+        MemoryTransitionPolicy().apply(contradiction, contradiction_identity, contradiction_reconciled)
+    assert first.slot.active_claim_id is not None
+    assert {claim.canonical_value: claim.current.state for claim in first.claims} == {"sqlite": "ACTIVE"}
 
 
 def test_multiple_active_claims_raise_structured_invariant_before_reconciliation() -> None:
@@ -441,7 +488,7 @@ def test_non_contiguous_revision_history_is_rejected() -> None:
         )
 
 
-def test_late_correction_is_historical_and_does_not_replace_current() -> None:
+def test_late_correction_is_pending_and_does_not_replace_current() -> None:
     scope = _scope(ScopeRef("memoryos", "workspace", "workspace-a"))
     initial = _proposal(metadata={"effective_at": "2026-01-01T00:00:00+00:00"})
     _identity, _reconciled, first = _apply(initial, scope)
@@ -451,10 +498,22 @@ def test_late_correction_is_historical_and_does_not_replace_current() -> None:
         semantic=SemanticAssessment("correction", "confirmed", "past", "corrects"),
         metadata={"effective_at": "2025-01-01T00:00:00+00:00"},
     )
-    _late_identity, reconciled, transitioned = _apply(late, scope, first.slot, first.claims)
+    late_identity = StableMemoryIdentityResolver().resolve(
+        late,
+        scope,
+        tenant_id="t1",
+        owner_user_id="u1",
+    )
+    reconciled = MemorySemanticReconciler().reconcile(
+        late,
+        late_identity,
+        slot=first.slot,
+        claims=first.claims,
+    )
 
     assert reconciled.historical_only
-    assert transitioned.slot.active_claim_id == first.slot.active_claim_id
-    historical = next(claim for claim in transitioned.claims if claim.claim_id != first.slot.active_claim_id)
-    assert historical.current.state == "PROPOSED"
-    assert historical.current.qualifiers["non_current_historical"] is True
+    assert reconciled.relation == SemanticRelation.AMBIGUOUS
+    with pytest.raises(PendingSemanticReconciliation):
+        MemoryTransitionPolicy().apply(late, late_identity, reconciled)
+    assert first.slot.active_claim_id is not None
+    assert {claim.canonical_value: claim.current.state for claim in first.claims} == {"sqlite": "ACTIVE"}

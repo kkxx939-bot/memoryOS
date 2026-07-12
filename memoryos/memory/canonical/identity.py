@@ -20,6 +20,11 @@ from memoryos.memory.schema import MemoryTypeRegistry, MemoryTypeSchema
 
 IDENTITY_ALGORITHM_V2 = "identity_v2"
 
+_BUILTIN_VALUE_ALIASES = {
+    "postgres": "postgresql",
+    "postgresql": "postgresql",
+}
+
 
 def canonical_text(value: Any) -> str:
     """Normalize scalar identity text without depending on presentation case."""
@@ -82,7 +87,12 @@ class AliasRegistry:
 
     def resolve(self, namespace: str, value: Any) -> str:
         normalized = canonical_text(value)
-        return self._aliases.get(namespace, {}).get(normalized, normalized)
+        configured = self._aliases.get(namespace, {}).get(normalized)
+        if configured is not None:
+            return str(configured)
+        if namespace.endswith(":value"):
+            return _BUILTIN_VALUE_ALIASES.get(normalized, normalized)
+        return normalized
 
     def canonical_scope(self, scope: ScopeRef) -> ScopeRef:
         identifier = self.resolve(f"scope:{scope.kind}", scope.id)
@@ -258,7 +268,7 @@ class StableMemoryIdentityResolver:
     def _claim_identity(self, schema: MemoryTypeSchema, proposal: MemorySemanticProposal) -> dict[str, Any]:
         keys = schema.claim_identity_keys(dict(proposal.value_fields))
         if not keys:
-            raise ValueError("claim requires schema-declared semantic value fields")
+            raise ValueError("claim requires canonical semantic value")
         return {
             key: self._canonical_field(proposal.memory_type, key, proposal.value_fields[key]) for key in sorted(keys)
         }

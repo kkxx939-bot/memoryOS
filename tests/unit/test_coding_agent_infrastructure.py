@@ -180,6 +180,12 @@ def test_http_client_exposes_remote_memory_health_and_trace_routes() -> None:
     client.health()
     client.remember(user_id="u1", content="remember")
     client.forget(user_id="u1", uri="memoryos://user/u1/memories/x")
+    client.list_pending(user_id="u1", lifecycle_states=["PENDING"])
+    client.review_pending(
+        user_id="u1",
+        pending_uri="memoryos://user/u1/memories/pending/p1",
+        decision="REJECT",
+    )
     client.read("memoryos://user/u1/memories/x", layer="L1")
     client.recall_trace("trace/id")
     client.checkpoint_session("session-1")
@@ -190,6 +196,8 @@ def test_http_client_exposes_remote_memory_health_and_trace_routes() -> None:
         "/health",
         "/v1/memories/remember",
         "/v1/memories/forget",
+        "/v1/memories/pending?user_id=u1&tenant_id=default&lifecycle_state=PENDING",
+        "/v1/memories/pending/review",
         "/v1/context/read?uri=memoryos%3A%2F%2Fuser%2Fu1%2Fmemories%2Fx&layer=L1",
         "/v1/recall-traces/trace%2Fid",
         "/v1/sessions/session-1/checkpoint",

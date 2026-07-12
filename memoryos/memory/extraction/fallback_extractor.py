@@ -9,12 +9,26 @@ from typing import Any
 
 from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.core.ids import stable_hash
-from memoryos.memory.canonical.evidence import EvidenceSignalKind, EvidenceSignalMatcher
+from memoryos.memory.admission import MemoryAdmissionGate
+from memoryos.memory.canonical.episode import EvidenceEpisode, SessionArchiveEpisodeAdapter
+from memoryos.memory.canonical.evidence import (
+    ConstraintPolarity,
+    EvidenceSignalKind,
+    EvidenceSignalMatcher,
+    has_explicit_replacement_cue,
+)
+from memoryos.memory.canonical.formation import CandidateProposalAdapter
+from memoryos.memory.canonical.prefetch import PrefetchedMemory
+from memoryos.memory.canonical.proposal import MemorySemanticProposal
 from memoryos.memory.extraction.memory_extractor import MemoryExtractorBackend
-from memoryos.memory.schema import MemoryCandidateDraft, MemoryType, MemoryTypeSchema
+from memoryos.memory.schema import AdmissionDecision, MemoryCandidateDraft, MemoryType, MemoryTypeSchema
 from memoryos.memory.view import adapter_id_from_archive, project_id_from_archive
 
-PROFILE_RE = re.compile(r"(?i)(^i am\b|i work\b|我是|我在|负责人|长期从事)")
+PROFILE_RE = re.compile(
+    r"(?i)(^i am\b|i work\b|i speak\b|my (?:primary |preferred |working )?language\b|"
+    r"my active project\b|i am working on\b|我是|我在|负责人|长期从事|主要使用|"
+    r"我的(?:主要|常用|工作)?语言|我会说|当前(?:的)?项目|我正在(?:参与|负责|开发))"
+)
 EVENT_RE = re.compile(r"(?i)(completed|implemented|fixed|released|verified|完成|修复|发布|已验证|已实现)")
 AGENT_EXPERIENCE_RE = re.compile(
     r"(?i)(reusable|lesson|pattern|approach|outcome|verified|implemented|fixed|经验|可复用|做法|结果|验证)"
@@ -26,14 +40,16 @@ REMEMBER_MARKERS = ("记住：", "记住:", "remember:", "Remember:")
 
 
 class RuleFallbackExtractor(MemoryExtractorBackend):
-    """没有模型时做保守提取，只处理能稳定识别的语义。"""
+    """没有模型时只发现可复核候选，不授予 canonical 写权限。"""
 
-    candidate_backend = True
+    semantic_proposal_backend = True
+    llm_semantic_backend = False
+    pending_only = True
 
     def __init__(self, signal_matcher: EvidenceSignalMatcher | None = None) -> None:
         self.signal_matcher = signal_matcher or EvidenceSignalMatcher()
 
-    def extract(
+    def extract_drafts(
         self,
         archive: SessionArchive,
         schemas: Sequence[MemoryTypeSchema],
@@ -89,6 +105,85 @@ class RuleFallbackExtractor(MemoryExtractorBackend):
             )
         return candidates
 
+    def extract(
+        self,
+        archive: SessionArchive,
+        schemas: Sequence[MemoryTypeSchema],
+    ) -> list[MemorySemanticProposal]:
+        """Return only proposals even when the degraded extractor is called directly."""
+
+        episode = SessionArchiveEpisodeAdapter().adapt(archive)
+        return self.extract_with_context(
+            archive,
+            schemas,
+            existing_memories=(),
+            episode=episode,
+        )
+
+    def extract_with_context(
+        self,
+        archive: SessionArchive,
+        schemas: Sequence[MemoryTypeSchema],
+        *,
+        existing_memories: Sequence[PrefetchedMemory],
+        episode: EvidenceEpisode,
+    ) -> list[MemorySemanticProposal]:
+        """Adapt explicit degraded-mode findings into the one proposal pipeline."""
+
+        candidates = self.extract_drafts(archive, schemas)
+        for candidate in candidates:
+            if not candidate.fields.get("_replacement_explicit"):
+                continue
+            identity_key = {
+                MemoryType.PROJECT_DECISION: "decision_topic",
+                MemoryType.PROJECT_RULE: "rule_topic",
+                MemoryType.PROFILE: "attribute_key",
+                MemoryType.PREFERENCE: "dimension",
+            }.get(candidate.memory_type)
+            if not identity_key:
+                continue
+            identity_value = str(candidate.fields.get(identity_key) or "").casefold()
+            matches = [
+                item
+                for item in existing_memories
+                if str(getattr(item, "memory_type", "")) == candidate.memory_type.value
+                and str(getattr(item, "state", "")).upper() == "ACTIVE"
+                and str(dict(getattr(item, "identity_fields", {}) or {}).get(identity_key) or "").casefold()
+                == identity_value
+            ]
+            if len(matches) != 1:
+                # Explicit wording without a unique, same-slot active target is
+                # reviewable evidence, not authority to guess a target. Keep
+                # the evidenced relation so formation can perform an exact
+                # Identity V2 slot lookup; without that lookup transition still
+                # fails closed into durable pending.
+                candidate.fields["_target_resolution_pending"] = True
+                continue
+            active = matches[0]
+            candidate.fields["_related_memory_ids"] = [str(active.uri)] if getattr(active, "uri", "") else []
+            candidate.fields["_related_slot_ids"] = (
+                [str(active.slot_id)] if getattr(active, "slot_id", "") else []
+            )
+            candidate.fields["_related_claim_ids"] = (
+                [str(active.claim_id)] if getattr(active, "claim_id", "") else []
+            )
+        adapter = CandidateProposalAdapter()
+        gate = MemoryAdmissionGate()
+        project_id = project_id_from_archive(archive)
+        adapter_id = adapter_id_from_archive(archive)
+        reviewable = [
+            candidate
+            for candidate in candidates
+            if gate.evaluate(
+                candidate,
+                user_id=archive.user_id,
+                project_id=project_id,
+                adapter_id=adapter_id,
+            ).decision
+            in {AdmissionDecision.ACCEPT, AdmissionDecision.PENDING}
+        ]
+        return [adapter.adapt(candidate, episode, archive) for candidate in reviewable]
+
     def _message_candidates(
         self,
         text: str,
@@ -134,9 +229,19 @@ class RuleFallbackExtractor(MemoryExtractorBackend):
                 )
             return candidates
 
-        constraint_signal = EvidenceSignalKind.CONSTRAINT in signal_kinds and not self._preference_negation(normalized)
+        constraint_signal = self._constraint_polarity(normalized) is not None and not self._preference_negation(
+            normalized
+        )
+        attributed = self._attributed_statement(normalized)
+        attributed_without_resolution = attributed and not self._has_user_resolution(normalized)
         rule_fields = self._rule_fields(normalized, project_id)
-        if MemoryType.PROJECT_RULE in schema_types and constraint_signal and rule_fields.get("rule_topic"):
+        if (
+            MemoryType.PROJECT_RULE in schema_types
+            and constraint_signal
+            and rule_fields.get("rule_topic")
+            and not attributed
+            and role in {"user", "system"}
+        ):
             candidates.append(
                 self._candidate(
                     MemoryType.PROJECT_RULE,
@@ -179,14 +284,18 @@ class RuleFallbackExtractor(MemoryExtractorBackend):
         decision_fields = self._decision_fields(normalized, project_id)
         if (
             MemoryType.PROJECT_DECISION in schema_types
-            and proposal_kinds
-            & {
-                EvidenceSignalKind.CONFIRMATION,
-                EvidenceSignalKind.PROPOSAL,
-                EvidenceSignalKind.EVALUATION,
-            }
+            and (
+                proposal_kinds
+                & {
+                    EvidenceSignalKind.CONFIRMATION,
+                    EvidenceSignalKind.PROPOSAL,
+                    EvidenceSignalKind.EVALUATION,
+                }
+                or decision_fields.get("_semantic_relation") in {"alternative", "supersedes"}
+            )
             and not self._evaluation_without_candidate(normalized)
             and decision_fields.get("decision_topic")
+            and not attributed_without_resolution
         ):
             candidates.append(
                 self._candidate(
@@ -202,13 +311,14 @@ class RuleFallbackExtractor(MemoryExtractorBackend):
                     reason="decision_fallback_hint",
                 )
             )
-        if MemoryType.PROFILE in schema_types and PROFILE_RE.search(normalized):
+        profile_fields = self._profile_fields(normalized)
+        if MemoryType.PROFILE in schema_types and PROFILE_RE.search(normalized) and profile_fields:
             candidates.append(
                 self._candidate(
                     MemoryType.PROFILE,
                     title=self._title(normalized, "User profile"),
                     content=normalized,
-                    fields={"attribute_key": "profile_summary", "summary": normalized},
+                    fields={**profile_fields, "summary": normalized},
                     confidence=0.78,
                     role=role,
                     adapter_id=adapter_id,
@@ -333,30 +443,285 @@ class RuleFallbackExtractor(MemoryExtractorBackend):
             return ""
 
     def _clauses(self, text: str) -> list[str]:
-        clauses = [item.strip() for item in re.split(r"[。！？.!?;；,，]+", text) if item.strip()]
+        # Commas carry contrast, conditions and exceptions. Splitting on them
+        # silently turns a conditional rule into an unconditional one.
+        # The same is true when a semicolon separates a base rule from its
+        # exception, for example ``forbid Redis; unless used as a cache``.
+        if re.search(
+            r"(?i)(?:\bunless\b|\bexcept(?:\s+when|\s+for)?\b|\bonly\s+if\b|除非|例外|仅限|只有)",
+            text,
+        ):
+            return [text.strip()]
+        clauses = [item.strip() for item in re.split(r"[。！？.!?;；]+", text) if item.strip()]
         return clauses or [text.strip()]
 
     def _decision_fields(self, text: str, project_id: str) -> dict[str, Any]:
-        database = self._database_value(text)
+        databases = self._database_values(text)
+        database = self._selected_database(text, databases)
         if database:
-            return {
+            fields: dict[str, Any] = {
                 "decision_topic": "primary_storage_backend",
                 "canonical_value": database,
                 "decision": text,
                 "project_id": project_id,
             }
+            if self._alternative_statement(text):
+                fields.update(
+                    {
+                        "_semantic_speech_act": "proposal",
+                        "_semantic_commitment": "exploratory",
+                        "_semantic_temporal_scope": "current",
+                        "_semantic_relation": "alternative",
+                    }
+                )
+            elif self._replacement_statement(text):
+                fields.update(
+                    {
+                        "_semantic_speech_act": "correction",
+                        "_semantic_commitment": "confirmed",
+                        "_semantic_temporal_scope": "current",
+                        "_semantic_relation": "supersedes",
+                        "_replacement_explicit": True,
+                    }
+                )
+            elif self._future_option_statement(text):
+                fields.update(
+                    {
+                        "_semantic_speech_act": (
+                            "evaluation_request"
+                            if re.search(r"(?i)(?:\bevaluat(?:e|ion)\b|评估)", text)
+                            else "proposal"
+                        ),
+                        "_semantic_commitment": "exploratory",
+                        "_semantic_temporal_scope": "future",
+                        "_semantic_relation": "alternative",
+                    }
+                )
+            elif self._explicit_current_decision(text):
+                fields.update(
+                    {
+                        "_semantic_speech_act": "confirmation",
+                        "_semantic_commitment": "confirmed",
+                        "_semantic_temporal_scope": "current",
+                        "_semantic_relation": "unrelated",
+                    }
+                )
+            else:
+                # A database being available is not evidence that it is the
+                # selected primary backend. Keep the extracted value reviewable
+                # while failing closed on commitment, time and relation.
+                fields.update(
+                    {
+                        "_semantic_speech_act": "confirmation",
+                        "_semantic_commitment": "unknown",
+                        "_semantic_temporal_scope": "unknown",
+                        "_semantic_relation": "ambiguous",
+                    }
+                )
+            return fields
+        if len(databases) > 1 and self._undecided_options(text):
+            return {
+                "decision_topic": "primary_storage_backend",
+                "decision": text,
+                "options": databases,
+                "project_id": project_id,
+                "_semantic_speech_act": "proposal",
+                "_semantic_commitment": "unknown",
+                "_semantic_temporal_scope": "current",
+                "_semantic_relation": "alternative",
+            }
         return {"decision": text, "project_id": project_id}
 
     def _rule_fields(self, text: str, project_id: str) -> dict[str, Any]:
-        if re.search(r"(?i)redis", text) and EvidenceSignalKind.CONSTRAINT in self._signal_kinds(text):
-            return {
+        polarity = self._constraint_polarity(text)
+        if self._complex_constraint_statement(text):
+            # Multiple competing subjects or opposing constraints are not one
+            # atomic rule. Archive the source sentence and let a stronger
+            # extractor or human review decompose it instead of guessing.
+            return {"rule": text, "project_id": project_id}
+        semantic_fields = self._rule_semantic_fields(text)
+        if re.search(r"(?i)redis", text) and polarity is not None:
+            canonical_value = {
+                ConstraintPolarity.REQUIRE: "required",
+                ConstraintPolarity.CONDITIONAL_REQUIRE: "required",
+                ConstraintPolarity.FORBID: "forbidden",
+                ConstraintPolarity.CONDITIONAL_FORBID: "forbidden",
+                ConstraintPolarity.ALLOW: "allowed",
+                ConstraintPolarity.PREFER: "preferred",
+                ConstraintPolarity.DISCOURAGE: "discouraged",
+            }[polarity]
+            fields: dict[str, Any] = {
                 "rule_topic": "redis_usage",
-                "canonical_value": "forbidden",
+                "canonical_value": canonical_value,
+                "polarity": polarity.value,
                 "rule": text,
                 "project_id": project_id,
+                **semantic_fields,
             }
+            exception = self._exception(text)
+            condition = self._condition(text)
+            if polarity in {ConstraintPolarity.CONDITIONAL_FORBID, ConstraintPolarity.CONDITIONAL_REQUIRE}:
+                if exception:
+                    fields["exception"] = exception
+                elif condition:
+                    fields["condition"] = condition
+                else:
+                    fields.update(
+                        {
+                            "_semantic_commitment": "unknown",
+                            "_semantic_temporal_scope": "unknown",
+                            "_semantic_relation": "ambiguous",
+                        }
+                    )
+            return fields
         topic = self._rule_topic(text)
-        return {"rule_topic": topic, "rule": text, "project_id": project_id}
+        fields = {
+            "rule_topic": topic,
+            "rule": text,
+            "project_id": project_id,
+            **semantic_fields,
+        }
+        if topic and polarity is not None:
+            fields["polarity"] = polarity.value
+            fields["canonical_value"] = {
+                ConstraintPolarity.REQUIRE: "required",
+                ConstraintPolarity.CONDITIONAL_REQUIRE: "required",
+                ConstraintPolarity.FORBID: "forbidden",
+                ConstraintPolarity.CONDITIONAL_FORBID: "forbidden",
+                ConstraintPolarity.ALLOW: "allowed",
+                ConstraintPolarity.PREFER: "preferred",
+                ConstraintPolarity.DISCOURAGE: "discouraged",
+            }[polarity]
+        return fields
+
+    def _constraint_polarity(self, text: str) -> ConstraintPolarity | None:
+        usable = [
+            match
+            for match in self.signal_matcher.match(text)
+            if match.kind == EvidenceSignalKind.CONSTRAINT
+            and match.polarity is not None
+            and not (match.negated or match.quoted or match.metalinguistic)
+        ]
+        return usable[-1].polarity if usable else None
+
+    def _exception(self, text: str) -> str:
+        preposed = re.search(
+            r"(?i)^\s*(?:除非|unless)\s*(.+?)(?:，|,)\s*(?:(?:否则|otherwise)\s*)?",
+            text,
+        )
+        if preposed:
+            return preposed.group(1).strip(" ，,。.")
+        match = re.search(
+            r"(?i)(?:除非|unless|except(?:\s+when|\s+for)?|only\s+if)\s*(.+)$",
+            text,
+        )
+        return match.group(1).strip(" ，,。.") if match else ""
+
+    def _condition(self, text: str) -> str:
+        match = re.search(
+            r"(?i)^(?:如果|若|当|仅当|只有|if|when|only\s+if)\s*(.+?)[，,]\s*"
+            r"(?:必须|需要|要求|不得|禁止|不允许|不要|must|required|require|must\s+not|do\s+not)",
+            text,
+        )
+        return match.group(1).strip(" ，,") if match else ""
+
+    def _rule_semantic_fields(self, text: str) -> dict[str, str]:
+        if self._uncertain_rule_statement(text):
+            return {
+                "_semantic_speech_act": "proposal",
+                "_semantic_commitment": "unknown",
+                "_semantic_temporal_scope": "unknown",
+                "_semantic_relation": "ambiguous",
+            }
+        if re.search(r"(?i)(?:\bfuture\b|\blater\b|以后|未来|稍后|届时)", text):
+            return {
+                "_semantic_speech_act": "proposal",
+                "_semantic_commitment": "intended",
+                "_semantic_temporal_scope": "future",
+                "_semantic_relation": "unrelated",
+            }
+        return {
+            "_semantic_speech_act": "confirmation",
+            "_semantic_commitment": "confirmed",
+            "_semantic_temporal_scope": "current",
+            "_semantic_relation": "unrelated",
+        }
+
+    def _uncertain_rule_statement(self, text: str) -> bool:
+        return bool(
+            re.search(
+                r"(?i)(?:可能|也许|或许|大概|未确定|不确定|\bmaybe\b|\bmight\b|\bpossibly\b|"
+                r"\bmay\s+(?:need|require)\b|\bcould\s+(?:need|require|use)\b)",
+                text,
+            )
+        )
+
+    def _complex_constraint_statement(self, text: str) -> bool:
+        usable = [
+            match
+            for match in self.signal_matcher.match(text)
+            if match.kind == EvidenceSignalKind.CONSTRAINT
+            and match.polarity is not None
+            and not (match.negated or match.quoted or match.metalinguistic)
+        ]
+        if not usable:
+            return False
+        subjects = set(self._database_values(text))
+        if re.search(r"(?i)\bredis\b", text):
+            subjects.add("redis")
+        if len(subjects) > 1 and re.search(
+            r"(?i)(?:或者|或是|或(?!许)|以及|和|及|、|/|\bor\b|\band\b)", text
+        ):
+            return True
+        if len(usable) < 2:
+            return False
+        explicit_correction = bool(
+            re.search(r"(?i)(?:不是.{0,32}而是|not\s+.{0,32}\bbut\b|rather\s+than)", text)
+        )
+        if len({match.polarity for match in usable}) > 1 and not explicit_correction:
+            return True
+        return len(subjects) > 1 and bool(re.search(r"(?i)(?:但是|不过|而是|但|\bbut\b|\bhowever\b)", text))
+
+    def _profile_fields(self, text: str) -> dict[str, Any]:
+        project_role = re.search(
+            r"(?i)(?:我是|i am)\s*([^，,。.!]+?)\s*(?:的|the)?\s*(负责人|maintainer|owner|lead)", text
+        )
+        if project_role:
+            subject = project_role.group(1).strip()
+            role = project_role.group(2).strip()
+            return {
+                "attribute_key": "project_role",
+                "canonical_value": f"{subject}:{role}",
+                "active_project": subject,
+            }
+        active_project = re.search(
+            r"(?i)(?:我的?当前(?:的)?项目(?:是|为)|我正在(?:参与|负责|开发)|"
+            r"my active project is|i am working on)\s*([^，,。.!]+?)(?:\s*项目|\s+project)?$",
+            text,
+        )
+        if active_project:
+            return {"attribute_key": "active_project", "canonical_value": active_project.group(1).strip()}
+        location = re.search(r"(?i)(?:我在|i work in|i am based in)\s*([^，,。.!]+?)(?:工作|办公|\bwork\b|$)", text)
+        if location:
+            return {"attribute_key": "work_location", "canonical_value": location.group(1).strip()}
+        occupation = re.search(
+            r"(?i)(?:我是|i am an?|i work as an?)\s*([^，,。.!]*(?:工程师|研究员|教授|教师|医生|设计师|经理|"
+            r"engineer|researcher|professor|teacher|doctor|designer|manager|developer|tester))$",
+            text,
+        )
+        if occupation:
+            return {"attribute_key": "occupation", "canonical_value": occupation.group(1).strip()}
+        language = re.search(
+            r"(?i)(?:我的(?:主要|常用|工作)?语言(?:是|为)|我会说|"
+            r"my (?:primary |preferred |working )?language is|i speak)\s*([^，,。.!]+)",
+            text,
+        )
+        if language:
+            return {"attribute_key": "language", "canonical_value": language.group(1).strip()}
+        skill = re.search(r"(?i)(?:主要使用|primarily use|mainly use)\s*([^，,。.!]+)", text)
+        if skill:
+            return {"attribute_key": "primary_skill", "canonical_value": skill.group(1).strip()}
+        return {}
 
     def _rule_topic(self, text: str) -> str:
         patterns = (
@@ -388,11 +753,99 @@ class RuleFallbackExtractor(MemoryExtractorBackend):
         return next((dimension for pattern, dimension in patterns if re.search(pattern, text)), "")
 
     def _database_value(self, text: str) -> str:
-        match = re.search(r"(?i)\b(sqlite|postgres(?:ql)?|mysql|mariadb|mongodb)\b", text)
-        if match is None:
+        return self._selected_database(text, self._database_values(text))
+
+    def _database_values(self, text: str) -> list[str]:
+        values = []
+        for match in re.finditer(r"(?i)\b(sqlite|postgres(?:ql)?|mysql|mariadb|mongodb)\b", text):
+            value = match.group(1).casefold()
+            normalized = "postgresql" if value == "postgres" else value
+            if normalized not in values:
+                values.append(normalized)
+        return values
+
+    def _selected_database(self, text: str, values: list[str]) -> str:
+        if not values:
             return ""
-        value = match.group(1).casefold()
-        return "postgresql" if value == "postgres" else value
+        if len(values) == 1:
+            return values[0]
+        if self._undecided_options(text):
+            return ""
+        final = re.search(
+            r"(?i)(?:最终(?:决定)?|最后(?:决定)?|finally(?:\s+decided)?|正式(?:改成|改为)|(?:改成|改为|切换到)|(?:switch(?:ed)?\s+to|replace(?:d)?\s+with))(.+)$",
+            text,
+        )
+        if final:
+            selected = self._database_values(final.group(1))
+            if selected:
+                return selected[-1]
+        if self._alternative_statement(text):
+            backup = re.search(
+                r"(?i)\b(sqlite|postgres(?:ql)?|mysql|mariadb|mongodb)\b.{0,20}(?:备用|备选|backup|alternative|option)",
+                text,
+            )
+            if backup:
+                value = backup.group(1).casefold()
+                return "postgresql" if value == "postgres" else value
+        return ""
+
+    def _replacement_statement(self, text: str) -> bool:
+        return has_explicit_replacement_cue(text)
+
+    def _explicit_current_decision(self, text: str) -> bool:
+        """Return true only for wording that actually selects a current value."""
+
+        return bool(
+            re.search(
+                r"(?i)(?:最终(?:决定)?|最后(?:决定)?|正式决定|决定(?:使用|采用)|"
+                r"继续使用|仍然(?:保持|使用)|保持不变|保持(?:为|使用)|作为当前|确认为当前|当前(?:使用|采用)|"
+                r"(?:finally|decided?|adopt(?:ed)?|continue\s+using|remain(?:s|ed)?)(?:\s+to|\s+as|\s+using)?)",
+                text,
+            )
+        )
+
+    def _future_option_statement(self, text: str) -> bool:
+        return bool(
+            re.search(
+                r"(?i)(?:\bfuture\b|\blater\b|\bevaluat(?:e|ion)\b|\bcan\s+consider\b|"
+                r"以后|未来|稍后|评估|候选|可以考虑)",
+                text,
+            )
+        )
+
+    def _alternative_statement(self, text: str) -> bool:
+        return bool(re.search(r"(?i)(备用|备选|alternative|backup|option|也可以|同时保留)", text))
+
+    def _undecided_options(self, text: str) -> bool:
+        return bool(
+            re.search(r"(?i)(暂时|尚未|还没|没有).{0,12}(决定|确定)|(?:都可以|either).{0,20}(?:未决定|not decided)", text)
+            or (len(self._database_values(text)) > 1 and re.search(r"(?i)(?:\sor\s|或者|或).*(?:都可以|未决定|not decided)", text))
+        )
+
+    def _attributed_statement(self, text: str) -> bool:
+        return bool(
+            re.search(
+                r"(?i)(?:他说|她说|他们说|有人(?:说|建议|要求|认为)|"
+                r"我(?:曾经?)?听说|听说|据说|传闻|\bi\s+heard\b|\breportedly\b|\baccording\s+to\b|"
+                r"(?:[A-Za-z0-9_\u4e00-\u9fff]{1,20})\s*(?:说|表示|声称|认为|建议|提到)|"
+                r"he\s+(?:said|suggested|required)|she\s+(?:said|suggested|required)|"
+                r"they\s+(?:said|suggested|required)|someone\s+(?:said|suggested|required|recommended)|"
+                r"(?:[A-Za-z0-9_]{1,32})\s+(?:said|says|suggested|recommended|claimed))",
+                text,
+            )
+        )
+
+    def _has_user_resolution(self, text: str) -> bool:
+        # A later first-person final choice is the user's own proposition, not
+        # the quoted speaker's. Other attributed content stays out of fallback.
+        return bool(
+            re.search(
+                r"(?i)(?:但|但是|不过|而我|but).{0,80}(?:我|we)"
+                r".{0,32}(?:最终(?:决定)?|最后(?:决定)?|决定(?:使用|采用)|正式(?:改成|改为)|"
+                r"decid(?:e|ed)|adopt(?:ed)?)",
+                text,
+            )
+        )
 
     def _evaluation_without_candidate(self, text: str) -> bool:
         return EvidenceSignalKind.EVALUATION in self._signal_kinds(text) and not self._database_value(text)

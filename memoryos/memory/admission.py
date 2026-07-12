@@ -169,7 +169,22 @@ class MemoryAdmissionGate:
         return any(token in text for token in ("completed", "implemented", "fixed", "released", "decided", "完成", "修复", "发布", "已采用", "决定"))
 
     def _project_rule(self, text: str) -> bool:
-        return any(token in text for token in ("must", "never", "do not", "禁止", "不允许", "必须", "不要", "项目规则", "约束", "最高强约束"))
+        return any(
+            token in text
+            for token in (
+                "must",
+                "never",
+                "do not",
+                "禁止",
+                "不得",
+                "不允许",
+                "必须",
+                "不要",
+                "项目规则",
+                "约束",
+                "最高强约束",
+            )
+        )
 
     def _project_decision(self, text: str) -> bool:
         return any(

@@ -57,6 +57,25 @@ class SQLiteIndexStoreTest(unittest.TestCase):
                 filters={"applicability_scope_keys": ["memoryos:principal:u1"]},
             )
 
+    def test_pending_admission_is_hidden_by_default_and_explicitly_reviewable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteIndexStore(Path(tmp) / "index.sqlite3")
+            pending = ContextObject(
+                uri="memoryos://user/u1/memories/pending/p1",
+                context_type=ContextType.MEMORY,
+                title="pending database proposal",
+                owner_user_id="u1",
+                metadata={"admission": {"decision": "pending"}},
+            )
+            store.upsert_index(pending, content="PostgreSQL candidate")
+
+            assert not store.search("PostgreSQL", filters={"owner_user_id": "u1"})
+            reviewed = store.search(
+                "PostgreSQL",
+                filters={"owner_user_id": "u1", "admission_status": "pending"},
+            )
+            assert [hit.uri for hit in reviewed] == [pending.uri]
+
 
 if __name__ == "__main__":
     unittest.main()

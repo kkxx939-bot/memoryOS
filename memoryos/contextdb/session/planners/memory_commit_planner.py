@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, replace
-from typing import Any
+from typing import Any, cast
 
 from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
 from memoryos.contextdb.session.planning import (
@@ -18,10 +18,8 @@ from memoryos.contextdb.session.planning import (
 from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.contextdb.store.source_store import IndexStore, RelationStore, SourceStore
 from memoryos.core.ids import stable_hash
-from memoryos.memory.admission import MemoryAdmissionGate
 from memoryos.memory.canonical import (
     AliasRegistry,
-    CandidateProposalAdapter,
     CanonicalMemoryFormationService,
     EpisodeSalienceGate,
     EvidenceRef,
@@ -29,18 +27,12 @@ from memoryos.memory.canonical import (
     MemorySemanticProposal,
     SessionArchiveEpisodeAdapter,
 )
-from memoryos.memory.extraction import MemoryExtractorBackend, RuleFallbackExtractor
-from memoryos.memory.model.memory import MemoryCandidate, MemoryKind
+from memoryos.memory.extraction import MemoryExtractionBatchResult, MemoryExtractorBackend
 from memoryos.memory.schema import (
-    MEMORY_SCHEMA_VERSION,
-    AdmissionDecision,
-    MemoryCandidateDraft,
     MemoryOperationGroup,
-    MemoryOperationGroupItem,
     MemoryType,
     MemoryTypeRegistry,
 )
-from memoryos.memory.service.memory_updater import MemoryUpdater
 from memoryos.memory.view import MemoryViewRouter, adapter_id_from_archive, project_id_from_archive
 from memoryos.operations.model.context_operation import ContextOperation
 
@@ -59,7 +51,7 @@ class RuleMemoryCommitPlanner:
         self,
         extractor: MemoryExtractorBackend | None = None,
         registry: MemoryTypeRegistry | None = None,
-        admission_gate: MemoryAdmissionGate | None = None,
+        admission_gate: Any | None = None,
         view_router: MemoryViewRouter | None = None,
         source_store: SourceStore | None = None,
         index_store: IndexStore | None = None,
@@ -68,10 +60,9 @@ class RuleMemoryCommitPlanner:
         alias_registry: AliasRegistry | None = None,
     ) -> None:
         self.registry = registry or MemoryTypeRegistry()
-        self.extractor = extractor or RuleFallbackExtractor()
+        self.extractor = extractor
         self.view_router = view_router or getattr(admission_gate, "view_router", None) or MemoryViewRouter()
-        self.admission_gate = admission_gate or MemoryAdmissionGate(self.registry, self.view_router)
-        self.updater = MemoryUpdater()
+        self.admission_gate = admission_gate
         self.episode_adapter = SessionArchiveEpisodeAdapter()
         self.salience_gate = EpisodeSalienceGate()
         self.prefetcher = ExistingMemoryPrefetcher(
@@ -80,7 +71,6 @@ class RuleMemoryCommitPlanner:
             relation_store,
             hybrid_search=hybrid_search,
         )
-        self.candidate_adapter = CandidateProposalAdapter()
         self.formation = CanonicalMemoryFormationService(source_store, alias_registry=alias_registry)
 
     def plan(self, archive: SessionArchive) -> MemoryPlanningResult:
@@ -113,87 +103,67 @@ class RuleMemoryCommitPlanner:
         manifest_digest = str(getattr(archive, "manifest_digest", "") or "")
         planning_id = stable_hash([archive.task_id, archive.session_id, archive_digest], length=32)
         operation_group_identity = f"commit_group_{archive.task_id}"
-        if not salience.salient:
-            context = self._context(
-                planning_id,
-                operation_group_identity,
-                archive,
-                episode,
-                prefetch,
-                canonical_inputs,
-                staging,
-                evidence_refs,
-                group,
-                operations,
-                outcomes,
-                salience.episode_fingerprint,
-                salience.reasons,
-                archive_digest,
-                manifest_digest,
-            )
-            return MemoryPlanningResult((), context)
         project_id = project_id_from_archive(archive)
         adapter_id = adapter_id_from_archive(archive)
+        batch_extract = getattr(self.extractor, "extract_batch_with_context", None)
         contextual_extract = getattr(self.extractor, "extract_with_context", None)
+        extraction_security_flags: tuple[str, ...] = ()
+        extracted: Any = []
         try:
-            extracted: Any = (
-                contextual_extract(
-                    archive,
-                    schemas,
-                    existing_memories=prefetch,
-                    episode=episode,
+            if self.extractor is None:
+                batch_result = None
+            else:
+                batch_result = cast(
+                    MemoryExtractionBatchResult | None,
+                    batch_extract(
+                        archive,
+                        schemas,
+                        existing_memories=prefetch,
+                        episode=episode,
+                    )
+                    if callable(batch_extract)
+                    else None,
                 )
-                if callable(contextual_extract)
-                else self.extractor.extract(archive, schemas)
-            )
+            if self.extractor is not None and batch_result is not None:
+                extracted = list(batch_result.accepted)
+                extraction_security_flags = tuple(batch_result.security_flags)
+                outcomes.extend(
+                    ProposalPlanningOutcome(
+                        item.proposal_id or f"rejected_candidate_{item.index}",
+                        "REJECT",
+                        item.reason,
+                        candidate_index=item.index,
+                        security_flags=tuple(item.security_flags),
+                    )
+                    for item in batch_result.rejected
+                )
+            elif self.extractor is not None:
+                extracted = (
+                    contextual_extract(
+                        archive,
+                        schemas,
+                        existing_memories=prefetch,
+                        episode=episode,
+                    )
+                    if callable(contextual_extract)
+                    else self.extractor.extract(archive, schemas)
+                )
         except (ConnectionError, OSError, RuntimeError, TimeoutError) as exc:
             raise MemoryExtractionBackendError(type(exc).__name__, retryable=True) from exc
         semantic_proposals: list[MemorySemanticProposal] = []
         for candidate in extracted:
-            if isinstance(candidate, MemorySemanticProposal):
-                semantic_proposals.append(candidate)
-                continue
-            admission = self.admission_gate.evaluate(
-                candidate,
-                user_id=archive.user_id,
-                project_id=project_id,
-                adapter_id=adapter_id,
-            )
-            group.add(candidate, admission)
-        for item in group.accepted:
-            proposal = self.candidate_adapter.adapt(item.candidate, episode, archive)
-            canonical_inputs.append(ProposalPlanningInput(proposal, tuple(item.admission.retrieval_views)))
-            evidence_refs.extend(proposal.evidence_refs)
-            formed = self.formation.plan(
-                proposal,
-                archive=archive,
-                episode=episode,
-                retrieval_views=item.admission.retrieval_views,
-                staged_objects=staging,
-                commit_group_id=operation_group_identity,
-            )
-            outcomes.append(ProposalPlanningOutcome(proposal.proposal_id, formed.decision.value, formed.reason))
-            operations.extend(formed.operations)
-            self.formation.stage(formed.operations, staging)
-        for item in group.pending:
-            operation = self._operation(archive, item)
-            operation.payload.update(
-                {
-                    "merge_decision": "ADD",
-                    "existing_uri": "",
-                    "merge_reason": "pending_candidate",
-                }
-            )
-            operations.append(operation)
+            if not isinstance(candidate, MemorySemanticProposal):
+                raise TypeError("memory extractor must emit MemorySemanticProposal objects")
+            semantic_proposals.append(candidate)
         for proposal in semantic_proposals:
-            views = self._proposal_views(proposal, archive.user_id, project_id)
-            canonical_inputs.append(ProposalPlanningInput(proposal, tuple(views)))
+            proposal_views = self._proposal_views(proposal, archive.user_id, project_id, adapter_id)
+            canonical_inputs.append(ProposalPlanningInput(proposal, tuple(proposal_views)))
             evidence_refs.extend(proposal.evidence_refs)
             formed = self.formation.plan(
                 proposal,
                 archive=archive,
                 episode=episode,
-                retrieval_views=views,
+                retrieval_views=proposal_views,
                 staged_objects=staging,
                 commit_group_id=operation_group_identity,
             )
@@ -216,6 +186,7 @@ class RuleMemoryCommitPlanner:
             salience.reasons,
             archive_digest,
             manifest_digest,
+            extraction_security_flags,
         )
         return MemoryPlanningResult(tuple(operations), context)
 
@@ -235,16 +206,28 @@ class RuleMemoryCommitPlanner:
         inputs = context.proposal_inputs
         staging: dict[str, Any] = {}
         operations: list[ContextOperation] = []
-        outcomes: list[ProposalPlanningOutcome] = []
+        outcomes: list[ProposalPlanningOutcome] = [
+            item for item in context.proposal_outcomes if item.decision == "REJECT"
+        ]
         for item in inputs:
-            formed = self.formation.plan(
-                item.proposal,
-                archive=archive,
-                episode=episode,
-                retrieval_views=list(item.retrieval_views),
-                staged_objects=staging,
-                commit_group_id=context.operation_group_identity,
-            )
+            if item.forced_pending_reason:
+                formed = self.formation.plan_pending(
+                    item.proposal,
+                    archive=archive,
+                    episode=episode,
+                    reason=item.forced_pending_reason,
+                    retrieval_views=list(item.retrieval_views),
+                    commit_group_id=context.operation_group_identity,
+                )
+            else:
+                formed = self.formation.plan(
+                    item.proposal,
+                    archive=archive,
+                    episode=episode,
+                    retrieval_views=list(item.retrieval_views),
+                    staged_objects=staging,
+                    commit_group_id=context.operation_group_identity,
+                )
             outcomes.append(ProposalPlanningOutcome(item.proposal.proposal_id, formed.decision.value, formed.reason))
             operations.extend(formed.operations)
             self.formation.stage(formed.operations, staging)
@@ -264,6 +247,7 @@ class RuleMemoryCommitPlanner:
             context.salience_reasons,
             archive_digest,
             manifest_digest,
+            context.extraction_security_flags,
         )
         replanned = replace(replanned, prefetch_snapshot=context.prefetch_snapshot)
         return MemoryPlanningResult(tuple(operations), replanned)
@@ -285,6 +269,7 @@ class RuleMemoryCommitPlanner:
         salience_reasons: tuple[str, ...],
         archive_digest: str,
         manifest_digest: str,
+        extraction_security_flags: tuple[str, ...] = (),
     ) -> PlanningContext:
         snapshots = tuple(
             PrefetchSnapshot(
@@ -327,111 +312,25 @@ class RuleMemoryCommitPlanner:
             operation_group_identity=group_id,
             admission_summary=tuple(sorted(group.summary().items())),
             proposal_outcomes=tuple(outcomes),
+            extraction_security_flags=tuple(extraction_security_flags),
             salience_fingerprint=salience_fingerprint,
             salience_reasons=salience_reasons,
         )
 
-    def _proposal_views(self, proposal: MemorySemanticProposal, user_id: str, project_id: str) -> list[str]:
-        if proposal.memory_type == MemoryType.PROFILE.value:
-            return [f"user:{user_id}:profile"]
-        if proposal.memory_type == MemoryType.PREFERENCE.value:
-            return [f"user:{user_id}:preferences"]
-        suffix = {
-            MemoryType.PROJECT_RULE.value: "rules",
-            MemoryType.PROJECT_DECISION.value: "decisions",
-            MemoryType.AGENT_EXPERIENCE.value: "agent_experience",
-        }.get(proposal.memory_type, "knowledge")
-        return [f"project:{project_id}:{suffix}"] if project_id else [f"user:{user_id}:profile"]
-
-    def _operation(self, archive: SessionArchive, item: MemoryOperationGroupItem) -> ContextOperation:
-        candidate = item.candidate
-        admission = item.admission
-        memory = self._memory(archive, candidate, item)
-        operation = self.updater.add_memory(memory, evidence=self._evidence(candidate))
-        operation.source_session_id = candidate.source_session_id or archive.session_id
-        operation.payload = {
-            **operation.payload,
-            "memory_type": candidate.memory_type.value,
-            "admission": admission.to_metadata(),
-            "retrieval_views": admission.retrieval_views,
-            "source_adapter_id": candidate.source_adapter_id,
-            "source_session_id": candidate.source_session_id or archive.session_id,
-            "source_roles": [candidate.source_role],
-            "merge_key": admission.merge_key or candidate.merge_key,
-            "schema_version": MEMORY_SCHEMA_VERSION,
-            "fields": dict(candidate.fields),
-        }
-        context_object = operation.payload.get("context_object")
-        if isinstance(context_object, dict):
-            metadata = dict(context_object.get("metadata", {}) or {})
-            archive_metadata = dict(archive.metadata or {})
-            metadata.update(
-                {
-                    "memory_type": candidate.memory_type.value,
-                    "admission": admission.to_metadata(),
-                    "retrieval_views": admission.retrieval_views,
-                    "source": memory.source,
-                    "source_adapter_id": candidate.source_adapter_id,
-                    "source_session_id": candidate.source_session_id or archive.session_id,
-                    "source_roles": [candidate.source_role],
-                    "merge_key": admission.merge_key or candidate.merge_key,
-                    "schema_version": MEMORY_SCHEMA_VERSION,
-                    "fields": dict(candidate.fields),
-                    "connect": dict(archive_metadata.get("connect", {}) or {}),
-                    "scope": dict(archive_metadata.get("scope", {}) or {}),
-                    "provenance": dict(archive_metadata.get("provenance", {}) or {}),
-                }
-            )
-            context_object["metadata"] = metadata
-        return operation
-
-    def _memory(
-        self, archive: SessionArchive, candidate: MemoryCandidateDraft, item: MemoryOperationGroupItem
-    ) -> MemoryCandidate:
-        admission = item.admission
-        source: dict[str, Any] = {
-            "adapter_id": candidate.source_adapter_id,
-            "session_id": candidate.source_session_id or archive.session_id,
-            "message_ids": candidate.source_message_ids,
-            "roles": [candidate.source_role],
-        }
-        uri = self._candidate_uri(archive.user_id, candidate)
-        title = candidate.title[:96] or candidate.memory_type.value
-        if admission.decision != AdmissionDecision.PENDING:
-            raise ValueError("non-canonical memory operations are limited to pending candidates")
-        confidence = min(candidate.confidence, admission.confidence)
-        admission_metadata = admission.to_metadata()
-        merge_key = admission.merge_key or candidate.merge_key
-        return MemoryCandidate(
-            uri=uri,
-            user_id=archive.user_id,
-            title=title,
-            content=candidate.content,
-            kind=MemoryKind.CANDIDATE,
-            confidence=confidence,
-            memory_type=candidate.memory_type.value,
-            retrieval_views=admission.retrieval_views,
-            admission=admission_metadata,
-            merge_key=merge_key,
-            fields=dict(candidate.fields),
-            source=source,
-            memory_schema_version=MEMORY_SCHEMA_VERSION,
+    def _proposal_views(
+        self,
+        proposal: MemorySemanticProposal,
+        user_id: str,
+        project_id: str,
+        adapter_id: str,
+    ) -> list[str]:
+        schema = self.registry.get(MemoryType(proposal.memory_type))
+        return self.view_router.route(
+            proposal,
+            schema,
+            user_id=user_id,
+            project_id=project_id,
+            adapter_id=adapter_id,
         )
-
-    def _candidate_uri(self, user_id: str, candidate: MemoryCandidateDraft) -> str:
-        digest = stable_hash([user_id, candidate.memory_type.value, candidate.merge_key], length=20)
-        return f"memoryos://user/{user_id}/memories/candidates/{digest}"
-
-    def _evidence(self, candidate: MemoryCandidateDraft) -> list[dict]:
-        return [
-            *candidate.evidence,
-            {
-                "source_adapter_id": candidate.source_adapter_id,
-                "source_session_id": candidate.source_session_id,
-                "source_message_ids": candidate.source_message_ids,
-                "reason": candidate.reason,
-            },
-        ]
-
 
 MemoryCommitPlanner = RuleMemoryCommitPlanner

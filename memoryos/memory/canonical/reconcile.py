@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Protocol
 
-from memoryos.memory.canonical.identity import ResolvedMemoryIdentity
+from memoryos.memory.canonical.identity import ResolvedMemoryIdentity, canonical_identity_value
 from memoryos.memory.canonical.proposal import (
     Commitment,
     EpistemicStatus,
@@ -17,6 +17,36 @@ from memoryos.memory.canonical.proposal import (
     TemporalScope,
 )
 from memoryos.memory.canonical.state import MemoryClaim, MemorySlot
+
+_REPLACEMENT_RELATIONS = {SemanticRelation.CORRECTS, SemanticRelation.SUPERSEDES}
+_NON_CORE_VALUE_FIELDS = frozenset(
+    {
+        "title",
+        "display_name",
+        "summary",
+        "details",
+        "rationale",
+        "reason",
+        "decision",
+        "rule",
+        "source_text",
+        "display_text",
+        "source_wording",
+        "evidence",
+    }
+)
+_APPLICABILITY_FIELDS = (
+    "environment",
+    "device",
+    "activity",
+    "valid_time",
+    "condition",
+    "conditions",
+    "exception",
+    "exceptions",
+    "applicability_qualifier",
+)
+_AUTHORITATIVE_SOURCE_ROLES = frozenset({"user", "system"})
 
 
 @dataclass(frozen=True)
@@ -134,18 +164,27 @@ class MemorySemanticReconciler:
         current = dict(claim.current.value_fields)
         semantic = proposal.semantic
         assert isinstance(semantic, NormalizedSemanticAssessment)
+        replacement = self._validated_replacement_relation(proposal, active, incoming_claim=claim)
+        if replacement is not None:
+            return replacement
         if semantic.speech_act in {SpeechAct.RETRACTION, SpeechAct.REJECTION} and self._authoritative_evidence(
             proposal
         ):
             return SemanticRelation.CORRECTS
         if incoming == current:
-            if claim.current.state != "ACTIVE" and active is not None and self._confirmed_current(proposal):
-                return SemanticRelation.SUPERSEDES
+            if semantic.relation_to_existing == SemanticRelation.SUPPLEMENTS and self._supported_suggestion(proposal):
+                return SemanticRelation.SUPPLEMENTS
             return SemanticRelation.DUPLICATE
-        if all(key not in current or current[key] == value for key, value in incoming.items()):
+        incoming_core = self._core_value_fields(incoming)
+        current_core = self._core_value_fields(current)
+        if incoming_core and incoming_core == current_core:
+            if semantic.relation_to_existing == SemanticRelation.SUPPLEMENTS and self._supported_suggestion(proposal):
+                return SemanticRelation.SUPPLEMENTS
+            return SemanticRelation.DUPLICATE
+        if incoming_core and all(
+            key not in current_core or current_core[key] == value for key, value in incoming_core.items()
+        ):
             return SemanticRelation.SUPPLEMENTS
-        if semantic.speech_act == SpeechAct.CORRECTION and self._authoritative_evidence(proposal):
-            return SemanticRelation.CORRECTS
         return SemanticRelation.AMBIGUOUS
 
     def _different_claim_relation(
@@ -161,17 +200,16 @@ class MemorySemanticReconciler:
             claim for claim in claims if claim.claim_id in related or claim.uri in related or claim.slot_id in related
         )
         suggestion = semantic.relation_to_existing
-        if (
-            semantic.speech_act == SpeechAct.CORRECTION
-            and active is not None
-            and self._authoritative_evidence(proposal)
-        ):
-            return SemanticRelation.CORRECTS
         if semantic.speech_act in {SpeechAct.PROPOSAL, SpeechAct.EVALUATION_REQUEST} or (
             semantic.commitment in {Commitment.WEAK, Commitment.EXPLORATORY}
             and semantic.temporal_scope == TemporalScope.FUTURE
         ):
             return SemanticRelation.ALTERNATIVE
+        if suggestion == SemanticRelation.ALTERNATIVE and self._supported_suggestion(proposal):
+            return SemanticRelation.ALTERNATIVE
+        replacement = self._validated_replacement_relation(proposal, active)
+        if replacement is not None:
+            return replacement
         if (
             suggestion == SemanticRelation.CONTRADICTS
             and active is not None
@@ -185,19 +223,20 @@ class MemorySemanticReconciler:
             and self._supported_suggestion(proposal)
         ):
             return SemanticRelation.SUPPLEMENTS
-        if self._confirmed_current(proposal) and active is not None:
-            return SemanticRelation.SUPERSEDES
         if active is None and not claims:
             return SemanticRelation.UNRELATED
         return SemanticRelation.AMBIGUOUS
 
     def _supported_suggestion(self, proposal: MemorySemanticProposal) -> bool:
         transition_refs = tuple(proposal.field_evidence_refs.get("transition", ()))
+        relation_refs = tuple(proposal.field_evidence_refs.get("semantic.relation_to_existing", ()))
         return bool(
             proposal.metadata.get("semantic_relation_evidence_validated") is True
             and proposal.evidence_refs
             and transition_refs
+            and relation_refs
             and set(transition_refs).issubset(proposal.evidence_refs)
+            and set(relation_refs).issubset(proposal.evidence_refs)
         )
 
     def _authoritative_evidence(self, proposal: MemorySemanticProposal) -> bool:
@@ -207,19 +246,89 @@ class MemorySemanticReconciler:
             and proposal.metadata.get("transition_evidence_validated") is True
             and transition_refs
             and set(transition_refs).issubset(proposal.evidence_refs)
+            and self._source_authoritative(proposal, transition_refs)
         )
 
-    def _confirmed_current(self, proposal: MemorySemanticProposal) -> bool:
+    def _validated_replacement_relation(
+        self,
+        proposal: MemorySemanticProposal,
+        active: MemoryClaim | None,
+        *,
+        incoming_claim: MemoryClaim | None = None,
+    ) -> SemanticRelation | None:
         semantic = proposal.semantic
         assert isinstance(semantic, NormalizedSemanticAssessment)
-        return (
+        relation = semantic.relation_to_existing
+        if relation not in _REPLACEMENT_RELATIONS or active is None:
+            return None
+        if incoming_claim is not None and incoming_claim.claim_id == active.claim_id:
+            return None
+        if semantic.temporal_scope != TemporalScope.CURRENT:
+            return None
+        if not self._explicitly_targets_active(proposal, active):
+            return None
+        if self._applicability_conflicts(proposal, active):
+            return None
+        relation_refs = tuple(proposal.field_evidence_refs.get("semantic.relation_to_existing", ()))
+        if not (
             self._authoritative_evidence(proposal)
-            and semantic.temporal_scope in {TemporalScope.CURRENT, TemporalScope.UNSPECIFIED}
-            and (
-                semantic.speech_act in {SpeechAct.CONFIRMATION, SpeechAct.CORRECTION}
-                or semantic.commitment == Commitment.CONFIRMED
-            )
-        )
+            and proposal.metadata.get("semantic_relation_evidence_validated") is True
+            and proposal.metadata.get("replacement_evidence_validated") is True
+            and relation_refs
+            and set(relation_refs).issubset(proposal.evidence_refs)
+        ):
+            return None
+        return relation
+
+    def _explicitly_targets_active(self, proposal: MemorySemanticProposal, active: MemoryClaim) -> bool:
+        explicit_claim_targets = {
+            *proposal.related_claim_ids,
+            *proposal.related_memory_ids,
+        }
+        return active.claim_id in explicit_claim_targets or active.uri in explicit_claim_targets
+
+    def _source_authoritative(
+        self,
+        proposal: MemorySemanticProposal,
+        transition_refs: tuple[object, ...],
+    ) -> bool:
+        declared = str(proposal.metadata.get("source_role") or "").strip().casefold()
+        if declared and declared not in _AUTHORITATIVE_SOURCE_ROLES:
+            return False
+        actor_kinds = {
+            str(actor_kind).strip().casefold()
+            for ref in transition_refs
+            if (actor_kind := getattr(ref, "actor_kind", None))
+        }
+        if actor_kinds and not actor_kinds.issubset(_AUTHORITATIVE_SOURCE_ROLES):
+            return False
+        return bool(declared in _AUTHORITATIVE_SOURCE_ROLES or actor_kinds)
+
+    def _applicability_conflicts(self, proposal: MemorySemanticProposal, active: MemoryClaim) -> bool:
+        incoming = proposal.value_fields
+        current = active.current.value_fields
+        for field_name in _APPLICABILITY_FIELDS:
+            incoming_value = incoming.get(field_name)
+            current_value = current.get(field_name)
+            incoming_present = self._present(incoming_value)
+            current_present = self._present(current_value)
+            if incoming_present != current_present:
+                return True
+            if not incoming_present:
+                continue
+            if canonical_identity_value(incoming_value) != canonical_identity_value(current_value):
+                return True
+        return False
+
+    def _core_value_fields(self, values: dict) -> dict:
+        return {
+            key: canonical_identity_value(value)
+            for key, value in values.items()
+            if key not in _NON_CORE_VALUE_FIELDS
+        }
+
+    def _present(self, value: object) -> bool:
+        return value is not None and value != "" and value != () and value != [] and value != {}
 
     def _effective_time(self, value: MemorySemanticProposal | MemoryClaim) -> datetime:
         if isinstance(value, MemoryClaim):

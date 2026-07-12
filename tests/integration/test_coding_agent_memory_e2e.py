@@ -9,14 +9,62 @@ from memoryos.connect import ConnectMetadata
 from memoryos.memory.extraction import FakeMemoryModelProvider, LLMMemoryExtractorBackend
 
 
+def _project_rule_response(event_id: str, text: str, project_id: str, *, proposal_id: str) -> str:
+    atomic = {"event_id": event_id, "span_start": 0, "span_end": len(text)}
+    semantic = {
+        "speech_act": "confirmation",
+        "commitment": "confirmed",
+        "temporal_scope": "current",
+        "relation_to_existing": "unrelated",
+        "utterance_mode": "directive",
+        "attribution": "source_actor",
+        "durability": "durable",
+        "modal_force": "require",
+        "atomicity": "atomic",
+    }
+    rule_topic = text.split("must ", 1)[-1].rstrip(".")
+    identity = {"rule_topic": rule_topic}
+    values = {"canonical_value": "required", "rule": text}
+    bindings = {
+        **{f"identity.{key}": [atomic] for key in identity},
+        **{f"value.{key}": [atomic] for key in values},
+        **{f"semantic.{key}": [atomic] for key in semantic},
+        "transition": [atomic],
+    }
+    return json.dumps(
+        {
+            "candidates": [
+                {
+                    "proposal_id": proposal_id,
+                    "memory_type": "project_rule",
+                    "identity_fields": identity,
+                    "value_fields": values,
+                    "semantic": semantic,
+                    "epistemic_status": "EXPLICIT",
+                    "suggested_scope_refs": [
+                        {"namespace": "memoryos", "kind": "workspace", "id": project_id}
+                    ],
+                    "evidence_refs": [atomic],
+                    "atomic_evidence_ref": atomic,
+                    "field_evidence_refs": bindings,
+                    "confidence": 0.95,
+                    "source_role": "user",
+                }
+            ]
+        }
+    )
+
+
 def test_finalize_extract_commit_and_cross_agent_project_recall(tmp_path) -> None:  # noqa: ANN001
-    client = MemoryOSClient(str(tmp_path))
+    text = "Project rule: must run pytest before merge."
+    provider = FakeMemoryModelProvider(_project_rule_response("m1", text, "project-a", proposal_id="p-pytest"))
+    client = MemoryOSClient(str(tmp_path), memory_extractor=LLMMemoryExtractorBackend(provider))
     result = client.commit_agent_session(
         user_id="u1",
         session_id="claude-native",
         session_key="stable-session",
         project_id="project-a",
-        messages=[{"id": "m1", "role": "user", "content": "Project rule: must run pytest before merge."}],
+        messages=[{"id": "m1", "role": "user", "content": text}],
         connect_metadata=ConnectMetadata.default_agent("claude_code").to_dict(),
         async_commit=True,
     )
@@ -87,15 +135,53 @@ def test_user_preference_is_recalled_across_projects(tmp_path) -> None:  # noqa:
 
 
 def test_runtime_injected_llm_extractor_enters_operation_plane(tmp_path) -> None:  # noqa: ANN001
+    text = "We decided to use SQLite as the primary storage backend."
+    atomic = {"event_id": "message:0", "span_start": 0, "span_end": len(text)}
+    semantic = {
+        "speech_act": "confirmation",
+        "commitment": "confirmed",
+        "temporal_scope": "current",
+        "relation_to_existing": "unrelated",
+        "utterance_mode": "assertion",
+        "attribution": "source_actor",
+        "durability": "durable",
+        "modal_force": "none",
+        "atomicity": "atomic",
+    }
+    bindings = {
+        "identity.decision_topic": [atomic],
+        "value.canonical_value": [atomic],
+        **{f"semantic.{field_name}": [atomic] for field_name in semantic},
+        "transition": [atomic],
+    }
     provider = FakeMemoryModelProvider(
-        response='{"candidates":[{"proposal_id":"p-sqlite","memory_type":"project_decision","identity_fields":{"decision_topic":"primary storage backend"},"value_fields":{"canonical_value":"SQLite"},"semantic":{"speech_act":"confirmation","commitment":"confirmed","temporal_scope":"current","relation_to_existing":"unrelated"},"epistemic_status":"EXPLICIT","suggested_scope_refs":[{"namespace":"memoryos","kind":"workspace","id":"p1"}],"evidence_refs":[{"event_id":"message:0"}],"field_evidence_refs":{"identity.decision_topic":[{"event_id":"message:0"}],"value.canonical_value":[{"event_id":"message:0"}],"semantic.speech_act":[{"event_id":"message:0"}],"semantic.commitment":[{"event_id":"message:0"}],"semantic.temporal_scope":[{"event_id":"message:0"}],"semantic.relation_to_existing":[{"event_id":"message:0"}],"transition":[{"event_id":"message:0"}]},"confidence":0.9,"source_role":"user"}]}'
+        response=json.dumps(
+            {
+                "candidates": [
+                    {
+                        "proposal_id": "p-sqlite",
+                        "memory_type": "project_decision",
+                        "identity_fields": {"decision_topic": "primary storage backend"},
+                        "value_fields": {"canonical_value": "SQLite"},
+                        "semantic": semantic,
+                        "epistemic_status": "EXPLICIT",
+                        "suggested_scope_refs": [{"namespace": "memoryos", "kind": "workspace", "id": "p1"}],
+                        "evidence_refs": [atomic],
+                        "atomic_evidence_ref": atomic,
+                        "field_evidence_refs": bindings,
+                        "confidence": 0.9,
+                        "source_role": "user",
+                    }
+                ]
+            }
+        )
     )
     client = MemoryOSClient(str(tmp_path), memory_extractor=LLMMemoryExtractorBackend(provider))
     client.commit_agent_session(
         user_id="u1",
         session_id="s1",
         project_id="p1",
-        messages=[{"role": "user", "content": "We decided to use SQLite as the primary storage backend."}],
+        messages=[{"role": "user", "content": text}],
         connect_metadata=ConnectMetadata.default_agent("codex").to_dict(),
         async_commit=True,
     )
@@ -105,7 +191,13 @@ def test_runtime_injected_llm_extractor_enters_operation_plane(tmp_path) -> None
 
 
 def test_http_session_append_finalize_recall_flow(tmp_path) -> None:  # noqa: ANN001
-    client = MemoryOSClient(str(tmp_path), mode="server")
+    text = "Project rule: must run ruff before merge."
+    provider = FakeMemoryModelProvider(_project_rule_response("e1", text, "p1", proposal_id="p-ruff"))
+    client = MemoryOSClient(
+        str(tmp_path),
+        mode="server",
+        memory_extractor=LLMMemoryExtractorBackend(provider),
+    )
     app = MemoryOSASGI(client)
 
     async def post(path: str, payload: dict) -> dict:
@@ -132,7 +224,7 @@ def test_http_session_append_finalize_recall_flow(tmp_path) -> None:  # noqa: AN
                 "user_id": "u1",
                 "project_id": "p1",
                 "session_id": "native",
-                "prompt": "Project rule: must run ruff before merge.",
+                    "prompt": text,
             },
         )
     )

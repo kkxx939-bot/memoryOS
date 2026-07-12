@@ -2,19 +2,57 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+import pytest
+
+from memoryos.api.sdk.client import MemoryOSClient
 from memoryos.contextdb.session.planners.memory_commit_planner import MemoryCommitPlanner
 from memoryos.contextdb.session.session_model import SessionArchive
+from memoryos.memory.admission import MemoryAdmissionGate
+from memoryos.memory.canonical import CandidateProposalAdapter, MemorySemanticProposal, SessionArchiveEpisodeAdapter
 from memoryos.memory.extraction import RuleFallbackExtractor
-from memoryos.memory.schema import MemoryCandidateDraft, MemoryType, MemoryTypeRegistry, MemoryTypeSchema
+from memoryos.memory.schema import (
+    AdmissionDecision,
+    MemoryCandidateDraft,
+    MemoryType,
+    MemoryTypeRegistry,
+    MemoryTypeSchema,
+)
 from memoryos.memory.view import MemoryViewRouter
 
 
 class FakeExtractor:
+    semantic_proposal_backend = True
+    llm_semantic_backend = True
+
     def __init__(self, candidates: list[MemoryCandidateDraft]) -> None:
         self.candidates = candidates
 
-    def extract(self, archive: SessionArchive, schemas: Sequence[MemoryTypeSchema]) -> list[MemoryCandidateDraft]:  # noqa: ARG002
-        return self.candidates
+    def extract(
+        self,
+        archive: SessionArchive,
+        schemas: Sequence[MemoryTypeSchema],
+    ) -> list[MemorySemanticProposal]:
+        return self.extract_with_context(
+            archive,
+            schemas,
+            existing_memories=(),
+            episode=SessionArchiveEpisodeAdapter().adapt(archive),
+        )
+
+    def extract_with_context(self, archive, schemas, *, existing_memories, episode):  # noqa: ANN001, ANN201, ARG002
+        adapter = CandidateProposalAdapter()
+        gate = MemoryAdmissionGate()
+        return [
+            adapter.adapt(candidate, episode, archive)
+            for candidate in self.candidates
+            if gate.evaluate(
+                candidate,
+                user_id=archive.user_id,
+                project_id=str(archive.metadata.get("project_id") or ""),
+                adapter_id="codex",
+            ).decision
+            in {AdmissionDecision.ACCEPT, AdmissionDecision.PENDING}
+        ]
 
 
 def _draft(
@@ -36,6 +74,11 @@ def _draft(
     )
 
 
+class LegacyDraftOnlyExtractor:
+    def extract(self, archive, schemas):  # noqa: ANN001, ANN201, ARG002
+        return [_draft(MemoryType.PREFERENCE, "concise", fields={"preference": "concise"})]
+
+
 def test_memory_extractor_outputs_structured_candidates() -> None:
     archive = SessionArchive(
         user_id="u1",
@@ -53,7 +96,7 @@ def test_memory_extractor_outputs_structured_candidates() -> None:
         metadata={"project_id": "memoryos", "connect": {"adapter_id": "codex"}},
     )
 
-    candidates = RuleFallbackExtractor().extract(archive, [])
+    candidates = RuleFallbackExtractor().extract_drafts(archive, [])
 
     assert candidates
     assert all(isinstance(candidate, MemoryCandidateDraft) for candidate in candidates)
@@ -64,10 +107,30 @@ def test_memory_extractor_outputs_structured_candidates() -> None:
     }
 
 
+def test_runtime_and_planner_reject_legacy_draft_only_extractor_before_writes(tmp_path) -> None:  # noqa: ANN001
+    backend = LegacyDraftOnlyExtractor()
+    archive = SessionArchive(
+        user_id="u1",
+        session_id="legacy-draft",
+        archive_uri="memoryos://user/u1/sessions/history/legacy-draft",
+        messages=[{"id": "m1", "role": "user", "content": "I prefer concise answers."}],
+    )
+
+    with pytest.raises(TypeError, match="LLM MemorySemanticProposal"):
+        MemoryOSClient(str(tmp_path), memory_extractor=backend)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="MemorySemanticProposal"):
+        MemoryCommitPlanner(extractor=backend).plan(archive)  # type: ignore[arg-type]
+
+
+def test_runtime_rejects_rule_fallback_as_natural_language_semantic_backend(tmp_path) -> None:  # noqa: ANN001
+    with pytest.raises(TypeError, match="LLM MemorySemanticProposal"):
+        MemoryOSClient(str(tmp_path), memory_extractor=RuleFallbackExtractor())
+
+
 def test_fallback_identity_is_semantic_and_unknown_constraint_is_archive_only() -> None:
     extractor = RuleFallbackExtractor()
     schemas = MemoryTypeRegistry().list()
-    first = extractor.extract(
+    first = extractor.extract_drafts(
         SessionArchive(
             user_id="u1",
             session_id="s1",
@@ -76,7 +139,7 @@ def test_fallback_identity_is_semantic_and_unknown_constraint_is_archive_only() 
         ),
         schemas,
     )[0]
-    second = extractor.extract(
+    second = extractor.extract_drafts(
         SessionArchive(
             user_id="u1",
             session_id="s2",
@@ -85,7 +148,7 @@ def test_fallback_identity_is_semantic_and_unknown_constraint_is_archive_only() 
         ),
         schemas,
     )[0]
-    unknown = extractor.extract(
+    unknown = extractor.extract_drafts(
         SessionArchive(
             user_id="u1",
             session_id="s3",
@@ -102,7 +165,7 @@ def test_fallback_identity_is_semantic_and_unknown_constraint_is_archive_only() 
 
 
 def test_memory_commit_planner_uses_schema_pipeline() -> None:
-    planner = MemoryCommitPlanner()
+    planner = MemoryCommitPlanner(extractor=RuleFallbackExtractor())
 
     assert isinstance(planner.extractor, RuleFallbackExtractor)
     assert hasattr(planner, "admission_gate")
@@ -124,7 +187,12 @@ def test_memory_commit_planner_returns_operations_for_accepted_and_pending_only(
                 _draft(
                     MemoryType.PROJECT_RULE,
                     "MemoryOS must keep URI trees stable.",
-                    fields={"rule": "keep URI trees stable", "project_id": "memoryos"},
+                    fields={
+                        "rule_topic": "uri_tree_stability",
+                        "canonical_value": "keep URI trees stable",
+                        "rule": "keep URI trees stable",
+                        "project_id": "memoryos",
+                    },
                 ),
                 _draft(
                     MemoryType.PROJECT_RULE,
@@ -146,24 +214,16 @@ def test_memory_commit_planner_returns_operations_for_accepted_and_pending_only(
 
     operations = planner.plan(archive)
 
-    assert len(operations.operations) == 3
-    assert dict(operations.context.admission_summary) == {
-        "accepted": 1,
-        "pending": 1,
-        "rejected": 1,
-        "archive_only": 1,
-        "private_only": 0,
-        "restricted": 1,
-    }
+    assert len(operations.operations) == 2
+    assert {item.decision for item in operations.context.proposal_outcomes} == {"PENDING"}
+    assert all(operation.payload.get("canonical_pending_proposal") is True for operation in operations.operations)
     assert {operation.payload["memory_type"] for operation in operations.operations} == {"project_rule"}
-    assert {operation.payload["admission"]["decision"] for operation in operations.operations} == {
-        "accept",
-        "pending",
-    }
+    assert {operation.payload["admission"]["decision"] for operation in operations.operations} == {"pending"}
     assert (
         len([operation for operation in operations.operations if operation.payload.get("canonical_memory") is True])
-        == 2
+        == 0
     )
+    assert all(operation.payload.get("canonical_pending_proposal") is True for operation in operations.operations)
 
 
 def test_memory_operation_payload_contains_schema_metadata() -> None:
@@ -177,24 +237,23 @@ def test_memory_operation_payload_contains_schema_metadata() -> None:
         metadata={"project_id": "memoryos", "connect": {"adapter_id": "codex"}},
     )
 
-    operation = MemoryCommitPlanner().plan(archive).operations[0]
+    operation = MemoryCommitPlanner(extractor=RuleFallbackExtractor()).plan(archive).operations[0]
     metadata = operation.payload["context_object"]["metadata"]
 
     assert operation.payload["memory_type"] == "project_rule"
-    assert operation.payload["admission"]["decision"] == "accept"
+    assert operation.payload["admission"]["decision"] == "pending"
+    assert operation.payload["canonical_pending_proposal"] is True
     assert "project:memoryos:rules" in operation.payload["retrieval_views"]
-    assert operation.payload["source_adapter_id"] == "codex"
-    assert operation.payload["source_session_id"] == "s1"
-    assert operation.payload["merge_key"]
-    assert operation.payload["schema_version"] == "canonical_memory_v2"
-    assert metadata["memory_type"] == "project_rule"
+    assert operation.payload["schema_version"] == "canonical_pending_proposal_v1"
+    assert metadata["canonical_kind"] == "pending_proposal"
+    assert metadata["proposal"]["memory_type"] == "project_rule"
     assert metadata["retrieval_views"] == operation.payload["retrieval_views"]
-    assert metadata["source_adapter_id"] == "codex"
-    assert metadata["source_session_id"] == "s1"
-    assert metadata["source_roles"] == ["user"]
+    assert metadata["proposal"]["metadata"]["source_adapter_id"] == "codex"
+    assert metadata["proposal"]["metadata"]["source_session_id"] == "s1"
+    assert metadata["source_role"] == "user"
 
 
-def test_project_rule_accepted_with_retrieval_views() -> None:
+def test_project_rule_fallback_is_pending_with_retrieval_views() -> None:
     archive = SessionArchive(
         user_id="u1",
         session_id="s1",
@@ -203,9 +262,10 @@ def test_project_rule_accepted_with_retrieval_views() -> None:
         metadata={"project_id": "memoryOS", "connect": {"adapter_id": "codex"}},
     )
 
-    operation = MemoryCommitPlanner().plan(archive).operations[0]
+    operation = MemoryCommitPlanner(extractor=RuleFallbackExtractor()).plan(archive).operations[0]
 
-    assert operation.payload["admission"]["decision"] == "accept"
+    assert operation.payload["admission"]["decision"] == "pending"
+    assert operation.payload["canonical_pending_proposal"] is True
     assert "project:memoryOS:rules" in operation.payload["retrieval_views"]
 
 
@@ -218,7 +278,7 @@ def test_user_preference_accepted_with_user_views() -> None:
         metadata={"connect": {"adapter_id": "codex"}},
     )
 
-    operation = MemoryCommitPlanner().plan(archive).operations[0]
+    operation = MemoryCommitPlanner(extractor=RuleFallbackExtractor()).plan(archive).operations[0]
 
     assert operation.payload["memory_type"] == "preference"
     assert operation.payload["admission"]["decision"] in {"accept", "pending"}
@@ -239,10 +299,11 @@ def test_agent_experience_from_assistant_result() -> None:
         metadata={"project_id": "memoryOS", "connect": {"adapter_id": "codex"}},
     )
 
-    operation = MemoryCommitPlanner().plan(archive).operations[0]
+    operation = MemoryCommitPlanner(extractor=RuleFallbackExtractor()).plan(archive).operations[0]
 
     assert operation.payload["memory_type"] == "agent_experience"
-    assert operation.payload["admission"]["decision"] == "accept"
+    assert operation.payload["admission"]["decision"] == "pending"
+    assert operation.payload["canonical_pending_proposal"] is True
 
 
 def test_raw_tool_output_archive_only() -> None:
@@ -255,7 +316,7 @@ def test_raw_tool_output_archive_only() -> None:
         ],
         metadata={"project_id": "memoryOS", "connect": {"adapter_id": "codex"}},
     )
-    planner = MemoryCommitPlanner()
+    planner = MemoryCommitPlanner(extractor=RuleFallbackExtractor())
 
     result = planner.plan(archive)
     assert result.operations == ()
@@ -303,7 +364,10 @@ def test_memory_commit_planner_accepts_view_router_injection() -> None:
         metadata={"project_id": "memoryos", "connect": {"adapter_id": "codex"}},
     )
 
-    operation = MemoryCommitPlanner(view_router=FixedViewRouter()).plan(archive).operations[0]
+    operation = MemoryCommitPlanner(
+        extractor=RuleFallbackExtractor(),
+        view_router=FixedViewRouter(),
+    ).plan(archive).operations[0]
 
     assert operation.payload["retrieval_views"] == ["custom:u1:memoryos:codex"]
     assert operation.payload["context_object"]["metadata"]["retrieval_views"] == ["custom:u1:memoryos:codex"]

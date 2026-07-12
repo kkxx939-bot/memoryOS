@@ -43,14 +43,20 @@ from memoryos.memory.canonical.projection_state import (
     ProjectionStepStatus,
 )
 from memoryos.memory.canonical.proposal import (
+    Atomicity,
+    Attribution,
     Commitment,
+    Durability,
     EpistemicStatus,
     MemorySemanticProposal,
+    ModalForce,
     NormalizedSemanticAssessment,
+    PendingMemoryProposal,
     SemanticAssessment,
     SemanticRelation,
     SpeechAct,
     TemporalScope,
+    UtteranceMode,
 )
 from memoryos.memory.canonical.reconcile import AmbiguousSemanticReconciler, MemorySemanticReconciler
 from memoryos.memory.canonical.repository import CanonicalMemoryRepository
@@ -107,6 +113,7 @@ __all__ = [
     "MemoryScope",
     "MemorySemanticNormalizer",
     "MemorySemanticProposal",
+    "PendingMemoryProposal",
     "EvidenceRef",
     "EvidenceSignalKind",
     "EvidenceSignalMatch",
@@ -125,6 +132,11 @@ __all__ = [
     "Commitment",
     "TemporalScope",
     "SemanticRelation",
+    "UtteranceMode",
+    "Attribution",
+    "Durability",
+    "ModalForce",
+    "Atomicity",
     "SemanticAssessment",
     "NormalizedSemanticAssessment",
     "AliasRegistry",

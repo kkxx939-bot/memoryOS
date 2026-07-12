@@ -8,24 +8,30 @@ from memoryos.api.sdk.client import MemoryOSClient
 from memoryos.connect import ConnectMetadata
 from memoryos.contextdb.context_db import ContextDB
 from memoryos.contextdb.session import SessionArchive, SessionArchiveStore, SessionCommitService
+from memoryos.contextdb.session.planners.memory_commit_planner import MemoryCommitPlanner
 from memoryos.contextdb.store.local_stores import (
     FileSystemSourceStore,
     InMemoryIndexStore,
     InMemoryQueueStore,
     InMemoryRelationStore,
 )
+from memoryos.memory.extraction import RuleFallbackExtractor
+from memoryos.operations.commit.operation_committer import OperationCommitter
 from memoryos.operations.model.context_diff import ContextDiff
+from memoryos.operations.model.context_operation import ContextOperation
 from memoryos.prediction.model.prediction_request import PredictionRequest
 from memoryos.workers.session_commit_worker import SessionCommitWorker
 
 
 class RecordingCommitter:
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, list]] = []
+    def __init__(self, delegate: OperationCommitter) -> None:
+        self.delegate = delegate
+        self.source_store = delegate.source_store
+        self.calls: list[tuple[str, list[ContextOperation]]] = []
 
-    def commit(self, user_id: str, operations: list) -> ContextDiff:
+    def commit(self, user_id: str, operations: list[ContextOperation]) -> ContextDiff:
         self.calls.append((user_id, list(operations)))
-        return ContextDiff(user_id=user_id, operations=list(operations))
+        return self.delegate.commit(user_id, operations)
 
 
 def _archive(session_id: str = "s1") -> SessionArchive:
@@ -49,23 +55,55 @@ def _archive(session_id: str = "s1") -> SessionArchive:
     )
 
 
-def _context_db(tmp_path, queue: InMemoryQueueStore, committer: RecordingCommitter) -> ContextDB:
+def _stores_with_recording_committer(
+    tmp_path,
+    queue: InMemoryQueueStore,
+) -> tuple[FileSystemSourceStore, InMemoryIndexStore, InMemoryRelationStore, RecordingCommitter]:  # noqa: ANN001
     source = FileSystemSourceStore(tmp_path)
     index = InMemoryIndexStore()
     relations = InMemoryRelationStore()
-    service = SessionCommitService(SessionArchiveStore(tmp_path), queue, committer=cast(Any, committer))
-    return ContextDB(source, index, relations, queue_store=queue, session_commit_service=service, committer=cast(Any, committer))
+    committer = RecordingCommitter(
+        OperationCommitter(
+            source,
+            index,
+            str(tmp_path),
+            relation_store=relations,
+            queue_store=queue,
+        )
+    )
+    return source, index, relations, committer
+
+
+def _context_db(tmp_path, queue: InMemoryQueueStore) -> tuple[ContextDB, RecordingCommitter]:  # noqa: ANN001
+    source, index, relations, committer = _stores_with_recording_committer(tmp_path, queue)
+    service = SessionCommitService(
+        SessionArchiveStore(tmp_path),
+        queue,
+        committer=cast(Any, committer),
+        memory_planner=MemoryCommitPlanner(extractor=RuleFallbackExtractor()),
+    )
+    database = ContextDB(
+        source,
+        index,
+        relations,
+        queue_store=queue,
+        session_commit_service=service,
+        committer=cast(Any, committer),
+    )
+    return database, committer
 
 
 def test_commit_session_async_true_does_not_leave_worker_session_commit_job(tmp_path) -> None:
     queue = InMemoryQueueStore()
-    committer = RecordingCommitter()
-    db = _context_db(tmp_path, queue, committer)
+    db, committer = _context_db(tmp_path, queue)
 
     result = db.commit_session(_archive(), async_commit=True)
 
-    assert result.status == "done"
+    assert result.status == "done_with_pending"
     assert result.done is True
+    assert result.pending_count > 0
+    assert result.pending_persisted is True
+    assert result.canonical_active_operation_count == 0
     assert queue.lease("session_commit", 1) == []
     assert committer.calls
     committed_once = sum(len(operations) for _, operations in committer.calls)
@@ -78,8 +116,7 @@ def test_commit_session_async_true_does_not_leave_worker_session_commit_job(tmp_
 
 def test_commit_session_async_true_retry_same_task_does_not_recommit_operations(tmp_path) -> None:
     queue = InMemoryQueueStore()
-    committer = RecordingCommitter()
-    db = _context_db(tmp_path, queue, committer)
+    db, committer = _context_db(tmp_path, queue)
     archive = _archive()
 
     first = db.commit_session(archive, async_commit=True)
@@ -87,16 +124,17 @@ def test_commit_session_async_true_retry_same_task_does_not_recommit_operations(
     second = db.commit_session(archive, async_commit=True)
 
     assert first.task_id == second.task_id
-    assert second.status == "done"
+    assert second.status == "done_with_pending"
     assert second.done is True
+    assert second.pending_count == first.pending_count
+    assert second.pending_persisted is True
     assert len(committer.calls) == call_count_after_first
     assert queue.lease("session_commit", 1) == []
 
 
 def test_commit_session_async_false_keeps_sync_archive_pending_job(tmp_path) -> None:
     queue = InMemoryQueueStore()
-    committer = RecordingCommitter()
-    db = _context_db(tmp_path, queue, committer)
+    db, committer = _context_db(tmp_path, queue)
 
     result = db.commit_session(_archive(), async_commit=False)
 
@@ -109,8 +147,13 @@ def test_commit_session_async_false_keeps_sync_archive_pending_job(tmp_path) -> 
 
 def test_session_commit_worker_processes_real_pending_archive_once(tmp_path) -> None:
     queue = InMemoryQueueStore()
-    committer = RecordingCommitter()
-    service = SessionCommitService(SessionArchiveStore(tmp_path), queue, committer=cast(Any, committer))
+    _source, _index, _relations, committer = _stores_with_recording_committer(tmp_path, queue)
+    service = SessionCommitService(
+        SessionArchiveStore(tmp_path),
+        queue,
+        committer=cast(Any, committer),
+        memory_planner=MemoryCommitPlanner(extractor=RuleFallbackExtractor()),
+    )
     archive = _archive()
     queued = service.sync_archive(archive)
 
@@ -118,7 +161,7 @@ def test_session_commit_worker_processes_real_pending_archive_once(tmp_path) -> 
     assert [job.job_id for job in pending] == [queued.task_id]
     result = SessionCommitWorker(service).process_archive(archive)
 
-    assert result == {"task_id": archive.task_id, "status": "done", "done": True}
+    assert result == {"task_id": archive.task_id, "status": "done_with_pending", "done": True}
     assert committer.calls
     committed_once = sum(len(operations) for _, operations in committer.calls)
     assert committed_once > 0

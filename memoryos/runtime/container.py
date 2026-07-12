@@ -65,8 +65,11 @@ def build_runtime_container(
 ) -> RuntimeContainer:
     """组装默认运行链路，并拒绝会直接生成数据库操作的旧提取器。"""
 
-    if config.memory_extractor is not None and not getattr(config.memory_extractor, "candidate_backend", False):
-        raise TypeError("memory_extractor must be a semantic candidate/proposal backend")
+    if config.memory_extractor is not None and (
+        not getattr(config.memory_extractor, "semantic_proposal_backend", False)
+        or not getattr(config.memory_extractor, "llm_semantic_backend", False)
+    ):
+        raise TypeError("memory_extractor must be an LLM MemorySemanticProposal backend")
     root_path = config.root_path
     source = source_store or FileSystemSourceStore(root_path)
     index = index_store or SQLiteIndexStore(root_path / "indexes" / "context.sqlite3")

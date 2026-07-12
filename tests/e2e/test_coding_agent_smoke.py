@@ -39,6 +39,19 @@ async def _request(
 
 
 def test_agent_session_to_memory_http_mcp_smoke(tmp_path) -> None:  # noqa: ANN001
+    source_text = "We decided to use SQLite for the local queue."
+    atomic = {"event_id": "event-1", "span_start": 0, "span_end": len(source_text)}
+    semantic = {
+        "speech_act": "confirmation",
+        "commitment": "confirmed",
+        "temporal_scope": "current",
+        "relation_to_existing": "unrelated",
+        "utterance_mode": "assertion",
+        "attribution": "source_actor",
+        "durability": "durable",
+        "modal_force": "none",
+        "atomicity": "atomic",
+    }
     provider = FakeMemoryModelProvider(
         response=json.dumps(
             {
@@ -48,23 +61,16 @@ def test_agent_session_to_memory_http_mcp_smoke(tmp_path) -> None:  # noqa: ANN0
                         "memory_type": "project_decision",
                         "identity_fields": {"decision_topic": "local queue"},
                         "value_fields": {"canonical_value": "SQLite"},
-                        "semantic": {
-                            "speech_act": "confirmation",
-                            "commitment": "confirmed",
-                            "temporal_scope": "current",
-                            "relation_to_existing": "unrelated",
-                        },
+                        "semantic": semantic,
                         "epistemic_status": "EXPLICIT",
                         "suggested_scope_refs": [{"namespace": "memoryos", "kind": "workspace", "id": "project-a"}],
-                        "evidence_refs": [{"event_id": "event-1"}],
+                        "evidence_refs": [atomic],
+                        "atomic_evidence_ref": atomic,
                         "field_evidence_refs": {
-                            "identity.decision_topic": [{"event_id": "event-1"}],
-                            "value.canonical_value": [{"event_id": "event-1"}],
-                            "semantic.speech_act": [{"event_id": "event-1"}],
-                            "semantic.commitment": [{"event_id": "event-1"}],
-                            "semantic.temporal_scope": [{"event_id": "event-1"}],
-                            "semantic.relation_to_existing": [{"event_id": "event-1"}],
-                            "transition": [{"event_id": "event-1"}],
+                            "identity.decision_topic": [atomic],
+                            "value.canonical_value": [atomic],
+                            **{f"semantic.{field_name}": [atomic] for field_name in semantic},
+                            "transition": [atomic],
                         },
                         "confidence": 0.95,
                         "source_role": "user",
@@ -92,7 +98,7 @@ def test_agent_session_to_memory_http_mcp_smoke(tmp_path) -> None:  # noqa: ANN0
                 "user_id": "u1",
                 "project_id": "project-a",
                 "session_id": "native-1",
-                "prompt": "We decided to use SQLite for the local queue.",
+                "prompt": source_text,
             },
         )
     )
@@ -148,6 +154,44 @@ def test_agent_session_to_memory_http_mcp_smoke(tmp_path) -> None:  # noqa: ANN0
         project_id="project-a",
         search_scope="project_decisions",
     )
+    client.remember(
+        user_id="u1",
+        project_id="project-a",
+        memory_type="project_decision",
+        title="review target",
+        content="PostgreSQL",
+    )
+    pending_result = client.remember(
+        user_id="u1",
+        project_id="project-a",
+        memory_type="project_decision",
+        title="review target",
+        content="MySQL",
+    )
+    pending_http = asyncio.run(
+        _request(
+            app,
+            "GET",
+            "/v1/memories/pending",
+            query_string=b"user_id=u1&lifecycle_state=PENDING",
+        )
+    )["results"]
+    reviewable = next(item for item in pending_http if item["uri"] == pending_result["uri"])
+    rejected = asyncio.run(
+        _request(
+            app,
+            "POST",
+            "/v1/memories/pending/review",
+            {
+                "user_id": "u1",
+                "pending_uri": reviewable["uri"],
+                "decision": "REJECT",
+                "expected_lifecycle_revision": reviewable["lifecycle_revision"],
+                "expected_proposal_fingerprint": reviewable["proposal_fingerprint"],
+                "command_id": "reject-smoke-candidate",
+            },
+        )
+    )
 
     assert finalized["done"] is True
     assert direct, [obj.to_dict() for obj in client.source_store.list_objects()]
@@ -157,3 +201,4 @@ def test_agent_session_to_memory_http_mcp_smoke(tmp_path) -> None:  # noqa: ANN0
     assert archive_read["archive"]["archive_uri"] == finalized["archive_uri"]
     assert mcp_search["error"] is None and mcp_search["results"]
     assert health["error"] is None and health["http_server"] == "ready"
+    assert rejected["status"] == "rejected"
