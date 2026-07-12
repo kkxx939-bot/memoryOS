@@ -34,6 +34,7 @@ from memoryos.memory.canonical import (
 from memoryos.memory.extraction import MemoryExtractionBatchResult, RejectedMemoryCandidate
 from memoryos.memory.schema import MemoryCandidateDraft, MemoryType, MemoryTypeSchema
 from memoryos.operations.commit.operation_committer import OperationCommitter
+from memoryos.operations.commit.redo_log import RedoIntegrityError
 from memoryos.operations.model.context_operation import ContextOperation
 from memoryos.operations.model.operation_action import OperationAction
 
@@ -73,7 +74,7 @@ def _pending_draft(*, missing_source: bool = False) -> MemoryCandidateDraft:
 
 
 def _stores(tmp_path):  # noqa: ANN001, ANN202
-    source = FileSystemSourceStore(tmp_path)
+    source = FileSystemSourceStore(tmp_path, tenant_id="t1")
     index = InMemoryIndexStore()
     relations = InMemoryRelationStore()
     queue = InMemoryQueueStore()
@@ -151,13 +152,16 @@ def test_admission_pending_is_stable_durable_and_review_query_only(tmp_path) -> 
 
     db = ContextDB(source, index, relations, queue_store=queue, committer=committer)
     assembler = ContextAssembler(db)
-    assert assembler.search(
-        "Redis",
-        user_id="u1",
-        tenant_id="t1",
-        project_id="memoryos",
-        context_type="memory",
-    ) == []
+    assert (
+        assembler.search(
+            "Redis",
+            user_id="u1",
+            tenant_id="t1",
+            project_id="memoryos",
+            context_type="memory",
+        )
+        == []
+    )
     review = assembler.search(
         "Redis",
         user_id="u1",
@@ -378,10 +382,14 @@ def test_pending_lifecycle_commit_rejects_forged_state_history_content_and_immut
     with pytest.raises(ValueError, match="content does not match"):
         committer.commit("u1", [forged_content])
 
-    desired = CanonicalMemoryRepository(source).load_pending(uri, tenant_id="t1", owner_user_id="u1").with_lifecycle(
-        LifecycleState.CONFIRMED,
-        reason="reviewed",
-        updated_at="2026-07-11T05:00:00Z",
+    desired = (
+        CanonicalMemoryRepository(source)
+        .load_pending(uri, tenant_id="t1", owner_user_id="u1")
+        .with_lifecycle(
+            LifecycleState.CONFIRMED,
+            reason="reviewed",
+            updated_at="2026-07-11T05:00:00Z",
+        )
     )
     rewritten = replace(
         desired,
@@ -498,9 +506,20 @@ def test_pending_add_source_written_redo_resumes_without_being_treated_as_overwr
     )
     operation = formed.operations[0]
     fresh_retry = ContextOperation.from_dict(deepcopy(operation.to_dict()))
-    committer.redo.begin(operation, phase="started")
+    relation_manifest = committer._build_regular_relation_manifest(operation)
+    committer.redo.begin(
+        operation,
+        phase="started",
+        relation_manifest=relation_manifest,
+    )
     committer._apply_source(operation)
-    committer.redo.advance(operation, phase="source_written")
+    committer._apply_regular_relation_manifest(operation, relation_manifest)
+    committer.redo.advance(
+        operation,
+        phase="source_written",
+        source_effect=committer._capture_regular_source_effect(operation, relation_manifest),
+        relation_manifest=relation_manifest,
+    )
 
     diff = committer.commit("u1", [fresh_retry])
 
@@ -524,14 +543,25 @@ def test_pending_add_source_written_redo_rejects_tampered_source_effect(tmp_path
     )
     operation = formed.operations[0]
     fresh_retry = ContextOperation.from_dict(deepcopy(operation.to_dict()))
-    committer.redo.begin(operation, phase="started")
+    relation_manifest = committer._build_regular_relation_manifest(operation)
+    committer.redo.begin(
+        operation,
+        phase="started",
+        relation_manifest=relation_manifest,
+    )
     committer._apply_source(operation)
-    committer.redo.advance(operation, phase="source_written")
+    committer._apply_regular_relation_manifest(operation, relation_manifest)
+    committer.redo.advance(
+        operation,
+        phase="source_written",
+        source_effect=committer._capture_regular_source_effect(operation, relation_manifest),
+        relation_manifest=relation_manifest,
+    )
     tampered = source.read_object(str(operation.target_uri))
     tampered.title = "tampered pending source"
     source.write_object(tampered, content="tampered content")
 
-    with pytest.raises(ValueError, match="SourceStore effect does not match"):
+    with pytest.raises((ValueError, RedoIntegrityError), match="SourceStore effect does not match"):
         committer.commit("u1", [fresh_retry])
 
     assert not committer._operation_marker(operation.operation_id).exists()
@@ -597,9 +627,20 @@ def test_automatic_target_update_redo_adopts_persisted_target_and_preserves_unch
     fresh_retry = ContextOperation.from_dict(deepcopy(raw.to_dict()))
     resolved = committer.target_resolver.resolve(raw, user_id="u1")
     assert resolved.resolved and raw.target_uri == current.uri
-    committer.redo.begin(raw, phase="started")
+    relation_manifest = committer._build_regular_relation_manifest(raw)
+    committer.redo.begin(
+        raw,
+        phase="started",
+        relation_manifest=relation_manifest,
+    )
     committer._apply_source(raw)
-    committer.redo.advance(raw, phase="source_written")
+    committer._apply_regular_relation_manifest(raw, relation_manifest)
+    committer.redo.advance(
+        raw,
+        phase="source_written",
+        source_effect=committer._capture_regular_source_effect(raw, relation_manifest),
+        relation_manifest=relation_manifest,
+    )
 
     diff = committer.commit("u1", [fresh_retry])
 
@@ -648,10 +689,7 @@ def test_all_pending_session_result_reports_durable_substate(tmp_path) -> None: 
     assert result.pending_count == 1
     assert result.pending_persisted is True
     memory_diff = json.loads(
-        (
-            tmp_path
-            / "tenants/t1/users/u1/sessions/history/pending-session/memory_diff.json"
-        ).read_text(encoding="utf-8")
+        (tmp_path / "tenants/t1/users/u1/sessions/history/pending-session/memory_diff.json").read_text(encoding="utf-8")
     )
     assert memory_diff["archive_committed"] is True
     assert memory_diff["canonical_active_operation_count"] == 0

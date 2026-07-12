@@ -40,7 +40,10 @@ class RetrievalService:
             "trace_id": trace_id,
             "created_at": utc_now(),
             "query": query[:1000],
-            "scope": {key: kwargs.get(key) for key in ("user_id", "project_id", "adapter_id", "search_scope")},
+            "scope": {
+                key: kwargs.get(key)
+                for key in ("tenant_id", "user_id", "project_id", "adapter_id", "search_scope")
+            },
             "retrieval_views": kwargs.get("retrieval_views") or [],
             "metadata_filters": kwargs.get("connect_filters") or {},
             "candidate_count": len(selected) + len(dropped),

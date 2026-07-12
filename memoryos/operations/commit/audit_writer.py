@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from memoryos.core.ids import require_safe_path_segment
 from memoryos.core.time import utc_now
 
 
@@ -13,6 +14,7 @@ class AuditWriter:
         self.root = Path(root)
 
     def record(self, user_id: str, event_type: str, payload: dict) -> Path:
+        user_id = require_safe_path_segment(user_id, "user_id")
         path = self.root / "system" / "audit" / f"{user_id}.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
         operation_id = str(payload.get("operation_id", ""))

@@ -22,14 +22,15 @@ from memoryos.contextdb.session.session_archive import SessionArchiveStore
 from memoryos.contextdb.store.local_stores import InMemoryLockStore
 from memoryos.contextdb.store.source_store import (
     IndexStore,
+    LockLostError,
     LockStore,
     QueueJob,
     QueueStore,
     RelationStore,
     SourceStore,
 )
-from memoryos.contextdb.transaction.path_lock import PathLock
-from memoryos.core.ids import stable_hash
+from memoryos.contextdb.transaction.path_lock import LeaseGuard, PathLock
+from memoryos.core.ids import require_safe_path_segment, stable_hash
 from memoryos.core.time import utc_now
 from memoryos.memory.canonical.event import canonical_json, resolve_content_path
 from memoryos.memory.canonical.evidence import evidence_hash
@@ -40,7 +41,7 @@ from memoryos.memory.canonical.transaction import RevisionConflictError
 from memoryos.operations.commit.audit_writer import AuditWriter
 from memoryos.operations.commit.diff_writer import DiffWriter
 from memoryos.operations.commit.operation_coalescer import OperationCoalescer
-from memoryos.operations.commit.redo_log import RedoLog
+from memoryos.operations.commit.redo_log import RedoIntegrityError, RedoLog
 from memoryos.operations.model.context_diff import ContextDiff
 from memoryos.operations.model.context_operation import ContextOperation
 from memoryos.operations.model.operation_action import OperationAction
@@ -61,24 +62,178 @@ class OperationCommitter:
         relation_store: RelationStore | None = None,
         queue_store: QueueStore | None = None,
         target_resolver: TargetResolver | None = None,
+        tenant_id: str | None = None,
     ) -> None:
+        source_tenant = getattr(source_store, "tenant_id", None)
+        if source_tenant is not None:
+            source_tenant = self._validate_tenant_id(source_tenant, "SourceStore tenant_id")
+        bound_tenant = (
+            self._validate_tenant_id(tenant_id, "OperationCommitter tenant_id")
+            if tenant_id is not None
+            else source_tenant or "default"
+        )
+        if source_tenant is not None and source_tenant != bound_tenant:
+            raise ValueError("OperationCommitter tenant does not match SourceStore tenant")
         self.source_store = source_store
         self.index_store = index_store
         self.relation_store = relation_store
         self.queue_store = queue_store
         self.root = Path(root)
+        self.artifact_root = (
+            self.root if bound_tenant == "default" else self.root / "tenants" / bound_tenant
+        )
         self.coalescer = OperationCoalescer()
         self.conflicts = ConflictResolver()
         self.target_resolver = target_resolver or TargetResolver(index_store, source_store=source_store)
-        self.redo = RedoLog(root)
-        self.diff_writer = DiffWriter(root)
-        self.audit = AuditWriter(root)
+        self.redo = RedoLog(self.artifact_root)
+        self.diff_writer = DiffWriter(self.artifact_root)
+        self.audit = AuditWriter(self.artifact_root)
         self.path_lock = PathLock(lock_store or InMemoryLockStore())
         self.action_policy_updater = ActionPolicyUpdater()
+        self.tenant_id = bound_tenant
+
+    def _lock_key(self, raw_key: str) -> str:
+        # The default tenant keeps its historical lock key. Non-default
+        # tenants have physically distinct artifacts and therefore receive a
+        # tenant-qualified key in the shared lock store.
+        return raw_key if self.tenant_id == "default" else f"tenant:{self.tenant_id}:{raw_key}"
+
+    @staticmethod
+    def _validate_tenant_id(value: object, label: str) -> str:
+        if (
+            not isinstance(value, str)
+            or not value.strip()
+            or value in {".", ".."}
+            or "/" in value
+            or "\\" in value
+        ):
+            raise ValueError(f"{label} must be one safe non-empty path segment")
+        return value
+
+    def _explicit_tenant_declarations(self, operation: ContextOperation) -> list[tuple[str, str]]:
+        payload = operation.payload
+        if not isinstance(payload, dict):
+            raise ValueError("operation payload must be an object")
+        declarations: list[tuple[str, str]] = []
+
+        def inspect(container: object, path: str) -> None:
+            if not isinstance(container, dict) or "tenant_id" not in container:
+                return
+            declarations.append(
+                (path, self._validate_tenant_id(container["tenant_id"], f"{path}.tenant_id"))
+            )
+
+        def inspect_scope(container: object, path: str) -> None:
+            if not isinstance(container, dict):
+                return
+            inspect(container, path)
+            inspect(container.get("visibility"), f"{path}.visibility")
+            inspect(container.get("authority"), f"{path}.authority")
+
+        inspect(payload, "payload")
+        inspect_scope(payload.get("scope"), "payload.scope")
+        inspect(payload.get("visibility"), "payload.visibility")
+        inspect(payload.get("authority"), "payload.authority")
+        object_payload = payload.get("context_object")
+        if isinstance(object_payload, dict):
+            inspect(object_payload, "payload.context_object")
+            inspect_scope(object_payload.get("scope"), "payload.context_object.scope")
+            inspect(object_payload.get("visibility"), "payload.context_object.visibility")
+            inspect(object_payload.get("authority"), "payload.context_object.authority")
+            metadata = object_payload.get("metadata")
+            if isinstance(metadata, dict):
+                inspect(metadata, "payload.context_object.metadata")
+                inspect_scope(metadata.get("scope"), "payload.context_object.metadata.scope")
+                inspect(metadata.get("visibility"), "payload.context_object.metadata.visibility")
+                inspect(metadata.get("authority"), "payload.context_object.metadata.authority")
+        return declarations
+
+    def _operation_matches_bound_tenant(self, operation: ContextOperation) -> bool:
+        try:
+            declarations = self._explicit_tenant_declarations(operation)
+        except ValueError:
+            return False
+        return all(value == self.tenant_id for _, value in declarations)
+
+    def _validate_and_bind_operations(
+        self,
+        user_id: str,
+        operations: list[ContextOperation],
+    ) -> None:
+        """Validate the complete principal/tenant boundary before durable effects."""
+
+        require_safe_path_segment(user_id, "commit user_id")
+        declarations_by_operation: list[tuple[ContextOperation, list[tuple[str, str]]]] = []
+        for operation in operations:
+            require_safe_path_segment(operation.operation_id, "operation_id")
+            if operation.user_id != user_id:
+                raise ValueError("operation user does not match commit user")
+            declarations = self._explicit_tenant_declarations(operation)
+            if any(value != self.tenant_id for _, value in declarations):
+                paths = ", ".join(path for path, value in declarations if value != self.tenant_id)
+                raise ValueError(f"operation tenant does not match bound tenant: {paths}")
+            declarations_by_operation.append((operation, declarations))
+
+        # Bind only after every operation has passed so a rejected batch is not
+        # partially normalized and no artifact is written with an implicit tenant.
+        for operation, _ in declarations_by_operation:
+            operation.payload.setdefault("tenant_id", self.tenant_id)
+            object_payload = operation.payload.get("context_object")
+            if isinstance(object_payload, dict):
+                object_payload.setdefault("tenant_id", self.tenant_id)
+
+    def _validate_recovery_artifact_tenant(self, payload: object, label: str) -> None:
+        if not isinstance(payload, dict) or "tenant_id" not in payload:
+            return
+        tenant = self._validate_tenant_id(payload["tenant_id"], f"{label} tenant_id")
+        if tenant != self.tenant_id:
+            raise RedoIntegrityError(f"{label} crosses the bound tenant")
+
+    def _validate_redo_boundary(
+        self,
+        user_id: str,
+        operation: ContextOperation,
+        *,
+        source_effect: dict | None = None,
+        relation_manifest: dict | None = None,
+    ) -> None:
+        try:
+            self._validate_and_bind_operations(user_id, [operation])
+        except ValueError as exc:
+            raise RedoIntegrityError("redo operation crosses its user or tenant boundary") from exc
+        self._validate_recovery_artifact_tenant(source_effect, "redo source effect")
+        self._validate_recovery_artifact_tenant(relation_manifest, "redo relation manifest")
+
+    def _validate_canonical_artifact_keys(self, operation: ContextOperation) -> tuple[str, str]:
+        transaction_id = require_safe_path_segment(
+            operation.payload.get("transaction_id"),
+            "canonical transaction_id",
+        )
+        idempotency_key = require_safe_path_segment(
+            operation.payload.get("idempotency_key"),
+            "canonical idempotency_key",
+        )
+        return transaction_id, idempotency_key
+
+    def _reject_cross_boundary_redo_collisions(
+        self,
+        user_id: str,
+        operations: list[ContextOperation],
+    ) -> None:
+        requested_ids = {operation.operation_id for operation in operations}
+        if not requested_ids:
+            return
+        for entry in self.redo.pending_entries():
+            if entry.operation_id not in requested_ids:
+                continue
+            if entry.operation.user_id != user_id or not self._operation_matches_bound_tenant(entry.operation):
+                raise RedoIntegrityError("redo operation id is already bound to another user or tenant")
 
     def commit(self, user_id: str, operations: list[ContextOperation]) -> ContextDiff:
         """执行这一步处理，并保持已有状态约束。"""
 
+        self._validate_and_bind_operations(user_id, operations)
+        self._reject_cross_boundary_redo_collisions(user_id, operations)
         canonical = [operation for operation in operations if operation.payload.get("canonical_memory") is True]
         if canonical:
             diffs: list[ContextDiff] = []
@@ -130,60 +285,108 @@ class OperationCommitter:
         committed: list[ContextOperation] = []
         pending_redo = {entry.operation_id: entry for entry in self.redo.pending_entries()}
         self._preflight_regular_operations(conflict_result.accepted)
-        try:
-            for operation in conflict_result.accepted:
-                if operation.status == OperationStatus.PENDING:
-                    pending.append(operation)
-                    continue
-                lock_key = operation.target_uri or f"{operation.user_id}:{operation.operation_id}"
-                with self.path_lock.acquire(lock_key):
-                    marker = self._operation_marker(operation.operation_id)
-                    if marker.exists():
-                        persisted = self._validate_operation_marker(marker, operation)
-                        operation.status = OperationStatus.COMMITTED
-                        committed.append(persisted)
+        with ExitStack() as lock_stack:
+            guard_by_key = {
+                lock_key: lock_stack.enter_context(self.path_lock.acquire(self._lock_key(lock_key)))
+                for lock_key in sorted(
+                    {
+                        operation.target_uri or f"{operation.user_id}:{operation.operation_id}"
+                        for operation in conflict_result.accepted
+                        if operation.status != OperationStatus.PENDING
+                    }
+                )
+            }
+            held_guards = list(guard_by_key.values())
+            try:
+                for operation in conflict_result.accepted:
+                    if operation.status == OperationStatus.PENDING:
+                        pending.append(operation)
                         continue
-                    pending_entry = pending_redo.get(operation.operation_id)
-                    if pending_entry is not None and pending_entry.phase not in {"started", "begin"}:
-                        self.resume(user_id, pending_entry.operation, pending_entry.phase)
+                    lock_key = operation.target_uri or f"{operation.user_id}:{operation.operation_id}"
+                    guard = guard_by_key[lock_key]
+                    with guard.fenced():
+                        marker = self._operation_marker(operation.operation_id)
                         if marker.exists():
                             persisted = self._validate_operation_marker(marker, operation)
+                            self._ensure_single_operation_diff(user_id, persisted)
                             operation.status = OperationStatus.COMMITTED
                             committed.append(persisted)
                             continue
-                    self._validate_pending_lifecycle_cas(operation)
-                    self.redo.begin(operation, phase="started")
-                    self._apply_source(operation)
-                    self.redo.advance(operation, phase="source_written")
-                    self._apply_index(operation)
-                    self.redo.advance(operation, phase="index_written")
-                    self.audit.record(user_id, "context_operation_committed", operation.to_dict())
-                    self.redo.advance(operation, phase="audit_written")
-                    operation.status = OperationStatus.COMMITTED
-                committed.append(operation)
-        except RevisionConflictError as exc:
-            regular_partials: list[ContextDiff] = []
-            if committed or pending or target_rejected or conflict_result.rejected:
-                regular_partials.append(
-                    self._finalize_regular_diff(
-                        user_id,
-                        committed,
-                        pending,
-                        target_rejected,
-                        conflict_result.rejected,
+                        pending_entry = pending_redo.get(operation.operation_id)
+                        if pending_entry is not None and pending_entry.phase not in {"started", "begin"}:
+                            self._resume_under_guard(
+                                user_id,
+                                pending_entry.operation,
+                                pending_entry.phase,
+                                source_effect=pending_entry.source_effect,
+                                relation_manifest=pending_entry.relation_manifest,
+                                guard=guard,
+                            )
+                            if marker.exists():
+                                persisted = self._validate_operation_marker(marker, operation)
+                                self._ensure_single_operation_diff(user_id, persisted)
+                                operation.status = OperationStatus.COMMITTED
+                                committed.append(persisted)
+                                continue
+                        self._validate_pending_lifecycle_cas(operation)
+                        relation_manifest = self._build_regular_relation_manifest(operation)
+                        self.redo.begin(
+                            operation,
+                            phase="started",
+                            relation_manifest=relation_manifest,
+                        )
+                        self._apply_source(operation)
+                        self._apply_regular_relation_manifest(operation, relation_manifest)
+                        source_effect = self._capture_regular_source_effect(
+                            operation,
+                            relation_manifest,
+                        )
+                        self._validate_regular_recovery_effect(
+                            user_id,
+                            operation,
+                            source_effect,
+                            relation_manifest=relation_manifest,
+                        )
+                        self.redo.advance(
+                            operation,
+                            phase="source_written",
+                            source_effect=source_effect,
+                            relation_manifest=relation_manifest,
+                        )
+                    with guard.fenced():
+                        self._apply_index(operation)
+                        self.redo.advance(operation, phase="index_written")
+                    with guard.fenced():
+                        self.audit.record(user_id, "context_operation_committed", operation.to_dict())
+                        self.redo.advance(operation, phase="audit_written")
+                        operation.status = OperationStatus.COMMITTED
+                        self._finalize_single_regular_operation(user_id, operation)
+                    committed.append(operation)
+            except RevisionConflictError as exc:
+                regular_partials: list[ContextDiff] = []
+                if committed or pending or target_rejected or conflict_result.rejected:
+                    regular_partials.append(
+                        self._finalize_regular_diff(
+                            user_id,
+                            committed,
+                            pending,
+                            target_rejected,
+                            conflict_result.rejected,
+                            held_guards=held_guards,
+                        )
                     )
-                )
-            if exc.committed_diff is not None:
-                regular_partials.append(exc.committed_diff)
-            committed_diff = self._combine_diffs(user_id, regular_partials) if regular_partials else None
-            raise RevisionConflictError(str(exc), committed_diff=committed_diff) from exc
-        return self._finalize_regular_diff(
-            user_id,
-            committed,
-            pending,
-            target_rejected,
-            conflict_result.rejected,
-        )
+                if exc.committed_diff is not None:
+                    regular_partials.append(exc.committed_diff)
+                committed_diff = self._combine_diffs(user_id, regular_partials) if regular_partials else None
+                raise RevisionConflictError(str(exc), committed_diff=committed_diff) from exc
+            return self._finalize_regular_diff(
+                user_id,
+                committed,
+                pending,
+                target_rejected,
+                conflict_result.rejected,
+                held_guards=held_guards,
+            )
 
     def _finalize_regular_diff(
         self,
@@ -192,10 +395,61 @@ class OperationCommitter:
         pending: list[ContextOperation],
         target_rejected: list[ContextOperation],
         conflict_rejected: list[ContextOperation],
+        *,
+        held_guards: list[LeaseGuard] | None = None,
     ) -> ContextDiff:
+        if held_guards is not None:
+            with self.path_lock.fenced(held_guards):
+                return self._finalize_regular_diff_locked(
+                    user_id,
+                    committed,
+                    pending,
+                    target_rejected,
+                    conflict_rejected,
+                )
+        guards = []
+        with ExitStack() as lock_stack:
+            lock_keys = sorted(
+                {
+                    operation.target_uri or f"{operation.user_id}:{operation.operation_id}"
+                    for operation in committed
+                }
+            )
+            for lock_key in lock_keys:
+                guards.append(lock_stack.enter_context(self.path_lock.acquire(self._lock_key(lock_key))))
+            with self.path_lock.fenced(guards):
+                return self._finalize_regular_diff_locked(
+                    user_id,
+                    committed,
+                    pending,
+                    target_rejected,
+                    conflict_rejected,
+                )
+
+    def _finalize_regular_diff_locked(
+        self,
+        user_id: str,
+        committed: list[ContextOperation],
+        pending: list[ContextOperation],
+        target_rejected: list[ContextOperation],
+        conflict_rejected: list[ContextOperation],
+    ) -> ContextDiff:
+        for operation in committed:
+            marker = self._operation_marker(operation.operation_id)
+            if not marker.exists():
+                raise RedoIntegrityError("combined regular diff contains an unmarked Source effect")
+            self._validate_operation_marker(marker, operation)
+            self._validate_single_operation_diff(user_id, operation)
         diff_members = [*committed, *pending, *target_rejected, *conflict_rejected]
         diff_key = stable_hash(
-            sorted((operation.operation_id, operation.status.value) for operation in diff_members),
+            sorted(
+                (
+                    operation.operation_id,
+                    operation.status.value,
+                    self._operation_effect_fingerprint(operation),
+                )
+                for operation in diff_members
+            ),
             length=32,
         )
         diff = ContextDiff(
@@ -206,7 +460,8 @@ class OperationCommitter:
             diff_id=f"diff_{diff_key}",
             created_at=min((operation.created_at for operation in diff_members if operation.created_at), default=utc_now()),
         )
-        diff_path = self.root / "system" / "diffs" / f"{diff.diff_id}.json"
+        diff_id = require_safe_path_segment(diff.diff_id, "diff_id")
+        diff_path = self.artifact_root / "system" / "diffs" / f"{diff_id}.json"
         if diff_path.exists():
             persisted = self._diff_from_payload(json.loads(diff_path.read_text(encoding="utf-8")))
             requested_ids = {
@@ -221,23 +476,81 @@ class OperationCommitter:
             }
             if requested_ids != persisted_ids:
                 raise ValueError("regular diff id conflicts with a different operation set")
-            persisted_by_id = {item.operation_id: item for item in persisted.operations}
-            if any(
-                self._operation_effect_fingerprint(operation)
-                != self._operation_effect_fingerprint(persisted_by_id[operation.operation_id])
-                for operation in diff.operations
-            ):
-                raise ValueError("regular diff conflicts with a different persisted effect")
+            for kind in ("operations", "pending_operations", "rejected_operations"):
+                persisted_by_id = {
+                    item.operation_id: item for item in getattr(persisted, kind)
+                }
+                if any(
+                    self._operation_effect_fingerprint(operation)
+                    != self._operation_effect_fingerprint(persisted_by_id[operation.operation_id])
+                    for operation in getattr(diff, kind)
+                ):
+                    raise ValueError("regular diff conflicts with a different persisted effect")
             diff = persisted
         else:
             self.diff_writer.write(diff)
-        for operation in committed:
-            self._write_operation_marker(operation)
-            self.redo.advance(operation, phase="diff_written")
-            self.redo.commit(operation.operation_id)
+        return diff
+
+    def _finalize_single_regular_operation(
+        self,
+        user_id: str,
+        operation: ContextOperation,
+    ) -> ContextDiff:
+        diff = self._ensure_single_operation_diff(user_id, operation)
+        self.redo.advance(operation, phase="diff_written")
+        self._write_operation_marker(operation)
+        self.redo.commit(operation.operation_id)
+        return diff
+
+    def _ensure_single_operation_diff(
+        self,
+        user_id: str,
+        operation: ContextOperation,
+    ) -> ContextDiff:
+        operation_id = require_safe_path_segment(operation.operation_id, "operation_id")
+        path = self.artifact_root / "system" / "diffs" / f"diff_{operation_id}.json"
+        if path.exists():
+            return self._validate_single_operation_diff(user_id, operation)
+        operation.status = OperationStatus.COMMITTED
+        diff = ContextDiff(
+            user_id=user_id,
+            operations=[operation],
+            diff_id=f"diff_{operation.operation_id}",
+            created_at=operation.created_at,
+        )
+        self.diff_writer.write(diff)
+        return diff
+
+    def _validate_single_operation_diff(
+        self,
+        user_id: str,
+        operation: ContextOperation,
+    ) -> ContextDiff:
+        operation_id = require_safe_path_segment(operation.operation_id, "operation_id")
+        path = self.artifact_root / "system" / "diffs" / f"diff_{operation_id}.json"
+        if not path.exists():
+            raise RedoIntegrityError("committed regular operation has no single-operation diff")
+        diff = self._diff_from_payload(json.loads(path.read_text(encoding="utf-8")))
+        if (
+            diff.user_id != user_id
+            or len(diff.operations) != 1
+            or diff.pending_operations
+            or diff.rejected_operations
+            or diff.operations[0].operation_id != operation.operation_id
+            or self._operation_effect_fingerprint(diff.operations[0])
+            != self._operation_effect_fingerprint(operation)
+        ):
+            raise RedoIntegrityError("single-operation diff conflicts with its committed effect")
         return diff
 
     def _combine_diffs(self, user_id: str, diffs: list[ContextDiff]) -> ContextDiff:
+        for diff in diffs:
+            if diff.user_id != user_id:
+                raise ValueError("committed diff crosses a user boundary")
+            self._validate_and_bind_operations(
+                user_id,
+                [*diff.operations, *diff.pending_operations, *diff.rejected_operations],
+            )
         if len(diffs) == 1:
             return diffs[0]
 
@@ -266,7 +579,8 @@ class OperationCommitter:
             diff_id=f"diff_commit_group_{stable_hash([user_id, canonical_json(effect_members)], length=32)}",
             created_at=min((diff.created_at for diff in diffs if diff.created_at), default=utc_now()),
         )
-        path = self.root / "system" / "diffs" / f"{combined.diff_id}.json"
+        combined_id = require_safe_path_segment(combined.diff_id, "diff_id")
+        path = self.artifact_root / "system" / "diffs" / f"{combined_id}.json"
         if not path.exists():
             self.diff_writer.write(combined)
             return combined
@@ -298,10 +612,6 @@ class OperationCommitter:
         transaction_id = next(iter(transaction_ids))
         idempotency_key = next(iter(idempotency_keys))
         completed = self._transaction_marker(idempotency_key)
-        if completed.exists():
-            diff = self._validate_transaction_marker(completed, operations)
-            self._finalize_canonical_outbox(transaction_id, idempotency_key, diff.operations)
-            return diff
 
         slot_uri = next(
             (
@@ -321,72 +631,97 @@ class OperationCommitter:
             ),
         }
         with ExitStack() as locks:
+            guards: list[LeaseGuard] = []
             for lock_key in sorted(lock_keys):
-                locks.enter_context(self.path_lock.acquire(lock_key))
-            if completed.exists():
-                diff = self._validate_transaction_marker(completed, operations)
-                self._finalize_canonical_outbox(transaction_id, idempotency_key, diff.operations)
-                return diff
-            self._preflight_canonical_revisions(operations)
-            self._validate_authoritative_batch(operations)
-            backups = self._capture_canonical_state(operations)
-            committed: list[ContextOperation] = []
-            self._write_outbox_event(
-                transaction_id,
-                idempotency_key,
-                operations,
-                status="prepared",
-                before_images=backups,
-            )
-            for operation in operations:
-                self.redo.begin(operation, phase="started")
-            try:
-                for operation in operations:
-                    self._apply_canonical_source(operation)
-                    self.redo.advance(operation, phase="source_written")
-                    self.audit.record(user_id, "canonical_memory_operation_applied", operation.to_dict())
-                    self.redo.advance(operation, phase="audit_written")
-                    operation.status = OperationStatus.COMMITTED
-                    committed.append(operation)
-                self._write_outbox_event(
-                    transaction_id,
-                    idempotency_key,
-                    committed,
-                    status="source_committed",
-                    before_images=backups,
-                )
-            except Exception:
-                self._restore_canonical_state(backups)
+                guards.append(locks.enter_context(self.path_lock.acquire(self._lock_key(lock_key))))
+            with self.path_lock.fenced(guards):
+                if completed.exists():
+                    diff = self._validate_transaction_marker(completed, operations)
+                    self._finalize_canonical_outbox(transaction_id, idempotency_key, diff.operations)
+                    return diff
+                self._preflight_canonical_revisions(operations)
+                self._validate_authoritative_batch(operations)
+                backups = self._capture_canonical_state(operations)
+                before_by_uri = {
+                    str(snapshot["uri"]): (
+                        snapshot["object"] if isinstance(snapshot.get("object"), ContextObject) else None
+                    )
+                    for snapshot in backups
+                }
+                relation_manifests = {
+                    operation.operation_id: self._build_canonical_relation_manifest(
+                        operation,
+                        before_by_uri.get(str(operation.target_uri or "")),
+                    )
+                    for operation in operations
+                }
+                committed: list[ContextOperation] = []
                 self._write_outbox_event(
                     transaction_id,
                     idempotency_key,
                     operations,
-                    status="aborted",
+                    status="prepared",
+                    before_images=backups,
                 )
                 for operation in operations:
-                    self.redo.commit(operation.operation_id)
+                    self.redo.begin(operation, phase="started")
+            try:
+                for operation in operations:
+                    with self.path_lock.fenced(guards):
+                        self._apply_canonical_source(operation)
+                        self._apply_canonical_relation_manifest(
+                            operation,
+                            relation_manifests[operation.operation_id],
+                        )
+                        self.redo.advance(operation, phase="source_written")
+                        self.audit.record(user_id, "canonical_memory_operation_applied", operation.to_dict())
+                        self.redo.advance(operation, phase="audit_written")
+                        operation.status = OperationStatus.COMMITTED
+                        committed.append(operation)
+                with self.path_lock.fenced(guards):
+                    self._write_outbox_event(
+                        transaction_id,
+                        idempotency_key,
+                        committed,
+                        status="source_committed",
+                        before_images=backups,
+                    )
+            except LockLostError:
+                raise
+            except Exception:
+                with self.path_lock.fenced(guards):
+                    self._restore_canonical_state(backups)
+                    self._write_outbox_event(
+                        transaction_id,
+                        idempotency_key,
+                        operations,
+                        status="aborted",
+                    )
+                    for operation in operations:
+                        self.redo.commit(operation.operation_id)
+                    self.audit.record(
+                        user_id,
+                        "canonical_memory_transaction_rolled_back",
+                        {"transaction_id": transaction_id, "operation_ids": [item.operation_id for item in operations]},
+                    )
+                raise
+            with self.path_lock.fenced(guards):
+                diff = ContextDiff(
+                    user_id=user_id,
+                    operations=committed,
+                    diff_id=f"diff_{transaction_id}",
+                )
+                self.diff_writer.write(diff)
+                self._write_transaction_marker(completed, diff, committed)
                 self.audit.record(
                     user_id,
-                    "canonical_memory_transaction_rolled_back",
-                    {"transaction_id": transaction_id, "operation_ids": [item.operation_id for item in operations]},
+                    "canonical_memory_transaction_committed",
+                    {"transaction_id": transaction_id, "operation_ids": [item.operation_id for item in committed]},
                 )
-                raise
-            diff = ContextDiff(
-                user_id=user_id,
-                operations=committed,
-                diff_id=f"diff_{transaction_id}",
-            )
-            self.diff_writer.write(diff)
-            self._write_transaction_marker(completed, diff, committed)
-            self.audit.record(
-                user_id,
-                "canonical_memory_transaction_committed",
-                {"transaction_id": transaction_id, "operation_ids": [item.operation_id for item in committed]},
-            )
-            self._finalize_canonical_outbox(transaction_id, idempotency_key, committed, slot_uri=slot_uri)
-            for operation in committed:
-                self.redo.commit(operation.operation_id)
-            return diff
+                self._finalize_canonical_outbox(transaction_id, idempotency_key, committed, slot_uri=slot_uri)
+                for operation in committed:
+                    self.redo.commit(operation.operation_id)
+                return diff
 
     def _preflight_canonical_groups(
         self,
@@ -449,9 +784,11 @@ class OperationCommitter:
     def _validate_canonical_envelope(self, user_id: str, operations: list[ContextOperation]) -> None:
         """Validate immutable ownership boundaries before any marker fast path."""
 
+        self._validate_and_bind_operations(user_id, operations)
         if not user_id:
             raise ValueError("canonical commit requires a user_id")
         for operation in operations:
+            self._validate_canonical_artifact_keys(operation)
             if operation.user_id != user_id:
                 raise ValueError("canonical operation user does not match commit user")
             object_payload = operation.payload.get("context_object")
@@ -466,10 +803,12 @@ class OperationCommitter:
                 raise ValueError("canonical context object tenant or owner does not match commit user")
             if operation.context_type != ContextType.MEMORY or obj.context_type != operation.context_type:
                 raise ValueError("canonical context type must be memory and match its operation")
-            operation_tenant = str(operation.payload.get("tenant_id") or "default")
-            object_tenant = str(obj.tenant_id or "default")
+            operation_tenant = str(operation.payload.get("tenant_id") or self.tenant_id)
+            object_tenant = str(obj.tenant_id or self.tenant_id)
             if object_tenant != operation_tenant:
                 raise ValueError("canonical context object tenant does not match operation tenant")
+            if operation_tenant != self.tenant_id:
+                raise ValueError("canonical operation tenant does not match bound tenant")
             metadata = dict(obj.metadata or {})
             if operation.payload.get("canonical_pending_resolution") is True:
                 if (
@@ -494,7 +833,7 @@ class OperationCommitter:
             if parsed.authority != "user" or parsed.user_id != expected_storage_owner:
                 raise ValueError("canonical target URI owner does not match canonical subject boundary")
             visibility = dict(scope.get("visibility", {}) or {})
-            if str(visibility.get("tenant_id") or "default") != operation_tenant:
+            if str(visibility.get("tenant_id") or operation_tenant) != operation_tenant:
                 raise ValueError("canonical visibility scope crosses the operation tenant")
             principals = {
                 str(item) for item in dict(scope.get("authority", {}) or {}).get("principal_ids", []) or []
@@ -944,7 +1283,9 @@ class OperationCommitter:
             marker = self._transaction_marker(key)
             if not marker.exists():
                 raise RevisionConflictError("pending proposal cannot resolve before its canonical transaction commits")
+            self._validate_transaction_marker_tenant(marker)
             diff = self._transaction_marker_diff(marker)
+            self._validate_and_bind_operations(operation.user_id, diff.operations)
             committed_claims_by_key[key] = {
                 str(payload.get("uri"))
                 for marker_operation in diff.operations
@@ -1035,19 +1376,26 @@ class OperationCommitter:
         *,
         slot_uri: str | None = None,
     ) -> Path:
-        outbox_path = self.root / "system" / "outbox" / f"{transaction_id}.json"
+        require_safe_path_segment(idempotency_key, "canonical idempotency_key")
+        outbox_path = self._outbox_path(transaction_id)
         outbox_complete = False
         if outbox_path.exists():
             try:
                 existing = json.loads(outbox_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
                 raise ValueError("canonical committed outbox is unreadable") from exc
+            try:
+                self._validate_recovery_artifact_tenant(existing, "canonical committed outbox")
+            except RedoIntegrityError as exc:
+                raise ValueError("canonical committed outbox crosses the bound tenant") from exc
             if existing.get("status") == "committed":
                 existing_operations = [
                     ContextOperation.from_dict(item)
                     for item in existing.get("operations", []) or []
                     if isinstance(item, dict)
                 ]
+                if operations:
+                    self._validate_and_bind_operations(operations[0].user_id, existing_operations)
                 if (
                     existing.get("transaction_id") != transaction_id
                     or existing.get("idempotency_key") != idempotency_key
@@ -1389,6 +1737,158 @@ class OperationCommitter:
             self._add_relation(obj.uri, "belongs_to_slot", slot_uri, relation_metadata)
             self._add_relation(slot_uri, "has_claim", obj.uri, relation_metadata)
 
+    def _build_canonical_relation_manifest(
+        self,
+        operation: ContextOperation,
+        before_object: ContextObject | None,
+    ) -> dict:
+        payload = operation.payload.get("context_object")
+        if not isinstance(payload, dict):
+            raise ValueError("canonical relation manifest requires context_object")
+        desired = ContextObject.from_dict(payload)
+        expected = self._canonical_relation_specs(operation, desired)
+        expected_keys = {self._relation_spec_key(spec) for spec in expected}
+        previous_keys = (
+            self._canonical_managed_relation_keys(before_object)
+            if self.relation_store is not None
+            else []
+        )
+        remove = self._unique_relation_keys(
+            [key for key in previous_keys if self._relation_spec_key(key) not in expected_keys]
+        )
+        core = {
+            "schema_version": "canonical_relation_manifest_v1",
+            "operation_id": operation.operation_id,
+            "user_id": operation.user_id,
+            "tenant_id": str(operation.payload.get("tenant_id") or "default"),
+            "transaction_id": str(operation.payload.get("transaction_id") or ""),
+            "idempotency_key": str(operation.payload.get("idempotency_key") or ""),
+            "target_uri": operation.target_uri,
+            "expected": expected,
+            "remove": remove,
+        }
+        return {**core, "fingerprint": stable_hash(core, length=64)}
+
+    def _validate_canonical_relation_manifest(
+        self,
+        operation: ContextOperation,
+        manifest: dict,
+    ) -> None:
+        if manifest.get("schema_version") != "canonical_relation_manifest_v1":
+            raise RedoIntegrityError("canonical relation manifest schema is unsupported")
+        core = {key: value for key, value in manifest.items() if key != "fingerprint"}
+        if manifest.get("fingerprint") != stable_hash(core, length=64):
+            raise RedoIntegrityError("canonical relation manifest fingerprint is corrupt")
+        if (
+            manifest.get("operation_id") != operation.operation_id
+            or manifest.get("user_id") != operation.user_id
+            or manifest.get("tenant_id") != str(operation.payload.get("tenant_id") or "default")
+            or manifest.get("transaction_id") != str(operation.payload.get("transaction_id") or "")
+            or manifest.get("idempotency_key") != str(operation.payload.get("idempotency_key") or "")
+            or manifest.get("target_uri") != operation.target_uri
+            or not isinstance(manifest.get("expected"), list)
+            or not isinstance(manifest.get("remove"), list)
+        ):
+            raise RedoIntegrityError("canonical relation manifest crosses its operation boundary")
+
+    def _apply_canonical_relation_manifest(
+        self,
+        operation: ContextOperation,
+        manifest: dict,
+    ) -> None:
+        self._validate_canonical_relation_manifest(operation, manifest)
+        if self.relation_store is None:
+            if manifest.get("expected") or manifest.get("remove"):
+                raise RedoIntegrityError("canonical relation manifest requires a RelationStore")
+            return
+        for key in manifest.get("remove", []) or []:
+            self.relation_store.delete_relation(
+                str(key["source_uri"]),
+                str(key["relation_type"]),
+                str(key["target_uri"]),
+            )
+        self._ensure_relation_specs([dict(item) for item in manifest.get("expected", []) or []])
+        self._validate_canonical_relation_manifest_effect(manifest)
+
+    def _validate_canonical_relation_manifest_effect(self, manifest: dict) -> None:
+        if self.relation_store is None:
+            if manifest.get("expected") or manifest.get("remove"):
+                raise RedoIntegrityError("canonical relation effect has no RelationStore")
+            return
+        for spec in manifest.get("expected", []) or []:
+            actual = {
+                canonical_json(self._relation_effect_spec(relation))
+                for relation in self.relation_store.relations_of(str(spec["source_uri"]))
+            }
+            if canonical_json(spec) not in actual:
+                raise RedoIntegrityError("canonical RelationStore effect is incomplete")
+        for key in manifest.get("remove", []) or []:
+            if any(
+                relation.source_uri == key["source_uri"]
+                and relation.relation_type == key["relation_type"]
+                and relation.target_uri == key["target_uri"]
+                for relation in self.relation_store.relations_of(str(key["source_uri"]))
+            ):
+                raise RedoIntegrityError("canonical RelationStore retained a removed managed relation")
+
+    def _canonical_relation_specs(
+        self,
+        operation: ContextOperation,
+        obj: ContextObject,
+    ) -> list[dict]:
+        if self.relation_store is None:
+            return []
+        metadata = dict(obj.metadata or {})
+        relation_metadata = {
+            "tenant_id": obj.tenant_id or "default",
+            "owner_user_id": obj.owner_user_id,
+            "canonical_transaction_id": operation.payload.get("transaction_id"),
+            "canonical_idempotency_key": operation.payload.get("idempotency_key"),
+            "source_revision": metadata.get("revision"),
+            "commit_group_id": operation.payload.get("commit_group_id"),
+        }
+        specs = []
+        for relation in obj.relations:
+            specs.append(
+                self._relation_spec(
+                    relation.source_uri,
+                    relation.relation_type,
+                    relation.target_uri,
+                    {**dict(relation.metadata or {}), **relation_metadata},
+                    weight=relation.weight,
+                )
+            )
+        if metadata.get("canonical_kind") == "claim":
+            slot_uri = obj.uri.rsplit("/claims/", 1)[0]
+            specs.extend(
+                [
+                    self._relation_spec(obj.uri, "belongs_to_slot", slot_uri, relation_metadata),
+                    self._relation_spec(slot_uri, "has_claim", obj.uri, relation_metadata),
+                ]
+            )
+        return self._unique_relation_specs(specs)
+
+    def _canonical_managed_relation_keys(
+        self,
+        obj: ContextObject | None,
+    ) -> list[dict]:
+        if obj is None:
+            return []
+        keys = [self._relation_key_payload(self._relation_effect_spec(relation)) for relation in obj.relations]
+        if dict(obj.metadata or {}).get("canonical_kind") == "claim":
+            slot_uri = obj.uri.rsplit("/claims/", 1)[0]
+            keys.extend(
+                [
+                    self._relation_key_payload(
+                        self._relation_spec(obj.uri, "belongs_to_slot", slot_uri, {})
+                    ),
+                    self._relation_key_payload(
+                        self._relation_spec(slot_uri, "has_claim", obj.uri, {})
+                    ),
+                ]
+            )
+        return self._unique_relation_keys(keys)
+
     def _validate_existing_canonical_effect(self, operation: ContextOperation) -> None:
         payload = operation.payload.get("context_object")
         if not isinstance(payload, dict):
@@ -1418,7 +1918,8 @@ class OperationCommitter:
         status: str = "committed",
         before_images: list[dict] | None = None,
     ) -> Path:
-        path = self.root / "system" / "outbox" / f"{transaction_id}.json"
+        require_safe_path_segment(idempotency_key, "canonical idempotency_key")
+        path = self._outbox_path(transaction_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         claim_revisions = []
         for operation in operations:
@@ -1436,6 +1937,7 @@ class OperationCommitter:
                 )
         event: dict = {
             "event_type": "MemoryCommitted",
+            "tenant_id": self.tenant_id,
             "transaction_id": transaction_id,
             "idempotency_key": idempotency_key,
             "claim_revisions": claim_revisions,
@@ -1457,6 +1959,18 @@ class OperationCommitter:
                 existing = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 existing = {}
+            if existing:
+                try:
+                    self._validate_recovery_artifact_tenant(existing, "canonical outbox")
+                except RedoIntegrityError as exc:
+                    raise ValueError("canonical outbox crosses the bound tenant") from exc
+                existing_operations = [
+                    ContextOperation.from_dict(item)
+                    for item in existing.get("operations", []) or []
+                    if isinstance(item, dict)
+                ]
+                if operations:
+                    self._validate_and_bind_operations(operations[0].user_id, existing_operations)
             merged_claims = {
                 str(item.get("uri")): item for item in existing.get("claim_revisions", []) or [] if item.get("uri")
             }
@@ -1564,6 +2078,7 @@ class OperationCommitter:
         outbox_path: Path,
         operations: list[ContextOperation],
     ) -> None:
+        transaction_id = require_safe_path_segment(transaction_id, "canonical transaction_id")
         if self.queue_store is None:
             return
         try:
@@ -1588,7 +2103,12 @@ class OperationCommitter:
             )
 
     def _transaction_marker(self, idempotency_key: str) -> Path:
-        return self.root / "system" / "transactions" / f"{idempotency_key}.json"
+        key = require_safe_path_segment(idempotency_key, "canonical idempotency_key")
+        return self.artifact_root / "system" / "transactions" / f"{key}.json"
+
+    def _outbox_path(self, transaction_id: str) -> Path:
+        key = require_safe_path_segment(transaction_id, "canonical transaction_id")
+        return self.artifact_root / "system" / "outbox" / f"{key}.json"
 
     def _write_transaction_marker(
         self,
@@ -1596,11 +2116,17 @@ class OperationCommitter:
         diff: ContextDiff,
         operations: list[ContextOperation],
     ) -> None:
+        if not operations:
+            raise ValueError("canonical transaction marker requires operations")
+        keys = {self._validate_canonical_artifact_keys(operation)[1] for operation in operations}
+        if len(keys) != 1 or path != self._transaction_marker(next(iter(keys))):
+            raise ValueError("canonical transaction marker path does not match its operations")
         if path.exists():
             self._validate_transaction_marker(path, operations)
             return
         payload = {
-            "schema_version": "canonical_transaction_marker_v2",
+            "schema_version": "canonical_transaction_marker_v3",
+            "tenant_id": self.tenant_id,
             "request_fingerprint": self._canonical_transaction_request_fingerprint(operations),
             "effect_fingerprint": self._canonical_transaction_effect_fingerprint(operations),
             "diff": diff.to_dict(),
@@ -1615,7 +2141,17 @@ class OperationCommitter:
         path: Path,
         operations: list[ContextOperation],
     ) -> ContextDiff:
+        if not operations:
+            raise ValueError("canonical transaction marker validation requires operations")
+        keys = {self._validate_canonical_artifact_keys(operation)[1] for operation in operations}
+        if len(keys) != 1 or path != self._transaction_marker(next(iter(keys))):
+            raise ValueError("canonical transaction marker path does not match its operations")
+        self._validate_transaction_marker_tenant(path)
         diff = self._transaction_marker_diff(path)
+        self._validate_and_bind_operations(operations[0].user_id, operations)
+        self._validate_and_bind_operations(operations[0].user_id, diff.operations)
+        if diff.user_id != operations[0].user_id:
+            raise ValueError("canonical transaction marker crosses a user boundary")
         if (
             self._canonical_transaction_request_fingerprint(diff.operations)
             != self._canonical_transaction_request_fingerprint(operations)
@@ -1625,9 +2161,18 @@ class OperationCommitter:
             raise ValueError("canonical idempotency marker conflicts with the requested transaction")
         return diff
 
+    def _validate_transaction_marker_tenant(self, path: Path) -> None:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if "tenant_id" not in payload:
+            return
+        tenant = self._validate_tenant_id(payload["tenant_id"], "canonical transaction marker tenant_id")
+        if tenant != self.tenant_id:
+            raise ValueError("canonical transaction marker crosses the bound tenant")
+
     def _transaction_marker_diff(self, path: Path) -> ContextDiff:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        if payload.get("schema_version") != "canonical_transaction_marker_v2":
+        schema_version = payload.get("schema_version")
+        if schema_version not in {"canonical_transaction_marker_v2", "canonical_transaction_marker_v3"}:
             # Legacy transaction markers stored the full persisted diff. They
             # are still safe to compare because the desired operation payloads
             # are present in that record.
@@ -1636,16 +2181,35 @@ class OperationCommitter:
         if not isinstance(diff_payload, dict):
             raise ValueError("canonical transaction marker is missing its persisted diff")
         diff = self._diff_from_payload(diff_payload)
+        request_fingerprint = (
+            self._canonical_transaction_request_fingerprint_v2(diff.operations)
+            if schema_version == "canonical_transaction_marker_v2"
+            else self._canonical_transaction_request_fingerprint(diff.operations)
+        )
+        effect_fingerprint = (
+            self._canonical_transaction_effect_fingerprint_v2(diff.operations)
+            if schema_version == "canonical_transaction_marker_v2"
+            else self._canonical_transaction_effect_fingerprint(diff.operations)
+        )
         if (
-            payload.get("request_fingerprint")
-            != self._canonical_transaction_request_fingerprint(diff.operations)
-            or payload.get("effect_fingerprint")
-            != self._canonical_transaction_effect_fingerprint(diff.operations)
+            payload.get("request_fingerprint") != request_fingerprint
+            or payload.get("effect_fingerprint") != effect_fingerprint
         ):
             raise ValueError("canonical transaction marker integrity check failed")
         return diff
 
     def _canonical_transaction_request_fingerprint(self, operations: list[ContextOperation]) -> str:
+        normalized = []
+        for operation in sorted(operations, key=lambda item: item.operation_id):
+            payload = json.loads(json.dumps(operation.to_dict(), ensure_ascii=False))
+            payload.pop("status", None)
+            payload.pop("created_at", None)
+            self._strip_relation_timestamps(payload)
+            normalized.append(payload)
+        canonical_json(normalized)
+        return stable_hash(normalized, length=64)
+
+    def _canonical_transaction_request_fingerprint_v2(self, operations: list[ContextOperation]) -> str:
         normalized = []
         for operation in sorted(operations, key=lambda item: item.operation_id):
             payload = operation.to_dict()
@@ -1664,12 +2228,49 @@ class OperationCommitter:
                     "context_type": operation.context_type.value,
                     "action": operation.action.value,
                     "target_uri": operation.target_uri,
+                    "context_object": self._context_object_without_relation_timestamps(
+                        operation.payload.get("context_object")
+                    ),
+                    "content": operation.payload.get("content", ""),
+                }
+            )
+        canonical_json(effects)
+        return stable_hash(effects, length=64)
+
+    def _canonical_transaction_effect_fingerprint_v2(self, operations: list[ContextOperation]) -> str:
+        effects = []
+        for operation in sorted(operations, key=lambda item: item.operation_id):
+            effects.append(
+                {
+                    "operation_id": operation.operation_id,
+                    "user_id": operation.user_id,
+                    "context_type": operation.context_type.value,
+                    "action": operation.action.value,
+                    "target_uri": operation.target_uri,
                     "context_object": operation.payload.get("context_object"),
                     "content": operation.payload.get("content", ""),
                 }
             )
         canonical_json(effects)
         return stable_hash(effects, length=64)
+
+    def _strip_relation_timestamps(self, operation_payload: dict) -> None:
+        payload = operation_payload.get("payload")
+        if not isinstance(payload, dict):
+            return
+        context_object = payload.get("context_object")
+        payload["context_object"] = self._context_object_without_relation_timestamps(context_object)
+
+    def _context_object_without_relation_timestamps(self, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        normalized = json.loads(json.dumps(value, ensure_ascii=False))
+        relations = normalized.get("relations")
+        if isinstance(relations, list):
+            for relation in relations:
+                if isinstance(relation, dict):
+                    relation.pop("created_at", None)
+        return normalized
 
     def _diff_from_payload(self, payload: dict) -> ContextDiff:
         return ContextDiff(
@@ -1682,48 +2283,700 @@ class OperationCommitter:
             schema_version=str(payload.get("schema_version", "context_diff_v1")),
         )
 
-    def resume(self, user_id: str, operation: ContextOperation, phase: str) -> bool:
+    def resume(
+        self,
+        user_id: str,
+        operation: ContextOperation,
+        phase: str,
+        *,
+        source_effect: dict | None = None,
+        relation_manifest: dict | None = None,
+    ) -> bool:
         """处理 resume 这一步。"""
 
+        self._validate_redo_boundary(
+            user_id,
+            operation,
+            source_effect=source_effect,
+            relation_manifest=relation_manifest,
+        )
+        if phase in {"started", "begin"}:
+            if operation.payload.get("canonical_memory") is True:
+                diff = self.commit(user_id, [operation])
+                return any(op.operation_id == operation.operation_id for op in diff.operations)
+            return self._resume_started_source_effect(
+                user_id,
+                operation,
+                relation_manifest=relation_manifest,
+            )
+        lock_key = operation.target_uri or f"{operation.user_id}:{operation.operation_id}"
+        with self.path_lock.acquire(self._lock_key(lock_key)) as guard:
+            with guard.fenced():
+                return self._resume_under_guard(
+                    user_id,
+                    operation,
+                    phase,
+                    source_effect=source_effect,
+                    relation_manifest=relation_manifest,
+                    guard=guard,
+                )
+
+    def _resume_started_source_effect(
+        self,
+        user_id: str,
+        operation: ContextOperation,
+        *,
+        relation_manifest: dict | None,
+    ) -> bool:
+        """Adopt a fully matching Source effect from the begin -> phase crash window."""
+
+        lock_key = operation.target_uri or f"{operation.user_id}:{operation.operation_id}"
+        with self.path_lock.acquire(self._lock_key(lock_key)) as guard:
+            with guard.fenced():
+                if relation_manifest is not None:
+                    self._validate_regular_relation_manifest(operation, relation_manifest)
+                elif self.relation_store is not None:
+                    raise RedoIntegrityError("regular redo entry is missing its relation manifest")
+                replay_source = operation.action == OperationAction.REFRESH_LAYERS
+                if not replay_source:
+                    effect = self._capture_regular_source_effect(operation, relation_manifest)
+                    try:
+                        self._validate_regular_recovery_effect(
+                            user_id,
+                            operation,
+                            effect,
+                            require_relation_presence=False,
+                            relation_manifest=relation_manifest,
+                        )
+                    except RedoIntegrityError:
+                        replay_source = True
+                if replay_source:
+                    self._apply_source(operation)
+                if isinstance(relation_manifest, dict):
+                    self._apply_regular_relation_manifest(operation, relation_manifest)
+                effect = self._capture_regular_source_effect(operation, relation_manifest)
+                self._validate_regular_recovery_effect(
+                    user_id,
+                    operation,
+                    effect,
+                    relation_manifest=relation_manifest,
+                )
+                self.redo.advance(
+                    operation,
+                    phase="source_written",
+                    source_effect=effect,
+                    relation_manifest=relation_manifest,
+                )
+                return self._resume_under_guard(
+                    user_id,
+                    operation,
+                    "source_written",
+                    source_effect=effect,
+                    relation_manifest=relation_manifest,
+                    guard=guard,
+                )
+
+    def _resume_under_guard(
+        self,
+        user_id: str,
+        operation: ContextOperation,
+        phase: str,
+        *,
+        source_effect: dict | None,
+        relation_manifest: dict | None,
+        guard: LeaseGuard,
+    ) -> bool:
+        del guard
         if phase in {"committed"}:
             if operation.payload.get("canonical_memory") is not True:
-                self._write_operation_marker(operation)
+                marker = self._operation_marker(operation.operation_id)
+                if not marker.exists():
+                    raise RedoIntegrityError("committed redo entry has no operation marker")
+                self._validate_operation_marker(marker, operation)
             self.redo.commit(operation.operation_id)
             return False
-        if phase in {"started", "begin"}:
-            diff = self.commit(user_id, [operation])
-            return any(op.operation_id == operation.operation_id for op in diff.operations)
         if operation.payload.get("canonical_memory") is True:
             return self._resume_canonical(user_id, operation, phase)
+        self._validate_and_restore_regular_recovery_effect(
+            user_id,
+            operation,
+            source_effect,
+            relation_manifest,
+        )
         if phase == "source_written":
             self._apply_index(operation)
             self.redo.advance(operation, phase="index_written")
             self.audit.record(user_id, "context_operation_committed", operation.to_dict())
             self.redo.advance(operation, phase="audit_written")
-            self._write_recovery_diff(user_id, operation)
-            self.redo.advance(operation, phase="diff_written")
-            self._write_operation_marker(operation)
-            self.redo.commit(operation.operation_id)
+            self._finalize_single_regular_operation(user_id, operation)
             return True
         if phase == "index_written":
             self.audit.record(user_id, "context_operation_committed", operation.to_dict())
             self.redo.advance(operation, phase="audit_written")
-            self._write_recovery_diff(user_id, operation)
-            self.redo.advance(operation, phase="diff_written")
-            self._write_operation_marker(operation)
-            self.redo.commit(operation.operation_id)
+            self._finalize_single_regular_operation(user_id, operation)
             return True
         if phase == "audit_written":
-            self._write_recovery_diff(user_id, operation)
-            self.redo.advance(operation, phase="diff_written")
-            self._write_operation_marker(operation)
-            self.redo.commit(operation.operation_id)
+            self._finalize_single_regular_operation(user_id, operation)
             return True
         if phase == "diff_written":
+            self._ensure_single_operation_diff(user_id, operation)
             self._write_operation_marker(operation)
             self.redo.commit(operation.operation_id)
             return True
         return False
+
+    def _capture_regular_source_effect(
+        self,
+        operation: ContextOperation,
+        relation_manifest: dict | None = None,
+    ) -> dict:
+        uris = self._regular_source_effect_uris(operation)
+        snapshots = []
+        for uri in uris:
+            try:
+                obj = self.source_store.read_object(uri)
+            except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+                snapshots.append({"uri": uri, "exists": False})
+                continue
+            layer_hashes: dict[str, str | None] = {}
+            layer_uris = tuple(
+                dict.fromkeys(
+                    item
+                    for item in (obj.layers.l0_uri, obj.layers.l1_uri, obj.layers.l2_uri or obj.uri)
+                    if item
+                )
+            )
+            for layer_uri in layer_uris:
+                try:
+                    content = self.source_store.read_content(str(layer_uri))
+                except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+                    layer_hashes[str(layer_uri)] = None
+                else:
+                    layer_hashes[str(layer_uri)] = evidence_hash(content)
+            snapshots.append(
+                {
+                    "uri": uri,
+                    "exists": True,
+                    "object": obj.to_dict(),
+                    "layer_hashes": layer_hashes,
+                }
+            )
+        core = {
+            "schema_version": "regular_source_effect_v2",
+            "operation_id": operation.operation_id,
+            "user_id": operation.user_id,
+            "uris": uris,
+            "snapshots": snapshots,
+            "relations": (
+                list(relation_manifest.get("expected", []) or [])
+                if isinstance(relation_manifest, dict)
+                else self._expected_regular_relation_specs(operation)
+            ),
+            "relation_manifest_fingerprint": (
+                str(relation_manifest.get("fingerprint") or "")
+                if isinstance(relation_manifest, dict)
+                else ""
+            ),
+        }
+        return {**core, "fingerprint": stable_hash(core, length=64)}
+
+    def _validate_regular_recovery_effect(
+        self,
+        user_id: str,
+        operation: ContextOperation,
+        source_effect: dict | None,
+        *,
+        require_relation_presence: bool = True,
+        relation_manifest: dict | None = None,
+    ) -> None:
+        if not isinstance(source_effect, dict):
+            raise RedoIntegrityError("regular redo entry is missing its SourceStore effect")
+        if source_effect.get("schema_version") != "regular_source_effect_v2":
+            raise RedoIntegrityError("regular redo SourceStore effect schema is unsupported")
+        stored_core = {key: value for key, value in source_effect.items() if key != "fingerprint"}
+        if source_effect.get("fingerprint") != stable_hash(stored_core, length=64):
+            raise RedoIntegrityError("regular redo SourceStore effect fingerprint is corrupt")
+        if (
+            source_effect.get("operation_id") != operation.operation_id
+            or source_effect.get("user_id") != user_id
+            or list(source_effect.get("uris", []) or []) != self._regular_source_effect_uris(operation)
+        ):
+            raise RedoIntegrityError("regular redo SourceStore effect is bound to another operation")
+        actual = self._capture_regular_source_effect(operation, relation_manifest)
+        if actual.get("fingerprint") != source_effect.get("fingerprint"):
+            raise RedoIntegrityError("regular redo SourceStore effect does not match durable state")
+        expected_tenant = self._regular_operation_tenant(operation)
+        self._validate_regular_action_postcondition(operation, actual)
+        if relation_manifest is not None:
+            self._validate_regular_relation_manifest(operation, relation_manifest)
+        elif self.relation_store is not None:
+            raise RedoIntegrityError("regular redo entry is missing its relation manifest")
+        expected_relations = (
+            list(relation_manifest.get("expected", []) or [])
+            if isinstance(relation_manifest, dict)
+            else self._expected_regular_relation_specs(operation)
+        )
+        if source_effect.get("relations") != expected_relations:
+            raise RedoIntegrityError("regular redo relation effect does not match its operation")
+        if source_effect.get("relation_manifest_fingerprint", "") != (
+            str(relation_manifest.get("fingerprint") or "")
+            if isinstance(relation_manifest, dict)
+            else ""
+        ):
+            raise RedoIntegrityError("regular redo relation manifest does not match its SourceStore effect")
+        for snapshot in actual.get("snapshots", []) or []:
+            if not snapshot.get("exists") or not isinstance(snapshot.get("object"), dict):
+                raise RedoIntegrityError("regular redo SourceStore effect is missing its target object")
+            obj = ContextObject.from_dict(snapshot["object"])
+            try:
+                parsed = ContextURI.parse(obj.uri)
+            except (TypeError, ValueError) as exc:
+                raise RedoIntegrityError("regular redo SourceStore URI is invalid") from exc
+            if parsed.authority == "user":
+                if parsed.user_id != user_id or obj.owner_user_id != user_id:
+                    raise RedoIntegrityError("regular redo SourceStore effect crosses a user boundary")
+            elif obj.owner_user_id not in {None, "", user_id}:
+                raise RedoIntegrityError("regular redo SourceStore effect crosses an owner boundary")
+            if str(obj.tenant_id or "default") != expected_tenant:
+                raise RedoIntegrityError("regular redo SourceStore effect crosses a tenant boundary")
+            if obj.context_type != operation.context_type:
+                raise RedoIntegrityError("regular redo SourceStore effect changes context type")
+        if require_relation_presence:
+            if isinstance(relation_manifest, dict):
+                self._validate_regular_relation_manifest_effect(relation_manifest)
+            else:
+                self._validate_regular_relation_postcondition(expected_relations)
+
+    def _validate_and_restore_regular_recovery_effect(
+        self,
+        user_id: str,
+        operation: ContextOperation,
+        source_effect: dict | None,
+        relation_manifest: dict | None,
+    ) -> None:
+        self._validate_regular_recovery_effect(
+            user_id,
+            operation,
+            source_effect,
+            require_relation_presence=False,
+            relation_manifest=relation_manifest,
+        )
+        if isinstance(relation_manifest, dict):
+            self._apply_regular_relation_manifest(operation, relation_manifest)
+        else:
+            assert isinstance(source_effect, dict)
+            self._restore_regular_relation_effect(operation, source_effect)
+        self._validate_regular_recovery_effect(
+            user_id,
+            operation,
+            source_effect,
+            relation_manifest=relation_manifest,
+        )
+
+    def _validate_regular_action_postcondition(
+        self,
+        operation: ContextOperation,
+        effect: dict,
+    ) -> None:
+        snapshots = {
+            str(snapshot.get("uri") or ""): snapshot
+            for snapshot in effect.get("snapshots", []) or []
+            if isinstance(snapshot, dict)
+        }
+
+        def required(uri: str) -> tuple[ContextObject, dict]:
+            snapshot = snapshots.get(uri)
+            if snapshot is None or not snapshot.get("exists") or not isinstance(snapshot.get("object"), dict):
+                raise RedoIntegrityError(f"regular redo {operation.action.value} effect is missing {uri}")
+            return ContextObject.from_dict(snapshot["object"]), snapshot
+
+        object_payload = operation.payload.get("context_object")
+        desired = ContextObject.from_dict(object_payload) if isinstance(object_payload, dict) else None
+        if operation.action in {OperationAction.ADD, OperationAction.UPDATE, OperationAction.MERGE}:
+            if desired is None:
+                raise RedoIntegrityError("regular object write has no desired object")
+            actual, snapshot = required(desired.uri)
+            normalized = self._normalized_regular_object_effect(operation)
+            if not isinstance(normalized, dict) or canonical_json(actual.to_dict()) != canonical_json(normalized):
+                raise RedoIntegrityError("regular object write did not persist its desired object")
+            content = str(operation.payload.get("content", ""))
+            if content:
+                content_uri = actual.layers.l2_uri or actual.uri
+                if dict(snapshot.get("layer_hashes", {}) or {}).get(content_uri) != evidence_hash(content):
+                    raise RedoIntegrityError("regular object write did not persist its desired content")
+            return
+        if operation.action == OperationAction.SUPERSEDE:
+            if not operation.target_uri or desired is None:
+                raise RedoIntegrityError("supersede effect is missing an old or replacement URI")
+            old, _old_snapshot = required(operation.target_uri)
+            new, new_snapshot = required(desired.uri)
+            reason = str(operation.payload.get("reason") or operation.payload.get("supersede_reason") or "")
+            superseded_at = str(new.metadata.get("superseded_at") or "")
+            expected_new = ContextObject.from_dict(desired.to_dict())
+            expected_new.lifecycle_state = LifecycleState.ACTIVE
+            expected_new.metadata = {
+                **expected_new.metadata,
+                "supersedes": old.uri,
+                "superseded_at": superseded_at,
+                "supersede_reason": reason,
+            }
+            content = str(operation.payload.get("content", ""))
+            content_uri = new.layers.l2_uri or new.uri
+            if (
+                old.lifecycle_state != LifecycleState.OBSOLETE
+                or str(old.metadata.get("superseded_by") or "") != new.uri
+                or str(old.metadata.get("supersede_reason") or "") != reason
+                or not superseded_at
+                or str(old.metadata.get("superseded_at") or "") != superseded_at
+                or new.lifecycle_state != LifecycleState.ACTIVE
+                or str(new.metadata.get("supersedes") or "") != old.uri
+                or str(new.metadata.get("supersede_reason") or "") != reason
+                or canonical_json(new.to_dict()) != canonical_json(expected_new.to_dict())
+                or (
+                    content
+                    and dict(new_snapshot.get("layer_hashes", {}) or {}).get(content_uri)
+                    != evidence_hash(content)
+                )
+            ):
+                raise RedoIntegrityError("supersede SourceStore effect is incomplete")
+            return
+        if not operation.target_uri:
+            raise RedoIntegrityError(f"regular redo {operation.action.value} has no target URI")
+        target, snapshot = required(operation.target_uri)
+        if operation.action == OperationAction.DELETE:
+            if (
+                target.lifecycle_state != LifecycleState.DELETED
+                or target.metadata.get("delete_reason") != OperationAction.DELETE.value
+            ):
+                raise RedoIntegrityError("delete SourceStore effect is not the durable soft-delete state")
+            return
+        if operation.action == OperationAction.ARCHIVE:
+            if (
+                target.lifecycle_state != LifecycleState.ARCHIVED
+                or target.metadata.get("archive_reason") != operation.payload.get("reason", "")
+                or not target.metadata.get("archived_at")
+            ):
+                raise RedoIntegrityError("archive SourceStore effect is incomplete")
+            return
+        if operation.action == OperationAction.COMPRESS:
+            layer_hashes = dict(snapshot.get("layer_hashes", {}) or {})
+            if (
+                target.lifecycle_state != LifecycleState.COLD
+                or target.metadata.get("compression_reason") != operation.payload.get("reason", "")
+                or not target.metadata.get("compressed_at")
+                or not target.layers.l0_uri
+                or not target.layers.l1_uri
+                or not target.layers.l2_uri
+                or any(layer_hashes.get(uri) is None for uri in target.layers.to_dict().values() if uri)
+            ):
+                raise RedoIntegrityError("compress SourceStore effect is incomplete")
+            return
+        if operation.action == OperationAction.REFRESH_LAYERS:
+            layer_hashes = dict(snapshot.get("layer_hashes", {}) or {})
+            if (
+                not target.layers.l0_uri
+                or not target.layers.l1_uri
+                or not target.layers.l2_uri
+                or any(layer_hashes.get(uri) is None for uri in target.layers.to_dict().values() if uri)
+            ):
+                raise RedoIntegrityError("layer refresh SourceStore effect is incomplete")
+            return
+        policy_actions = {
+            OperationAction.REWARD,
+            OperationAction.PENALIZE,
+            OperationAction.COOLDOWN,
+            OperationAction.SUPPRESS,
+            OperationAction.DISABLE,
+        }
+        if operation.action in policy_actions and operation.context_type == ContextType.ACTION_POLICY:
+            applied = {str(item) for item in target.metadata.get("applied_operation_ids", []) or []}
+            if operation.operation_id not in applied:
+                raise RedoIntegrityError("action-policy SourceStore effect is missing its operation id")
+            return
+        if operation.action == OperationAction.DISABLE:
+            if (
+                target.lifecycle_state != LifecycleState.DELETED
+                or target.metadata.get("delete_reason") != OperationAction.DISABLE.value
+            ):
+                raise RedoIntegrityError("disable SourceStore effect is not durable")
+            return
+        if operation.action != OperationAction.REINDEX:
+            raise RedoIntegrityError(f"unsupported regular redo action: {operation.action.value}")
+
+    def _build_regular_relation_manifest(self, operation: ContextOperation) -> dict:
+        """Bind the exact managed relation delta before the Source mutation."""
+
+        expected: list[dict] = []
+        previous: list[dict] = []
+        if self.relation_store is not None:
+            object_payload = operation.payload.get("context_object")
+            desired = ContextObject.from_dict(object_payload) if isinstance(object_payload, dict) else None
+            current: ContextObject | None = None
+            current_uri = operation.target_uri or (desired.uri if desired is not None else None)
+            if current_uri:
+                try:
+                    current = self.source_store.read_object(str(current_uri))
+                except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+                    current = None
+            if operation.action in {OperationAction.ADD, OperationAction.UPDATE, OperationAction.MERGE}:
+                if current is not None:
+                    previous.extend(self._relation_specs_for_object(current))
+                if desired is not None:
+                    expected.extend(self._relation_specs_for_object(desired))
+            elif operation.action == OperationAction.SUPERSEDE:
+                if desired is not None:
+                    try:
+                        previous_new = self.source_store.read_object(desired.uri)
+                    except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+                        previous_new = None
+                    if previous_new is not None:
+                        previous.extend(self._relation_specs_for_object(previous_new))
+                    expected.extend(self._relation_specs_for_object(desired))
+                if current is not None and desired is not None:
+                    relation_metadata = {
+                        "tenant_id": desired.tenant_id or current.tenant_id or "default",
+                        "owner_user_id": desired.owner_user_id or current.owner_user_id,
+                    }
+                    expected.extend(
+                        [
+                            self._relation_spec(
+                                desired.uri,
+                                "supersedes",
+                                current.uri,
+                                relation_metadata,
+                            ),
+                            self._relation_spec(
+                                current.uri,
+                                "superseded_by",
+                                desired.uri,
+                                relation_metadata,
+                            ),
+                        ]
+                    )
+            elif current is not None:
+                previous.extend(self._relation_specs_for_object(current))
+                expected.extend(self._relation_specs_for_object(current))
+
+        expected = self._unique_relation_specs(expected)
+        previous = self._unique_relation_specs(previous)
+        expected_keys = {self._relation_spec_key(spec) for spec in expected}
+        remove = [
+            self._relation_key_payload(spec)
+            for spec in previous
+            if self._relation_spec_key(spec) not in expected_keys
+        ]
+        remove = self._unique_relation_keys(remove)
+        core = {
+            "schema_version": "regular_relation_manifest_v1",
+            "operation_id": operation.operation_id,
+            "operation_fingerprint": self._operation_effect_fingerprint(operation),
+            "user_id": operation.user_id,
+            "tenant_id": self._regular_operation_tenant(operation),
+            "context_type": operation.context_type.value,
+            "target_uri": operation.target_uri,
+            "expected": expected,
+            "remove": remove,
+        }
+        return {**core, "fingerprint": stable_hash(core, length=64)}
+
+    def _validate_regular_relation_manifest(
+        self,
+        operation: ContextOperation,
+        manifest: dict | None,
+    ) -> None:
+        if not isinstance(manifest, dict):
+            raise RedoIntegrityError("regular redo entry is missing its relation manifest")
+        if manifest.get("schema_version") != "regular_relation_manifest_v1":
+            raise RedoIntegrityError("regular redo relation manifest schema is unsupported")
+        core = {key: value for key, value in manifest.items() if key != "fingerprint"}
+        if manifest.get("fingerprint") != stable_hash(core, length=64):
+            raise RedoIntegrityError("regular redo relation manifest fingerprint is corrupt")
+        if (
+            manifest.get("operation_id") != operation.operation_id
+            or manifest.get("operation_fingerprint") != self._operation_effect_fingerprint(operation)
+            or manifest.get("user_id") != operation.user_id
+            or manifest.get("tenant_id") != self._regular_operation_tenant(operation)
+            or manifest.get("context_type") != operation.context_type.value
+            or manifest.get("target_uri") != operation.target_uri
+            or not isinstance(manifest.get("expected"), list)
+            or not isinstance(manifest.get("remove"), list)
+        ):
+            raise RedoIntegrityError("regular redo relation manifest crosses its operation boundary")
+        expected = [dict(item) for item in manifest.get("expected", []) if isinstance(item, dict)]
+        remove = [dict(item) for item in manifest.get("remove", []) if isinstance(item, dict)]
+        if len(expected) != len(manifest.get("expected", [])) or len(remove) != len(manifest.get("remove", [])):
+            raise RedoIntegrityError("regular redo relation manifest contains an invalid entry")
+        if expected != self._unique_relation_specs(expected) or remove != self._unique_relation_keys(remove):
+            raise RedoIntegrityError("regular redo relation manifest is not canonical")
+        expected_keys = {self._relation_spec_key(spec) for spec in expected}
+        if any(self._relation_spec_key(item) in expected_keys for item in remove):
+            raise RedoIntegrityError("regular redo relation manifest removes an expected relation")
+
+    def _apply_regular_relation_manifest(
+        self,
+        operation: ContextOperation,
+        manifest: dict,
+    ) -> None:
+        self._validate_regular_relation_manifest(operation, manifest)
+        if self.relation_store is None:
+            if manifest.get("expected") or manifest.get("remove"):
+                raise RedoIntegrityError("regular relation manifest requires a RelationStore")
+            return
+        for key in manifest.get("remove", []) or []:
+            self.relation_store.delete_relation(
+                str(key["source_uri"]),
+                str(key["relation_type"]),
+                str(key["target_uri"]),
+            )
+        self._ensure_relation_specs([dict(item) for item in manifest.get("expected", []) or []])
+        self._validate_regular_relation_manifest_effect(manifest)
+
+    def _validate_regular_relation_manifest_effect(self, manifest: dict) -> None:
+        if self.relation_store is None:
+            if manifest.get("expected") or manifest.get("remove"):
+                raise RedoIntegrityError("regular relation effect has no RelationStore")
+            return
+        for spec in manifest.get("expected", []) or []:
+            actual = {
+                canonical_json(self._relation_effect_spec(relation))
+                for relation in self.relation_store.relations_of(str(spec["source_uri"]))
+            }
+            if canonical_json(spec) not in actual:
+                raise RedoIntegrityError("regular redo RelationStore effect is incomplete")
+        for key in manifest.get("remove", []) or []:
+            if any(
+                relation.source_uri == key["source_uri"]
+                and relation.relation_type == key["relation_type"]
+                and relation.target_uri == key["target_uri"]
+                for relation in self.relation_store.relations_of(str(key["source_uri"]))
+            ):
+                raise RedoIntegrityError("regular redo RelationStore retained a removed managed relation")
+
+    def _relation_spec(
+        self,
+        source_uri: str,
+        relation_type: str,
+        target_uri: str,
+        metadata: dict,
+        *,
+        weight: float = 1.0,
+    ) -> dict:
+        return {
+            "source_uri": source_uri,
+            "relation_type": relation_type,
+            "target_uri": target_uri,
+            "weight": float(weight),
+            "metadata": {key: value for key, value in metadata.items() if value is not None},
+        }
+
+    def _relation_spec_key(self, spec: dict) -> tuple[str, str, str]:
+        return (
+            str(spec.get("source_uri") or ""),
+            str(spec.get("relation_type") or ""),
+            str(spec.get("target_uri") or ""),
+        )
+
+    def _relation_key_payload(self, spec: dict) -> dict:
+        source_uri, relation_type, target_uri = self._relation_spec_key(spec)
+        return {
+            "source_uri": source_uri,
+            "relation_type": relation_type,
+            "target_uri": target_uri,
+        }
+
+    def _unique_relation_specs(self, specs: list[dict]) -> list[dict]:
+        unique = {canonical_json(spec): spec for spec in specs}
+        return [unique[key] for key in sorted(unique)]
+
+    def _unique_relation_keys(self, keys: list[dict]) -> list[dict]:
+        unique = {canonical_json(key): key for key in keys}
+        return [unique[key] for key in sorted(unique)]
+
+    def _expected_regular_relation_specs(self, operation: ContextOperation) -> list[dict]:
+        if self.relation_store is None:
+            return []
+        specs: list[dict] = []
+        object_payload = operation.payload.get("context_object")
+        if operation.action in {OperationAction.ADD, OperationAction.UPDATE, OperationAction.MERGE}:
+            if isinstance(object_payload, dict):
+                try:
+                    obj = self.source_store.read_object(str(object_payload["uri"]))
+                except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+                    obj = ContextObject.from_dict(object_payload)
+                specs.extend(self._relation_specs_for_object(obj))
+        elif operation.action == OperationAction.SUPERSEDE:
+            if operation.target_uri and isinstance(object_payload, dict):
+                old_obj = self.source_store.read_object(operation.target_uri)
+                try:
+                    new_obj = self.source_store.read_object(str(object_payload["uri"]))
+                except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+                    new_obj = ContextObject.from_dict(object_payload)
+                specs.extend(self._relation_specs_for_object(new_obj))
+                metadata = {
+                    "tenant_id": new_obj.tenant_id or old_obj.tenant_id or "default",
+                    "owner_user_id": new_obj.owner_user_id or old_obj.owner_user_id,
+                }
+                specs.extend(
+                    [
+                        {
+                            "source_uri": new_obj.uri,
+                            "relation_type": "supersedes",
+                            "target_uri": old_obj.uri,
+                            "weight": 1.0,
+                            "metadata": {key: value for key, value in metadata.items() if value is not None},
+                        },
+                        {
+                            "source_uri": old_obj.uri,
+                            "relation_type": "superseded_by",
+                            "target_uri": new_obj.uri,
+                            "weight": 1.0,
+                            "metadata": {key: value for key, value in metadata.items() if value is not None},
+                        },
+                    ]
+                )
+        elif operation.context_type == ContextType.ACTION_POLICY and operation.target_uri and operation.action in {
+            OperationAction.REWARD,
+            OperationAction.PENALIZE,
+            OperationAction.COOLDOWN,
+            OperationAction.SUPPRESS,
+            OperationAction.DISABLE,
+        }:
+            specs.extend(self._relation_specs_for_object(self.source_store.read_object(operation.target_uri)))
+        unique = {canonical_json(spec): spec for spec in specs}
+        return [unique[key] for key in sorted(unique)]
+
+    def _restore_regular_relation_effect(self, operation: ContextOperation, source_effect: dict) -> None:
+        expected = self._expected_regular_relation_specs(operation)
+        if source_effect.get("relations") != expected:
+            raise RedoIntegrityError("regular redo relation effect does not match its operation")
+        self._ensure_relation_specs(expected)
+
+    def _validate_regular_relation_postcondition(self, expected: list[dict]) -> None:
+        if self.relation_store is None:
+            if expected:
+                raise RedoIntegrityError("regular redo relation effect has no RelationStore")
+            return
+        for spec in expected:
+            actual = {
+                canonical_json(self._relation_effect_spec(relation))
+                for relation in self.relation_store.relations_of(str(spec["source_uri"]))
+            }
+            if canonical_json(spec) not in actual:
+                raise RedoIntegrityError("regular redo RelationStore effect is incomplete")
+
+    def _regular_source_effect_uris(self, operation: ContextOperation) -> list[str]:
+        uris: list[str] = []
+        if operation.target_uri:
+            uris.append(str(operation.target_uri))
+        object_payload = operation.payload.get("context_object")
+        if isinstance(object_payload, dict) and object_payload.get("uri"):
+            uris.append(str(object_payload["uri"]))
+        return list(dict.fromkeys(uris))
+
+    def _regular_operation_tenant(self, operation: ContextOperation) -> str:
+        if not self._operation_matches_bound_tenant(operation):
+            raise ValueError("regular operation tenant does not match bound tenant")
+        return self.tenant_id
 
     def _resume_canonical(self, user_id: str, operation: ContextOperation, phase: str) -> bool:
         if phase == "source_written":
@@ -1750,25 +3003,60 @@ class OperationCommitter:
         operations = [entry.operation for entry in entries]
         if not operations:
             return []
+        for entry in entries:
+            self._validate_redo_boundary(
+                user_id,
+                entry.operation,
+                source_effect=getattr(entry, "source_effect", None),
+                relation_manifest=getattr(entry, "relation_manifest", None),
+            )
+            self._validate_canonical_artifact_keys(entry.operation)
         transaction_ids = {str(operation.payload.get("transaction_id", "")) for operation in operations}
         idempotency_keys = {str(operation.payload.get("idempotency_key", "")) for operation in operations}
         if len(transaction_ids) != 1 or "" in transaction_ids or len(idempotency_keys) != 1:
             raise ValueError("canonical recovery requires one complete transaction")
         transaction_id = next(iter(transaction_ids))
         idempotency_key = next(iter(idempotency_keys))
-        outbox_path = self.root / "system" / "outbox" / f"{transaction_id}.json"
+        outbox_path = self._outbox_path(transaction_id)
         prepared = json.loads(outbox_path.read_text(encoding="utf-8"))
+        self._validate_recovery_artifact_tenant(prepared, "canonical recovery outbox")
         expected_operation_ids = [str(item) for item in prepared.get("operation_ids", []) or []]
         by_id = {operation.operation_id: operation for operation in operations}
-        for payload in prepared.get("operations", []) or []:
-            operation = ContextOperation.from_dict(payload)
+        prepared_operations = [
+            ContextOperation.from_dict(payload)
+            for payload in prepared.get("operations", []) or []
+            if isinstance(payload, dict)
+        ]
+        try:
+            self._validate_and_bind_operations(user_id, prepared_operations)
+        except ValueError as exc:
+            raise RedoIntegrityError("canonical recovery outbox crosses its user or tenant boundary") from exc
+        for operation in prepared_operations:
             by_id.setdefault(operation.operation_id, operation)
         if set(expected_operation_ids) != set(by_id):
             raise RuntimeError("canonical recovery outbox is missing transaction operations")
         ordered = [by_id[operation_id] for operation_id in expected_operation_ids]
-        self._validate_canonical_envelope(user_id, ordered)
+        try:
+            self._validate_canonical_envelope(user_id, ordered)
+        except ValueError as exc:
+            raise RedoIntegrityError("canonical recovery operations cross their user or tenant boundary") from exc
         self._preflight_canonical_revisions(ordered, check_revisions=False)
         self._validate_authoritative_batch(ordered)
+        before_by_uri: dict[str, ContextObject | None] = {}
+        for snapshot in prepared.get("before_images", []) or []:
+            if not isinstance(snapshot, dict):
+                continue
+            object_payload = snapshot.get("object")
+            before_by_uri[str(snapshot.get("uri") or "")] = (
+                ContextObject.from_dict(object_payload) if isinstance(object_payload, dict) else None
+            )
+        relation_manifests = {
+            operation.operation_id: self._build_canonical_relation_manifest(
+                operation,
+                before_by_uri.get(str(operation.target_uri or "")),
+            )
+            for operation in ordered
+        }
         slot_uri = next(
             (
                 str(payload.get("uri"))
@@ -1787,85 +3075,110 @@ class OperationCommitter:
             ),
         }
         with ExitStack() as locks:
+            guards: list[LeaseGuard] = []
             for lock_key in sorted(lock_keys):
-                locks.enter_context(self.path_lock.acquire(lock_key))
+                guards.append(locks.enter_context(self.path_lock.acquire(self._lock_key(lock_key))))
             marker = self._transaction_marker(idempotency_key)
-            if marker.exists():
-                diff = self._validate_transaction_marker(marker, ordered)
+            with self.path_lock.fenced(guards):
+                if marker.exists():
+                    diff = self._validate_transaction_marker(marker, ordered)
+                    self._finalize_canonical_outbox(
+                        transaction_id,
+                        idempotency_key,
+                        diff.operations,
+                        slot_uri=slot_uri,
+                    )
+                    for operation in ordered:
+                        self.redo.commit(operation.operation_id)
+                    return [operation.operation_id for operation in diff.operations]
+            for operation in ordered:
+                with self.path_lock.fenced(guards):
+                    payload = operation.payload.get("context_object")
+                    if not isinstance(payload, dict):
+                        raise ValueError("canonical recovery requires context_object")
+                    uri = str(payload["uri"])
+                    if operation.payload.get("canonical_pending_resolution") is True:
+                        desired_obj = ContextObject.from_dict(payload)
+                        try:
+                            current = self.source_store.read_object(uri)
+                        except (FileNotFoundError, IsADirectoryError, NotADirectoryError) as exc:
+                            raise RevisionConflictError(
+                                "canonical recovery cannot find its pending resolution target"
+                            ) from exc
+                        if canonical_json(current.to_dict()) == canonical_json(desired_obj.to_dict()):
+                            self._validate_existing_canonical_effect(operation)
+                        else:
+                            self._validate_pending_lifecycle_cas(operation, validate_resolution_links=False)
+                            self._apply_canonical_source(operation)
+                        self._apply_canonical_relation_manifest(
+                            operation,
+                            relation_manifests[operation.operation_id],
+                        )
+                        self.audit.record(
+                            user_id,
+                            "canonical_memory_operation_applied_during_recovery",
+                            operation.to_dict(),
+                        )
+                        operation.status = OperationStatus.COMMITTED
+                        continue
+                    expected = int(operation.payload.get("expected_revision", 0))
+                    desired_revision = int(dict(payload.get("metadata", {}) or {}).get("revision", 0))
+                    try:
+                        actual = int(dict(self.source_store.read_object(uri).metadata or {}).get("revision", 0))
+                    except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+                        actual = 0
+                    if actual == expected:
+                        self._apply_canonical_source(operation)
+                    elif actual == desired_revision:
+                        self._validate_existing_canonical_effect(operation)
+                    else:
+                        raise RevisionConflictError(
+                            f"canonical recovery conflict for {uri}: expected {expected} or {desired_revision}, actual {actual}"
+                        )
+                    self._apply_canonical_relation_manifest(
+                        operation,
+                        relation_manifests[operation.operation_id],
+                    )
+                    self.audit.record(user_id, "canonical_memory_operation_applied_during_recovery", operation.to_dict())
+                    operation.status = OperationStatus.COMMITTED
+            with self.path_lock.fenced(guards):
+                diff = ContextDiff(user_id=user_id, operations=ordered, diff_id=f"diff_{transaction_id}")
+                self.diff_writer.write(diff)
+                self._write_transaction_marker(marker, diff, ordered)
+                self.audit.record(
+                    user_id,
+                    "canonical_memory_transaction_recovered",
+                    {"transaction_id": transaction_id, "operation_ids": [item.operation_id for item in ordered]},
+                )
                 self._finalize_canonical_outbox(
                     transaction_id,
                     idempotency_key,
-                    diff.operations,
+                    ordered,
                     slot_uri=slot_uri,
                 )
                 for operation in ordered:
                     self.redo.commit(operation.operation_id)
-                return [operation.operation_id for operation in diff.operations]
-            for operation in ordered:
-                payload = operation.payload.get("context_object")
-                if not isinstance(payload, dict):
-                    raise ValueError("canonical recovery requires context_object")
-                uri = str(payload["uri"])
-                if operation.payload.get("canonical_pending_resolution") is True:
-                    desired_obj = ContextObject.from_dict(payload)
-                    try:
-                        current = self.source_store.read_object(uri)
-                    except (FileNotFoundError, IsADirectoryError, NotADirectoryError) as exc:
-                        raise RevisionConflictError(
-                            "canonical recovery cannot find its pending resolution target"
-                        ) from exc
-                    if canonical_json(current.to_dict()) == canonical_json(desired_obj.to_dict()):
-                        self._validate_existing_canonical_effect(operation)
-                    else:
-                        self._validate_pending_lifecycle_cas(operation, validate_resolution_links=False)
-                        self._apply_canonical_source(operation)
-                    self.audit.record(
-                        user_id,
-                        "canonical_memory_operation_applied_during_recovery",
-                        operation.to_dict(),
-                    )
-                    operation.status = OperationStatus.COMMITTED
-                    continue
-                expected = int(operation.payload.get("expected_revision", 0))
-                desired_revision = int(dict(payload.get("metadata", {}) or {}).get("revision", 0))
-                try:
-                    actual = int(dict(self.source_store.read_object(uri).metadata or {}).get("revision", 0))
-                except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
-                    actual = 0
-                if actual == expected:
-                    self._apply_canonical_source(operation)
-                elif actual == desired_revision:
-                    self._validate_existing_canonical_effect(operation)
-                else:
-                    raise RevisionConflictError(
-                        f"canonical recovery conflict for {uri}: expected {expected} or {desired_revision}, actual {actual}"
-                    )
-                self.audit.record(user_id, "canonical_memory_operation_applied_during_recovery", operation.to_dict())
-                operation.status = OperationStatus.COMMITTED
-            diff = ContextDiff(user_id=user_id, operations=ordered, diff_id=f"diff_{transaction_id}")
-            self.diff_writer.write(diff)
-            self._write_transaction_marker(marker, diff, ordered)
-            self.audit.record(
-                user_id,
-                "canonical_memory_transaction_recovered",
-                {"transaction_id": transaction_id, "operation_ids": [item.operation_id for item in ordered]},
-            )
-            self._finalize_canonical_outbox(
-                transaction_id,
-                idempotency_key,
-                ordered,
-                slot_uri=slot_uri,
-            )
-            for operation in ordered:
-                self.redo.commit(operation.operation_id)
-            return [operation.operation_id for operation in ordered]
+                return [operation.operation_id for operation in ordered]
 
-    def recover_pending_canonical(self, user_id: str) -> list[str]:
+    def recover_pending_canonical(
+        self,
+        user_id: str,
+        *,
+        commit_group_id: str | None = None,
+    ) -> list[str]:
         """恢复卡在准备阶段或源数据已写入阶段的记忆事务。"""
 
         grouped: dict[str, list] = {}
         for entry in self.redo.pending_entries():
-            if entry.operation.payload.get("canonical_memory") is not True:
+            if (
+                entry.operation.user_id != user_id
+                or not self._operation_matches_bound_tenant(entry.operation)
+                or entry.operation.payload.get("canonical_memory") is not True
+                or (
+                    commit_group_id is not None
+                    and str(entry.operation.payload.get("commit_group_id") or "") != commit_group_id
+                )
+            ):
                 continue
             transaction_id = str(entry.operation.payload.get("transaction_id", ""))
             grouped.setdefault(transaction_id, []).append(entry)
@@ -1874,14 +3187,114 @@ class OperationCommitter:
             recovered.extend(self.resume_canonical_batch(user_id, entries))
         return recovered
 
+    def recover_pending_regular_memory(
+        self,
+        user_id: str,
+        *,
+        commit_group_id: str,
+    ) -> list[str]:
+        """Finish redo-backed pending-memory effects for one session commit group."""
+
+        recovered: list[str] = []
+        for entry in self.redo.pending_entries():
+            operation = entry.operation
+            if (
+                operation.user_id != user_id
+                or not self._operation_matches_bound_tenant(operation)
+                or operation.payload.get("canonical_memory") is True
+                or operation.payload.get("canonical_pending_proposal") is not True
+                or operation.payload.get("commit_consumer")
+                or str(operation.payload.get("commit_group_id") or "") != commit_group_id
+            ):
+                continue
+            if self.resume(
+                user_id,
+                operation,
+                entry.phase,
+                source_effect=entry.source_effect,
+                relation_manifest=entry.relation_manifest,
+            ):
+                recovered.append(operation.operation_id)
+        return recovered
+
+    def committed_canonical_diffs(
+        self,
+        user_id: str,
+        commit_group_id: str,
+    ) -> list[ContextDiff]:
+        """Load every integrity-checked transaction marker bound to one commit group."""
+
+        root = self.artifact_root / "system" / "transactions"
+        if not root.exists():
+            return []
+        result: list[ContextDiff] = []
+        for path in sorted(root.glob("*.json")):
+            diff = self._transaction_marker_diff(path)
+            if not diff.operations:
+                continue
+            group_ids = {
+                str(operation.payload.get("commit_group_id") or "")
+                for operation in diff.operations
+            }
+            if commit_group_id not in group_ids:
+                continue
+            if group_ids != {commit_group_id}:
+                raise ValueError("canonical transaction marker crosses commit groups")
+            if any(
+                diff.user_id != user_id
+                or operation.user_id != user_id
+                or operation.payload.get("canonical_memory") is not True
+                for operation in diff.operations
+            ):
+                raise ValueError("canonical transaction marker crosses a user boundary")
+            self._validate_transaction_marker_tenant(path)
+            self._validate_and_bind_operations(user_id, diff.operations)
+            result.append(diff)
+        return result
+
+    def committed_memory_effect_diffs(
+        self,
+        user_id: str,
+        commit_group_id: str,
+    ) -> list[ContextDiff]:
+        """Load marker-backed canonical and pending-memory effects for one group."""
+
+        result = self.committed_canonical_diffs(user_id, commit_group_id)
+        root = self.artifact_root / "system" / "operations"
+        if not root.exists():
+            return result
+        for path in sorted(root.glob("*.json")):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            operation_payload = payload.get("operation")
+            if not isinstance(operation_payload, dict):
+                continue
+            operation = ContextOperation.from_dict(operation_payload)
+            if str(operation.payload.get("commit_group_id") or "") != commit_group_id:
+                continue
+            if operation.payload.get("canonical_pending_proposal") is not True:
+                continue
+            if operation.payload.get("commit_consumer"):
+                continue
+            if operation.user_id != user_id:
+                raise ValueError("pending-memory operation marker crosses a user boundary")
+            self._validate_and_bind_operations(user_id, [operation])
+            stored = self._validate_operation_marker(path, operation)
+            result.append(
+                ContextDiff(
+                    user_id=user_id,
+                    operations=[stored],
+                    diff_id=f"diff_{stored.operation_id}",
+                    created_at=stored.created_at,
+                )
+            )
+        return result
+
     def _write_recovery_diff(self, user_id: str, operation: ContextOperation) -> None:
-        operation.status = OperationStatus.COMMITTED
-        self.diff_writer.write(
-            ContextDiff(user_id=user_id, operations=[operation], diff_id=f"diff_{operation.operation_id}")
-        )
+        self._ensure_single_operation_diff(user_id, operation)
 
     def _operation_marker(self, operation_id: str) -> Path:
-        return self.root / "system" / "operations" / f"{operation_id}.json"
+        key = require_safe_path_segment(operation_id, "operation_id")
+        return self.artifact_root / "system" / "operations" / f"{key}.json"
 
     def _write_operation_marker(self, operation: ContextOperation) -> None:
         if operation.payload.get("canonical_memory") is True:
@@ -1892,6 +3305,7 @@ class OperationCommitter:
         stored_operation["status"] = OperationStatus.COMMITTED.value
         payload = {
             "schema_version": "operation_idempotency_marker_v2",
+            "tenant_id": self.tenant_id,
             "operation_id": operation.operation_id,
             "action": operation.action.value,
             "context_type": operation.context_type.value,
@@ -1921,6 +3335,11 @@ class OperationCommitter:
         payload = json.loads(path.read_text(encoding="utf-8"))
         if payload.get("schema_version") != "operation_idempotency_marker_v2":
             raise ValueError("legacy operation marker cannot verify the persisted effect")
+        if "tenant_id" in payload:
+            tenant = self._validate_tenant_id(payload["tenant_id"], "operation marker tenant_id")
+            if tenant != self.tenant_id:
+                raise ValueError("operation idempotency marker crosses the bound tenant")
+        self._validate_and_bind_operations(operation.user_id, [operation])
         expected = {
             "operation_id": operation.operation_id,
             "action": operation.action.value,
@@ -1934,6 +3353,7 @@ class OperationCommitter:
         if not isinstance(stored_payload, dict):
             raise ValueError("operation idempotency marker is missing its persisted operation")
         stored = ContextOperation.from_dict(stored_payload)
+        self._validate_and_bind_operations(operation.user_id, [stored])
         if operation.target_uri not in {None, stored.target_uri} or payload.get("target_uri") != stored.target_uri:
             raise ValueError("operation idempotency marker conflicts with the requested target")
         requested = operation
@@ -2195,46 +3615,111 @@ class OperationCommitter:
         )
 
     def _apply_relations(self, obj: ContextObject, operation: ContextOperation) -> None:
+        del operation
         if self.relation_store is None:
             return
+        self._ensure_relation_specs(self._relation_specs_for_object(obj))
+
+    def _relation_specs_for_object(self, obj: ContextObject) -> list[dict]:
         metadata = dict(obj.metadata)
         relation_metadata = {"tenant_id": obj.tenant_id or "default", "owner_user_id": obj.owner_user_id}
+        specs: list[dict] = []
+
+        def add(source_uri: str, relation_type: str, target_uri: str, relation_meta: dict) -> None:
+            if not target_uri:
+                return
+            specs.append(
+                {
+                    "source_uri": source_uri,
+                    "relation_type": relation_type,
+                    "target_uri": target_uri,
+                    "weight": 1.0,
+                    "metadata": {key: value for key, value in relation_meta.items() if value is not None},
+                }
+            )
+
         if obj.context_type == ContextType.ACTION_POLICY:
-            self._add_relation(obj.uri, "anchored_by", str(metadata.get("memory_anchor_uri", "")), relation_metadata)
+            add(obj.uri, "anchored_by", str(metadata.get("memory_anchor_uri", "")), relation_metadata)
             for uri in metadata.get("required_resource_uris", []) or []:
-                self._add_relation(obj.uri, "requires_resource", str(uri), relation_metadata)
+                add(obj.uri, "requires_resource", str(uri), relation_metadata)
             for uri in metadata.get("required_skill_uris", []) or []:
-                self._add_relation(obj.uri, "requires_skill", str(uri), relation_metadata)
+                add(obj.uri, "requires_skill", str(uri), relation_metadata)
             for uri in metadata.get("supported_behavior_pattern_uris", []) or []:
-                self._add_relation(obj.uri, "supported_by", str(uri), relation_metadata)
+                add(obj.uri, "supported_by", str(uri), relation_metadata)
             for uri in metadata.get("constrained_by_memory_uris", []) or []:
-                self._add_relation(obj.uri, "constrained_by", str(uri), relation_metadata)
+                add(obj.uri, "constrained_by", str(uri), relation_metadata)
         elif obj.context_type in {ContextType.BEHAVIOR_PATTERN, ContextType.BEHAVIOR_CLUSTER}:
-            self._add_relation(obj.uri, "anchored_by", str(metadata.get("memory_anchor_uri", "")), relation_metadata)
+            add(obj.uri, "anchored_by", str(metadata.get("memory_anchor_uri", "")), relation_metadata)
             for uri in metadata.get("case_refs", []) or []:
-                self._add_relation(obj.uri, "aggregated_from", str(uri), relation_metadata)
+                add(obj.uri, "aggregated_from", str(uri), relation_metadata)
             for uri in metadata.get("related_policy_uris", []) or metadata.get("policy_uris", []) or []:
-                self._add_relation(str(uri), "supported_by", obj.uri, relation_metadata)
+                add(str(uri), "supported_by", obj.uri, relation_metadata)
         elif obj.context_type == ContextType.MEMORY:
             for policy_uri in metadata.get("constrains_policy_uris", []) or []:
-                self._add_relation(str(policy_uri), "constrained_by", obj.uri, relation_metadata)
+                add(str(policy_uri), "constrained_by", obj.uri, relation_metadata)
             for behavior_uri in metadata.get("supporting_behavior_uris", []) or []:
-                self._add_relation(obj.uri, "evidence_for", str(behavior_uri), relation_metadata)
+                add(obj.uri, "evidence_for", str(behavior_uri), relation_metadata)
         for relation in obj.relations:
-            if self.relation_store is not None:
-                self.relation_store.add_relation(relation)
+            specs.append(self._relation_effect_spec(relation))
+        unique = {canonical_json(spec): spec for spec in specs}
+        return [unique[key] for key in sorted(unique)]
 
     def _add_relation(self, source_uri: str, relation_type: str, target_uri: str, metadata: dict) -> None:
         if self.relation_store is None or not target_uri:
             return
-        self.relation_store.add_relation(
-            ContextRelation(
-                source_uri=source_uri,
-                relation_type=relation_type,
-                target_uri=target_uri,
-                metadata={key: value for key, value in metadata.items() if value is not None},
-            )
+        self._ensure_relation_specs(
+            [
+                {
+                    "source_uri": source_uri,
+                    "relation_type": relation_type,
+                    "target_uri": target_uri,
+                    "weight": 1.0,
+                    "metadata": {key: value for key, value in metadata.items() if value is not None},
+                }
+            ]
         )
+
+    def _ensure_relation_specs(self, specs: list[dict]) -> None:
+        if self.relation_store is None:
+            return
+        for spec in specs:
+            existing = self.relation_store.relations_of(str(spec["source_uri"]))
+            matching_key = next(
+                (
+                    relation
+                    for relation in existing
+                    if relation.source_uri == spec["source_uri"]
+                    and relation.relation_type == spec["relation_type"]
+                    and relation.target_uri == spec["target_uri"]
+                ),
+                None,
+            )
+            if matching_key is not None and self._relation_effect_spec(matching_key) == spec:
+                continue
+            if matching_key is not None:
+                self.relation_store.delete_relation(
+                    matching_key.source_uri,
+                    matching_key.relation_type,
+                    matching_key.target_uri,
+                )
+            self.relation_store.add_relation(
+                ContextRelation(
+                    source_uri=str(spec["source_uri"]),
+                    relation_type=str(spec["relation_type"]),
+                    target_uri=str(spec["target_uri"]),
+                    weight=float(spec.get("weight", 1.0)),
+                    metadata=dict(spec.get("metadata", {}) or {}),
+                )
+            )
+
+    def _relation_effect_spec(self, relation: ContextRelation) -> dict:
+        return {
+            "source_uri": relation.source_uri,
+            "relation_type": relation.relation_type,
+            "target_uri": relation.target_uri,
+            "weight": float(relation.weight),
+            "metadata": dict(relation.metadata),
+        }
 
     def _read_content_or_empty(self, uri: str) -> str:
         try:

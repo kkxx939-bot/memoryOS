@@ -14,7 +14,7 @@ from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
 from memoryos.contextdb.store.source_store import IndexStore, RelationStore, SourceStore
 from memoryos.memory.canonical.identity import IDENTITY_ALGORITHM_V2
 from memoryos.memory.canonical.projection_state import ProjectionRecord, ProjectionRecordStore
-from memoryos.memory.canonical.scope import scope_key_candidates_from_payload
+from memoryos.memory.canonical.scope import MemoryScope
 from memoryos.memory.canonical.visibility import read_committed_canonical, relation_is_committed
 
 
@@ -449,33 +449,22 @@ class CanonicalMemoryRetriever:
         return ("PROPOSED", "ACTIVE", "SUPERSEDED", "CONFLICTED", "RETRACTED")
 
     def _visible(self, metadata: dict[str, Any], query: CanonicalMemoryQuery) -> bool:
-        scope = dict(metadata.get("scope", {}) or {})
-        visibility = dict(scope.get("visibility", {}) or {})
-        if str(visibility.get("tenant_id", "default")) != query.tenant_id:
-            return False
-        principals = {str(item) for item in visibility.get("allowed_principal_ids", []) or []}
-        services = {str(item) for item in visibility.get("allowed_service_ids", []) or []}
-        private = bool(visibility.get("private", False))
-        if not private and not principals and not services:
-            return True
+        scope = self._canonical_scope(metadata)
         return bool(
-            (query.principal_id and query.principal_id in principals)
-            or (query.service_id and query.service_id in services)
+            scope is not None
+            and scope.visibility.permits(
+                tenant_id=query.tenant_id,
+                principal_id=query.principal_id,
+                service_id=query.service_id,
+            )
         )
 
     def _authority_permits(self, metadata: dict[str, Any], query: CanonicalMemoryQuery) -> bool:
-        scope = dict(metadata.get("scope", {}) or {})
-        authority = dict(metadata.get("authority") or scope.get("authority") or {})
-        if not authority:
+        scope = self._canonical_scope(metadata)
+        if scope is None or scope.authority.inferred:
             return False
-        if authority.get("tenant_id") and str(authority["tenant_id"]) != query.tenant_id:
-            return False
-        if bool(authority.get("inferred", False)):
-            return False
-        principals = {
-            str(item) for item in (authority.get("allowed_principal_ids") or authority.get("principal_ids") or [])
-        }
-        services = {str(item) for item in (authority.get("allowed_service_ids") or authority.get("service_ids") or [])}
+        principals = set(scope.authority.principal_ids)
+        services = set(scope.authority.service_ids)
         if not principals and not services:
             return True
         provenance = dict(metadata.get("provenance", {}) or {})
@@ -486,17 +475,22 @@ class CanonicalMemoryRetriever:
         return bool(asserted_by in principals or asserted_by_service in services)
 
     def _applicable(self, metadata: dict[str, Any], available_scope_keys: Sequence[str]) -> bool:
-        scope = dict(metadata.get("scope", {}) or {})
-        applicability = dict(scope.get("applicability", {}) or {})
-        required = [
-            set(scope_key_candidates_from_payload(item))
-            for item in applicability.get("all_of", []) or []
-            if isinstance(item, dict) and item.get("kind") and item.get("id")
-        ]
-        if not required:
+        scope = self._canonical_scope(metadata)
+        if scope is None:
             return False
+        required = tuple(item.key for item in scope.applicability.all_of)
         available = set(available_scope_keys)
-        return all(bool(candidates & available) for candidates in required)
+        return all(scope_key in available for scope_key in required)
+
+    def _canonical_scope(self, metadata: dict[str, Any]) -> MemoryScope | None:
+        raw_scope = metadata.get("scope")
+        if not isinstance(raw_scope, dict):
+            return None
+        try:
+            scope = MemoryScope.from_dict(raw_scope)
+        except (KeyError, TypeError, ValueError):
+            return None
+        return scope if scope.canonical_subject is not None else None
 
     def _payload(
         self,

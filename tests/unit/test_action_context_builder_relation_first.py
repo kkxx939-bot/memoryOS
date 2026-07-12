@@ -167,18 +167,23 @@ class ActionContextBuilderRelationFirstTest(unittest.TestCase):
         )
         for name, lifecycle, metadata, owner, tenant in cases:
             with self.subTest(name=name):
-                self.source.write_object(
-                    ContextObject(
-                        uri=anchor_uri,
-                        context_type=ContextType.MEMORY,
-                        title=name,
-                        owner_user_id=owner,
-                        tenant_id=tenant,
-                        lifecycle_state=lifecycle,
-                        metadata=metadata,
-                    ),
-                    content=name,
+                anchor = ContextObject(
+                    uri=anchor_uri,
+                    context_type=ContextType.MEMORY,
+                    title=name,
+                    owner_user_id=owner,
+                    tenant_id=tenant,
+                    lifecycle_state=lifecycle,
+                    metadata=metadata,
                 )
+                if tenant == "default":
+                    self.source.write_object(anchor, content=name)
+                else:
+                    self.source.delete_object(anchor_uri)
+                    FileSystemSourceStore(self.root, tenant_id=tenant).write_object(
+                        anchor,
+                        content=name,
+                    )
                 self.assertEqual(
                     builder.verified_memory_anchor_uris("u1", [self.policy]),
                     set(),
@@ -240,7 +245,8 @@ class ActionContextBuilderRelationFirstTest(unittest.TestCase):
 
     def test_cross_tenant_memory_rule_relation_does_not_enter_action_context(self) -> None:
         cross_tenant_uri = "memoryos://user/u1/memories/policies/tenant-b-rule"
-        self.source.write_object(
+        tenant_b_source = FileSystemSourceStore(self.root, tenant_id="tenant-b")
+        tenant_b_source.write_object(
             ContextObject(
                 uri=cross_tenant_uri,
                 context_type=ContextType.MEMORY,

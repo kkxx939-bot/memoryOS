@@ -61,26 +61,54 @@ def _claim(revision: int, state: str = "ACTIVE") -> MemoryClaim:
 
 
 def _scope() -> dict:
+    workspace: dict[str, object] = {
+        "namespace": "memoryos",
+        "kind": "workspace",
+        "id": "memoryos",
+        "parent_id": None,
+        "attributes": {},
+        "confidence": 1.0,
+        "source": "explicit",
+        "inferred": False,
+    }
     return {
-        "applicability": {
-            "all_of": [
-                {
-                    "namespace": "memoryos",
-                    "kind": "workspace",
-                    "id": "memoryos",
-                    "parent_id": None,
-                    "attributes": {},
-                }
-            ]
-        },
+        "canonical_subject": workspace,
+        "applicability": {"all_of": [workspace]},
         "visibility": {
             "tenant_id": "t1",
             "allowed_principal_ids": [],
             "allowed_service_ids": [],
             "private": False,
         },
+        "authority": {
+            "principal_ids": ["u1"],
+            "service_ids": [],
+            "inferred": False,
+        },
         "origin_refs": [],
     }
+
+
+def _artifact_root(root):  # noqa: ANN001, ANN202
+    return root / "tenants" / "t1"
+
+
+def _persist_committed_claim(source, artifact_root, obj, content: str) -> None:  # noqa: ANN001
+    revision = int(obj.metadata.get("revision", 0))
+    idempotency_key = f"projection-fixture-revision-{revision}"
+    transaction_id = f"projection-fixture-transaction-{revision}"
+    obj.metadata = {
+        **obj.metadata,
+        "canonical_idempotency_key": idempotency_key,
+        "canonical_transaction_id": transaction_id,
+    }
+    marker = artifact_root / "system" / "transactions" / f"{idempotency_key}.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(
+        json.dumps({"schema_version": "projection_test_committed_fixture_v1", "tenant_id": "t1"}),
+        encoding="utf-8",
+    )
+    source.write_object(obj, content=content)
 
 
 def _enqueue(queue, tmp_path, revision: int, job_id: str) -> None:  # noqa: ANN001
@@ -116,7 +144,8 @@ def _enqueue(queue, tmp_path, revision: int, job_id: str) -> None:  # noqa: ANN0
 
 
 def test_projection_sidecar_retry_idempotency_stale_guard_and_rebuild(tmp_path) -> None:  # noqa: ANN001
-    source = FileSystemSourceStore(tmp_path)
+    artifact_root = _artifact_root(tmp_path)
+    source = FileSystemSourceStore(tmp_path, tenant_id="t1")
     index = CountingIndexStore()
     queue = InMemoryQueueStore()
     claim = _claim(1)
@@ -126,18 +155,23 @@ def test_projection_sidecar_retry_idempotency_stale_guard_and_rebuild(tmp_path) 
         memory_type="project_decision",
         scope=_scope(),
     )
-    source.write_object(obj, content=json.dumps({"claim": "SQLite", "revision": 1}))
+    _persist_committed_claim(
+        source,
+        artifact_root,
+        obj,
+        json.dumps({"claim": "SQLite", "revision": 1}),
+    )
     canonical_before = source.read_object(claim.uri).to_dict()
     status_events: list[ProjectionRecord] = []
     projector = CanonicalMemoryProjector(
         source,
         index,
-        tmp_path,
+        artifact_root,
         vector_store=FailingVectorStore(),
         status_callback=status_events.append,
     )
     worker = MemoryProjectionWorker(projector, queue)
-    _enqueue(queue, tmp_path, 1, "projection-1")
+    _enqueue(queue, artifact_root, 1, "projection-1")
 
     first = worker.process_pending()
     assert first["failed"] == ["outbox_projection-1"]
@@ -195,8 +229,8 @@ def test_projection_sidecar_retry_idempotency_stale_guard_and_rebuild(tmp_path) 
     assert record_path.read_bytes() == record_bytes
     assert source.read_content(projected_record.manifest_uri) == manifest_bytes
 
-    scope_current = next((tmp_path / "views" / "scope").glob("**/current.json"))
-    taxonomy_current = next((tmp_path / "views" / "taxonomy").glob("**/current.json"))
+    scope_current = next((artifact_root / "views" / "scope").glob("**/current.json"))
+    taxonomy_current = next((artifact_root / "views" / "taxonomy").glob("**/current.json"))
     assert json.loads(scope_current.read_text(encoding="utf-8"))["source_revision"] == 1
     assert json.loads(taxonomy_current.read_text(encoding="utf-8"))["source_revision"] == 1
 
@@ -207,42 +241,50 @@ def test_projection_sidecar_retry_idempotency_stale_guard_and_rebuild(tmp_path) 
         memory_type="project_decision",
         scope=_scope(),
     )
-    source.write_object(updated_obj, content=json.dumps({"claim": "SQLite", "revision": 2}))
-    _enqueue(queue, tmp_path, 1, "stale-projection")
+    _persist_committed_claim(
+        source,
+        artifact_root,
+        updated_obj,
+        json.dumps({"claim": "SQLite", "revision": 2}),
+    )
+    _enqueue(queue, artifact_root, 1, "stale-projection")
     stale = worker.process_pending()
     assert stale["stale"] == ["outbox_stale-projection"]
     old = projector.record_store.load(claim.uri, 1)
     assert old is not None and old.current is False and old.status == "stale"
     assert claim.uri not in index.indexed_uris()
 
-    _enqueue(queue, tmp_path, 2, "projection-2")
+    _enqueue(queue, artifact_root, 2, "projection-2")
     worker.process_pending()
     current = projector.record_store.load_current(claim.uri, source_revision=2)
     assert current is not None
-    new_scope_current = next((tmp_path / "views" / "scope").glob("**/current.json"))
-    new_taxonomy_current = next((tmp_path / "views" / "taxonomy").glob("**/current.json"))
+    new_scope_current = next((artifact_root / "views" / "scope").glob("**/current.json"))
+    new_taxonomy_current = next((artifact_root / "views" / "taxonomy").glob("**/current.json"))
     assert json.loads(new_scope_current.read_text(encoding="utf-8"))["source_revision"] == 2
     assert json.loads(new_taxonomy_current.read_text(encoding="utf-8"))["source_revision"] == 2
 
     new_scope_current.unlink()
     rebuilt = projector.rebuild()
     assert rebuilt == {"projected": 1, "skipped": 0}
-    assert next((tmp_path / "views" / "scope").glob("**/current.json")).exists()
+    assert next((artifact_root / "views" / "scope").glob("**/current.json")).exists()
 
 
 def test_late_projection_cannot_overwrite_new_canonical_revision(tmp_path) -> None:  # noqa: ANN001
-    source = FileSystemSourceStore(tmp_path)
+    artifact_root = _artifact_root(tmp_path)
+    source = FileSystemSourceStore(tmp_path, tenant_id="t1")
     index = InMemoryIndexStore()
     vectors = InMemoryVectorStore()
     claim = _claim(1)
-    source.write_object(
+    _persist_committed_claim(
+        source,
+        artifact_root,
         claim.to_context_object(
             tenant_id="t1",
             owner_user_id="u1",
             memory_type="project_decision",
             scope=_scope(),
         ),
-        content="revision one",
+        "revision one",
     )
     projector_entered = threading.Event()
     resume_projector = threading.Event()
@@ -255,7 +297,7 @@ def test_late_projection_cannot_overwrite_new_canonical_revision(tmp_path) -> No
     projector = CanonicalMemoryProjector(
         source,
         index,
-        tmp_path,
+        artifact_root,
         vector_store=vectors,
         test_hook=hook,
     )
@@ -277,7 +319,7 @@ def test_late_projection_cannot_overwrite_new_canonical_revision(tmp_path) -> No
         memory_type="project_decision",
         scope=_scope(),
     )
-    source.write_object(revision_two, content="revision two")
+    _persist_committed_claim(source, artifact_root, revision_two, "revision two")
     canonical_revision_two = source.read_object(claim.uri).to_dict()
     resume_projector.set()
     thread.join(timeout=5)
@@ -289,5 +331,5 @@ def test_late_projection_cannot_overwrite_new_canonical_revision(tmp_path) -> No
     assert source.read_content(claim.uri) == "revision two"
     assert claim.uri not in index.indexed_uris()
     assert claim.uri not in vectors.rows
-    stale = ProjectionRecordStore(tmp_path).load(claim.uri, 1)
+    stale = ProjectionRecordStore(artifact_root).load(claim.uri, 1)
     assert stale is not None and stale.status == "stale" and stale.current is False

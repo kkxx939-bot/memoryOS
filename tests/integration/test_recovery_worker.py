@@ -57,7 +57,11 @@ def test_recovery_worker_source_written_completes_index_audit_diff(tmp_path) -> 
     source, index, committer, worker = _committer(tmp_path)
     op = _add_op("source-written")
     committer._apply_source(op)
-    committer.redo.begin(op, phase="source_written")
+    committer.redo.begin(
+        op,
+        phase="source_written",
+        source_effect=committer._capture_regular_source_effect(op),
+    )
 
     result = worker.process_pending("u1")
 
@@ -72,7 +76,11 @@ def test_recovery_worker_index_written_completes_audit_and_diff(tmp_path) -> Non
     op = _add_op("index-written")
     committer._apply_source(op)
     committer._apply_index(op)
-    committer.redo.begin(op, phase="index_written")
+    committer.redo.begin(
+        op,
+        phase="index_written",
+        source_effect=committer._capture_regular_source_effect(op),
+    )
 
     worker.process_pending("u1")
 
@@ -87,7 +95,11 @@ def test_recovery_worker_audit_written_completes_diff(tmp_path) -> None:
     committer._apply_source(op)
     committer._apply_index(op)
     committer.audit.record("u1", "context_operation_committed", op.to_dict())
-    committer.redo.begin(op, phase="audit_written")
+    committer.redo.begin(
+        op,
+        phase="audit_written",
+        source_effect=committer._capture_regular_source_effect(op),
+    )
 
     worker.process_pending("u1")
 
@@ -99,8 +111,13 @@ def test_recovery_worker_audit_written_completes_diff(tmp_path) -> None:
 def test_recovery_worker_diff_written_only_commits_redo(tmp_path) -> None:
     _, _, committer, worker = _committer(tmp_path)
     op = _add_op("diff-written")
+    committer._apply_source(op)
     committer.diff_writer.write(ContextDiff(user_id="u1", operations=[op], diff_id=f"diff_{op.operation_id}"))
-    committer.redo.begin(op, phase="diff_written")
+    committer.redo.begin(
+        op,
+        phase="diff_written",
+        source_effect=committer._capture_regular_source_effect(op),
+    )
 
     result = worker.process_pending("u1")
 
@@ -117,13 +134,21 @@ def test_recovery_worker_reward_and_penalize_do_not_apply_twice(tmp_path) -> Non
     reward = ContextOperation(user_id="u1", context_type=ContextType.ACTION_POLICY, action=OperationAction.REWARD, target_uri=policy.uri, payload={"reward": 1.0}, operation_id="reward-recovery")
     committer.commit("u1", [reward])
     first = source.read_object(policy.uri).metadata
-    committer.redo.begin(reward, phase="source_written")
+    committer.redo.begin(
+        reward,
+        phase="source_written",
+        source_effect=committer._capture_regular_source_effect(reward),
+    )
     worker.process_pending("u1")
     assert source.read_object(policy.uri).metadata["success_count"] == first["success_count"]
 
     penalty = ContextOperation(user_id="u1", context_type=ContextType.ACTION_POLICY, action=OperationAction.PENALIZE, target_uri=policy.uri, payload={"penalty": 1.0}, operation_id="penalty-recovery")
     committer.commit("u1", [penalty])
     second = source.read_object(policy.uri).metadata
-    committer.redo.begin(penalty, phase="source_written")
+    committer.redo.begin(
+        penalty,
+        phase="source_written",
+        source_effect=committer._capture_regular_source_effect(penalty),
+    )
     worker.process_pending("u1")
     assert source.read_object(policy.uri).metadata["failure_count"] == second["failure_count"]

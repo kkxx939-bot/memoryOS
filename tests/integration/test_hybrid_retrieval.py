@@ -20,6 +20,7 @@ from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
 from memoryos.contextdb.store.local_stores import FileSystemSourceStore, InMemoryIndexStore, InMemoryRelationStore
 from memoryos.contextdb.store.source_store import IndexHit
 from memoryos.contextdb.store.vector_store import InMemoryVectorStore, VectorHit
+from memoryos.memory.canonical.scope import ScopeRef
 from memoryos.prediction.model.prediction_ledger import PredictionLedger
 from memoryos.prediction.model.prediction_request import PredictionRequest
 from memoryos.prediction.pipeline.prediction_engine import PredictionEngine
@@ -54,6 +55,117 @@ def test_hybrid_search_falls_back_to_index_without_vector(tmp_path) -> None:
     hits = HybridSearch(index, source_store=source).search("hot", filters={"owner_user_id": "u1"}, namespace="memoryos://user/u1/", context_type=ContextType.MEMORY)
     assert hits[0].uri == obj.uri
     assert hits[0].source == "index"
+
+
+def test_hybrid_and_assembler_keep_same_asset_ids_isolated_by_parent_path(tmp_path) -> None:
+    source = FileSystemSourceStore(tmp_path)
+    index = InMemoryIndexStore()
+
+    def scoped(uri: str, parent: str) -> ContextObject:
+        return ContextObject(
+            uri=uri,
+            context_type=ContextType.MEMORY,
+            title="camera calibration",
+            owner_user_id="u1",
+            metadata={
+                "retrieval_views": ["test:camera"],
+                "scope": {
+                    "applicability": {
+                        "all_of": [
+                            {
+                                "namespace": "memoryos",
+                                "kind": "asset",
+                                "id": "camera",
+                                "parent_path": [parent],
+                            }
+                        ]
+                    }
+                }
+            },
+        )
+
+    first = scoped("memoryos://user/u1/memories/camera-a", "workspace-a")
+    second = scoped("memoryos://user/u1/memories/camera-b", "workspace-b")
+    for obj in (first, second):
+        source.write_object(obj, content="camera calibration")
+        index.upsert_index(obj, content="camera calibration")
+    first_key = ScopeRef("memoryos", "asset", "camera", parent_path=("workspace-a",)).key
+    hybrid = HybridSearch(index, source_store=source)
+
+    hits = hybrid.search(
+        "camera",
+        filters={"owner_user_id": "u1", "applicability_scope_keys": [first_key]},
+        context_type=ContextType.MEMORY,
+    )
+    assert [hit.uri for hit in hits] == [first.uri]
+
+    assembler = ContextAssembler(
+        ContextDB(source, index, InMemoryRelationStore()),
+        hybrid_search=hybrid,
+    )
+    allowed = assembler._allowed_source_uris(
+        user_id="u1",
+        tenant_id="default",
+        context_type=ContextType.MEMORY,
+        project_id="",
+        applicability_scope_keys=[first_key],
+    )
+    assert allowed == (first.uri,)
+    view_results = assembler._search_memory_views(
+        "camera",
+        user_id="u1",
+        context_type=ContextType.MEMORY,
+        limit=10,
+        search_scope=None,
+        retrieval_views=["test:camera"],
+        project_id="",
+        adapter_id="",
+        tenant_id="default",
+        applicability_scope_keys=[first_key],
+    )
+    assert [item["uri"] for item in view_results] == [first.uri]
+
+
+def test_mixed_valid_and_malformed_scope_is_not_retrievable(tmp_path) -> None:
+    source = FileSystemSourceStore(tmp_path)
+    index = InMemoryIndexStore()
+    obj = ContextObject(
+        uri="memoryos://user/u1/memories/malformed-scope",
+        context_type=ContextType.MEMORY,
+        title="mixed malformed scope",
+        owner_user_id="u1",
+        metadata={
+            "scope": {
+                "applicability": {
+                    "all_of": [
+                        {"namespace": "memoryos", "kind": "workspace", "id": "w1"},
+                        {"namespace": "memoryos", "kind": "location"},
+                    ]
+                }
+            }
+        },
+    )
+    source.write_object(obj, content="mixed malformed scope")
+    index.upsert_index(obj, content="mixed malformed scope")
+    filters = {
+        "owner_user_id": "u1",
+        "applicability_scope_keys": ["memoryos:workspace:w1"],
+    }
+
+    assert not index.search("mixed", filters=filters)
+    assert not HybridSearch(index, source_store=source).search(
+        "mixed",
+        filters=filters,
+        context_type=ContextType.MEMORY,
+    )
+    assembler = ContextAssembler(ContextDB(source, index, InMemoryRelationStore()))
+    assert assembler._allowed_source_uris(
+        user_id="u1",
+        tenant_id="default",
+        context_type=ContextType.MEMORY,
+        project_id="",
+        applicability_scope_keys=["memoryos:workspace:w1"],
+    ) == ()
 
 
 def test_hybrid_search_logs_embedding_failure_and_returns_index_hits(tmp_path, caplog) -> None:

@@ -649,6 +649,24 @@ class LLMMemoryExtractorBackend:
         if any(reference not in existing_candidates for reference in related_candidate_refs):
             raise ValueError(f"candidate[{index}] related_candidate_refs contains an illegal reference")
         related_items = tuple(existing_candidates[reference] for reference in related_candidate_refs)
+        relation = str(semantic.get("relation_to_existing", "unrelated")).strip().casefold()
+        if relation in {"corrects", "supersedes", "supplements"}:
+            if len(related_items) != 1:
+                raise ValueError(
+                    f"candidate[{index}] {relation} requires exactly one related active claim"
+                )
+            related_item = related_items[0]
+            if (
+                related_item.state.upper() != "ACTIVE"
+                or not related_item.slot_id
+                or not related_item.claim_id
+                or related_item.memory_type != memory_type
+            ):
+                raise ValueError(
+                    f"candidate[{index}] {relation} related target is not one compatible active claim"
+                )
+        elif relation == "unrelated" and related_items:
+            raise ValueError(f"candidate[{index}] unrelated relation cannot declare related targets")
         related_slot_ids = tuple(dict.fromkeys(item.slot_id for item in related_items if item.slot_id))
         related_claim_ids = tuple(dict.fromkeys(item.claim_id for item in related_items if item.claim_id))
         actual_source_role = self._source_role((atomic_evidence_ref,), episode)

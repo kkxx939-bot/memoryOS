@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -172,6 +173,54 @@ def test_opaque_existing_candidate_ref_maps_to_internal_ids_without_exposing_uri
     assert result.accepted[0].related_memory_ids == ()
     assert result.accepted[0].related_slot_ids == ("s1",)
     assert result.accepted[0].related_claim_ids == ("c1",)
+
+
+def test_replacement_and_supplement_require_one_compatible_active_target() -> None:
+    archive = _archive("I confirm my answers preference: concise answers.")
+    episode = SessionArchiveEpisodeAdapter().adapt(archive)
+    active = PrefetchedMemory(
+        uri="memoryos://user/u1/memories/canonical/slots/s1/claims/c1",
+        memory_type="preference",
+        state="ACTIVE",
+        revision=1,
+        slot_id="s1",
+        claim_id="c1",
+        canonical_value="concise",
+        identity_fields={"subject": "answers", "dimension": "length"},
+        scope={},
+        l0="concise",
+        l1="concise answers",
+    )
+    cases = [
+        (_semantic_candidate(semantic=_semantic_fields(relation_to_existing="supersedes")), (active,)),
+        (
+            _semantic_candidate(
+                semantic=_semantic_fields(relation_to_existing="supplements"),
+                related_candidate_refs=["existing_0", "existing_1"],
+            ),
+            (active, active),
+        ),
+        (
+            _semantic_candidate(
+                semantic=_semantic_fields(relation_to_existing="supersedes"),
+                related_candidate_refs=["existing_0"],
+            ),
+            (replace(active, state="PROPOSED"),),
+        ),
+    ]
+
+    for candidate, existing in cases:
+        backend = LLMMemoryExtractorBackend(
+            FakeMemoryModelProvider(json.dumps({"candidates": [candidate]}))
+        )
+        result = backend.extract_batch_with_context(
+            archive,
+            MemoryTypeRegistry().list(),
+            existing_memories=existing,
+            episode=episode,
+        )
+        assert result.accepted == ()
+        assert "related active claim" in result.rejected[0].reason or "compatible active claim" in result.rejected[0].reason
 
 
 def test_v2_proposal_payload_remains_readable_but_new_semantics_fail_closed() -> None:

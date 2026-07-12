@@ -71,10 +71,15 @@ def build_runtime_container(
     ):
         raise TypeError("memory_extractor must be an LLM MemorySemanticProposal backend")
     root_path = config.root_path
-    source = source_store or FileSystemSourceStore(root_path)
-    index = index_store or SQLiteIndexStore(root_path / "indexes" / "context.sqlite3")
-    relation = relation_store or SQLiteRelationStore(root_path / "indexes" / "relations.sqlite3")
-    queue = queue_store or SQLiteQueueStore(root_path / "queues" / "jobs.sqlite3")
+    source = source_store or FileSystemSourceStore(root_path, tenant_id=config.tenant_id)
+    source_tenant = getattr(source, "tenant_id", config.tenant_id)
+    if str(source_tenant) != config.tenant_id:
+        raise ValueError("SourceStore tenant does not match RuntimeConfig tenant_id")
+    tenant_root = root_path if config.tenant_id == "default" else root_path / "tenants" / config.tenant_id
+    index_root = tenant_root / "indexes"
+    index = index_store or SQLiteIndexStore(index_root / "context.sqlite3")
+    relation = relation_store or SQLiteRelationStore(index_root / "relations.sqlite3")
+    queue = queue_store or SQLiteQueueStore(tenant_root / "queues" / "jobs.sqlite3")
     lock = lock_store or SQLiteLockStore(root_path / "system" / "locks.sqlite3")
     configured_embedding = embedding_provider or config.embedding
     configured_vector_store = vector_store or config.vector_store
@@ -92,13 +97,14 @@ def build_runtime_container(
         lock_store=lock,
         relation_store=relation,
         queue_store=queue,
+        tenant_id=config.tenant_id,
     )
     session_archive_store = SessionArchiveStore(root_path)
     memory_projection_worker = MemoryProjectionWorker(
         CanonicalMemoryProjector(
             source,
             index,
-            root_path,
+            tenant_root,
             vector_store=configured_vector_store,
             embedding_provider=configured_embedding,
         ),

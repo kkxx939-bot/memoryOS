@@ -78,6 +78,7 @@ class CommitGroupStatus:
     canonical_last_error: str = ""
     canonical_retryable: bool = True
     canonical_result: dict[str, Any] = field(default_factory=dict)
+    canonical_effects: dict[str, dict[str, Any]] = field(default_factory=dict)
     canonical_attempt_id: str = ""
     canonical_lease_expires_at: str = ""
     consumers: dict[str, ConsumerStatus] = field(default_factory=lambda: {name: ConsumerStatus() for name in CONSUMERS})
@@ -105,6 +106,9 @@ class CommitGroupStatus:
             "canonical_last_error": self.canonical_last_error,
             "canonical_retryable": self.canonical_retryable,
             "canonical_result": dict(self.canonical_result),
+            "canonical_effects": {
+                key: dict(value) for key, value in self.canonical_effects.items()
+            },
             "canonical_attempt_id": self.canonical_attempt_id,
             "canonical_lease_expires_at": self.canonical_lease_expires_at,
             "consumers": {key: value.to_dict() for key, value in self.consumers.items()},
@@ -134,6 +138,11 @@ class CommitGroupStatus:
             canonical_last_error=str(payload.get("canonical_last_error", "")),
             canonical_retryable=bool(payload.get("canonical_retryable", True)),
             canonical_result=dict(payload.get("canonical_result", {}) or {}),
+            canonical_effects={
+                str(key): dict(value)
+                for key, value in dict(payload.get("canonical_effects", {}) or {}).items()
+                if isinstance(value, dict)
+            },
             canonical_attempt_id=str(payload.get("canonical_attempt_id", "")),
             canonical_lease_expires_at=str(payload.get("canonical_lease_expires_at", "")),
             consumers=statuses,
@@ -301,6 +310,52 @@ class CommitGroupStore:
         status = self._required(group_id)
         return status
 
+    def record_canonical_effect(
+        self,
+        group_id: str,
+        diff: dict[str, Any],
+    ) -> CommitGroupStatus:
+        """Append one marker-backed canonical diff without changing attempt ownership."""
+
+        diff_id = str(diff.get("diff_id") or "")
+        if not diff_id:
+            raise ValueError("canonical effect requires a diff_id")
+        with self.group_lock(group_id):
+            status = self._required_unlocked(group_id)
+            if str(diff.get("user_id") or "") != status.user_id:
+                raise ValueError("canonical effect user does not match its commit group")
+            operations = diff.get("operations", []) or []
+            if not isinstance(operations, list) or not operations:
+                raise ValueError("canonical effect requires committed operations")
+            for operation in operations:
+                if not isinstance(operation, dict):
+                    raise ValueError("canonical effect operation must be an object")
+                payload = operation.get("payload", {})
+                if not isinstance(payload, dict):
+                    raise ValueError("canonical effect payload must be an object")
+                if (
+                    str(operation.get("user_id") or "") != status.user_id
+                    or not (
+                        payload.get("canonical_memory") is True
+                        or (
+                            payload.get("canonical_pending_proposal") is True
+                            and not payload.get("commit_consumer")
+                        )
+                    )
+                    or str(payload.get("commit_group_id") or "") != group_id
+                    or str(payload.get("tenant_id") or "default") != status.tenant_id
+                ):
+                    raise ValueError("canonical effect crosses its commit-group boundary")
+            existing = status.canonical_effects.get(diff_id)
+            if existing is not None:
+                if self._canonical_json(existing) != self._canonical_json(diff):
+                    raise ValueError("canonical effect diff id conflicts with another effect")
+                return status
+            status.canonical_effects[diff_id] = dict(diff)
+            status.updated_at = _now()
+            self._write(status)
+            return status
+
     def complete_consumer(
         self,
         group_id: str,
@@ -433,6 +488,9 @@ class CommitGroupStore:
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc) > datetime.now(timezone.utc)
+
+    def _canonical_json(self, payload: dict[str, Any]) -> str:
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
     @contextmanager
     def group_lock(self, group_id: str) -> Iterator[None]:

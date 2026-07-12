@@ -5,9 +5,11 @@ from dataclasses import replace
 
 import pytest
 
+from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.contextdb.store.local_stores import (
     FileSystemSourceStore,
+    InMemoryIndexStore,
 )
 from memoryos.memory.canonical import (
     ActiveClaimInvariantError,
@@ -43,7 +45,71 @@ from memoryos.memory.canonical import (
     scope_key_from_payload,
 )
 from memoryos.memory.canonical.reconcile import MemorySemanticReconciler
+from memoryos.memory.canonical.scope import scope_keys_from_payloads
 from memoryos.memory.canonical.state import MemoryRevision
+from memoryos.operations.commit.operation_committer import OperationCommitter
+from memoryos.operations.model.context_diff import ContextDiff
+from memoryos.operations.model.context_operation import ContextOperation
+from memoryos.operations.model.operation_action import OperationAction
+from memoryos.operations.model.operation_status import OperationStatus
+
+
+def _write_committed_canonical_fixture(
+    source: FileSystemSourceStore,
+    entries: list[tuple[ContextObject, str]],
+    *,
+    key: str,
+) -> None:
+    """Persist canonical fixtures behind an integrity-valid transaction marker."""
+
+    transaction_id = f"tx-{key}"
+    idempotency_key = f"idem-{key}"
+    operations: list[ContextOperation] = []
+    for index, (raw_obj, content) in enumerate(entries):
+        obj = raw_obj
+        owner_user_id = obj.owner_user_id
+        assert isinstance(owner_user_id, str)
+        obj.metadata = {
+            **dict(obj.metadata or {}),
+            "canonical_transaction_id": transaction_id,
+            "canonical_idempotency_key": idempotency_key,
+        }
+        source.write_object(obj, content=content)
+        operations.append(
+            ContextOperation(
+                operation_id=f"op-{key}-{index}",
+                user_id=owner_user_id,
+                context_type=obj.context_type,
+                action=OperationAction.ADD,
+                target_uri=obj.uri,
+                status=OperationStatus.COMMITTED,
+                payload={
+                    "canonical_memory": True,
+                    "transaction_id": transaction_id,
+                    "idempotency_key": idempotency_key,
+                    "tenant_id": obj.tenant_id,
+                    "expected_revision": 0,
+                    "context_object": obj.to_dict(),
+                    "content": content,
+                },
+            )
+        )
+    assert operations
+    assert len({operation.user_id for operation in operations}) == 1
+    committer = OperationCommitter(
+        source,
+        InMemoryIndexStore(),
+        str(source.root),
+        tenant_id=source.tenant_id,
+    )
+    diff = ContextDiff(
+        user_id=operations[0].user_id,
+        operations=operations,
+        diff_id=f"diff-{transaction_id}",
+    )
+    marker = committer._transaction_marker(idempotency_key)
+    committer._write_transaction_marker(marker, diff, operations)
+    committer._validate_transaction_marker(marker, operations)
 
 
 def _explicit_bindings(
@@ -165,6 +231,71 @@ def test_scope_key_contains_parent_path_and_has_one_v2_candidate() -> None:
     assert unparented.source == ScopeResolutionSource.EXPLICIT
 
 
+def test_scope_parent_fields_must_be_consistent_and_hierarchical() -> None:
+    with pytest.raises(ValueError, match="parent_id"):
+        scope_keys_from_payloads(
+            [
+                {
+                    "namespace": "memoryos",
+                    "kind": "location",
+                    "id": "desk",
+                    "parent_id": "floor-b",
+                    "parent_path": ["building", "floor-a"],
+                }
+            ]
+        )
+    with pytest.raises(ValueError, match="does not support parent"):
+        ScopeRef("memoryos", "workspace", "w1", parent_id="organization-a")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"namespace": "memoryos", "kind": "workspace", "id": 123},
+        {"namespace": "memoryos", "kind": "asset", "id": "camera", "parent_path": "workspace-a"},
+        {"namespace": "memoryos", "kind": "asset", "id": "camera", "attributes": [["x", "y"]]},
+        {"namespace": "memoryos", "kind": "workspace", "id": "w1", "inferred": "false"},
+    ],
+)
+def test_scope_payload_types_fail_closed_without_string_coercion(payload: dict) -> None:
+    with pytest.raises(ValueError):
+        scope_keys_from_payloads([payload])
+
+
+def test_parent_scope_key_and_logical_path_have_one_canonical_identity() -> None:
+    short = ScopeRef("memoryos", "asset", "camera", parent_id="workspace-a")
+    full = ScopeRef(
+        "memoryos",
+        "asset",
+        "camera",
+        parent_id="workspace-a",
+        parent_path=("memoryos:workspace:workspace-a",),
+    )
+    expanded = ScopeRef(
+        "memoryos",
+        "location",
+        "desk",
+        parent_path=("memoryos:location:path:building-a/floor-1",),
+    )
+    logical = ScopeRef(
+        "memoryos",
+        "location",
+        "desk",
+        parent_path=("building-a", "floor-1"),
+    )
+    other_building = ScopeRef(
+        "memoryos",
+        "location",
+        "desk",
+        parent_path=("memoryos:location:path:building-b/floor-1",),
+    )
+
+    assert short.key == full.key
+    assert expanded.parent_path == ("building-a", "floor-1")
+    assert expanded.key == logical.key
+    assert expanded.key != other_building.key
+
+
 def test_identity_v2_uses_subject_not_author_and_preserves_tenant_boundary() -> None:
     proposal = _proposal()
     scope = _scope(ScopeRef("memoryos", "workspace", "workspace-a"))
@@ -257,8 +388,8 @@ def test_repository_rejects_non_v2_slot_instead_of_migrating(tmp_path) -> None: 
     )
     obj = slot.to_context_object(tenant_id="t1", owner_user_id="u1", scope=scope.to_dict())
     obj.metadata["identity_algorithm_version"] = "identity_v1"
-    source = FileSystemSourceStore(tmp_path)
-    source.write_object(obj)
+    source = FileSystemSourceStore(tmp_path, tenant_id="t1")
+    _write_committed_canonical_fixture(source, [(obj, "")], key="identity-v1-slot")
 
     with pytest.raises(CanonicalMemoryInvariantError, match="not Identity V2"):
         CanonicalMemoryRepository(source).load_uri(identity.slot_uri)
@@ -356,10 +487,11 @@ def test_duplicate_is_noop_and_contradiction_requires_review_without_changing_cu
     contradiction = replace(
         contradiction,
         related_claim_ids=(first.slot.active_claim_id,),
-        metadata={
-            **dict(contradiction.metadata),
-            "semantic_relation_evidence_validated": True,
-        },
+            metadata={
+                **dict(contradiction.metadata),
+                "relation_target_binding_validated": True,
+                "semantic_relation_evidence_validated": True,
+            },
     )
     contradiction_identity = StableMemoryIdentityResolver().resolve(
         contradiction,
@@ -413,7 +545,8 @@ def test_multiple_active_claims_raise_structured_invariant_before_reconciliation
 
 def test_repository_rejects_persisted_multiple_active_claims(tmp_path) -> None:  # noqa: ANN001
     proposal = _proposal()
-    scope = _scope(ScopeRef("memoryos", "workspace", "workspace-a"))
+    subject = ScopeRef("memoryos", "workspace", "workspace-a")
+    scope = replace(_scope(subject), canonical_subject=subject)
     identity = StableMemoryIdentityResolver().resolve(
         proposal,
         scope,
@@ -456,17 +589,31 @@ def test_repository_rejects_persisted_multiple_active_claims(tmp_path) -> None: 
         identity.canonical_subject_key,
         canonical_subject=identity.canonical_subject,
     )
-    source = FileSystemSourceStore(tmp_path)
+    source = FileSystemSourceStore(tmp_path, tenant_id="t1")
+    entries = []
     for claim in claims:
-        source.write_object(
-            claim.to_context_object(
-                tenant_id="t1",
-                owner_user_id="u1",
-                memory_type=proposal.memory_type,
-                scope=scope.to_dict(),
+        entries.append(
+            (
+                claim.to_context_object(
+                    tenant_id="t1",
+                    owner_user_id="u1",
+                    memory_type=proposal.memory_type,
+                    scope=scope.to_dict(),
+                ),
+                "",
             )
         )
-    source.write_object(slot.to_context_object(tenant_id="t1", owner_user_id="u1", scope=scope.to_dict()))
+    entries.append(
+        (
+            slot.to_context_object(
+                tenant_id="t1",
+                owner_user_id="u1",
+                scope=scope.to_dict(),
+            ),
+            "",
+        )
+    )
+    _write_committed_canonical_fixture(source, entries, key="multiple-active-claims")
 
     with pytest.raises(ActiveClaimInvariantError):
         CanonicalMemoryRepository(source).load(identity)

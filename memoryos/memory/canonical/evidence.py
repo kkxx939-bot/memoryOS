@@ -11,6 +11,7 @@ from typing import Any
 
 from memoryos.memory.canonical.episode import EvidenceEpisode
 from memoryos.memory.canonical.event import EventEnvelope, canonical_json
+from memoryos.memory.canonical.literal_grounding import literal_value_supported
 from memoryos.memory.canonical.proposal import EpistemicStatus, MemorySemanticProposal
 
 _V3_SEMANTIC_BINDINGS = (
@@ -74,6 +75,24 @@ _USER_RESOLUTION_RE = re.compile(
     r"(?i)(?:但|但是|不过|而我|\bbut\b).{0,80}(?:我|\bwe\b)"
     r".{0,32}(?:最终(?:决定)?|最后(?:决定)?|决定(?:使用|采用)|正式(?:改成|改为)|"
     r"decid(?:e|ed)|adopt(?:ed)?)"
+)
+_USER_REJECTION_RE = re.compile(
+    r"(?i)(?:但|但是|不过|而我|\bbut\b|\bhowever\b).{0,80}"
+    r"(?:我|我们|\bi\b|\bwe\b).{0,32}"
+    r"(?:不同意|拒绝|不采纳|不接受|不认可|\bdisagree\b|\bdo\s+not\s+agree\b|"
+    r"\bdon't\s+agree\b|\breject(?:ed)?\b|\bdeclin(?:e|ed)\b)"
+)
+_FUTURE_UNCERTAINTY_RE = re.compile(
+    r"(?i)(?:(?:可能|也许|或许|大概).{0,32}(?:以后|未来|稍后|届时|使用|采用|考虑)|"
+    r"(?:以后|未来|稍后|届时).{0,32}(?:可能|也许|或许|考虑|使用|采用)|"
+    r"\b(?:may|might|maybe|possibly|could)\b.{0,48}"
+    r"(?:\blater\b|\bin\s+the\s+future\b|\beventually\b|\buse\b|\badopt\b|\bconsider\b))"
+)
+_CURRENT_FINAL_RESOLUTION_RE = re.compile(
+    r"(?i)(?:(?:但|但是|不过|而是)?\s*(?:现在|当前|最终|最后|正式).{0,40}"
+    r"(?:决定|确认|采用|使用|改成|改为)|"
+    r"(?:\bbut\b|\bhowever\b)?\s*\b(?:now|currently|finally|formally)\b.{0,48}"
+    r"\b(?:decid(?:e|ed)|confirm(?:ed)?|adopt(?:ed)?|use|switch(?:ed)?)\b)"
 )
 
 
@@ -682,6 +701,11 @@ class ProposalEvidenceValidator:
             proposal,
             evidence_text_by_ref,
         )
+        relation_target_binding_validated = self._relation_target_binding_supported(
+            proposal,
+            evidence_text_by_ref,
+        )
+        metadata["relation_target_binding_validated"] = relation_target_binding_validated
         metadata["semantic_relation_evidence_validated"] = relation_evidence_validated
         relation = str(
             getattr(proposal.semantic.relation_to_existing, "value", proposal.semantic.relation_to_existing)
@@ -753,13 +777,17 @@ class ProposalEvidenceValidator:
             atomic = getattr(proposal, "atomic_evidence_ref", None)
             if atomic is None or atomic not in evidence_text_by_ref or atomic not in refs:
                 return False
-            related = bool(proposal.all_related_memory_ids)
+            related = self._relation_target_binding_supported(proposal, evidence_text_by_ref)
             if relation == "unrelated":
-                return not related
-            if relation in {"duplicate", "contradicts", "corrects", "supersedes"}:
                 return related
+            if relation in {"duplicate", "contradicts"}:
+                return related
+            if relation == "corrects":
+                return related and proposal.metadata.get("effect_authority") == "structured_explicit_command"
+            if relation == "supersedes":
+                return False
             if relation == "supplements":
-                return related or proposal.memory_type == "agent_experience"
+                return False
             return relation == "alternative"
         text = "\n".join(texts)
         related = bool(proposal.all_related_memory_ids)
@@ -797,6 +825,62 @@ class ProposalEvidenceValidator:
         if relation == "supersedes":
             return related and has_explicit_replacement_cue(text)
         return False
+
+    def _relation_target_binding_supported(
+        self,
+        proposal: MemorySemanticProposal,
+        evidence_text_by_ref: Mapping[EvidenceRef, str],
+    ) -> bool:
+        """Validate relation target shape without claiming natural-language semantics."""
+
+        relation = (
+            str(
+                getattr(
+                    proposal.semantic.relation_to_existing,
+                    "value",
+                    proposal.semantic.relation_to_existing,
+                )
+            )
+            .strip()
+            .casefold()
+        )
+        refs = tuple(proposal.field_evidence_refs.get("semantic.relation_to_existing", ()))
+        if not refs or any(ref not in evidence_text_by_ref for ref in refs):
+            return False
+        if _semantic_contract_version(proposal) == "v3":
+            atomic = getattr(proposal, "atomic_evidence_ref", None)
+            if atomic is None or tuple(refs) != (atomic,):
+                return False
+        related = tuple(proposal.all_related_memory_ids)
+        if relation == "unrelated":
+            return not related
+        if relation in {"corrects", "supersedes", "supplements"}:
+            claim_ids = tuple(dict.fromkeys(proposal.related_claim_ids))
+            memory_ids = tuple(dict.fromkeys(proposal.related_memory_ids))
+            slot_ids = tuple(dict.fromkeys(proposal.related_slot_ids))
+            if (
+                len(claim_ids) != len(proposal.related_claim_ids)
+                or len(memory_ids) != len(proposal.related_memory_ids)
+                or len(slot_ids) != len(proposal.related_slot_ids)
+                or len(claim_ids) > 1
+                or len(memory_ids) > 1
+                or len(slot_ids) > 1
+            ):
+                return False
+            if not claim_ids and not memory_ids:
+                return False
+            if claim_ids and memory_ids:
+                claim_id = claim_ids[0]
+                memory_id = memory_ids[0]
+                if memory_id != claim_id and not memory_id.endswith(f"/claims/{claim_id}"):
+                    return False
+            if slot_ids and memory_ids and "/claims/" in memory_ids[0]:
+                if f"/slots/{slot_ids[0]}/claims/" not in memory_ids[0]:
+                    return False
+            return True
+        if relation in {"duplicate", "contradicts"}:
+            return bool(related)
+        return relation == "alternative"
 
     def _reference_errors(
         self,
@@ -954,9 +1038,28 @@ class ProposalEvidenceValidator:
         relation = _semantic_value(semantic.relation_to_existing)
         modal_force = _semantic_value(getattr(semantic, "modal_force", "UNKNOWN"))
         utterance_mode = _semantic_value(getattr(semantic, "utterance_mode", "UNKNOWN"))
+        attribution = _semantic_value(getattr(semantic, "attribution", "UNKNOWN"))
+        temporal_scope = _semantic_value(semantic.temporal_scope)
         transition_text = evidence_text_by_ref[transition_ref]
         if utterance_mode in {"ASSERTION", "DIRECTIVE"} and re.search(r"[?？]", transition_text):
             errors.append("semantic_utterance_mode_conflicts_with_question_surface")
+        if (
+            attribution == "SOURCE_ACTOR"
+            and _ATTRIBUTED_SPEECH_RE.search(transition_text)
+            and _USER_REJECTION_RE.search(transition_text)
+        ):
+            errors.append("semantic_source_actor_conflicts_with_rejected_reported_speech")
+        future_matches = tuple(_FUTURE_UNCERTAINTY_RE.finditer(transition_text))
+        final_resolutions = tuple(_CURRENT_FINAL_RESOLUTION_RE.finditer(transition_text))
+        if (
+            temporal_scope == "CURRENT"
+            and future_matches
+            and (
+                not final_resolutions
+                or final_resolutions[-1].start() <= future_matches[-1].start()
+            )
+        ):
+            errors.append("semantic_current_conflicts_with_future_uncertainty_surface")
         if speech in {"RETRACTION", "REJECTION"} and relation != "CORRECTS":
             errors.append("semantic_retraction_relation_inconsistent")
         if speech in {"PROPOSAL", "EVALUATION_REQUEST"} and commitment == "CONFIRMED":
@@ -973,7 +1076,7 @@ class ProposalEvidenceValidator:
             "SCHEMA_MISMATCH",
         }:
             errors.append("modal_force_not_allowed_for_memory_type")
-        if not self._relation_evidence_supported(proposal, evidence_text_by_ref):
+        if not self._relation_target_binding_supported(proposal, evidence_text_by_ref):
             errors.append("semantic_relation_structure_invalid")
         return errors
 
@@ -1002,7 +1105,6 @@ class ProposalEvidenceValidator:
                     for ref in proposal.field_evidence_refs.get(binding, ())
                     if ref in evidence_text_by_ref
                 ]
-                haystack = "\n".join(field_texts).casefold()
                 polarity_field = key in {"canonical_value", "polarity", "constraint_polarity"} and str(
                     value
                 ).casefold() in {
@@ -1028,7 +1130,7 @@ class ProposalEvidenceValidator:
                         proposal.identity_fields,
                     )
                     if polarity_field
-                    else self._supported(value, haystack)
+                    else self._supported_in_texts(value, field_texts)
                     or self._semantically_supported(
                         key,
                         value,
@@ -1076,7 +1178,6 @@ class ProposalEvidenceValidator:
                     unsupported.append(field_name)
                     continue
                 field_texts = [evidence_text_by_ref[ref] for ref in refs]
-                haystack = "\n".join(field_texts).casefold()
                 source_value = dict(proposal.metadata.get("source_grounded_field_values", {}) or {}).get(
                     field_name
                 )
@@ -1099,7 +1200,9 @@ class ProposalEvidenceValidator:
                         "conditional_forbid",
                     }
                 )
-                if not self._supported(value, haystack) and not self._supported(source_value, haystack) and not (
+                if not self._supported_in_texts(value, field_texts) and not self._supported_in_texts(
+                    source_value, field_texts
+                ) and not (
                     polarity_value
                     and self._semantically_supported(
                         key,
@@ -1260,15 +1363,7 @@ class ProposalEvidenceValidator:
         )
 
     def _supported(self, value: Any, haystack: str) -> bool:
-        if value is None or value == "":
-            return False
-        if isinstance(value, bool | int | float):
-            return str(value).casefold() in haystack
-        if isinstance(value, str):
-            candidates = {value.casefold(), value.replace("_", " ").casefold(), value.replace("-", " ").casefold()}
-            return any(candidate in haystack for candidate in candidates)
-        if isinstance(value, Mapping):
-            return all(self._supported(item, haystack) for item in value.values())
-        if isinstance(value, list | tuple | set):
-            return all(self._supported(item, haystack) for item in value)
-        return str(value).casefold() in haystack
+        return self._supported_in_texts(value, (haystack,))
+
+    def _supported_in_texts(self, value: Any, evidence_texts: list[str] | tuple[str, ...]) -> bool:
+        return literal_value_supported(value, evidence_texts)

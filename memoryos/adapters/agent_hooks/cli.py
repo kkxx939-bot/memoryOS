@@ -26,7 +26,11 @@ def main(argv: list[str] | None = None) -> int:
         config = AgentHookConfig.from_env("codex")
         from memoryos.adapters.agent_hooks.mcp_client import AgentHookMCPClient
 
-        result = PendingQueue(config.queue_path).flush(AgentHookMCPClient(config))
+        result = PendingQueue(
+            config.queue_path,
+            tenant_id=config.tenant_id,
+            user_id=config.user_id,
+        ).flush(AgentHookMCPClient(config))
         _emit({"ok": True, "flushed": result}, args.format)
         return 0
     payload = _read_payload(args.payload_file)

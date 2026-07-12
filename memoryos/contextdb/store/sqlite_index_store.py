@@ -13,6 +13,37 @@ from typing import Any
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.store.source_store import IndexHit
 
+_SCOPE_KEY_SCHEMA_VERSION = 2
+_INVALID_SCOPE_KEY = "__memoryos_invalid_scope__"
+
+
+def lexical_terms(text: object) -> tuple[str, ...]:
+    """Return deterministic complete Latin tokens and CJK character bigrams."""
+
+    normalized = str(text).casefold()
+    terms = re.findall(r"[a-z0-9_]+", normalized)
+    for sequence in re.findall(r"[\u4e00-\u9fff]+", normalized):
+        if len(sequence) == 1:
+            terms.append(sequence)
+        else:
+            terms.extend(sequence[index : index + 2] for index in range(len(sequence) - 1))
+    return tuple(dict.fromkeys(term for term in terms if term))
+
+
+def lexical_match_count(query: object, haystack: object) -> int:
+    query_terms = lexical_terms(query)
+    if not query_terms:
+        return 0
+    haystack_terms = set(lexical_terms(haystack))
+    return sum(1 for term in query_terms if term in haystack_terms)
+
+
+def lexical_relevance(query: object, haystack: object) -> float:
+    query_terms = lexical_terms(query)
+    if not query_terms:
+        return 0.0
+    return lexical_match_count(query, haystack) / len(query_terms)
+
 
 class SQLiteIndexStore:
     """保存可检索元数据，并在截断结果前完成结构化过滤。"""
@@ -33,11 +64,7 @@ class SQLiteIndexStore:
         connect = self._mapping(obj.metadata.get("connect", {}))
         admission = self._mapping(obj.metadata.get("admission", {}))
         applicability = self._mapping(scope.get("applicability", {}))
-        scope_keys = [
-            f"{item.get('namespace', 'memoryos')}:{item.get('kind')}:{item.get('id')}"
-            for item in applicability.get("all_of", []) or []
-            if isinstance(item, dict) and item.get("kind") and item.get("id")
-        ]
+        scope_keys = self._scope_keys_from_metadata(obj.metadata)
         workspace = next(
             (str(item.get("id")) for item in applicability.get("all_of", []) or [] if isinstance(item, dict) and item.get("kind") == "workspace"),
             "",
@@ -136,8 +163,15 @@ class SQLiteIndexStore:
         return list(merged.values())[:limit]
 
     def _base_filter_sql(self, filters: dict) -> tuple[str, list[str]]:
-        sql = ""
-        params: list[str] = []
+        sql = (
+            " AND NOT EXISTS (SELECT 1 FROM json_each("
+            "CASE WHEN json_valid(c.scope_keys) THEN "
+            "CASE WHEN json_type(c.scope_keys) = 'array' THEN c.scope_keys "
+            "ELSE '[\"__memoryos_invalid_scope__\"]' END "
+            "ELSE '[\"__memoryos_invalid_scope__\"]' END"
+            ") WHERE value = ?)"
+        )
+        params: list[str] = [_INVALID_SCOPE_KEY]
         for field in (
             "tenant_id",
             "owner_user_id",
@@ -316,29 +350,13 @@ class SQLiteIndexStore:
         }
 
     def _lexical_relevance(self, query: str, haystack: str) -> float:
-        terms = self._lexical_terms(query)
-        if not terms:
-            return 0.0
-        normalized = str(haystack).casefold()
-        matched = sum(1 for term in terms if term in normalized)
-        return matched / len(terms)
+        return lexical_relevance(query, haystack)
 
     def _lexical_match_count(self, query: str, haystack: str) -> float:
-        terms = self._lexical_terms(query)
-        if not terms:
-            return 0.0
-        normalized = str(haystack).casefold()
-        return float(sum(1 for term in terms if term in normalized))
+        return float(lexical_match_count(query, haystack))
 
     def _lexical_terms(self, query: str) -> tuple[str, ...]:
-        normalized = str(query).casefold()
-        terms = re.findall(r"[a-z0-9_]+", normalized)
-        for sequence in re.findall(r"[\u4e00-\u9fff]+", normalized):
-            if len(sequence) == 1:
-                terms.append(sequence)
-            else:
-                terms.extend(sequence[index : index + 2] for index in range(len(sequence) - 1))
-        return tuple(dict.fromkeys(term for term in terms if term))
+        return lexical_terms(query)
 
     def _bounded(self, value: Any) -> float:
         if isinstance(value, bool):
@@ -364,6 +382,55 @@ class SQLiteIndexStore:
 
     def _mapping(self, value: Any) -> dict[str, Any]:
         return dict(value) if isinstance(value, Mapping) else {}
+
+    def _scope_keys_from_metadata(self, metadata: Mapping[str, Any]) -> list[str]:
+        # Imported lazily because context stores are loaded before the canonical
+        # memory package during SDK initialization.
+        from memoryos.memory.canonical.scope import MemoryScope, scope_key_from_payload
+
+        if metadata.get("canonical_kind") in {"claim", "slot", "pending_proposal"}:
+            raw_scope = metadata.get("scope")
+            if not isinstance(raw_scope, Mapping):
+                raise ValueError("canonical scope must be an object")
+            canonical_scope = MemoryScope.from_dict(raw_scope)
+            if canonical_scope.canonical_subject is None:
+                raise ValueError("canonical scope requires a subject")
+            return [scope.key for scope in canonical_scope.applicability.all_of]
+
+        raw_scope = metadata.get("scope")
+        if raw_scope is None:
+            return []
+        if not isinstance(raw_scope, Mapping):
+            raise ValueError("scope must be an object")
+        scope = dict(raw_scope)
+        raw_applicability = scope.get("applicability")
+        if raw_applicability is None:
+            return []
+        if not isinstance(raw_applicability, Mapping):
+            raise ValueError("scope applicability must be an object")
+        applicability = dict(raw_applicability)
+        items = applicability.get("all_of", [])
+        if not isinstance(items, list | tuple) or any(not isinstance(item, Mapping) for item in items):
+            raise ValueError("scope applicability must contain scope objects")
+        return list(dict.fromkeys(scope_key_from_payload(item) for item in items))
+
+    def _migrate_scope_keys(self, conn: sqlite3.Connection) -> None:
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if version >= _SCOPE_KEY_SCHEMA_VERSION:
+            return
+        for row in conn.execute("SELECT uri, metadata_json FROM contexts").fetchall():
+            try:
+                metadata = json.loads(str(row["metadata_json"] or "{}"))
+                if not isinstance(metadata, Mapping):
+                    raise ValueError("metadata must be an object")
+                keys = self._scope_keys_from_metadata(metadata)
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                keys = [_INVALID_SCOPE_KEY]
+            conn.execute(
+                "UPDATE contexts SET scope_keys = ? WHERE uri = ?",
+                (json.dumps(keys, ensure_ascii=False), str(row["uri"])),
+            )
+        conn.execute(f"PRAGMA user_version = {_SCOPE_KEY_SCHEMA_VERSION}")
 
     def _match_query(self, query: str) -> str:
         terms = re.findall(r"[\w\u4e00-\u9fff]+", str(query), flags=re.UNICODE)
@@ -407,7 +474,11 @@ class SQLiteIndexStore:
                 if name not in columns:
                     default = "'[]'" if name == "scope_keys" else "''"
                     conn.execute(f"ALTER TABLE contexts ADD COLUMN {name} TEXT NOT NULL DEFAULT {default}")
-            conn.execute("UPDATE contexts SET scope_keys = '[]' WHERE NOT json_valid(scope_keys)")
+            conn.execute(
+                "UPDATE contexts SET scope_keys = '[\"__memoryos_invalid_scope__\"]' "
+                "WHERE NOT json_valid(scope_keys) OR json_type(scope_keys) != 'array'"
+            )
+            self._migrate_scope_keys(conn)
             try:
                 conn.execute(
                     """

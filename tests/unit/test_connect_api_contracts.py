@@ -6,6 +6,7 @@ from typing import Any, cast
 import pytest
 
 from memoryos.api.http.app import handle
+from memoryos.api.mcp.config import MCPServerConfig
 from memoryos.api.mcp.server import MemoryOSMCPServer
 from memoryos.api.sdk.client import MemoryOSClient
 from memoryos.behavior.model.observation import Observation
@@ -777,7 +778,10 @@ def test_http_predict_allows_embodied_action_capable_metadata() -> None:
 
 
 def test_mcp_routes_and_unknown_tool() -> None:
-    server = MemoryOSMCPServer(cast(MemoryOSClient, FakeExternalClient()))
+    server = MemoryOSMCPServer(
+        cast(MemoryOSClient, FakeExternalClient()),
+        config=MCPServerConfig(root="/tmp/memory", user_id="u1"),
+    )
 
     assert server.call_tool("memoryos_predict", {"request": _request().__dict__})["error"]["code"] == "PERMISSION_DENIED"
     assert server.call_tool("memoryos_search_context", {"query": "memoryOS"})["results"]

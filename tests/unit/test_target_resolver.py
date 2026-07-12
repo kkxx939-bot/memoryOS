@@ -133,6 +133,9 @@ class TargetResolverTest(unittest.TestCase):
         self.assertIsNone(op.target_uri)
 
     def test_automatic_target_requires_matching_tenant_workspace_memory_type_and_scope(self) -> None:
+        tenant_a_source = FileSystemSourceStore(self.tmp.name, tenant_id="tenant-a")
+        tenant_b_source = FileSystemSourceStore(self.tmp.name, tenant_id="tenant-b")
+
         def scoped(workspace: str) -> dict:
             return {
                 "project_id": workspace,
@@ -180,7 +183,8 @@ class TargetResolverTest(unittest.TestCase):
             ),
         ]
         for row in rows:
-            self.source.write_object(row)
+            source = tenant_b_source if row.tenant_id == "tenant-b" else tenant_a_source
+            source.write_object(row)
             self.index.upsert_index(row, content="PostgreSQL database backend")
         op = ContextOperation(
             user_id="u1",
@@ -195,7 +199,7 @@ class TargetResolverTest(unittest.TestCase):
             },
         )
 
-        result = self.resolver.resolve(op, user_id="u1")
+        result = TargetResolver(self.index, tenant_a_source).resolve(op, user_id="u1")
 
         self.assertTrue(result.resolved)
         self.assertEqual(op.target_uri, "memoryos://user/u1/memories/correct")
@@ -290,6 +294,7 @@ class TargetResolverTest(unittest.TestCase):
         self.assertEqual(op.status, OperationStatus.REJECTED)
 
     def test_explicit_cross_tenant_target_is_rejected(self) -> None:
+        tenant_b_source = FileSystemSourceStore(self.tmp.name, tenant_id="tenant-b")
         target = ContextObject(
             uri="memoryos://user/u1/memories/other-tenant",
             context_type=ContextType.MEMORY,
@@ -297,7 +302,7 @@ class TargetResolverTest(unittest.TestCase):
             owner_user_id="u1",
             tenant_id="tenant-b",
         )
-        self.source.write_object(target)
+        tenant_b_source.write_object(target)
         op = ContextOperation(
             user_id="u1",
             context_type=ContextType.MEMORY,
@@ -306,7 +311,7 @@ class TargetResolverTest(unittest.TestCase):
             payload={"tenant_id": "tenant-a"},
         )
 
-        result = self.resolver.resolve(op, user_id="u1")
+        result = TargetResolver(self.index, tenant_b_source).resolve(op, user_id="u1")
 
         self.assertFalse(result.resolved)
         self.assertEqual(result.reason, "target_tenant_mismatch")
@@ -629,6 +634,42 @@ class TargetResolverTest(unittest.TestCase):
         self.assertTrue(result.resolved)
         self.assertEqual(operation.status, OperationStatus.RESOLVED)
 
+    def test_explicit_target_rejects_same_asset_id_under_a_different_parent_path(self) -> None:
+        def scope(parent: str) -> dict[str, Any]:
+            return {
+                "applicability": {
+                    "all_of": [
+                        {
+                            "namespace": "memoryos",
+                            "kind": "asset",
+                            "id": "camera",
+                            "parent_path": [parent],
+                        }
+                    ]
+                }
+            }
+
+        target = ContextObject(
+            uri="memoryos://user/u1/memories/camera",
+            context_type=ContextType.MEMORY,
+            title="camera",
+            owner_user_id="u1",
+            metadata={"scope": scope("workspace-a")},
+        )
+        self.source.write_object(target)
+        mismatched = ContextOperation(
+            user_id="u1",
+            context_type=ContextType.MEMORY,
+            action=OperationAction.DELETE,
+            target_uri=target.uri,
+            payload={"scope": scope("workspace-b")},
+        )
+
+        result = self.resolver.resolve(mismatched, user_id="u1")
+
+        self.assertFalse(result.resolved)
+        self.assertEqual(result.reason, "target_scope_mismatch")
+
     def test_automatic_resolution_ignores_invalid_stale_index_uri(self) -> None:
         class StaleIndex(InMemoryIndexStore):
             def search(self, query: str, filters: dict | None = None, limit: int = 10) -> list[IndexHit]:
@@ -697,6 +738,7 @@ class TargetResolverTest(unittest.TestCase):
         self.assertIsNone(operation.target_uri)
 
     def test_explicit_supersede_validates_old_target_and_distinct_replacement_boundaries(self) -> None:
+        tenant_a_source = FileSystemSourceStore(self.tmp.name, tenant_id="tenant-a")
         scope = {
             "project_id": "alpha",
             "visibility": {"tenant_id": "tenant-a"},
@@ -723,7 +765,7 @@ class TargetResolverTest(unittest.TestCase):
             tenant_id="tenant-a",
             metadata={"memory_type": "project_decision", "scope": scope},
         )
-        self.source.write_object(old, content="PostgreSQL")
+        tenant_a_source.write_object(old, content="PostgreSQL")
         operation = ContextOperation(
             user_id="u1",
             context_type=ContextType.MEMORY,
@@ -745,7 +787,7 @@ class TargetResolverTest(unittest.TestCase):
             },
         )
 
-        result = self.resolver.resolve(operation, user_id="u1")
+        result = TargetResolver(self.index, tenant_a_source).resolve(operation, user_id="u1")
 
         self.assertTrue(result.resolved)
         self.assertEqual(operation.target_uri, old.uri)
@@ -1021,6 +1063,121 @@ class TargetResolverTest(unittest.TestCase):
         self.assertEqual(explicit_result.reason, "target_scope_invalid")
         self.assertFalse(automatic_result.resolved)
         self.assertEqual(automatic_result.reason, "target_review_required")
+
+    def test_inconsistent_scope_parent_id_and_path_is_rejected(self) -> None:
+        target = ContextObject(
+            uri="memoryos://user/u1/memories/inconsistent-parent",
+            context_type=ContextType.MEMORY,
+            title="inconsistent parent",
+            owner_user_id="u1",
+            metadata={
+                "scope": {
+                    "applicability": {
+                        "all_of": [
+                            {
+                                "namespace": "memoryos",
+                                "kind": "location",
+                                "id": "desk",
+                                "parent_id": "floor-b",
+                                "parent_path": ["building", "floor-a"],
+                            }
+                        ]
+                    }
+                }
+            },
+        )
+        self.source.write_object(target)
+        operation = ContextOperation(
+            user_id="u1",
+            context_type=ContextType.MEMORY,
+            action=OperationAction.DELETE,
+            target_uri=target.uri,
+            payload={},
+        )
+
+        result = self.resolver.resolve(operation, user_id="u1")
+
+        self.assertFalse(result.resolved)
+        self.assertEqual(result.reason, "target_scope_invalid")
+
+    def test_sqlite_lexical_candidate_does_not_match_latin_identifier_substring(self) -> None:
+        sqlite_index = SQLiteIndexStore(f"{self.tmp.name}/target-index.sqlite3")
+        unrelated = ContextObject(
+            uri="memoryos://user/u1/memories/redistribution",
+            context_type=ContextType.MEMORY,
+            title="redistribution guide",
+            owner_user_id="u1",
+            hotness=1.0,
+        )
+        self.source.write_object(unrelated)
+        sqlite_index.upsert_index(unrelated, content="redistribution strategy")
+        operation = ContextOperation(
+            user_id="u1",
+            context_type=ContextType.MEMORY,
+            action=OperationAction.DELETE,
+            payload={"query": "Redis"},
+        )
+
+        result = TargetResolver(sqlite_index, self.source).resolve(operation, user_id="u1")
+
+        self.assertFalse(result.resolved)
+        self.assertEqual(result.reason, "target_review_required")
+        self.assertIsNone(operation.target_uri)
+
+        related = ContextObject(
+            uri="memoryos://user/u1/memories/redis",
+            context_type=ContextType.MEMORY,
+            title="Redis cache",
+            owner_user_id="u1",
+        )
+        self.source.write_object(related)
+        sqlite_index.upsert_index(related, content="Redis cache backend")
+        exact_operation = ContextOperation(
+            user_id="u1",
+            context_type=ContextType.MEMORY,
+            action=OperationAction.DELETE,
+            payload={"query": "Redis"},
+        )
+
+        exact = TargetResolver(sqlite_index, self.source).resolve(exact_operation, user_id="u1")
+
+        self.assertTrue(exact.resolved)
+        self.assertEqual(exact_operation.target_uri, related.uri)
+
+    def test_single_cjk_lexical_signal_cannot_auto_resolve_destructive_target(self) -> None:
+        target = ContextObject(
+            uri="memoryos://user/u1/memories/database",
+            context_type=ContextType.MEMORY,
+            title="数据库",
+            owner_user_id="u1",
+        )
+        self.source.write_object(target)
+
+        class SingleCjkIndex(InMemoryIndexStore):
+            def search(self, query: str, filters: dict | None = None, limit: int = 10) -> list[IndexHit]:
+                return [
+                    IndexHit(
+                        uri=target.uri,
+                        score=1.0,
+                        context_type="memory",
+                        metadata={
+                            "retrieval_scores": {"lexical": 1.0, "vector": 0.0, "identity": 0.0}
+                        },
+                    )
+                ]
+
+        operation = ContextOperation(
+            user_id="u1",
+            context_type=ContextType.MEMORY,
+            action=OperationAction.DELETE,
+            payload={"query": "库"},
+        )
+
+        result = TargetResolver(SingleCjkIndex(), self.source).resolve(operation, user_id="u1")
+
+        self.assertFalse(result.resolved)
+        self.assertEqual(result.reason, "target_review_required")
+        self.assertIsNone(operation.target_uri)
 
 
 if __name__ == "__main__":

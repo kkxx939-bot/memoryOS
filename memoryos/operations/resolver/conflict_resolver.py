@@ -7,6 +7,7 @@ from enum import Enum
 from typing import Any
 
 from memoryos.contextdb.model.context_type import ContextType
+from memoryos.memory.canonical.scope import scope_keys_from_payloads
 from memoryos.operations.model.context_operation import ContextOperation
 from memoryos.operations.model.operation_action import OperationAction
 from memoryos.operations.model.operation_status import OperationStatus
@@ -76,6 +77,7 @@ def operation_memory_metadata(operation: ContextOperation) -> MemoryOperationMet
         or ""
     )
     constrained = metadata.get("constrains_policy_uris") or operation.payload.get("constrains_policy_uris") or []
+    raw_scope = metadata["scope"] if "scope" in metadata else operation.payload.get("scope", {})
     return MemoryOperationMetadata(
         semantic_memory_type=semantic_memory_type,
         storage_memory_kind=storage_memory_kind,
@@ -84,20 +86,37 @@ def operation_memory_metadata(operation: ContextOperation) -> MemoryOperationMet
         structured_value=structured_value,
         related_action=related_action,
         constrains_policy_uris=tuple(str(item) for item in constrained),
-        scope=dict(metadata.get("scope", {}) or operation.payload.get("scope", {}) or {}),
+        scope=dict(raw_scope) if isinstance(raw_scope, dict) else {},
     )
 
 
-def _operation_scope_keys(operation: ContextOperation) -> set[str]:
+def _operation_scope_keys(operation: ContextOperation) -> set[str] | None:
     context_object = operation.payload.get("context_object")
     metadata = dict(context_object.get("metadata", {}) or {}) if isinstance(context_object, dict) else {}
-    scope = dict(metadata.get("scope", {}) or operation.payload.get("scope", {}) or {})
-    applicability = dict(scope.get("applicability", {}) or {})
-    return {
-        f"{item.get('namespace', 'memoryos')}:{item.get('kind')}:{item.get('id')}"
-        for item in applicability.get("all_of", []) or []
-        if isinstance(item, dict) and item.get("kind") and item.get("id")
-    }
+    raw_scope = metadata["scope"] if "scope" in metadata else operation.payload.get("scope", {})
+    if not isinstance(raw_scope, dict):
+        return None
+    raw_applicability = raw_scope.get("applicability", {}) or {}
+    if not isinstance(raw_applicability, dict):
+        return None
+    try:
+        keys = set(scope_keys_from_payloads(raw_applicability.get("all_of", [])))
+    except (KeyError, TypeError, ValueError):
+        return None
+    return keys or None
+
+
+def _operation_tenant(operation: ContextOperation) -> str:
+    context_object = operation.payload.get("context_object")
+    object_tenant = context_object.get("tenant_id") if isinstance(context_object, dict) else None
+    return str(operation.payload.get("tenant_id") or object_tenant or "default")
+
+
+def _explicit_global_scope(scope_keys: set[str]) -> bool:
+    if len(scope_keys) != 1:
+        return False
+    parts = next(iter(scope_keys)).split(":", 2)
+    return len(parts) == 3 and parts[1] == "global"
 
 
 class ConflictResolver:
@@ -242,7 +261,13 @@ class ConflictResolver:
                     continue
                 rule_scope = _operation_scope_keys(memory_op)
                 policy_scope = _operation_scope_keys(operation)
-                if rule_scope and policy_scope and rule_scope != policy_scope:
+                if rule_scope is None or policy_scope is None:
+                    continue
+                if memory_op.user_id != operation.user_id or _operation_tenant(memory_op) != _operation_tenant(
+                    operation
+                ):
+                    continue
+                if not _explicit_global_scope(rule_scope) and not rule_scope.issubset(policy_scope):
                     continue
                 if metadata.constrains_policy_uris and operation.target_uri not in metadata.constrains_policy_uris:
                     continue

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
+from numbers import Real
 from types import MappingProxyType
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 CORE_SCOPE_KINDS = frozenset({"principal", "workspace", "environment", "asset", "location", "episode", "global"})
 HIERARCHICAL_SCOPE_KINDS = frozenset({"asset", "location"})
@@ -24,18 +25,19 @@ class ScopeResolutionSource(str, Enum):
     INFERRED = "inferred"
 
 
-def _required(value: str, name: str) -> str:
-    normalized = str(value).strip()
+def _required(value: object, name: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a non-empty string")
+    normalized = value.strip()
     if not normalized:
         raise ValueError(f"{name} must be a non-empty string")
     return normalized
 
 
 def _confidence(value: Any) -> float:
-    try:
-        result = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("scope confidence must be a finite number between 0 and 1") from exc
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError("scope confidence must be a finite number between 0 and 1")
+    result = float(value)
     if not math.isfinite(result) or not 0.0 <= result <= 1.0:
         raise ValueError("scope confidence must be a finite number between 0 and 1")
     return result
@@ -43,6 +45,59 @@ def _confidence(value: Any) -> float:
 
 def _path_key(parts: tuple[str, ...]) -> str:
     return "/".join(quote(part, safe="") for part in parts)
+
+
+def _canonical_scope_reference_path(value: str) -> tuple[str, ...] | None:
+    """Expand one canonical scope key into its complete logical ID path."""
+
+    parts = value.split(":", 3)
+    if len(parts) < 3 or parts[1] not in CORE_SCOPE_KINDS:
+        return None
+    if parts[2] != "path":
+        identifier = ":".join(parts[2:]).strip()
+        return (identifier,) if identifier else None
+    if len(parts) != 4:
+        raise ValueError("canonical scope parent path is malformed")
+    logical = tuple(unquote(item).strip() for item in parts[3].split("/"))
+    if not logical or any(not item for item in logical):
+        raise ValueError("canonical scope parent path is malformed")
+    return logical
+
+
+def _append_logical_path(current: list[str], incoming: tuple[str, ...]) -> None:
+    """Append a full parent path without duplicating an already supplied prefix."""
+
+    overlap = 0
+    maximum = min(len(current), len(incoming))
+    for width in range(maximum, 0, -1):
+        if tuple(current[-width:]) == incoming[:width]:
+            overlap = width
+            break
+    current.extend(incoming[overlap:])
+
+
+def _logical_parent_path(values: Sequence[str]) -> tuple[str, ...]:
+    logical: list[str] = []
+    for value in values:
+        normalized = _required(value, "scope parent_path item")
+        expanded = _canonical_scope_reference_path(normalized)
+        if expanded is None:
+            logical.append(normalized)
+        else:
+            _append_logical_path(logical, expanded)
+    return tuple(logical)
+
+
+def _string_array(value: object, name: str) -> tuple[str, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes):
+        raise ValueError(f"{name} must be an array of non-empty strings")
+    return tuple(_required(item, f"{name} item") for item in value)
+
+
+def _mapping(value: object, name: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{name} must be an object")
+    return value
 
 
 @dataclass(frozen=True)
@@ -66,21 +121,36 @@ class ScopeRef:
             raise ValueError(f"unsupported core scope kind: {kind}")
         object.__setattr__(self, "kind", kind)
         object.__setattr__(self, "id", _required(self.id, "scope id"))
-        parent_id = _required(self.parent_id, "scope parent_id") if self.parent_id is not None else None
-        path = tuple(_required(item, "scope parent_path item") for item in self.parent_path)
-        if parent_id is not None and not path:
-            path = (parent_id,)
-        elif parent_id is None and path:
-            parent_id = path[-1]
+        parent_reference = _required(self.parent_id, "scope parent_id") if self.parent_id is not None else None
+        if not isinstance(self.parent_path, Sequence) or isinstance(self.parent_path, str | bytes):
+            raise ValueError("scope parent_path must be an array of non-empty strings")
+        path = _logical_parent_path(self.parent_path)
+        parent_reference_path = (
+            _canonical_scope_reference_path(parent_reference) if parent_reference is not None else None
+        )
+        if parent_reference is not None and parent_reference_path is None:
+            parent_reference_path = (parent_reference,)
+        if parent_reference_path and path and parent_reference_path[-1] != path[-1]:
+            raise ValueError("scope parent_id must equal the final parent_path item")
+        if kind not in HIERARCHICAL_SCOPE_KINDS and (parent_reference is not None or path):
+            raise ValueError(f"scope kind {kind} does not support parent hierarchy")
+        if parent_reference_path and not path:
+            path = parent_reference_path
+        elif parent_reference_path and len(parent_reference_path) > 1 and path != parent_reference_path:
+            raise ValueError("scope parent_id path must equal parent_path")
+        parent_id = path[-1] if path else None
         object.__setattr__(self, "parent_id", parent_id)
         object.__setattr__(self, "parent_path", path)
+        if not isinstance(self.attributes, Mapping):
+            raise ValueError("scope attributes must be an object")
         object.__setattr__(self, "attributes", MappingProxyType(dict(self.attributes)))
         object.__setattr__(self, "confidence", _confidence(self.confidence))
         source = (
             self.source if isinstance(self.source, ScopeResolutionSource) else ScopeResolutionSource(str(self.source))
         )
         object.__setattr__(self, "source", source)
-        object.__setattr__(self, "inferred", bool(self.inferred))
+        if not isinstance(self.inferred, bool):
+            raise ValueError("scope inferred must be a boolean")
 
     @property
     def hierarchy_path(self) -> tuple[str, ...]:
@@ -115,16 +185,29 @@ class ScopeRef:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> ScopeRef:
+        _mapping(payload, "scope")
+        parent_id = payload.get("parent_id")
+        if parent_id is not None and not isinstance(parent_id, str):
+            raise ValueError("scope parent_id must be a non-empty string")
+        attributes = payload.get("attributes", {})
+        _mapping(attributes, "scope attributes")
+        parent_path = _string_array(payload.get("parent_path", []), "scope parent_path")
+        inferred = payload.get("inferred", False)
+        if not isinstance(inferred, bool):
+            raise ValueError("scope inferred must be a boolean")
         return cls(
-            namespace=str(payload.get("namespace", "memoryos")),
-            kind=str(payload["kind"]),
-            id=str(payload["id"]),
-            parent_id=str(payload["parent_id"]) if payload.get("parent_id") else None,
-            attributes=dict(payload.get("attributes", {}) or {}),
-            parent_path=tuple(str(item) for item in payload.get("parent_path", []) or []),
+            namespace=_required(payload.get("namespace", "memoryos"), "scope namespace"),
+            kind=_required(payload.get("kind"), "scope kind"),
+            id=_required(payload.get("id"), "scope id"),
+            parent_id=parent_id,
+            attributes=attributes,
+            parent_path=parent_path,
             confidence=payload.get("confidence", 1.0),
-            source=str(payload.get("source") or ScopeResolutionSource.EXPLICIT.value),
-            inferred=bool(payload.get("inferred", False)),
+            source=_required(
+                payload.get("source", ScopeResolutionSource.EXPLICIT.value),
+                "scope source",
+            ),
+            inferred=inferred,
         )
 
 
@@ -141,6 +224,19 @@ def scope_key_candidates_from_payload(
 
     scope = payload if isinstance(payload, ScopeRef) else ScopeRef.from_dict(payload)
     return scope.key_candidates
+
+
+def scope_keys_from_payloads(payloads: object) -> tuple[str, ...]:
+    """Parse a complete all_of array so malformed members cannot disappear."""
+
+    if not isinstance(payloads, Sequence) or isinstance(payloads, str | bytes):
+        raise ValueError("scope applicability all_of must be an array")
+    keys: list[str] = []
+    for payload in payloads:
+        if not isinstance(payload, Mapping):
+            raise ValueError("scope applicability all_of must contain scope objects")
+        keys.append(scope_key_from_payload(payload))
+    return tuple(dict.fromkeys(keys))
 
 
 @dataclass(frozen=True)
@@ -160,7 +256,13 @@ class ScopeSelector:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> ScopeSelector:
-        return cls(tuple(ScopeRef.from_dict(item) for item in payload.get("all_of", []) or []))
+        _mapping(payload, "scope applicability")
+        raw_all_of = payload.get("all_of")
+        if not isinstance(raw_all_of, Sequence) or isinstance(raw_all_of, str | bytes):
+            raise ValueError("scope applicability all_of must be an array")
+        if any(not isinstance(item, Mapping) for item in raw_all_of):
+            raise ValueError("scope applicability all_of must contain scope objects")
+        return cls(tuple(ScopeRef.from_dict(item) for item in raw_all_of))
 
 
 @dataclass(frozen=True)
@@ -174,6 +276,12 @@ class VisibilityPolicy:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tenant_id", _required(self.tenant_id, "visibility tenant_id"))
+        if any(not isinstance(item, str) or not item.strip() for item in self.allowed_principal_ids):
+            raise ValueError("visibility allowed_principal_ids must contain non-empty strings")
+        if any(not isinstance(item, str) or not item.strip() for item in self.allowed_service_ids):
+            raise ValueError("visibility allowed_service_ids must contain non-empty strings")
+        if not isinstance(self.private, bool):
+            raise ValueError("visibility private must be a boolean")
         object.__setattr__(self, "allowed_principal_ids", tuple(dict.fromkeys(self.allowed_principal_ids)))
         object.__setattr__(self, "allowed_service_ids", tuple(dict.fromkeys(self.allowed_service_ids)))
 
@@ -197,11 +305,21 @@ class VisibilityPolicy:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> VisibilityPolicy:
+        _mapping(payload, "scope visibility")
+        private = payload.get("private", False)
+        if not isinstance(private, bool):
+            raise ValueError("visibility private must be a boolean")
         return cls(
-            tenant_id=str(payload.get("tenant_id") or "default"),
-            allowed_principal_ids=tuple(str(item) for item in payload.get("allowed_principal_ids", []) or []),
-            allowed_service_ids=tuple(str(item) for item in payload.get("allowed_service_ids", []) or []),
-            private=bool(payload.get("private", False)),
+            tenant_id=_required(payload.get("tenant_id"), "visibility tenant_id"),
+            allowed_principal_ids=_string_array(
+                payload.get("allowed_principal_ids", []),
+                "visibility allowed_principal_ids",
+            ),
+            allowed_service_ids=_string_array(
+                payload.get("allowed_service_ids", []),
+                "visibility allowed_service_ids",
+            ),
+            private=private,
         )
 
 
@@ -214,6 +332,12 @@ class AuthorityPolicy:
     inferred: bool = False
 
     def __post_init__(self) -> None:
+        if any(not isinstance(item, str) or not item.strip() for item in self.principal_ids):
+            raise ValueError("authority principal_ids must contain non-empty strings")
+        if any(not isinstance(item, str) or not item.strip() for item in self.service_ids):
+            raise ValueError("authority service_ids must contain non-empty strings")
+        if not isinstance(self.inferred, bool):
+            raise ValueError("authority inferred must be a boolean")
         object.__setattr__(self, "principal_ids", tuple(dict.fromkeys(self.principal_ids)))
         object.__setattr__(self, "service_ids", tuple(dict.fromkeys(self.service_ids)))
 
@@ -226,10 +350,14 @@ class AuthorityPolicy:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> AuthorityPolicy:
+        _mapping(payload, "scope authority")
+        inferred = payload.get("inferred", False)
+        if not isinstance(inferred, bool):
+            raise ValueError("authority inferred must be a boolean")
         return cls(
-            principal_ids=tuple(str(item) for item in payload.get("principal_ids", []) or []),
-            service_ids=tuple(str(item) for item in payload.get("service_ids", []) or []),
-            inferred=bool(payload.get("inferred", False)),
+            principal_ids=_string_array(payload.get("principal_ids", []), "authority principal_ids"),
+            service_ids=_string_array(payload.get("service_ids", []), "authority service_ids"),
+            inferred=inferred,
         )
 
 
@@ -262,13 +390,24 @@ class MemoryScope:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> MemoryScope:
+        _mapping(payload, "memory scope")
+        for field_name in ("applicability", "visibility", "authority"):
+            if field_name not in payload or not isinstance(payload[field_name], Mapping):
+                raise ValueError(f"memory scope {field_name} must be an object")
+        raw_origin = payload.get("origin_refs", [])
+        if not isinstance(raw_origin, Sequence) or isinstance(raw_origin, str | bytes):
+            raise ValueError("memory scope origin_refs must be an array")
+        if any(not isinstance(item, Mapping) for item in raw_origin):
+            raise ValueError("memory scope origin_refs must contain scope objects")
         subject = payload.get("canonical_subject")
+        if subject is not None and not isinstance(subject, Mapping):
+            raise ValueError("memory scope canonical_subject must be an object or null")
         return cls(
-            applicability=ScopeSelector.from_dict(dict(payload.get("applicability", {}) or {})),
-            visibility=VisibilityPolicy.from_dict(dict(payload.get("visibility", {}) or {})),
-            origin_refs=tuple(ScopeRef.from_dict(item) for item in payload.get("origin_refs", []) or []),
+            applicability=ScopeSelector.from_dict(payload["applicability"]),
+            visibility=VisibilityPolicy.from_dict(payload["visibility"]),
+            origin_refs=tuple(ScopeRef.from_dict(item) for item in raw_origin),
             canonical_subject=ScopeRef.from_dict(subject) if isinstance(subject, Mapping) else None,
-            authority=AuthorityPolicy.from_dict(dict(payload.get("authority", {}) or {})),
+            authority=AuthorityPolicy.from_dict(payload["authority"]),
         )
 
 

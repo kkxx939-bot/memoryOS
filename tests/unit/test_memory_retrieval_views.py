@@ -12,10 +12,10 @@ from memoryos.memory.service.memory_updater import MemoryUpdater
 from memoryos.operations.commit.operation_committer import OperationCommitter
 
 
-def _db(tmp_path):
+def _db(tmp_path, *, tenant_id: str = "default"):
     from memoryos.contextdb.store.local_stores import FileSystemSourceStore
 
-    source = FileSystemSourceStore(tmp_path)
+    source = FileSystemSourceStore(tmp_path, tenant_id=tenant_id)
     index = InMemoryIndexStore()
     relation = InMemoryRelationStore()
     return ContextDB(
@@ -29,6 +29,9 @@ def _db(tmp_path):
 
 def _commit_memory(db: ContextDB, memory: Memory) -> str:
     operation = MemoryUpdater().add_memory(memory)
+    tenant_id = str(getattr(db.source_store, "tenant_id", "default"))
+    operation.payload["tenant_id"] = tenant_id
+    operation.payload["context_object"]["tenant_id"] = tenant_id
     db.commit_operation(operation)
     return memory.uri
 
@@ -178,8 +181,9 @@ def test_source_view_scan_excludes_inactive_lifecycle_before_scoring_and_limit(t
 
 def test_source_view_scan_filters_tenant_before_limit(tmp_path) -> None:  # noqa: ANN001
     db = _db(tmp_path)
+    other_db = _db(tmp_path, tenant_id="other")
     other_uri = _commit_memory(
-        db,
+        other_db,
         MemoryCandidate(
             uri="memoryos://user/u1/memories/candidates/other-tenant",
             user_id="u1",
@@ -192,9 +196,16 @@ def test_source_view_scan_filters_tenant_before_limit(tmp_path) -> None:  # noqa
             merge_key="other-tenant",
         ),
     )
-    other = db.source_store.read_object(other_uri)
-    other.tenant_id = "other"
-    db.source_store.write_object(other, content="target phrase")
+    other_hits = ContextAssembler(other_db).search(
+        "target",
+        user_id="u1",
+        context_type=ContextType.MEMORY,
+        search_scope="candidates",
+        project_id="memoryOS",
+        tenant_id="other",
+        limit=1,
+    )
+    assert [item["uri"] for item in other_hits] == [other_uri]
     target_uri = _commit_memory(
         db,
         MemoryCandidate(

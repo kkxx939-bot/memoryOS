@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 from memoryos.contextdb.layers.layer_generator import l0_abstract, l1_overview
 from memoryos.contextdb.model.lifecycle import LifecycleState
@@ -141,12 +141,7 @@ class SessionCommitService:
                     group,
                     abstract,
                     overview,
-                    memory_diff={
-                        "status": "failed",
-                        "error": group.canonical_last_error,
-                        "operation_count": 0,
-                        "operations": [],
-                    },
+                    memory_diff=self._partial_memory_result(group),
                 )
             canonical_attempt_id = uuid.uuid4().hex
             if not self.commit_group_store.claim_canonical(
@@ -157,12 +152,16 @@ class SessionCommitService:
                 assert current is not None
                 return self._result(archive, current)
             try:
+                if self.committer is not None:
+                    self._recover_pending_memory_effects(archive.user_id, group_id)
+                    self._backfill_canonical_effects(group_id, archive.user_id)
                 memory_result = self.memory_planner.plan(archive)
                 memory_ops = list(memory_result.operations)
                 memory_diff = self._commit_memory_with_reconcile_retry(
                     archive,
                     memory_ops,
                     memory_result.context,
+                    commit_group_id=group_id,
                 )
             except MemoryExtractionBackendError as exc:
                 self._enqueue_memory_proposal(archive, exc)
@@ -275,33 +274,61 @@ class SessionCommitService:
         archive: SessionArchive,
         operations: list[ContextOperation],
         planning_context: PlanningContext | None = None,
+        *,
+        commit_group_id: str = "",
     ) -> dict:
         planned_operations = list(operations)
         try:
-            committed = self._commit_or_describe(archive.user_id, operations)
-        except RevisionConflictError as exc:
-            partial_diff = exc.committed_diff
-            if self.committer is not None:
-                self.committer.recover_pending_canonical(archive.user_id)
-            if planning_context is None:
-                raise RevisionConflictError("revision conflict has no request-scoped PlanningContext") from exc
-            replanned = self.memory_planner.replan(planning_context, archive)
-            planned_operations.extend(replanned.operations)
-            if self.committer is not None:
-                retried_diff = self.committer.commit(archive.user_id, list(replanned.operations))
-                combined_diff = self.committer.combine_committed_diffs(
-                    archive.user_id,
-                    [item for item in (partial_diff, retried_diff) if item is not None],
-                )
-                committed = self._diff_payload(combined_diff, status="committed")
-            else:
-                retried = self._commit_or_describe(archive.user_id, list(replanned.operations))
-                partial = (
-                    self._diff_payload(partial_diff, status="committed")
-                    if partial_diff is not None
-                    else None
-                )
-                committed = self._merge_diff_payloads(*(item for item in (partial, retried) if item is not None))
+            try:
+                committed = self._commit_or_describe(archive.user_id, operations)
+            except RevisionConflictError as exc:
+                partial_diff = exc.committed_diff
+                if self.committer is not None:
+                    self._recover_pending_memory_effects(
+                        archive.user_id,
+                        commit_group_id,
+                    )
+                if planning_context is None:
+                    raise RevisionConflictError("revision conflict has no request-scoped PlanningContext") from exc
+                replanned = self.memory_planner.replan(planning_context, archive)
+                planned_operations.extend(replanned.operations)
+                if self.committer is not None:
+                    retried_diff = self.committer.commit(archive.user_id, list(replanned.operations))
+                    combined_diff = self.committer.combine_committed_diffs(
+                        archive.user_id,
+                        [item for item in (partial_diff, retried_diff) if item is not None],
+                    )
+                    committed = self._diff_payload(combined_diff, status="committed")
+                else:
+                    retried = self._commit_or_describe(archive.user_id, list(replanned.operations))
+                    partial = (
+                        self._diff_payload(partial_diff, status="committed")
+                        if partial_diff is not None
+                        else None
+                    )
+                    committed = self._merge_diff_payloads(*(item for item in (partial, retried) if item is not None))
+        except BaseException as original_error:
+            if commit_group_id and self.committer is not None:
+                recovery_error: Exception | None = None
+                try:
+                    self._recover_pending_memory_effects(archive.user_id, commit_group_id)
+                except (OSError, TimeoutError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+                    recovery_error = exc
+                try:
+                    self._backfill_canonical_effects(commit_group_id, archive.user_id)
+                except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+                    if recovery_error is None:
+                        recovery_error = exc
+                if recovery_error is not None:
+                    raise recovery_error from original_error
+            raise
+        if commit_group_id and self.committer is not None:
+            self._backfill_canonical_effects(commit_group_id, archive.user_id)
+            committed = self._merge_canonical_effects(
+                commit_group_id,
+                archive.user_id,
+                committed,
+            )
         return self._memory_commit_metadata(committed, planned_operations)
 
     def _run_consumer(
@@ -553,6 +580,106 @@ class SessionCommitService:
             merged[key] = list(by_id.values())
         merged["operation_count"] = len(merged["operations"])
         return merged
+
+    def _backfill_canonical_effects(self, group_id: str, user_id: str) -> CommitGroupStatus:
+        if self.committer is None:
+            status = self.commit_group_store.load(group_id)
+            if status is None:
+                raise KeyError(f"unknown commit group: {group_id}")
+            return status
+        committed_effects = getattr(self.committer, "committed_memory_effect_diffs", None)
+        if not callable(committed_effects):
+            status = self.commit_group_store.load(group_id)
+            if status is None:
+                raise KeyError(f"unknown commit group: {group_id}")
+            return status
+        load_effects = cast(Callable[[str, str], list[ContextDiff]], committed_effects)
+        for diff in load_effects(user_id, group_id):
+            self.commit_group_store.record_canonical_effect(group_id, diff.to_dict())
+        status = self.commit_group_store.load(group_id)
+        if status is None:
+            raise KeyError(f"unknown commit group: {group_id}")
+        return status
+
+    def _recover_pending_memory_effects(self, user_id: str, group_id: str) -> None:
+        if self.committer is None:
+            return
+        recover_canonical = getattr(self.committer, "recover_pending_canonical", None)
+        if callable(recover_canonical):
+            recover_canonical(
+                user_id,
+                commit_group_id=group_id or None,
+            )
+        if not group_id:
+            return
+        recover_regular = getattr(self.committer, "recover_pending_regular_memory", None)
+        if callable(recover_regular):
+            recover_regular(
+                user_id,
+                commit_group_id=group_id,
+            )
+
+    def _merge_canonical_effects(
+        self,
+        group_id: str,
+        user_id: str,
+        current: dict[str, Any],
+    ) -> dict[str, Any]:
+        if self.committer is None:
+            return current
+        status = self.commit_group_store.load(group_id)
+        if status is None:
+            raise KeyError(f"unknown commit group: {group_id}")
+        diffs = [self._context_diff_from_payload(payload) for payload in status.canonical_effects.values()]
+        if any(current.get(key) for key in ("operations", "pending_operations", "rejected_operations")):
+            diffs.append(self._context_diff_from_payload(current))
+        if not diffs:
+            return current
+        combine = getattr(self.committer, "combine_committed_diffs", None)
+        if callable(combine):
+            combine_diffs = cast(Callable[[str, list[ContextDiff]], ContextDiff], combine)
+            combined = combine_diffs(user_id, diffs)
+            return self._diff_payload(combined, status="committed")
+        return self._merge_diff_payloads(*(self._diff_payload(diff, "committed") for diff in diffs))
+
+    def _context_diff_from_payload(self, payload: dict[str, Any]) -> ContextDiff:
+        return ContextDiff(
+            user_id=str(payload["user_id"]),
+            operations=[ContextOperation.from_dict(item) for item in payload.get("operations", []) or []],
+            pending_operations=[
+                ContextOperation.from_dict(item) for item in payload.get("pending_operations", []) or []
+            ],
+            rejected_operations=[
+                ContextOperation.from_dict(item) for item in payload.get("rejected_operations", []) or []
+            ],
+            diff_id=str(payload.get("diff_id") or ""),
+            created_at=str(payload.get("created_at") or ""),
+            schema_version=str(payload.get("schema_version") or "context_diff_v1"),
+        )
+
+    def _partial_memory_result(self, group: CommitGroupStatus) -> dict[str, Any]:
+        if group.canonical_result:
+            return {
+                **group.canonical_result,
+                "status": "partial_failed",
+                "error": group.canonical_last_error,
+            }
+        if group.canonical_effects:
+            merged = self._merge_diff_payloads(*group.canonical_effects.values())
+            merged.update(
+                {
+                    "user_id": group.user_id,
+                    "status": "partial_failed",
+                    "error": group.canonical_last_error,
+                }
+            )
+            return self._memory_commit_metadata(merged, [])
+        return {
+            "status": "failed",
+            "error": group.canonical_last_error,
+            "operation_count": 0,
+            "operations": [],
+        }
 
     def _memory_commit_metadata(
         self,

@@ -31,7 +31,7 @@ from memoryos.memory.canonical import (
     VisibilityPolicy,
     bind_field_evidence,
 )
-from memoryos.memory.canonical.reconcile import MemorySemanticReconciler
+from memoryos.memory.canonical.reconcile import MemorySemanticReconciler, RelationAuthority
 
 
 def _explicit_bindings(
@@ -227,7 +227,26 @@ def _validated_decision_proposal(
         span_start=0,
         span_end=len(text),
     )
-    evidence_refs = (atomic_ref,)
+    evidence_refs = [atomic_ref]
+    bindings = _explicit_bindings(
+        identity_fields,
+        values,
+        (atomic_ref,),
+        semantic_contract_version="v3",
+    )
+    for field_name, field_value in values.items():
+        literal = str(field_value)
+        if literal not in text:
+            continue
+        start = text.index(literal)
+        child = EvidenceRef.from_event(
+            episode.events[0],
+            source_uri=episode.source_uris[0],
+            span_start=start,
+            span_end=start + len(literal),
+        )
+        evidence_refs.append(child)
+        bindings[f"value.{field_name}"] = (child,)
     proposal = MemorySemanticNormalizer().normalize(
         MemorySemanticProposal(
             proposal_id=proposal_id,
@@ -249,13 +268,8 @@ def _validated_decision_proposal(
             suggested_scope_refs=(episode.origin.primary_scope,),
             related_memory_ids=(),
             related_claim_ids=related_claim_ids,
-            evidence_refs=evidence_refs,
-            field_evidence_refs=_explicit_bindings(
-                identity_fields,
-                values,
-                evidence_refs,
-                semantic_contract_version="v3",
-            ),
+            evidence_refs=tuple(evidence_refs),
+            field_evidence_refs=bindings,
             confidence=0.99,
             extractor_version="test",
             semantic_contract_version="v3",
@@ -566,8 +580,9 @@ def test_explicit_mysql_switch_requires_target_and_replacement_evidence() -> Non
         relation="supersedes",
         related_claim_ids=(first.slot.active_claim_id,),
     )
-    assert mysql.metadata["semantic_relation_evidence_validated"] is True
-    assert mysql.metadata["replacement_evidence_validated"] is True
+    assert mysql.metadata["relation_target_binding_validated"] is True
+    assert mysql.metadata["semantic_relation_evidence_validated"] is False
+    assert mysql.metadata["replacement_evidence_validated"] is False
 
     with pytest.raises(PendingSemanticReconciliation, match="destructive_effect_requires_structured_review"):
         _apply(mysql, mysql_scope, first.slot, first.claims)
@@ -638,7 +653,30 @@ def test_model_mislabelled_backup_cannot_authorize_destructive_transition() -> N
         relation="supersedes",
         related_claim_ids=(first.slot.active_claim_id,),
     )
-    assert mislabeled.metadata["replacement_evidence_validated"] is True
+    assert mislabeled.metadata["relation_target_binding_validated"] is True
+    assert mislabeled.metadata["semantic_relation_evidence_validated"] is False
+    assert mislabeled.metadata["replacement_evidence_validated"] is False
+    mislabeled = replace(
+        mislabeled,
+        metadata={
+            **dict(mislabeled.metadata),
+            "relation_semantic_authority": "structured_confirmed_review",
+            "effect_authority": "structured_explicit_command",
+        },
+    )
+    mislabeled_identity = StableMemoryIdentityResolver().resolve(
+        mislabeled,
+        mislabeled_scope,
+        tenant_id="t1",
+        owner_user_id="u1",
+    )
+    mislabeled_reconciliation = MemorySemanticReconciler().reconcile(
+        mislabeled,
+        mislabeled_identity,
+        slot=first.slot,
+        claims=first.claims,
+    )
+    assert mislabeled_reconciliation.relation_authority == RelationAuthority.MODEL_REPORTED
 
     with pytest.raises(PendingSemanticReconciliation, match="destructive_effect_requires_structured_review"):
         _apply(mislabeled, mislabeled_scope, first.slot, first.claims)
@@ -646,6 +684,32 @@ def test_model_mislabelled_backup_cannot_authorize_destructive_transition() -> N
     assert {claim.canonical_value: claim.current.state for claim in first.claims} == {
         "postgresql": "ACTIVE",
     }
+
+
+def test_transition_rejects_relation_target_tuple_that_disagrees_with_repository_state() -> None:
+    postgres, scope = _validated_decision_proposal(
+        "数据库继续使用 PostgreSQL",
+        "PostgreSQL",
+        proposal_id="postgres-relation-state",
+        speech_act="confirmation",
+        commitment="confirmed",
+        relation="unrelated",
+    )
+    _, first = _apply(postgres, scope)
+    assert first.slot.active_claim_id is not None
+    mysql, mysql_scope = _validated_decision_proposal(
+        "数据库正式改为 MySQL",
+        "MySQL",
+        proposal_id="mysql-relation-state",
+        speech_act="correction",
+        commitment="confirmed",
+        relation="supersedes",
+        related_claim_ids=(first.slot.active_claim_id,),
+    )
+    inconsistent = replace(mysql, related_slot_ids=("another-slot",))
+
+    with pytest.raises(PendingSemanticReconciliation, match="relation_slot_target_mismatch"):
+        _apply(inconsistent, mysql_scope, first.slot, first.claims)
 
 
 def test_v3_atomic_source_durable_current_assertion_can_become_active() -> None:
@@ -1060,6 +1124,7 @@ def test_unconfirmed_supplement_cannot_revise_active_claim_but_confirmed_details
         claims=first.claims,
     )
     assert weak_reconciled.relation == SemanticRelation.SUPPLEMENTS
+    assert weak_reconciled.relation_authority == RelationAuthority.STATE_DERIVED
     with pytest.raises(
         PendingSemanticReconciliation,
         match="nonfinal_relation_requires_review|unconfirmed_supplement",

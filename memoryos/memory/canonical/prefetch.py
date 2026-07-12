@@ -10,6 +10,7 @@ from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
 from memoryos.contextdb.store.source_store import IndexStore, RelationStore, SourceStore
 from memoryos.memory.canonical.episode import EvidenceEpisode
+from memoryos.memory.canonical.scope import MemoryScope
 from memoryos.memory.canonical.visibility import read_committed_canonical, relation_is_committed
 
 
@@ -94,6 +95,8 @@ class ExistingMemoryPrefetcher:
             if type_hints and str(metadata.get("memory_type", "")) not in type_hints:
                 continue
             if not self._visible(metadata, episode.tenant_id, owner_user_id):
+                continue
+            if not self._authority_permits(metadata):
                 continue
             if not self._applicable(metadata, legal_scope_keys):
                 continue
@@ -184,22 +187,39 @@ class ExistingMemoryPrefetcher:
         return results[: self.top_k]
 
     def _applicable(self, metadata: dict[str, Any], legal_scope_keys: set[str]) -> bool:
-        scope = dict(metadata.get("scope", {}) or {})
-        applicability = dict(scope.get("applicability", {}) or {})
-        required = {
-            f"{item.get('namespace', 'memoryos')}:{item.get('kind')}:{item.get('id')}"
-            for item in applicability.get("all_of", []) or []
-            if isinstance(item, dict) and item.get("kind") and item.get("id")
-        }
-        return not required or required.issubset(legal_scope_keys)
+        scope = self._canonical_scope(metadata)
+        if scope is None:
+            return False
+        required = {item.key for item in scope.applicability.all_of}
+        return required.issubset(legal_scope_keys)
 
     def _visible(self, metadata: dict[str, Any], tenant_id: str, principal_id: str) -> bool:
-        scope = dict(metadata.get("scope", {}) or {})
-        visibility = dict(scope.get("visibility", {}) or {})
-        if visibility and str(visibility.get("tenant_id", "default")) != tenant_id:
+        scope = self._canonical_scope(metadata)
+        return bool(
+            scope is not None
+            and scope.visibility.permits(tenant_id=tenant_id, principal_id=principal_id)
+        )
+
+    def _authority_permits(self, metadata: dict[str, Any]) -> bool:
+        scope = self._canonical_scope(metadata)
+        if scope is None or scope.authority.inferred:
             return False
-        allowed = {str(item) for item in visibility.get("allowed_principal_ids", []) or []}
-        return not allowed or principal_id in allowed
+        if not scope.authority.principal_ids and not scope.authority.service_ids:
+            return True
+        return bool(
+            str(metadata.get("asserted_by") or "") in set(scope.authority.principal_ids)
+            or str(metadata.get("asserted_by_service") or "") in set(scope.authority.service_ids)
+        )
+
+    def _canonical_scope(self, metadata: dict[str, Any]) -> MemoryScope | None:
+        raw_scope = metadata.get("scope")
+        if not isinstance(raw_scope, dict):
+            return None
+        try:
+            scope = MemoryScope.from_dict(raw_scope)
+        except (KeyError, TypeError, ValueError):
+            return None
+        return scope if scope.canonical_subject is not None else None
 
     def _read(self, uri: str | None) -> str:
         if not uri or self.source_store is None:

@@ -558,6 +558,18 @@ class CanonicalMemoryFormationService:
         if self.source_store is not None or staged_objects:
             repository = CanonicalMemoryRepository(cast(SourceStore, self._planning_source(staged_objects)))
             slot, claims = repository.load(identity)
+        target_state_error = self._related_active_target_error(normalized, slot, claims)
+        if target_state_error:
+            return self._pending_result(
+                normalized,
+                memory_scope=memory_scope,
+                archive=archive,
+                episode=episode,
+                reason=f"semantic_reconciliation_pending:{target_state_error}",
+                retrieval_views=retrieval_views or [],
+                commit_group_id=commit_group_id or "",
+                related_existing_memory_ids=normalized.all_related_memory_ids,
+            )
         reconciled = self.reconciler.reconcile(normalized, identity, slot=slot, claims=claims)
         try:
             transition = (
@@ -621,6 +633,37 @@ class CanonicalMemoryFormationService:
         )
         self._decorate_operations(operations, normalized, retrieval_views or [])
         return CanonicalFormationResult(tuple(operations), admission.decision, admission.reason, normalized)
+
+    def _related_active_target_error(
+        self,
+        proposal: MemorySemanticProposal,
+        slot: MemorySlot | None,
+        claims: tuple[MemoryClaim, ...],
+    ) -> str:
+        """Bind high-impact relation identifiers to one exact repository ACTIVE Claim."""
+
+        relation = str(
+            getattr(proposal.semantic.relation_to_existing, "value", proposal.semantic.relation_to_existing)
+        ).strip().casefold()
+        if relation not in {"corrects", "supersedes", "supplements"}:
+            return ""
+        if slot is None or not slot.active_claim_id:
+            return "relation_target_requires_active_claim"
+        active = next((claim for claim in claims if claim.claim_id == slot.active_claim_id), None)
+        if active is None or active.current.state != "ACTIVE":
+            return "relation_target_requires_active_claim"
+        if proposal.related_claim_ids and tuple(proposal.related_claim_ids) != (active.claim_id,):
+            return "relation_claim_target_mismatch"
+        if proposal.related_slot_ids and tuple(proposal.related_slot_ids) != (slot.slot_id,):
+            return "relation_slot_target_mismatch"
+        if proposal.related_memory_ids and tuple(proposal.related_memory_ids) not in {
+            (active.claim_id,),
+            (active.uri,),
+        }:
+            return "relation_memory_target_mismatch"
+        if not proposal.related_claim_ids and not proposal.related_memory_ids:
+            return "relation_target_missing"
+        return ""
 
     def _bind_system_resolved_replacement_target(
         self,
@@ -1169,6 +1212,9 @@ class CanonicalMemoryFormationService:
         service = self
 
         class PlanningSource:
+            root = getattr(service.source_store, "root", None)
+            tenant_id = getattr(service.source_store, "tenant_id", "default")
+
             def read_object(self, uri: str) -> ContextObject:
                 if uri in request_staging:
                     return request_staging[uri]

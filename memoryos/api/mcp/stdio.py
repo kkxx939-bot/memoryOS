@@ -33,7 +33,10 @@ def main() -> None:
 
     @sdk_server.list_tools()
     async def list_tools() -> list[Any]:
-        return [types.Tool(name=item["name"], description=item["description"], inputSchema=item["inputSchema"]) for item in tool_definitions(config)]
+        return [
+            types.Tool(name=item["name"], description=item["description"], inputSchema=item["inputSchema"])
+            for item in tool_definitions(config)
+        ]
 
     @sdk_server.call_tool()
     async def call_tool(name: str, arguments: dict[str, Any]) -> Any:
@@ -66,9 +69,10 @@ def _build_transport_client(config: MCPServerConfig) -> MemoryOSClient | HTTPMem
             api_token=os.environ.get("MEMORYOS_API_TOKEN"),
             account_id=os.environ.get("MEMORYOS_ACCOUNT_ID"),
             user_id=config.user_id,
+            tenant_id=config.tenant_id,
         )
         if base_url
-        else MemoryOSClient(config.root)
+        else MemoryOSClient(config.root, tenant_id=config.tenant_id)
     )
 
 
@@ -81,7 +85,11 @@ def _handle_jsonrpc(server: MemoryOSMCPServer, line: str) -> dict[str, Any]:
         params = request.get("params", {})
         result: dict[str, Any]
         if method == "initialize":
-            result = {"protocolVersion": "2024-11-05", "serverInfo": {"name": "memoryos", "version": "0.1.0"}, "capabilities": {"tools": {}}}
+            result = {
+                "protocolVersion": "2024-11-05",
+                "serverInfo": {"name": "memoryos", "version": "0.1.0"},
+                "capabilities": {"tools": {}},
+            }
         elif method == "tools/list":
             result = {"tools": tool_definitions(server.config)}
         elif method == "tools/call":

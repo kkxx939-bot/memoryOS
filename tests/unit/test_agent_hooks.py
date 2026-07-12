@@ -49,6 +49,17 @@ class SecretFailHookMCPClient:
 
 
 def _config(tmp_path: Path, adapter_id: str = "codex") -> AgentHookConfig:
+    derived_workspaces = {
+        AgentHookEvent.from_payload(
+            payload,
+            adapter_id=adapter_id,
+            hook_name="after_turn",
+            user_id="u1",
+        )
+        .normalize()
+        .project_id
+        for payload in ({}, {"cwd": str(tmp_path)})
+    }
     return AgentHookConfig(
         root=str(tmp_path / "memory"),
         user_id="u1",
@@ -56,6 +67,7 @@ def _config(tmp_path: Path, adapter_id: str = "codex") -> AgentHookConfig:
         agent_name=adapter_id,
         token_budget=128,
         queue_path=str(tmp_path / "queue.jsonl"),
+        allowed_workspace_ids=frozenset(derived_workspaces),
     )
 
 
@@ -96,7 +108,13 @@ def test_codex_post_tool_use_appends_without_session_commit(tmp_path: Path) -> N
 
     result = adapter.handle(
         "PostToolUse",
-        {"event_id": "e1", "session_id": "s1", "tool_name": "shell", "tool_output": "ok", "changed_files": ["memoryos/api/mcp/server.py"]},
+        {
+            "event_id": "e1",
+            "session_id": "s1",
+            "tool_name": "shell",
+            "tool_output": "ok",
+            "changed_files": ["memoryos/api/mcp/server.py"],
+        },
     ).to_dict()
 
     assert result["queued"] is False
@@ -109,7 +127,7 @@ def test_codex_post_tool_use_appends_without_session_commit(tmp_path: Path) -> N
 def test_codex_stop_commits_and_flushes_queue(tmp_path: Path) -> None:
     fake = FakeHookMCPClient()
     config = _config(tmp_path)
-    queue = PendingQueue(config.queue_path)
+    queue = PendingQueue(config.queue_path, tenant_id=config.tenant_id, user_id=config.user_id)
     queue.enqueue(
         PendingItem(
             event_id="e1",
@@ -117,11 +135,14 @@ def test_codex_stop_commits_and_flushes_queue(tmp_path: Path) -> None:
             adapter_id="codex",
             hook_name="PostToolUse",
             payload={"tool_name": "memoryos_commit_session", "arguments": {"session_id": "s1"}},
+            user_id=config.user_id,
         )
     )
     adapter = CodexHookAdapter(config, mcp_client=fake, queue=queue)
 
-    result = adapter.handle("Stop", {"event_id": "stop1", "session_id": "s1", "messages": [{"role": "user", "content": "done"}]}).to_dict()
+    result = adapter.handle(
+        "Stop", {"event_id": "stop1", "session_id": "s1", "messages": [{"role": "user", "content": "done"}]}
+    ).to_dict()
 
     assert result["committed"] is True
     assert result["flushed"]["flushed"] == 1
@@ -143,7 +164,9 @@ def test_claude_code_before_prompt_and_after_turn(tmp_path: Path) -> None:
     adapter = ClaudeCodeHookAdapter(_config(tmp_path, "claude_code"), mcp_client=FakeHookMCPClient())
 
     before = adapter.handle("before_prompt", {"session_id": "s1", "input": "hello"}).to_dict()
-    after = adapter.handle("after_turn", {"session_id": "s1", "messages": [{"role": "assistant", "content": "ok"}], "unknown": "kept"}).to_dict()
+    after = adapter.handle(
+        "after_turn", {"session_id": "s1", "messages": [{"role": "assistant", "content": "ok"}], "unknown": "kept"}
+    ).to_dict()
 
     assert before["injection_text"]
     assert after["committed"] is True
@@ -163,9 +186,21 @@ def test_cursor_before_prompt_after_turn_and_flush(tmp_path: Path) -> None:
 
 def test_hooks_only_call_context_or_commit_tools_with_agent_metadata(tmp_path: Path) -> None:
     adapters: list[tuple[Any, str, dict[str, Any]]] = [
-        (CodexHookAdapter(_config(tmp_path, "codex"), mcp_client=FakeHookMCPClient()), "UserPromptSubmit", {"session_id": "s1", "prompt": "hello"}),
-        (ClaudeCodeHookAdapter(_config(tmp_path, "claude_code"), mcp_client=FakeHookMCPClient()), "before_prompt", {"session_id": "s2", "input": "hello"}),
-        (CursorHookAdapter(_config(tmp_path, "cursor"), mcp_client=FakeHookMCPClient()), "before_prompt", {"session_id": "s3", "prompt": "hello"}),
+        (
+            CodexHookAdapter(_config(tmp_path, "codex"), mcp_client=FakeHookMCPClient()),
+            "UserPromptSubmit",
+            {"session_id": "s1", "prompt": "hello"},
+        ),
+        (
+            ClaudeCodeHookAdapter(_config(tmp_path, "claude_code"), mcp_client=FakeHookMCPClient()),
+            "before_prompt",
+            {"session_id": "s2", "input": "hello"},
+        ),
+        (
+            CursorHookAdapter(_config(tmp_path, "cursor"), mcp_client=FakeHookMCPClient()),
+            "before_prompt",
+            {"session_id": "s3", "prompt": "hello"},
+        ),
     ]
 
     for adapter, hook_name, payload in adapters:
@@ -344,7 +379,9 @@ def test_pending_queue_mark_failed_redacts_error(tmp_path: Path) -> None:
     assert "<redacted-path>" in item.last_error
 
 
-def test_pending_queue_uses_msvcrt_fallback_when_fcntl_unavailable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_pending_queue_uses_msvcrt_fallback_when_fcntl_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     class FakeMsvcrt:
         LK_LOCK = 1
         LK_UNLCK = 2
@@ -432,10 +469,18 @@ def test_agent_hook_event_id_is_stable_for_retry_payloads(tmp_path: Path) -> Non
 def test_agent_hook_event_id_changes_for_different_tool_payloads(tmp_path: Path) -> None:
     base = {"session_id": "s1", "cwd": str(tmp_path), "tool_name": "shell"}
 
-    first = AgentHookEvent.from_payload({**base, "tool_input": {"cmd": "ls"}, "tool_output": "one"}, adapter_id="codex", hook_name="PostToolUse")
-    same = AgentHookEvent.from_payload({**base, "tool_input": {"cmd": "ls"}, "tool_output": "one"}, adapter_id="codex", hook_name="PostToolUse")
-    different_input = AgentHookEvent.from_payload({**base, "tool_input": {"cmd": "pwd"}, "tool_output": "one"}, adapter_id="codex", hook_name="PostToolUse")
-    different_output = AgentHookEvent.from_payload({**base, "tool_input": {"cmd": "ls"}, "tool_output": "two"}, adapter_id="codex", hook_name="PostToolUse")
+    first = AgentHookEvent.from_payload(
+        {**base, "tool_input": {"cmd": "ls"}, "tool_output": "one"}, adapter_id="codex", hook_name="PostToolUse"
+    )
+    same = AgentHookEvent.from_payload(
+        {**base, "tool_input": {"cmd": "ls"}, "tool_output": "one"}, adapter_id="codex", hook_name="PostToolUse"
+    )
+    different_input = AgentHookEvent.from_payload(
+        {**base, "tool_input": {"cmd": "pwd"}, "tool_output": "one"}, adapter_id="codex", hook_name="PostToolUse"
+    )
+    different_output = AgentHookEvent.from_payload(
+        {**base, "tool_input": {"cmd": "ls"}, "tool_output": "two"}, adapter_id="codex", hook_name="PostToolUse"
+    )
     different_files = AgentHookEvent.from_payload(
         {**base, "tool_input": {"cmd": "ls"}, "tool_output": "one", "changed_files": ["memoryos/a.py"]},
         adapter_id="codex",
@@ -455,9 +500,15 @@ def test_agent_hook_event_id_changes_for_different_tool_payloads(tmp_path: Path)
 
 
 def test_fallback_session_id_includes_prompt_hint(tmp_path: Path) -> None:
-    first = AgentHookEvent.from_payload({"cwd": str(tmp_path), "prompt": "task one"}, adapter_id="codex", hook_name="UserPromptSubmit")
-    second = AgentHookEvent.from_payload({"cwd": str(tmp_path), "prompt": "task two"}, adapter_id="codex", hook_name="UserPromptSubmit")
-    repeat = AgentHookEvent.from_payload({"cwd": str(tmp_path), "prompt": "task one"}, adapter_id="codex", hook_name="UserPromptSubmit")
+    first = AgentHookEvent.from_payload(
+        {"cwd": str(tmp_path), "prompt": "task one"}, adapter_id="codex", hook_name="UserPromptSubmit"
+    )
+    second = AgentHookEvent.from_payload(
+        {"cwd": str(tmp_path), "prompt": "task two"}, adapter_id="codex", hook_name="UserPromptSubmit"
+    )
+    repeat = AgentHookEvent.from_payload(
+        {"cwd": str(tmp_path), "prompt": "task one"}, adapter_id="codex", hook_name="UserPromptSubmit"
+    )
 
     assert first.session_id == repeat.session_id
     assert first.session_id != second.session_id

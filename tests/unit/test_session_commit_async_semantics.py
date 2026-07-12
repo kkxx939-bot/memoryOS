@@ -218,9 +218,19 @@ def test_mcp_commit_session_retry_same_payload_enqueues_one_stable_job(tmp_path)
     client = MemoryOSClient(str(tmp_path), queue_store=queue)
     server = MemoryOSMCPServer(
         client,
-        MCPServerConfig(root=str(tmp_path), user_id="u1", adapter_id="codex", agent_name="codex"),
+        MCPServerConfig(
+            root=str(tmp_path),
+            user_id="u1",
+            adapter_id="codex",
+            agent_name="codex",
+            allowed_workspace_ids=frozenset({"project-a"}),
+        ),
     )
-    args = {"session_id": "s1", "messages": [{"role": "user", "content": "same"}]}
+    args = {
+        "session_id": "s1",
+        "project_id": "project-a",
+        "messages": [{"role": "user", "content": "same"}],
+    }
 
     first = server.call_tool("memoryos_commit_session", args)
     second = server.call_tool("memoryos_commit_session", args)

@@ -6,6 +6,7 @@ from dataclasses import replace
 import pytest
 
 from memoryos.contextdb.context_db import ContextDB
+from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_relation import ContextRelation
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.retrieval.context_assembler import ContextAssembler
@@ -28,8 +29,14 @@ from memoryos.memory.canonical import (
     ScopeRef,
     TransitionProfile,
 )
+from memoryos.memory.canonical.prefetch import ExistingMemoryPrefetcher
 from memoryos.memory.canonical.projection_state import ProjectionRecordStore
 from memoryos.memory.canonical.retrieval import CanonicalInvariantViolation
+from memoryos.operations.commit.operation_committer import OperationCommitter
+from memoryos.operations.model.context_diff import ContextDiff
+from memoryos.operations.model.context_operation import ContextOperation
+from memoryos.operations.model.operation_action import OperationAction
+from memoryos.operations.model.operation_status import OperationStatus
 from memoryos.providers.embedding import HashingEmbeddingProvider
 
 
@@ -63,6 +70,68 @@ def _scope(*refs, tenant_id: str = "t1", principals=()):  # noqa: ANN001, ANN202
         },
         "origin_refs": [],
     }
+
+
+def _write_committed_canonical_fixture(
+    source: FileSystemSourceStore,
+    entries: list[tuple[ContextObject, str]],
+    *,
+    key: str,
+    action: OperationAction = OperationAction.ADD,
+) -> None:
+    """Persist canonical fixtures behind an integrity-valid transaction marker."""
+
+    transaction_id = f"tx-{key}"
+    idempotency_key = f"idem-{key}"
+    operations: list[ContextOperation] = []
+    for index, (obj, content) in enumerate(entries):
+        owner_user_id = obj.owner_user_id
+        assert isinstance(owner_user_id, str)
+        obj.metadata = {
+            **dict(obj.metadata or {}),
+            "canonical_transaction_id": transaction_id,
+            "canonical_idempotency_key": idempotency_key,
+        }
+        source.write_object(obj, content=content)
+        operations.append(
+            ContextOperation(
+                operation_id=f"op-{key}-{index}",
+                user_id=owner_user_id,
+                context_type=obj.context_type,
+                action=action,
+                target_uri=obj.uri,
+                status=OperationStatus.COMMITTED,
+                payload={
+                    "canonical_memory": True,
+                    "transaction_id": transaction_id,
+                    "idempotency_key": idempotency_key,
+                    "tenant_id": obj.tenant_id,
+                    "expected_revision": (
+                        0
+                        if action == OperationAction.ADD
+                        else max(0, int(obj.metadata.get("revision", 1)) - 1)
+                    ),
+                    "context_object": obj.to_dict(),
+                    "content": content,
+                },
+            )
+        )
+    assert operations
+    assert len({operation.user_id for operation in operations}) == 1
+    committer = OperationCommitter(
+        source,
+        InMemoryIndexStore(),
+        str(source.root),
+        tenant_id=source.tenant_id,
+    )
+    diff = ContextDiff(
+        user_id=operations[0].user_id,
+        operations=operations,
+        diff_id=f"diff-{transaction_id}",
+    )
+    marker = committer._transaction_marker(idempotency_key)
+    committer._write_transaction_marker(marker, diff, operations)
+    committer._validate_transaction_marker(marker, operations)
 
 
 def _write_claim(
@@ -116,15 +185,19 @@ def _write_claim(
         canonical_subject_key=subject.key,
         canonical_subject=subject,
     )
-    source.write_object(
-        slot.to_context_object(
-            tenant_id="t1",
-            owner_user_id=owner_user_id,
-            scope=scope,
-        ),
-        content=json.dumps({"slot_id": slot.slot_id}),
+    slot_obj = slot.to_context_object(
+        tenant_id="t1",
+        owner_user_id=owner_user_id,
+        scope=scope,
     )
-    source.write_object(obj, content=json.dumps({"value": value, "state": state}))
+    _write_committed_canonical_fixture(
+        source,
+        [
+            (slot_obj, json.dumps({"slot_id": slot.slot_id})),
+            (obj, json.dumps({"value": value, "state": state})),
+        ],
+        key=f"claim-{claim_id}-r1",
+    )
     projector.project(uri)
     return uri
 
@@ -173,15 +246,21 @@ def _write_two_revision_claim(
         canonical_subject_key=subject.key,
         canonical_subject=subject,
     )
-    source.write_object(slot_one.to_context_object(tenant_id="t1", owner_user_id="u1", scope=scope))
-    source.write_object(
-        claim_one.to_context_object(
-            tenant_id="t1",
-            owner_user_id="u1",
-            memory_type="project_decision",
-            scope=scope,
-        ),
-        content=old_value,
+    _write_committed_canonical_fixture(
+        source,
+        [
+            (slot_one.to_context_object(tenant_id="t1", owner_user_id="u1", scope=scope), ""),
+            (
+                claim_one.to_context_object(
+                    tenant_id="t1",
+                    owner_user_id="u1",
+                    memory_type="project_decision",
+                    scope=scope,
+                ),
+                old_value,
+            ),
+        ],
+        key="revisioned-r1",
     )
     projector.project(claim_uri, 1)
 
@@ -205,15 +284,22 @@ def _write_two_revision_claim(
         canonical_subject_key=subject.key,
     )
     slot_two = replace(slot_one, revision=2)
-    source.write_object(slot_two.to_context_object(tenant_id="t1", owner_user_id="u1", scope=scope))
-    source.write_object(
-        claim_two.to_context_object(
-            tenant_id="t1",
-            owner_user_id="u1",
-            memory_type="project_decision",
-            scope=scope,
-        ),
-        content=new_value,
+    _write_committed_canonical_fixture(
+        source,
+        [
+            (slot_two.to_context_object(tenant_id="t1", owner_user_id="u1", scope=scope), ""),
+            (
+                claim_two.to_context_object(
+                    tenant_id="t1",
+                    owner_user_id="u1",
+                    memory_type="project_decision",
+                    scope=scope,
+                ),
+                new_value,
+            ),
+        ],
+        key="revisioned-r2",
+        action=OperationAction.UPDATE,
     )
     if project_current:
         projector.project(claim_uri, 2)
@@ -221,7 +307,7 @@ def _write_two_revision_claim(
 
 
 def test_retrieval_distinguishes_current_options_history_visibility_and_scope(tmp_path) -> None:  # noqa: ANN001
-    source = FileSystemSourceStore(tmp_path)
+    source = FileSystemSourceStore(tmp_path, tenant_id="t1")
     index = InMemoryIndexStore()
     relations = InMemoryRelationStore()
     projector = CanonicalMemoryProjector(source, index, tmp_path)
@@ -292,7 +378,7 @@ def test_retrieval_distinguishes_current_options_history_visibility_and_scope(tm
 
 
 def test_canonical_scope_filter_precedes_limit(tmp_path) -> None:  # noqa: ANN001
-    source = FileSystemSourceStore(tmp_path)
+    source = FileSystemSourceStore(tmp_path, tenant_id="t1")
     index = InMemoryIndexStore()
     projector = CanonicalMemoryProjector(source, index, tmp_path)
     for number in range(30):
@@ -327,7 +413,7 @@ def test_canonical_scope_filter_precedes_limit(tmp_path) -> None:  # noqa: ANN00
 
 
 def test_reachy_preference_applies_to_person_and_environment_not_device_only(tmp_path) -> None:  # noqa: ANN001
-    source = FileSystemSourceStore(tmp_path)
+    source = FileSystemSourceStore(tmp_path, tenant_id="t1")
     index = InMemoryIndexStore()
     projector = CanonicalMemoryProjector(source, index, tmp_path)
     preference = _write_claim(
@@ -371,7 +457,7 @@ def test_reachy_preference_applies_to_person_and_environment_not_device_only(tmp
 
 
 def test_canonical_retrieval_supports_exact_vector_and_relation_expansion(tmp_path) -> None:  # noqa: ANN001
-    source = FileSystemSourceStore(tmp_path)
+    source = FileSystemSourceStore(tmp_path, tenant_id="t1")
     index = InMemoryIndexStore()
     vectors = InMemoryVectorStore()
     embedding = HashingEmbeddingProvider()
@@ -413,12 +499,16 @@ def test_canonical_retrieval_supports_exact_vector_and_relation_expansion(tmp_pa
     )
     relations.add_relation(
         ContextRelation(
-            source_uri=postgres,
-            relation_type="alternative",
-            target_uri=cockroach,
-            metadata={"tenant_id": "t1", "owner_user_id": "u1"},
+                source_uri=postgres,
+                relation_type="alternative",
+                target_uri=cockroach,
+                metadata={
+                    "tenant_id": "t1",
+                    "owner_user_id": "u1",
+                    "canonical_idempotency_key": "idem-claim-postgres-related-r1",
+                },
+            )
         )
-    )
     hybrid = HybridSearch(index, vector_store=vectors, embedding_provider=embedding, source_store=source)
     retriever = CanonicalMemoryRetriever(source, index, relations, hybrid_search=hybrid)
 
@@ -448,7 +538,7 @@ def test_canonical_retrieval_supports_exact_vector_and_relation_expansion(tmp_pa
 
 
 def test_stale_index_vector_and_projection_hits_are_filtered_by_canonical_revision(tmp_path) -> None:  # noqa: ANN001
-    source = FileSystemSourceStore(tmp_path)
+    source = FileSystemSourceStore(tmp_path, tenant_id="t1")
     index = InMemoryIndexStore()
     vectors = InMemoryVectorStore()
     embedding = HashingEmbeddingProvider()
@@ -490,7 +580,7 @@ def test_stale_index_vector_and_projection_hits_are_filtered_by_canonical_revisi
 
 
 def test_history_expands_old_revision_while_current_returns_only_slot_current(tmp_path) -> None:  # noqa: ANN001
-    source = FileSystemSourceStore(tmp_path)
+    source = FileSystemSourceStore(tmp_path, tenant_id="t1")
     index = InMemoryIndexStore()
     projector = CanonicalMemoryProjector(source, index, tmp_path)
     claim_uri, _slot_uri = _write_two_revision_claim(
@@ -519,7 +609,7 @@ def test_history_expands_old_revision_while_current_returns_only_slot_current(tm
 
 
 def test_late_historical_transaction_does_not_replace_effective_current_projection(tmp_path) -> None:  # noqa: ANN001
-    source = FileSystemSourceStore(tmp_path)
+    source = FileSystemSourceStore(tmp_path, tenant_id="t1")
     index = InMemoryIndexStore()
     projector = CanonicalMemoryProjector(source, index, tmp_path)
     scope = _scope(("workspace", "memoryos"))
@@ -570,14 +660,21 @@ def test_late_historical_transaction_does_not_replace_effective_current_projecti
         canonical_subject_key=subject.key,
         canonical_subject=subject,
     )
-    source.write_object(slot.to_context_object(tenant_id="t1", owner_user_id="u1", scope=scope))
-    source.write_object(
-        claim.to_context_object(
-            tenant_id="t1",
-            owner_user_id="u1",
-            memory_type="project_rule",
-            scope=scope,
-        )
+    _write_committed_canonical_fixture(
+        source,
+        [
+            (slot.to_context_object(tenant_id="t1", owner_user_id="u1", scope=scope), ""),
+            (
+                claim.to_context_object(
+                    tenant_id="t1",
+                    owner_user_id="u1",
+                    memory_type="project_rule",
+                    scope=scope,
+                ),
+                "",
+            ),
+        ],
+        key="late-history-r2",
     )
     projector.project(claim_uri, 2)
     retriever = CanonicalMemoryRetriever(source, index)
@@ -600,12 +697,13 @@ def test_late_historical_transaction_does_not_replace_effective_current_projecti
 
 
 def test_multiple_active_claims_raise_invariant_violation_instead_of_returning_first(tmp_path) -> None:  # noqa: ANN001
-    source = FileSystemSourceStore(tmp_path)
+    source = FileSystemSourceStore(tmp_path, tenant_id="t1")
     index = InMemoryIndexStore()
     scope = _scope(("workspace", "memoryos"))
     subject = ScopeRef.from_dict(scope["canonical_subject"])
     slot_uri = "memoryos://user/u1/memories/canonical/slots/broken"
     claims = []
+    entries = []
     for claim_id, value in (("c1", "sqlite"), ("c2", "postgres")):
         revision = MemoryRevision(
             revision=1,
@@ -626,14 +724,16 @@ def test_multiple_active_claims_raise_invariant_violation_instead_of_returning_f
             canonical_subject_key=subject.key,
         )
         claims.append(claim)
-        source.write_object(
-            claim.to_context_object(
-                tenant_id="t1",
-                owner_user_id="u1",
-                memory_type="project_decision",
-                scope=scope,
-            ),
-            content=value,
+        entries.append(
+            (
+                claim.to_context_object(
+                    tenant_id="t1",
+                    owner_user_id="u1",
+                    memory_type="project_decision",
+                    scope=scope,
+                ),
+                value,
+            )
         )
     slot = MemorySlot(
         slot_id="broken",
@@ -647,7 +747,8 @@ def test_multiple_active_claims_raise_invariant_violation_instead_of_returning_f
         canonical_subject_key=subject.key,
         canonical_subject=subject,
     )
-    source.write_object(slot.to_context_object(tenant_id="t1", owner_user_id="u1", scope=scope))
+    entries.append((slot.to_context_object(tenant_id="t1", owner_user_id="u1", scope=scope), ""))
+    _write_committed_canonical_fixture(source, entries, key="broken-multiple-active")
 
     with pytest.raises(CanonicalInvariantViolation, match="multiple ACTIVE claims"):
         CanonicalMemoryRetriever(source, index).search(
@@ -661,7 +762,7 @@ def test_multiple_active_claims_raise_invariant_violation_instead_of_returning_f
 
 
 def test_mixed_revision_layer_refs_are_rejected_by_retrieval_and_assembly(tmp_path) -> None:  # noqa: ANN001
-    source = FileSystemSourceStore(tmp_path)
+    source = FileSystemSourceStore(tmp_path, tenant_id="t1")
     index = InMemoryIndexStore()
     relations = InMemoryRelationStore()
     projector = CanonicalMemoryProjector(source, index, tmp_path)
@@ -706,7 +807,7 @@ def test_mixed_revision_layer_refs_are_rejected_by_retrieval_and_assembly(tmp_pa
 
 
 def test_canonical_results_still_obey_connect_and_authority_filters(tmp_path) -> None:  # noqa: ANN001
-    source = FileSystemSourceStore(tmp_path)
+    source = FileSystemSourceStore(tmp_path, tenant_id="t1")
     index = InMemoryIndexStore()
     relations = InMemoryRelationStore()
     projector = CanonicalMemoryProjector(source, index, tmp_path)
@@ -733,7 +834,12 @@ def test_canonical_results_still_obey_connect_and_authority_filters(tmp_path) ->
         "authority": {"tenant_id": "t1", "allowed_principal_ids": ["u1"]},
         "asserted_by": "u1",
     }
-    source.write_object(claim, content="workspace canonical rule")
+    _write_committed_canonical_fixture(
+        source,
+        [(claim, "workspace canonical rule")],
+        key="connect-filtered-r2",
+        action=OperationAction.UPDATE,
+    )
     assembler = ContextAssembler(ContextDB(source, index, relations))
 
     allowed = assembler.search(
@@ -754,7 +860,12 @@ def test_canonical_results_still_obey_connect_and_authority_filters(tmp_path) ->
     )
     invalid_authority = source.read_object(claim_uri)
     invalid_authority.metadata = {**invalid_authority.metadata, "asserted_by": "u2"}
-    source.write_object(invalid_authority, content="workspace canonical rule")
+    _write_committed_canonical_fixture(
+        source,
+        [(invalid_authority, "workspace canonical rule")],
+        key="connect-filtered-r3-invalid-authority",
+        action=OperationAction.UPDATE,
+    )
     blocked_authority = CanonicalMemoryRetriever(source, index).search(
         CanonicalMemoryQuery(
             text="canonical rule",
@@ -767,3 +878,56 @@ def test_canonical_results_still_obey_connect_and_authority_filters(tmp_path) ->
     assert [item["uri"] for item in allowed] == [claim_uri]
     assert blocked_connect == []
     assert blocked_authority == []
+
+
+def test_prefetch_applicability_keeps_hierarchical_parent_path() -> None:
+    prefetcher = ExistingMemoryPrefetcher(None, None)
+    scope = _scope(("workspace", "workspace-a"))
+    asset = ScopeRef("memoryos", "asset", "camera", parent_path=("workspace-a",)).to_dict()
+    scope["canonical_subject"] = asset
+    scope["applicability"] = {"all_of": [asset]}
+    metadata = {
+        "scope": scope,
+        "asserted_by": "u1",
+    }
+    first_key = ScopeRef("memoryos", "asset", "camera", parent_path=("workspace-a",)).key
+    second_key = ScopeRef("memoryos", "asset", "camera", parent_path=("workspace-b",)).key
+
+    assert prefetcher._applicable(metadata, {first_key})
+    assert not prefetcher._applicable(metadata, {second_key})
+    assert not prefetcher._applicable(metadata, {"memoryos:asset:camera"})
+
+
+def test_mixed_valid_and_malformed_all_of_fails_closed() -> None:
+    scope = _scope(("workspace", "w1"))
+    scope["applicability"] = {
+        "all_of": [
+            {"namespace": "memoryos", "kind": "workspace", "id": "w1"},
+            {"namespace": "memoryos", "kind": "location"},
+        ]
+    }
+    metadata = {
+        "scope": scope,
+        "asserted_by": "u1",
+    }
+    available = {"memoryos:workspace:w1"}
+
+    assert not ExistingMemoryPrefetcher(None, None)._applicable(metadata, available)
+    retriever = CanonicalMemoryRetriever(InMemoryIndexStore(), InMemoryIndexStore())  # type: ignore[arg-type]
+    assert not retriever._applicable(metadata, tuple(available))
+
+
+def test_canonical_visibility_and_authority_shapes_fail_closed() -> None:
+    valid = _scope(("workspace", "w1"), tenant_id="default")
+    query = CanonicalMemoryQuery(
+        text="",
+        tenant_id="default",
+        principal_id="attacker",
+        applicability_scope_keys=("memoryos:workspace:w1",),
+    )
+    retriever = CanonicalMemoryRetriever(InMemoryIndexStore(), InMemoryIndexStore())  # type: ignore[arg-type]
+    malformed_visibility = {"scope": {**valid, "visibility": []}, "asserted_by": "u1"}
+    malformed_authority = {"scope": {**valid, "authority": []}, "asserted_by": "u1"}
+
+    assert not retriever._visible(malformed_visibility, query)
+    assert not retriever._authority_permits(malformed_authority, query)

@@ -6,7 +6,7 @@ import math
 from dataclasses import dataclass, field
 
 from memoryos.contextdb.model.context_type import ContextType
-from memoryos.core.ids import new_id
+from memoryos.core.ids import new_id, require_safe_path_segment
 from memoryos.core.time import utc_now
 from memoryos.operations.model.operation_action import OperationAction
 from memoryos.operations.model.operation_status import OperationStatus
@@ -45,6 +45,7 @@ class ContextOperation:
         self.confidence = confidence
         if not self.operation_id:
             self.operation_id = new_id("op")
+        require_safe_path_segment(self.operation_id, "operation_id")
         if not self.created_at:
             self.created_at = utc_now()
 

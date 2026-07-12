@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from memoryos.contextdb.store.source_store import LockLostError
 from memoryos.operations.commit.operation_committer import OperationCommitter
-from memoryos.operations.commit.redo_log import RedoLog
+from memoryos.operations.commit.redo_log import RedoIntegrityError, RedoLog
 
 
 @dataclass(frozen=True)
@@ -27,6 +28,8 @@ class RecoveryService:
         canonical_by_transaction: dict[str, list] = {}
         regular_entries = []
         for entry in entries:
+            if entry.operation.user_id != user_id:
+                continue
             if entry.operation.payload.get("canonical_memory") is True:
                 transaction_id = str(entry.operation.payload.get("transaction_id", ""))
                 canonical_by_transaction.setdefault(transaction_id, []).append(entry)
@@ -35,15 +38,33 @@ class RecoveryService:
         for transaction_entries in canonical_by_transaction.values():
             try:
                 recovered.extend(self.committer.resume_canonical_batch(user_id, transaction_entries))
-            except (FileNotFoundError, IsADirectoryError, NotADirectoryError) as exc:
+            except (
+                FileNotFoundError,
+                IsADirectoryError,
+                NotADirectoryError,
+                LockLostError,
+                RedoIntegrityError,
+            ) as exc:
                 for entry in transaction_entries:
                     self._record_failure(user_id, entry, exc)
         for entry in regular_entries:
             operation = entry.operation
             try:
-                if self.committer.resume(user_id, operation, entry.phase):
+                if self.committer.resume(
+                    user_id,
+                    operation,
+                    entry.phase,
+                    source_effect=entry.source_effect,
+                    relation_manifest=entry.relation_manifest,
+                ):
                     recovered.append(operation.operation_id)
-            except (FileNotFoundError, IsADirectoryError, NotADirectoryError) as exc:
+            except (
+                FileNotFoundError,
+                IsADirectoryError,
+                NotADirectoryError,
+                LockLostError,
+                RedoIntegrityError,
+            ) as exc:
                 self._record_failure(user_id, entry, exc)
         return RecoveryResult(recovered_count=len(recovered), operation_ids=recovered)
 

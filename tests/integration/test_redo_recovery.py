@@ -28,8 +28,12 @@ class RedoRecoveryTest(unittest.TestCase):
                 target_uri=obj.uri,
                 payload={"context_object": obj.to_dict(), "content": "prefers 26 degree"},
             )
-            source.write_object(obj, content="prefers 26 degree")
-            committer.redo.begin(operation, phase="source_written")
+            committer._apply_source(operation)
+            committer.redo.begin(
+                operation,
+                phase="source_written",
+                source_effect=committer._capture_regular_source_effect(operation),
+            )
             result = RecoveryService(committer.redo, committer).recover("u1")
             self.assertEqual(result.recovered_count, 1)
             self.assertTrue(index.search("26", filters={"owner_user_id": "u1", "context_type": "memory"}))

@@ -51,7 +51,11 @@ class RewardPenaltyIdempotencyTest(unittest.TestCase):
         reward = self.op(OperationAction.REWARD, {"reward": 1.0, "signal_type": "explicit_positive"})
         self.committer.commit("u1", [reward])
         first = self.source.read_object(self.policy.uri).metadata
-        self.committer.redo.begin(reward, phase="source_written")
+        self.committer.redo.begin(
+            reward,
+            phase="source_written",
+            source_effect=self.committer._capture_regular_source_effect(reward),
+        )
         RecoveryService(self.committer.redo, self.committer).recover("u1")
         second = self.source.read_object(self.policy.uri).metadata
         self.assertEqual(first["success_count"], second["success_count"])

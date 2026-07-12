@@ -22,7 +22,7 @@ from memoryos.memory.canonical.proposal import (
     SpeechAct,
     TemporalScope,
 )
-from memoryos.memory.canonical.reconcile import ReconciliationResult
+from memoryos.memory.canonical.reconcile import ReconciliationResult, RelationAuthority
 from memoryos.memory.canonical.semantic import EligibilityDisposition, MemoryTypeEligibilityPolicy
 from memoryos.memory.canonical.state import MemoryClaim, MemoryRevision, MemorySlot, TransitionProfile, profile_for
 from memoryos.memory.schema import MemoryType, MemoryTypeRegistry, MemoryTypeSchema
@@ -197,6 +197,10 @@ class MemoryTransitionPolicy:
                 "destructive_effect_requires_confirmed_pending_record",
             )
         active = reconciliation.active_claim
+        reconciliation = replace(
+            reconciliation,
+            relation_authority=RelationAuthority.STRUCTURED_REVIEW,
+        )
         authorization = self.__issue_effect_authorization(
             authority=_DestructiveEffectAuthority.STRUCTURED_PENDING_REVIEW,
             authorization_id=authorization_id,
@@ -261,6 +265,7 @@ class MemoryTransitionPolicy:
                 reconciliation.relation,
                 "nonfinal_relation_requires_review",
             )
+        self._validate_exact_relation_target(proposal, reconciliation)
         self._validate_v3_effect_gate(proposal, reconciliation)
         self._validate_destructive_effect_authorization(
             proposal,
@@ -658,8 +663,7 @@ class MemoryTransitionPolicy:
         if not (
             proposal.epistemic_status == EpistemicStatus.EXPLICIT
             and proposal.metadata.get("transition_evidence_validated") is True
-            and proposal.metadata.get("semantic_relation_evidence_validated") is True
-            and proposal.metadata.get("replacement_evidence_validated") is True
+            and reconciliation.relation_authority == RelationAuthority.STRUCTURED_REVIEW
             and transition_refs
             and relation_refs
             and set(transition_refs).issubset(proposal.evidence_refs)
@@ -670,6 +674,37 @@ class MemoryTransitionPolicy:
                 SemanticRelation.AMBIGUOUS,
                 "replacement_requires_validated_authoritative_evidence",
             )
+
+    def _validate_exact_relation_target(
+        self,
+        proposal: MemorySemanticProposal,
+        reconciliation: ReconciliationResult,
+    ) -> None:
+        semantic = proposal.semantic
+        assert isinstance(semantic, NormalizedSemanticAssessment)
+        if semantic.relation_to_existing not in {
+            SemanticRelation.CORRECTS,
+            SemanticRelation.SUPERSEDES,
+            SemanticRelation.SUPPLEMENTS,
+        }:
+            return
+        active = reconciliation.active_claim
+        if active is None:
+            raise PendingSemanticReconciliation(
+                reconciliation.relation,
+                "relation_target_requires_active_claim",
+            )
+        if proposal.related_claim_ids and tuple(proposal.related_claim_ids) != (active.claim_id,):
+            raise PendingSemanticReconciliation(reconciliation.relation, "relation_claim_target_mismatch")
+        if proposal.related_slot_ids and tuple(proposal.related_slot_ids) != (active.slot_id,):
+            raise PendingSemanticReconciliation(reconciliation.relation, "relation_slot_target_mismatch")
+        if proposal.related_memory_ids and tuple(proposal.related_memory_ids) not in {
+            (active.claim_id,),
+            (active.uri,),
+        }:
+            raise PendingSemanticReconciliation(reconciliation.relation, "relation_memory_target_mismatch")
+        if not proposal.related_claim_ids and not proposal.related_memory_ids:
+            raise PendingSemanticReconciliation(reconciliation.relation, "relation_target_missing")
 
     def _validate_retraction(
         self,
@@ -718,6 +753,11 @@ class MemoryTransitionPolicy:
             or reconciliation.relation not in {SemanticRelation.DUPLICATE, SemanticRelation.SUPPLEMENTS}
         ):
             return
+        if reconciliation.relation_authority == RelationAuthority.MODEL_REPORTED:
+            raise PendingSemanticReconciliation(
+                SemanticRelation.SUPPLEMENTS,
+                "supplement_requires_state_derivation_or_structured_review",
+            )
         semantic = proposal.semantic
         assert isinstance(semantic, NormalizedSemanticAssessment)
         confirmed = (

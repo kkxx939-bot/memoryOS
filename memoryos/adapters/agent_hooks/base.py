@@ -50,8 +50,14 @@ class BaseAgentHookAdapter:
     ) -> None:
         self.config = config
         self.mcp_client = mcp_client or AgentHookTransportClient(config)
-        self.queue = queue or PendingQueue(config.queue_path)
-        self.session_service = AgentSessionService(config.root)
+        if queue is not None and (queue.tenant_id != config.tenant_id or queue.user_id != config.user_id):
+            raise ValueError("pending hook queue principal does not match AgentHookConfig")
+        self.queue = queue or PendingQueue(
+            config.queue_path,
+            tenant_id=config.tenant_id,
+            user_id=config.user_id,
+        )
+        self.session_service = AgentSessionService(config.root, tenant_id=config.tenant_id)
 
     def assemble_context(self, event: AgentHookEvent, *, token_budget: int | None = None) -> HookResult:
         normalized = self._append_event(event)
@@ -74,14 +80,19 @@ class BaseAgentHookAdapter:
                 ok=True,
                 session_id=event.session_id,
                 injection_text=injection,
-                metadata={"source_uris": result.get("source_uris", []), "dropped_contexts": result.get("dropped_contexts", [])},
+                metadata={
+                    "source_uris": result.get("source_uris", []),
+                    "dropped_contexts": result.get("dropped_contexts", []),
+                },
             )
         except Exception as exc:
             return HookResult(ok=True, session_id=event.session_id, error=_hook_error(exc, "assemble_context"))
 
     def enqueue_commit(self, event: AgentHookEvent, *, messages: list[dict[str, Any]] | None = None) -> HookResult:
         normalized = self._append_event(event)
-        return HookResult(ok=True, session_id=event.session_id, metadata={"state": "ARCHIVED", "session_key": normalized.session_key})
+        return HookResult(
+            ok=True, session_id=event.session_id, metadata={"state": "ARCHIVED", "session_key": normalized.session_key}
+        )
 
     def commit_now(self, event: AgentHookEvent) -> HookResult:
         normalized = self._append_event(event)
@@ -100,6 +111,8 @@ class BaseAgentHookAdapter:
                         adapter_id=event.adapter_id,
                         hook_name=event.hook_name,
                         payload={"tool_name": "memoryos_commit_session", "arguments": arguments},
+                        tenant_id=self.config.tenant_id,
+                        user_id=self.config.user_id,
                         last_error=str(result["error"].get("code", "")),
                     )
                 )
@@ -110,7 +123,17 @@ class BaseAgentHookAdapter:
             committed = status in {"done", "committed"}
             queued = status in {"queued", "processing"}
             self.session_service.finalize(normalized.session_key, commit_state="COMMITTED" if committed else "QUEUED")
-            return HookResult(ok=True, session_id=event.session_id, committed=committed, queued=queued, metadata={"project_id": normalized.project_id, "session_key": normalized.session_key, "state": status.upper()})
+            return HookResult(
+                ok=True,
+                session_id=event.session_id,
+                committed=committed,
+                queued=queued,
+                metadata={
+                    "project_id": normalized.project_id,
+                    "session_key": normalized.session_key,
+                    "state": status.upper(),
+                },
+            )
         except Exception as exc:
             queued = self.queue.enqueue(
                 PendingItem(
@@ -119,10 +142,14 @@ class BaseAgentHookAdapter:
                     adapter_id=event.adapter_id,
                     hook_name=event.hook_name,
                     payload={"tool_name": "memoryos_commit_session", "arguments": arguments},
+                    tenant_id=self.config.tenant_id,
+                    user_id=self.config.user_id,
                     last_error=exc.__class__.__name__,
                 )
             )
-            return HookResult(ok=True, session_id=event.session_id, queued=queued, error=_hook_error(exc, "commit_session"))
+            return HookResult(
+                ok=True, session_id=event.session_id, queued=queued, error=_hook_error(exc, "commit_session")
+            )
 
     def flush(self) -> HookResult:
         try:
@@ -136,7 +163,13 @@ class BaseAgentHookAdapter:
         return HookResult(ok=True, session_id=event.session_id, metadata=metadata)
 
     def _append_event(self, event: AgentHookEvent):
+        event.tenant_id = self.config.tenant_id
+        event.user_id = self.config.user_id
+        event.adapter_id = self.config.adapter_id
+        event.agent_name = self.config.agent_name
         normalized = event.normalize()
+        if normalized.project_id not in self.config.allowed_workspace_ids:
+            raise PermissionError("agent hook workspace is not authorized by its trusted configuration")
         self.session_service.append_event(normalized)
         self.session_service.append_transcript(normalized)
         return normalized

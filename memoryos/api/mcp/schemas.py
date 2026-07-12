@@ -6,6 +6,7 @@ from typing import Any
 
 from memoryos.api.mcp.config import MCPServerConfig
 from memoryos.api.mcp.errors import ToolValidationError
+from memoryos.api.trusted_context import AUTHORITATIVE_FORGET, AUTHORITATIVE_REMEMBER
 from memoryos.connect import CapabilityProfile, ConnectMetadata, ConnectType, PipelineMode
 
 ALLOWED_METADATA_FIELDS = {
@@ -113,7 +114,13 @@ TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     },
     "memoryos_archive_search": {
         "type": "object",
-        "properties": {"query": {"type": "string"}, "user_id": {"type": "string"}, "limit": {"type": "integer"}},
+        "properties": {
+            "query": {"type": "string"},
+            "user_id": {"type": "string"},
+            "tenant_id": {"type": "string"},
+            "project_id": {"type": "string"},
+            "limit": {"type": "integer"},
+        },
         "required": ["query"],
     },
     "memoryos_archive_read": {
@@ -168,7 +175,12 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
 
 def tool_definitions(config: MCPServerConfig | None = None) -> list[dict[str, Any]]:
     action_tools = {"memoryos_predict", "memoryos_process_observation"}
-    enabled = config.enable_action_tools if config is not None else False
+    authoritative_tools = {
+        "memoryos_remember": AUTHORITATIVE_REMEMBER,
+        "memoryos_forget": AUTHORITATIVE_FORGET,
+    }
+    action_enabled = config.enable_action_tools if config is not None else False
+    capabilities = config.capabilities if config is not None else frozenset()
     return [
         {
             "name": name,
@@ -176,7 +188,8 @@ def tool_definitions(config: MCPServerConfig | None = None) -> list[dict[str, An
             "inputSchema": schema,
         }
         for name, schema in TOOL_INPUT_SCHEMAS.items()
-        if enabled or name not in action_tools
+        if (action_enabled or name not in action_tools)
+        and (name not in authoritative_tools or authoritative_tools[name] in capabilities)
     ]
 
 
@@ -285,6 +298,10 @@ def connection_schema(config: MCPServerConfig) -> dict[str, Any]:
         "allowed_run_modes": [PipelineMode.CONTEXT_REDUCTION],
         "allowed_adapter_ids": list(config.allowed_adapter_ids),
         "action_tools_enabled": config.enable_action_tools,
+        "trusted_user_id": config.user_id,
+        "trusted_tenant_id": config.tenant_id,
+        "trusted_capabilities": sorted(config.capabilities),
+        "trusted_workspace_ids": sorted(config.allowed_workspace_ids),
         "embodied_profile_example": ConnectMetadata.action_capable_embodied("reachy_mini").to_dict(),
     }
 
@@ -299,6 +316,8 @@ def _filtered_metadata(payload: dict[str, Any] | None) -> dict[str, Any]:
 
 def _allowed_agent_adapter_id(value: Any, config: MCPServerConfig) -> str:
     adapter_id = str(value)
+    if adapter_id != config.adapter_id:
+        raise ToolValidationError("adapter_id does not match the trusted MCP adapter")
     if adapter_id not in config.allowed_adapter_ids:
         raise ToolValidationError(f"adapter_id is not allowed: {adapter_id}")
     return adapter_id

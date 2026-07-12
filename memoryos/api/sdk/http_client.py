@@ -7,7 +7,21 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from typing import Any
+
+
+@dataclass(frozen=True)
+class RemoteMemoryOSError(RuntimeError):
+    code: str
+    message: str
+    retryable: bool = False
+    request_id: str = ""
+    operation: str = ""
+    status_code: int | None = None
+
+    def __str__(self) -> str:
+        return self.message or self.code
 
 
 class HTTPMemoryOSClient:
@@ -20,6 +34,7 @@ class HTTPMemoryOSClient:
         api_token: str | None = None,
         account_id: str | None = None,
         user_id: str | None = None,
+        tenant_id: str | None = None,
         connect_timeout: float = 2.0,
         read_timeout: float = 10.0,
         retries: int = 2,
@@ -28,6 +43,7 @@ class HTTPMemoryOSClient:
         self.api_token = api_token
         self.account_id = account_id
         self.user_id = user_id
+        self.tenant_id = tenant_id
         self.connect_timeout = max(0.05, connect_timeout)
         self.read_timeout = max(0.05, read_timeout)
         self.timeout = max(connect_timeout, read_timeout)
@@ -43,6 +59,8 @@ class HTTPMemoryOSClient:
             headers["X-MemoryOS-Account"] = self.account_id
         if self.user_id:
             headers["X-MemoryOS-User"] = self.user_id
+        if self.tenant_id:
+            headers["X-MemoryOS-Tenant"] = self.tenant_id
         request = urllib.request.Request(self.base_url + path, data=body, headers=headers, method=method)
         for attempt in range(self.retries + 1):
             try:
@@ -52,18 +70,47 @@ class HTTPMemoryOSClient:
             except urllib.error.HTTPError as exc:
                 retryable = exc.code >= 500
                 if not retryable or attempt >= self.retries:
-                    return {"error": {"code": "HTTP_ERROR", "message": f"HTTP {exc.code}", "retryable": retryable, "request_id": request_id, "operation": path}}
+                    return {
+                        "error": {
+                            "code": "HTTP_ERROR",
+                            "message": f"HTTP {exc.code}",
+                            "retryable": retryable,
+                            "request_id": request_id,
+                            "operation": path,
+                            "status_code": exc.code,
+                        }
+                    }
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 if attempt >= self.retries:
-                    return {"error": {"code": "REMOTE_UNAVAILABLE", "message": str(exc)[:200], "retryable": True, "request_id": request_id, "operation": path}}
+                    return {
+                        "error": {
+                            "code": "REMOTE_UNAVAILABLE",
+                            "message": str(exc)[:200],
+                            "retryable": True,
+                            "request_id": request_id,
+                            "operation": path,
+                        }
+                    }
             time.sleep(0.05 * (attempt + 1))
-        return {"error": {"code": "REMOTE_UNAVAILABLE", "message": "request failed", "retryable": True, "request_id": request_id, "operation": path}}
+        return {
+            "error": {
+                "code": "REMOTE_UNAVAILABLE",
+                "message": "request failed",
+                "retryable": True,
+                "request_id": request_id,
+                "operation": path,
+            }
+        }
 
     def search_context(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
-        return list(self.request("POST", "/v1/context/search", {"query": query, **kwargs}).get("results", []))
+        response = self.request("POST", "/v1/context/search", {"query": query, **kwargs})
+        _raise_remote_error(response)
+        return list(response.get("results", []))
 
     def assemble_context(self, query: str, **kwargs: Any) -> dict[str, Any]:
-        return self.request("POST", "/v1/context/assemble", {"query": query, **kwargs})
+        response = self.request("POST", "/v1/context/assemble", {"query": query, **kwargs})
+        _raise_remote_error(response)
+        return response
 
     def commit_agent_session(self, **kwargs: Any) -> dict[str, Any]:
         archived = self.append_session_event(kwargs)
@@ -107,15 +154,19 @@ class HTTPMemoryOSClient:
         user_id: str,
         tenant_id: str = "default",
         lifecycle_states: list[str] | None = None,
+        project_id: str = "",
     ) -> list[dict[str, Any]]:
         query = urllib.parse.urlencode(
             {
                 "user_id": user_id,
                 "tenant_id": tenant_id,
                 "lifecycle_state": ",".join(lifecycle_states or []),
+                **({"project_id": project_id} if project_id else {}),
             }
         )
-        return list(self.request("GET", f"/v1/memories/pending?{query}").get("results", []))
+        response = self.request("GET", f"/v1/memories/pending?{query}")
+        _raise_remote_error(response)
+        return list(response.get("results", []))
 
     def review_pending(self, **kwargs: Any) -> dict[str, Any]:
         return self.request("POST", "/v1/memories/pending/review", kwargs)
@@ -127,12 +178,27 @@ class HTTPMemoryOSClient:
     def recall_trace(self, trace_id: str) -> dict[str, Any]:
         return self.request("GET", f"/v1/recall-traces/{urllib.parse.quote(trace_id, safe='')}")
 
-    def archive_search(self, query: str, *, user_id: str, limit: int = 20) -> list[dict[str, Any]]:
+    def archive_search(
+        self,
+        query: str,
+        *,
+        user_id: str,
+        limit: int = 20,
+        tenant_id: str | None = None,
+        project_id: str = "",
+    ) -> list[dict[str, Any]]:
         response = self.request(
             "POST",
             "/v1/archives/search",
-            {"query": query, "user_id": user_id, "limit": limit},
+            {
+                "query": query,
+                "user_id": user_id,
+                "limit": limit,
+                **({"tenant_id": tenant_id} if tenant_id is not None else {}),
+                **({"project_id": project_id} if project_id else {}),
+            },
         )
+        _raise_remote_error(response)
         return list(response.get("results", []))
 
     def archive_read(self, archive_uri: str) -> dict[str, Any]:
@@ -145,4 +211,20 @@ class HTTPMemoryOSClient:
 
 def _request_id() -> str:
     import uuid
+
     return str(uuid.uuid4())
+
+
+def _raise_remote_error(response: dict[str, Any]) -> None:
+    raw = response.get("error")
+    if not isinstance(raw, dict):
+        return
+    status_code = raw.get("status_code")
+    raise RemoteMemoryOSError(
+        code=str(raw.get("code") or "REMOTE_ERROR"),
+        message=str(raw.get("message") or "remote MemoryOS request failed"),
+        retryable=bool(raw.get("retryable", False)),
+        request_id=str(raw.get("request_id") or ""),
+        operation=str(raw.get("operation") or ""),
+        status_code=int(status_code) if isinstance(status_code, int) else None,
+    )

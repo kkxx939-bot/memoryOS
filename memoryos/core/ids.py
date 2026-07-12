@@ -8,6 +8,21 @@ import uuid
 from typing import Any
 
 
+def require_safe_path_segment(value: object, field_name: str) -> str:
+    """Return one identifier that cannot escape its intended parent path."""
+
+    if (
+        not isinstance(value, str)
+        or not value
+        or value in {".", ".."}
+        or "/" in value
+        or "\\" in value
+        or "\x00" in value
+    ):
+        raise ValueError(f"{field_name} must be one safe non-empty path segment")
+    return value
+
+
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
 

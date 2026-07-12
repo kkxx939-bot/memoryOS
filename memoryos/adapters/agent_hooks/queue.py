@@ -40,6 +40,8 @@ class PendingItem:
     adapter_id: str
     hook_name: str
     payload: dict[str, Any]
+    tenant_id: str = "default"
+    user_id: str = "default"
     retry_count: int = 0
     created_at: str = field(default_factory=utc_now)
     last_error: str = ""
@@ -48,19 +50,33 @@ class PendingItem:
 
 
 class PendingQueue:
-    def __init__(self, path: str, *, max_retries: int = 3, processing_lease_seconds: int = 300) -> None:
+    def __init__(
+        self,
+        path: str,
+        *,
+        tenant_id: str = "default",
+        user_id: str = "default",
+        max_retries: int = 3,
+        processing_lease_seconds: int = 300,
+    ) -> None:
+        _validate_tenant_id(tenant_id)
+        _validate_user_id(user_id)
         self.path = Path(path)
+        self.tenant_id = tenant_id
+        self.user_id = user_id
         self.lock_path = self.path.with_suffix(self.path.suffix + ".lock")
         self.dead_letter_path = self.path.with_suffix(self.path.suffix + ".dead")
         self.max_retries = max(1, max_retries)
         self.processing_lease_seconds = max(1, processing_lease_seconds)
 
     def enqueue(self, item: PendingItem) -> bool:
+        if not self._owns(item):
+            raise PermissionError("pending hook item principal does not match the queue")
         queued = False
 
         def update(items: list[PendingItem]) -> list[PendingItem]:
             nonlocal queued
-            if any(existing.event_id == item.event_id for existing in items):
+            if any(_item_key(existing) == _item_key(item) for existing in items):
                 return items
             queued = True
             return [*items, item]
@@ -81,7 +97,7 @@ class PendingQueue:
             updated: list[PendingItem] = []
             claimed = []
             for item in items:
-                if len(claimed) < limit and _is_flushable(item, now):
+                if self._owns(item) and len(claimed) < limit and _is_flushable(item, now):
                     item.status = "processing"
                     item.processing_until = lease_until
                     claimed.append(item)
@@ -90,7 +106,7 @@ class PendingQueue:
 
         self._locked_update(claim)
         retry_items: list[PendingItem] = []
-        success_event_ids: set[str] = set()
+        success_keys: set[tuple[str, str, str]] = set()
         dead_letter_items: list[PendingItem] = []
         for item in claimed:
             tool_name = str(item.payload.get("tool_name", "memoryos_commit_session"))
@@ -109,7 +125,7 @@ class PendingQueue:
                 if isinstance(result, dict) and result.get("error"):
                     raise RuntimeError(str(result["error"].get("code", "MCP_ERROR")))
                 flushed += 1
-                success_event_ids.add(item.event_id)
+                success_keys.add(_item_key(item))
             except Exception as exc:
                 item.retry_count += 1
                 item.last_error = _safe_error(exc)
@@ -123,39 +139,44 @@ class PendingQueue:
                     retry_items.append(item)
 
         def finalize(items: list[PendingItem]) -> list[PendingItem]:
-            retry_by_event_id = {item.event_id: item for item in retry_items}
-            dead_letter_event_ids = {item.event_id for item in dead_letter_items}
+            retry_by_key = {_item_key(item): item for item in retry_items}
+            dead_letter_keys = {_item_key(item) for item in dead_letter_items}
             remaining: list[PendingItem] = []
-            seen_retry_ids: set[str] = set()
+            seen_retry_keys: set[tuple[str, str, str]] = set()
             for item in items:
-                if item.event_id in success_event_ids or item.event_id in dead_letter_event_ids:
+                key = _item_key(item)
+                if key in success_keys or key in dead_letter_keys:
                     continue
-                retry_item = retry_by_event_id.get(item.event_id)
+                retry_item = retry_by_key.get(key)
                 if retry_item is not None:
                     remaining.append(retry_item)
-                    seen_retry_ids.add(item.event_id)
+                    seen_retry_keys.add(key)
                     continue
                 remaining.append(item)
             for item in retry_items:
-                if item.event_id not in seen_retry_ids:
+                if _item_key(item) not in seen_retry_keys:
                     remaining.append(item)
             for item in dead_letter_items:
                 self._append_dead_letter(item)
             return remaining
 
-        remaining_count = self._locked_update(finalize) if claimed else len(self.list_items())
+        if claimed:
+            self._locked_update(finalize)
+        remaining_count = len(self.list_items())
         return {"flushed": flushed, "failed": failed, "remaining": remaining_count, "dead_lettered": dead_lettered}
 
     def list_items(self) -> list[PendingItem]:
-        return self._read_items()
+        return [item for item in self._read_items() if self._owns(item)]
 
     def mark_success(self, event_id: str) -> None:
-        self._locked_update(lambda items: [item for item in items if item.event_id != event_id])
+        self._locked_update(
+            lambda items: [item for item in items if not (self._owns(item) and item.event_id == event_id)]
+        )
 
     def mark_failed(self, event_id: str, error: str) -> None:
         def update(items: list[PendingItem]) -> list[PendingItem]:
             for item in items:
-                if item.event_id == event_id:
+                if self._owns(item) and item.event_id == event_id:
                     item.retry_count += 1
                     item.last_error = sanitize_error_text(str(error), max_text=300)
             return items
@@ -179,6 +200,9 @@ class PendingQueue:
             except Exception:
                 continue
         return items
+
+    def _owns(self, item: PendingItem) -> bool:
+        return item.tenant_id == self.tenant_id and item.user_id == self.user_id
 
     def _write_items(self, items: list[PendingItem]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -248,3 +272,29 @@ def _is_flushable(item: PendingItem, now: datetime) -> bool:
         return datetime.fromisoformat(item.processing_until) <= now
     except ValueError:
         return True
+
+
+def _item_key(item: PendingItem) -> tuple[str, str, str]:
+    return item.tenant_id, item.user_id, item.event_id
+
+
+def _validate_tenant_id(tenant_id: str) -> None:
+    if (
+        not isinstance(tenant_id, str)
+        or not tenant_id.strip()
+        or tenant_id in {".", ".."}
+        or "/" in tenant_id
+        or "\\" in tenant_id
+    ):
+        raise ValueError("tenant_id must be one safe non-empty path segment")
+
+
+def _validate_user_id(user_id: str) -> None:
+    if (
+        not isinstance(user_id, str)
+        or not user_id.strip()
+        or user_id in {".", ".."}
+        or "/" in user_id
+        or "\\" in user_id
+    ):
+        raise ValueError("user_id must be one safe non-empty path segment")

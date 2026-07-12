@@ -20,6 +20,14 @@ from memoryos.api.mcp.schemas import (
     require_process_observation_metadata,
     required_str,
 )
+from memoryos.api.trusted_context import (
+    AUTHORITATIVE_FORGET,
+    AUTHORITATIVE_REMEMBER,
+    COMMIT_SESSION,
+    READ_CONTEXT,
+    TrustedRequestContext,
+)
+from memoryos.contextdb.model.context_uri import ContextURI
 from memoryos.prediction.model.prediction_request import PredictionRequest
 
 
@@ -27,6 +35,10 @@ class MCPToolRouter:
     def __init__(self, client: Any, config: MCPServerConfig | None = None) -> None:
         self.client = client
         self.config = config or MCPServerConfig.from_env()
+        self.caller = self.config.trusted_context()
+        client_tenant = getattr(client, "tenant_id", self.caller.tenant_id)
+        if str(client_tenant) != self.caller.tenant_id:
+            raise ValueError("MCP client tenant does not match trusted caller tenant")
 
     def call(self, name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
         args = dict(arguments or {})
@@ -40,12 +52,23 @@ class MCPToolRouter:
             if name == "memoryos_health":
                 return self.health()
             if name == "memoryos_read":
-                return ok_payload(self.client.read(required_str(args, "uri"), layer=str(args.get("layer") or "L2")))
+                self.caller.require(READ_CONTEXT)
+                return _client_payload(
+                    self.client.read(
+                        required_str(args, "uri"),
+                        layer=str(args.get("layer") or "L2"),
+                        **self._local_caller_kwargs(),
+                    )
+                )
             if name == "memoryos_remember":
+                self.caller.require(AUTHORITATIVE_REMEMBER)
+                if self.caller.actor_kind != "user":
+                    raise PermissionError("authoritative remember requires a trusted user actor")
+                self._assert_identity(args)
                 metadata = normalize_agent_metadata(args.get("connect_metadata"), self.config)
-                return ok_payload(
+                return _client_payload(
                     self.client.remember(
-                        user_id=str(args.get("user_id") or self.config.user_id),
+                        user_id=self.caller.user_id,
                         content=required_str(args, "content"),
                         title=str(args.get("title") or ""),
                         memory_type=str(args.get("memory_type") or "project_decision"),
@@ -54,28 +77,49 @@ class MCPToolRouter:
                         condition=str(args.get("condition") or ""),
                         exception=str(args.get("exception") or ""),
                         connect_metadata=metadata,
+                        tenant_id=self.caller.tenant_id,
+                        **self._local_caller_kwargs(),
                     )
                 )
             if name == "memoryos_forget":
-                return ok_payload(
+                self.caller.require(AUTHORITATIVE_FORGET)
+                self._assert_identity(args)
+                return _client_payload(
                     self.client.forget(
-                        user_id=str(args.get("user_id") or self.config.user_id), uri=required_str(args, "uri")
+                        user_id=self.caller.user_id,
+                        uri=required_str(args, "uri"),
+                        tenant_id=self.caller.tenant_id,
+                        **self._local_caller_kwargs(),
                     )
                 )
             if name == "memoryos_archive_search":
+                self.caller.require(READ_CONTEXT)
                 return ok_payload(
                     {
                         "results": self.client.archive_search(
                             required_str(args, "query"),
-                            user_id=str(args.get("user_id") or self.config.user_id),
+                            user_id=self._bound_user(args),
                             limit=optional_int(args, "limit", 20, maximum=100),
+                            tenant_id=self._bound_tenant(args),
+                            project_id=str(args.get("project_id") or ""),
+                            **self._local_caller_kwargs(),
                         )
                     }
                 )
             if name == "memoryos_archive_read":
-                return ok_payload(self.client.archive_read(required_str(args, "archive_uri")))
+                self.caller.require(READ_CONTEXT)
+                archive_uri = required_str(args, "archive_uri")
+                if ContextURI.parse(archive_uri).user_id != self.caller.user_id:
+                    raise FileNotFoundError(archive_uri)
+                return _client_payload(self.client.archive_read(archive_uri, **self._local_caller_kwargs()))
             if name == "memoryos_recall_trace":
-                return ok_payload(self.client.recall_trace(required_str(args, "trace_id")))
+                self.caller.require(READ_CONTEXT)
+                return _client_payload(
+                    self.client.recall_trace(
+                        required_str(args, "trace_id"),
+                        **self._local_caller_kwargs(),
+                    )
+                )
             if name == "memoryos_connection_schema":
                 return ok_payload(connection_schema(self.config))
             if name == "memoryos_predict":
@@ -94,6 +138,7 @@ class MCPToolRouter:
             return exception_payload(exc)
 
     def search_context(self, args: dict[str, Any]) -> dict[str, Any]:
+        self.caller.require(READ_CONTEXT)
         query = required_str(args, "query")
         limit = optional_int(args, "limit", 10, minimum=0, maximum=100)
         metadata = normalize_agent_metadata(args.get("connect_metadata"), self.config)
@@ -110,40 +155,42 @@ class MCPToolRouter:
                 contexts.extend(
                     self.client.search_context(
                         query,
-                        user_id=args.get("user_id") or self.config.user_id,
+                        user_id=self._bound_user(args),
                         context_type=requested_type,
                         limit=limit,
                         connect_metadata=filter_metadata,
                         search_scope=str(search_scope) if search_scope else None,
                         retrieval_views=[str(item) for item in retrieval_views or []],
                         project_id=project_id,
-                        tenant_id=str(args.get("tenant_id") or "default"),
+                        tenant_id=self._bound_tenant(args),
                         applicability_scopes=[dict(item) for item in optional_list(args, "applicability_scopes") or []],
                         memory_states=[str(item) for item in optional_list(args, "memory_states") or []],
                         memory_types=[str(item) for item in optional_list(args, "memory_types") or []],
                         claim_uris=[str(item) for item in optional_list(args, "claim_uris") or []],
                         slot_uris=[str(item) for item in optional_list(args, "slot_uris") or []],
                         query_intent=str(args.get("query_intent")) if args.get("query_intent") else None,
+                        **self._local_caller_kwargs(),
                     )
                 )
             contexts = _dedupe_contexts(contexts)[:limit]
         else:
             contexts = self.client.search_context(
                 query,
-                user_id=args.get("user_id") or self.config.user_id,
+                user_id=self._bound_user(args),
                 context_type=None,
                 limit=limit,
                 connect_metadata=filter_metadata,
                 search_scope=str(search_scope) if search_scope else None,
                 retrieval_views=[str(item) for item in retrieval_views or []],
                 project_id=project_id,
-                tenant_id=str(args.get("tenant_id") or "default"),
+                tenant_id=self._bound_tenant(args),
                 applicability_scopes=[dict(item) for item in optional_list(args, "applicability_scopes") or []],
                 memory_states=[str(item) for item in optional_list(args, "memory_states") or []],
                 memory_types=[str(item) for item in optional_list(args, "memory_types") or []],
                 claim_uris=[str(item) for item in optional_list(args, "claim_uris") or []],
                 slot_uris=[str(item) for item in optional_list(args, "slot_uris") or []],
                 query_intent=str(args.get("query_intent")) if args.get("query_intent") else None,
+                **self._local_caller_kwargs(),
             )
         source_uris = [str(item.get("uri", "")) for item in contexts if item.get("uri")]
         return ok_payload(
@@ -151,6 +198,7 @@ class MCPToolRouter:
         )
 
     def assemble_context(self, args: dict[str, Any]) -> dict[str, Any]:
+        self.caller.require(READ_CONTEXT)
         query = required_str(args, "query")
         token_budget = optional_int(args, "token_budget", self.config.token_budget, minimum=0, maximum=200_000)
         limit = optional_int(args, "limit", 20, minimum=0, maximum=200)
@@ -162,7 +210,7 @@ class MCPToolRouter:
         filter_metadata = agent_search_filter_metadata(args.get("connect_metadata"), self.config)
         assembled = self.client.assemble_context(
             query,
-            user_id=args.get("user_id") or self.config.user_id,
+            user_id=self._bound_user(args),
             token_budget=token_budget,
             context_types=context_types,
             limit=limit,
@@ -170,13 +218,14 @@ class MCPToolRouter:
             search_scope=str(search_scope) if search_scope else None,
             retrieval_views=[str(item) for item in retrieval_views or []],
             project_id=project_id,
-            tenant_id=str(args.get("tenant_id") or "default"),
+            tenant_id=self._bound_tenant(args),
             applicability_scopes=[dict(item) for item in optional_list(args, "applicability_scopes") or []],
             memory_states=[str(item) for item in optional_list(args, "memory_states") or []],
             memory_types=[str(item) for item in optional_list(args, "memory_types") or []],
             claim_uris=[str(item) for item in optional_list(args, "claim_uris") or []],
             slot_uris=[str(item) for item in optional_list(args, "slot_uris") or []],
             query_intent=str(args.get("query_intent")) if args.get("query_intent") else None,
+            **self._local_caller_kwargs(),
         )
         payload = {
             "packed_context": assembled.get("packed_context", ""),
@@ -190,9 +239,14 @@ class MCPToolRouter:
         return ok_payload(payload)
 
     def commit_session(self, args: dict[str, Any]) -> dict[str, Any]:
+        self.caller.require(COMMIT_SESSION)
         session_id = required_str(args, "session_id")
-        user_id = str(args.get("user_id") or self.config.user_id)
+        user_id = self._bound_user(args)
+        tenant_id = self._bound_tenant(args)
         metadata = normalize_agent_metadata(args.get("connect_metadata"), self.config)
+        scope = dict(args.get("scope") or {})
+        self.caller.assert_identity(user_id=scope.get("user_id"), tenant_id=scope.get("tenant_id"))
+        scope.update({"user_id": user_id, "tenant_id": tenant_id})
         result = self.client.commit_agent_session(
             user_id=user_id,
             session_id=session_id,
@@ -203,8 +257,9 @@ class MCPToolRouter:
             async_commit=optional_bool(args, "async_commit", False),
             project_id=str(args.get("project_id") or ""),
             session_key=str(args.get("session_key") or ""),
-            scope=dict(args.get("scope") or {}),
+            scope=scope,
             provenance=dict(args.get("provenance") or {}),
+            **self._local_caller_kwargs(),
         )
         result_payload = _to_payload(result) or {"status": "accepted"}
         return ok_payload(
@@ -214,6 +269,22 @@ class MCPToolRouter:
                 "metadata": {"connect": metadata},
             }
         )
+
+    def _assert_identity(self, args: dict[str, Any]) -> None:
+        self.caller.assert_identity(user_id=args.get("user_id"), tenant_id=args.get("tenant_id"))
+
+    def _bound_user(self, args: dict[str, Any]) -> str:
+        self._assert_identity(args)
+        return self.caller.user_id
+
+    def _bound_tenant(self, args: dict[str, Any]) -> str:
+        self._assert_identity(args)
+        return self.caller.tenant_id
+
+    def _local_caller_kwargs(self) -> dict[str, TrustedRequestContext]:
+        if getattr(self.client, "mode", None) in {"local", "server"}:
+            return {"caller": self.caller}
+        return {}
 
     def health(self) -> dict[str, Any]:
         metadata = {
@@ -240,6 +311,9 @@ class MCPToolRouter:
         request_payload = args.get("request")
         if not isinstance(request_payload, dict):
             raise ValueError("requires object field: request")
+        required_str(request_payload, "user_id")
+        self.caller.assert_identity(user_id=request_payload.get("user_id"))
+        request_payload = {**request_payload, "user_id": self.caller.user_id}
         metadata = normalize_action_metadata(request_payload.get("connect_metadata") or args.get("connect_metadata"))
         request_payload = {**request_payload, "connect_metadata": metadata.to_dict()}
         result = self.client.predict(_prediction_request(request_payload), _policies(args.get("policies")))
@@ -250,6 +324,9 @@ class MCPToolRouter:
         request_payload = args.get("request")
         if not isinstance(request_payload, dict):
             raise ValueError("requires object field: request")
+        required_str(request_payload, "user_id")
+        self.caller.assert_identity(user_id=request_payload.get("user_id"))
+        request_payload = {**request_payload, "user_id": self.caller.user_id}
         metadata = require_process_observation_metadata(
             request_payload.get("connect_metadata") or args.get("connect_metadata")
         )
@@ -271,6 +348,12 @@ def _estimate_tokens(text: str) -> int:
     if not text:
         return 0
     return max(1, len(text) // 4)
+
+
+def _client_payload(value: dict[str, Any]) -> dict[str, Any]:
+    if value.get("error"):
+        return value
+    return ok_payload(value)
 
 
 def _to_payload(value: Any) -> Any:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -11,6 +12,7 @@ from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_uri import ContextURI
 from memoryos.contextdb.model.lifecycle import LifecycleState
 from memoryos.contextdb.store.source_store import IndexHit, IndexStore, SourceStore
+from memoryos.memory.canonical.scope import MemoryScope, scope_key_from_payload
 from memoryos.operations.model.context_operation import ContextOperation
 from memoryos.operations.model.operation_action import OperationAction
 from memoryos.operations.model.operation_status import OperationStatus
@@ -126,7 +128,11 @@ class TargetResolver:
         if candidates:
             top_score = self._base_relevance(candidates[0])
             second_score = self._base_relevance(candidates[1]) if len(candidates) > 1 else 0.0
-            if top_score >= self.absolute_threshold and (
+            weak_single_cjk = self._single_cjk_lexical_only(
+                self._query_for(operation),
+                candidates[0],
+            )
+            if not weak_single_cjk and top_score >= self.absolute_threshold and (
                 len(candidates) == 1 or top_score - second_score >= self.margin_threshold
             ):
                 operation.target_uri = candidates[0].uri
@@ -480,6 +486,31 @@ class TargetResolver:
         if metadata.get("fields") is not None and not isinstance(metadata.get("fields"), dict):
             return "target_scope_invalid"
         target_scope = dict(raw_target_scope or {})
+        if metadata.get("canonical_kind") in {"claim", "slot", "pending_proposal"}:
+            try:
+                canonical_scope = MemoryScope.from_dict(target_scope)
+            except (KeyError, TypeError, ValueError):
+                return "target_scope_invalid"
+            if canonical_scope.canonical_subject is None:
+                return "target_scope_invalid"
+            if canonical_scope.visibility.tenant_id != boundary.tenant_id:
+                return "target_tenant_mismatch"
+            if canonical_scope.authority.inferred:
+                return "target_scope_invalid"
+            asserted_by = str(
+                metadata.get("asserted_by")
+                or (target.owner_user_id if metadata.get("canonical_kind") == "pending_proposal" else "")
+                or ""
+            )
+            asserted_by_service = str(metadata.get("asserted_by_service") or "")
+            if (
+                canonical_scope.authority.principal_ids
+                or canonical_scope.authority.service_ids
+            ) and not (
+                asserted_by in set(canonical_scope.authority.principal_ids)
+                or asserted_by_service in set(canonical_scope.authority.service_ids)
+            ):
+                return "target_scope_invalid"
         if not self._valid_scope_shape(target_scope):
             return "target_scope_invalid"
         target_workspaces = self._workspace_values(target_scope, metadata)
@@ -536,6 +567,10 @@ class TargetResolver:
                 return False
             if item.get("namespace") is not None and not self._nonempty_string(item.get("namespace")):
                 return False
+            try:
+                scope_key_from_payload(item)
+            except (KeyError, TypeError, ValueError):
+                return False
         return True
 
     def _invalid_boundary_value(self, value: Any) -> bool:
@@ -549,7 +584,7 @@ class TargetResolver:
             return ()
         applicability = dict(raw_applicability)
         keys = [
-            f"{item.get('namespace', 'memoryos')}:{item.get('kind')}:{item.get('id')}"
+            scope_key_from_payload(item)
             for item in applicability.get("all_of", []) or []
             if isinstance(item, dict) and item.get("kind") and item.get("id")
         ]
@@ -616,6 +651,20 @@ class TargetResolver:
                 return 0.0
             values.append(self._bounded_score(value))
         return max(values, default=0.0)
+
+    def _single_cjk_lexical_only(self, query: str, hit: IndexHit) -> bool:
+        normalized = str(query).strip()
+        if not re.fullmatch(r"[\u4e00-\u9fff]", normalized):
+            return False
+        if not isinstance(hit.metadata, Mapping):
+            return True
+        raw_scores = hit.metadata.get("retrieval_scores", {})
+        if not isinstance(raw_scores, Mapping):
+            return True
+        scores = dict(raw_scores)
+        vector = self._finite_nonnegative(scores.get("vector", 0.0))
+        identity = self._finite_nonnegative(scores.get("identity", 0.0))
+        return not ((vector is not None and vector > 0) or (identity is not None and identity > 0))
 
     def _bounded_score(self, value: Any) -> float:
         try:

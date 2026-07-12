@@ -18,6 +18,7 @@ from memoryos.memory.canonical.retrieval import (
     CanonicalMemoryRetriever,
     CanonicalQueryIntent,
 )
+from memoryos.memory.canonical.scope import MemoryScope, scope_keys_from_payloads
 from memoryos.memory.retrieval_plan import MemoryRetrievalPlanner
 from memoryos.providers.rerank import Reranker
 
@@ -94,6 +95,7 @@ class ContextAssembler:
                 project_id=project_id,
                 adapter_id=adapter_id,
                 tenant_id=tenant_id,
+                applicability_scope_keys=applicability_scope_keys,
             )
             recalled = self._rerank(query, self._filter_connect(results, connect_filters))[:requested_limit]
             return self._merge_canonical(
@@ -217,20 +219,54 @@ class ContextAssembler:
                 and not include_candidates
             ):
                 continue
-            scope = dict(metadata.get("scope", {}) or {})
-            visibility = dict(scope.get("visibility", {}) or {})
-            if visibility:
-                if str(visibility.get("tenant_id", "default")) != tenant_id:
+            raw_scope = metadata.get("scope", {}) or {}
+            if not isinstance(raw_scope, dict):
+                continue
+            scope = dict(raw_scope)
+            if metadata.get("canonical_kind") in {"claim", "slot", "pending_proposal"}:
+                try:
+                    canonical_scope = MemoryScope.from_dict(raw_scope)
+                except (KeyError, TypeError, ValueError):
                     continue
-                principals = {str(item) for item in visibility.get("allowed_principal_ids", []) or []}
-                if principals and (user_id is None or user_id not in principals):
+                if canonical_scope.canonical_subject is None:
                     continue
-            applicability = dict(scope.get("applicability", {}) or {})
-            required_scopes = {
-                f"{item.get('namespace', 'memoryos')}:{item.get('kind')}:{item.get('id')}"
-                for item in applicability.get("all_of", []) or []
-                if isinstance(item, dict) and item.get("kind") and item.get("id")
-            }
+                if not canonical_scope.visibility.permits(tenant_id=tenant_id, principal_id=user_id):
+                    continue
+                if canonical_scope.authority.inferred:
+                    continue
+                asserted_by = str(
+                    metadata.get("asserted_by")
+                    or (obj.owner_user_id if metadata.get("canonical_kind") == "pending_proposal" else "")
+                    or ""
+                )
+                asserted_by_service = str(metadata.get("asserted_by_service") or "")
+                if (
+                    canonical_scope.authority.principal_ids
+                    or canonical_scope.authority.service_ids
+                ) and not (
+                    asserted_by in set(canonical_scope.authority.principal_ids)
+                    or asserted_by_service in set(canonical_scope.authority.service_ids)
+                ):
+                    continue
+                required_scopes = {item.key for item in canonical_scope.applicability.all_of}
+            else:
+                raw_visibility = scope.get("visibility", {}) or {}
+                if not isinstance(raw_visibility, dict):
+                    continue
+                visibility = dict(raw_visibility)
+                if visibility:
+                    if str(visibility.get("tenant_id", "default")) != tenant_id:
+                        continue
+                    principals = {str(item) for item in visibility.get("allowed_principal_ids", []) or []}
+                    if principals and (user_id is None or user_id not in principals):
+                        continue
+                try:
+                    raw_applicability = scope.get("applicability", {}) or {}
+                    if not isinstance(raw_applicability, dict):
+                        continue
+                    required_scopes = set(scope_keys_from_payloads(raw_applicability.get("all_of", [])))
+                except (KeyError, TypeError, ValueError):
+                    continue
             if required_scopes and not required_scopes.issubset(available_scopes):
                 continue
             fields = dict(metadata.get("fields", {}) or {})
@@ -435,6 +471,7 @@ class ContextAssembler:
         project_id: str,
         adapter_id: str,
         tenant_id: str,
+        applicability_scope_keys: Sequence[str] | None,
     ) -> list[dict[str, Any]]:
         if limit <= 0:
             return []
@@ -455,7 +492,7 @@ class ContextAssembler:
                 tenant_id=tenant_id,
                 context_type=context_type,
                 project_id=project_id,
-                applicability_scope_keys=None,
+                applicability_scope_keys=applicability_scope_keys,
                 include_candidates=plan.include_candidates,
             )
             or ()

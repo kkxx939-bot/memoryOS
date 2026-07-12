@@ -22,6 +22,7 @@ from memoryos.memory.canonical.projection_state import (
     ProjectionStatus,
     ProjectionStepStatus,
 )
+from memoryos.memory.canonical.scope import MemoryScope
 from memoryos.memory.canonical.visibility import read_committed_canonical
 from memoryos.providers.embedding import EmbeddingProvider, HashingEmbeddingProvider
 
@@ -76,6 +77,25 @@ class CanonicalMemoryProjector:
             return ProjectionResult(claim_uri, current_revision, "skipped_uncommitted")
         if metadata.get("canonical_kind") != "claim":
             return ProjectionResult(claim_uri, current_revision, "skipped_non_claim")
+        raw_scope = metadata.get("scope")
+        try:
+            canonical_scope = MemoryScope.from_dict(raw_scope) if isinstance(raw_scope, dict) else None
+        except (KeyError, TypeError, ValueError):
+            canonical_scope = None
+        asserted_by = str(metadata.get("asserted_by") or "")
+        asserted_by_service = str(metadata.get("asserted_by_service") or "")
+        if (
+            canonical_scope is None
+            or canonical_scope.canonical_subject is None
+            or canonical_scope.visibility.tenant_id != str(obj.tenant_id or "default")
+            or canonical_scope.authority.inferred
+            or (
+                (canonical_scope.authority.principal_ids or canonical_scope.authority.service_ids)
+                and asserted_by not in set(canonical_scope.authority.principal_ids)
+                and asserted_by_service not in set(canonical_scope.authority.service_ids)
+            )
+        ):
+            return ProjectionResult(claim_uri, current_revision, "skipped_invalid_scope")
         requested = current_revision if source_revision is None else int(source_revision)
         if requested < current_revision:
             stale_record = self.record_store.load(claim_uri, requested)
@@ -410,28 +430,29 @@ class CanonicalMemoryProjector:
 
     def _write_scope_views(self, obj: ContextObject, record: ProjectionRecord) -> None:
         metadata = dict(obj.metadata or {})
-        scope = dict(metadata.get("scope", {}) or {})
-        applicability = dict(scope.get("applicability", {}) or {})
-        for scope_ref in applicability.get("all_of", []) or []:
-            if not isinstance(scope_ref, dict):
-                continue
+        raw_scope = metadata.get("scope")
+        if not isinstance(raw_scope, dict):
+            return
+        try:
+            canonical_scope = MemoryScope.from_dict(raw_scope)
+        except (KeyError, TypeError, ValueError):
+            return
+        for scope_ref in canonical_scope.applicability.all_of:
             directory = (
                 self.root
                 / "views"
                 / "scope"
                 / self._segment(obj.tenant_id or "default")
-                / self._segment(scope_ref.get("namespace", "memoryos"))
-                / self._segment(scope_ref.get("kind", "unknown"))
+                / self._segment(scope_ref.namespace)
+                / self._segment(scope_ref.kind)
             )
-            parent_path = [str(item) for item in scope_ref.get("parent_path", []) or []]
-            if not parent_path and scope_ref.get("parent_id"):
-                parent_path = [str(scope_ref["parent_id"])]
+            parent_path = list(scope_ref.parent_path)
             directory = directory / ("path" if parent_path else "root")
             for parent in parent_path:
                 directory = directory / self._segment(parent)
             directory = (
                 directory
-                / self._segment(scope_ref.get("id", "unknown"))
+                / self._segment(scope_ref.id)
                 / self._segment(metadata.get("claim_id", "unknown"))
             )
             self._write_revisioned_view(directory, self._view_reference(obj, record))

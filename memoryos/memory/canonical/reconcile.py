@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Protocol
 
 from memoryos.memory.canonical.identity import ResolvedMemoryIdentity, canonical_identity_value
@@ -49,6 +50,14 @@ _APPLICABILITY_FIELDS = (
 _AUTHORITATIVE_SOURCE_ROLES = frozenset({"user", "system"})
 
 
+class RelationAuthority(str, Enum):
+    """Finite authority behind a reconciled relation."""
+
+    STATE_DERIVED = "STATE_DERIVED"
+    MODEL_REPORTED = "MODEL_REPORTED"
+    STRUCTURED_REVIEW = "STRUCTURED_REVIEW"
+
+
 @dataclass(frozen=True)
 class ReconciliationResult:
     relation: SemanticRelation
@@ -59,6 +68,7 @@ class ReconciliationResult:
     deterministic: bool = True
     pending_reason: str = ""
     historical_only: bool = False
+    relation_authority: RelationAuthority = RelationAuthority.MODEL_REPORTED
 
     @property
     def transition_allowed(self) -> bool:
@@ -152,7 +162,18 @@ class MemorySemanticReconciler:
             }
             else ""
         )
-        return ReconciliationResult(relation, slot, claim, active, claims, deterministic, pending, historical_only)
+        authority = self._relation_authority(proposal, relation, claim, active)
+        return ReconciliationResult(
+            relation,
+            slot,
+            claim,
+            active,
+            claims,
+            deterministic,
+            pending,
+            historical_only,
+            authority,
+        )
 
     def _same_claim_relation(
         self,
@@ -172,15 +193,19 @@ class MemorySemanticReconciler:
         ):
             return SemanticRelation.CORRECTS
         if incoming == current:
+            if self._safe_additive_supplement(proposal, claim, active):
+                return SemanticRelation.SUPPLEMENTS
             if semantic.relation_to_existing == SemanticRelation.SUPPLEMENTS and self._supported_suggestion(proposal):
                 return SemanticRelation.SUPPLEMENTS
             return SemanticRelation.DUPLICATE
         incoming_core = self._core_value_fields(incoming)
         current_core = self._core_value_fields(current)
         if incoming_core and incoming_core == current_core:
+            if self._safe_additive_supplement(proposal, claim, active):
+                return SemanticRelation.SUPPLEMENTS
             if semantic.relation_to_existing == SemanticRelation.SUPPLEMENTS and self._supported_suggestion(proposal):
                 return SemanticRelation.SUPPLEMENTS
-            return SemanticRelation.DUPLICATE
+            return SemanticRelation.AMBIGUOUS
         if incoming_core and all(
             key not in current_core or current_core[key] == value for key, value in incoming_core.items()
         ):
@@ -231,13 +256,53 @@ class MemorySemanticReconciler:
         transition_refs = tuple(proposal.field_evidence_refs.get("transition", ()))
         relation_refs = tuple(proposal.field_evidence_refs.get("semantic.relation_to_existing", ()))
         return bool(
-            proposal.metadata.get("semantic_relation_evidence_validated") is True
+            proposal.metadata.get("relation_target_binding_validated") is True
             and proposal.evidence_refs
             and transition_refs
             and relation_refs
             and set(transition_refs).issubset(proposal.evidence_refs)
             and set(relation_refs).issubset(proposal.evidence_refs)
         )
+
+    def _relation_authority(
+        self,
+        proposal: MemorySemanticProposal,
+        relation: SemanticRelation,
+        claim: MemoryClaim | None,
+        active: MemoryClaim | None,
+    ) -> RelationAuthority:
+        if relation in {SemanticRelation.UNRELATED, SemanticRelation.DUPLICATE}:
+            return RelationAuthority.STATE_DERIVED
+        if relation == SemanticRelation.SUPPLEMENTS and claim is not None and self._safe_additive_supplement(
+            proposal, claim, active
+        ):
+            return RelationAuthority.STATE_DERIVED
+        return RelationAuthority.MODEL_REPORTED
+
+    def _safe_additive_supplement(
+        self,
+        proposal: MemorySemanticProposal,
+        claim: MemoryClaim,
+        active: MemoryClaim | None,
+    ) -> bool:
+        if active is None or claim.claim_id != active.claim_id:
+            return False
+        incoming = dict(proposal.value_fields)
+        current = dict(claim.current.value_fields)
+        if any(key not in incoming or incoming[key] != value for key, value in current.items()):
+            return False
+        added_value_fields = set(incoming) - set(current)
+        if not added_value_fields.issubset(_NON_CORE_VALUE_FIELDS):
+            return False
+        display = proposal.metadata.get("display_fields", {})
+        if display is not None and not isinstance(display, dict):
+            return False
+        incoming_display = dict(display or {})
+        current_display = dict(claim.current.qualifiers.get("display_fields", {}) or {})
+        if any(key in current_display and current_display[key] != value for key, value in incoming_display.items()):
+            return False
+        added_display_fields = set(incoming_display) - set(current_display)
+        return bool(added_value_fields or added_display_fields)
 
     def _authoritative_evidence(self, proposal: MemorySemanticProposal) -> bool:
         transition_refs = tuple(proposal.field_evidence_refs.get("transition", ()))
@@ -272,8 +337,10 @@ class MemorySemanticReconciler:
         relation_refs = tuple(proposal.field_evidence_refs.get("semantic.relation_to_existing", ()))
         if not (
             self._authoritative_evidence(proposal)
-            and proposal.metadata.get("semantic_relation_evidence_validated") is True
-            and proposal.metadata.get("replacement_evidence_validated") is True
+            and (
+                proposal.metadata.get("relation_target_binding_validated") is True
+                or proposal.metadata.get("semantic_relation_evidence_validated") is True
+            )
             and relation_refs
             and set(relation_refs).issubset(proposal.evidence_refs)
         ):

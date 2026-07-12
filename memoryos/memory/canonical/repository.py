@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from typing import Any
+
+from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.store.source_store import SourceStore
 from memoryos.memory.canonical.identity import IDENTITY_ALGORITHM_V2, ResolvedMemoryIdentity
 from memoryos.memory.canonical.proposal import PendingMemoryProposal
-from memoryos.memory.canonical.scope import ScopeRef
+from memoryos.memory.canonical.scope import MemoryScope
 from memoryos.memory.canonical.state import (
     CanonicalMemoryInvariantError,
     MemoryClaim,
@@ -43,11 +46,17 @@ class CanonicalMemoryRepository:
             raise CanonicalMemoryInvariantError(f"canonical Slot URI contains {metadata.get('canonical_kind')!r}")
         if metadata.get("identity_algorithm_version") != IDENTITY_ALGORITHM_V2:
             raise CanonicalMemoryInvariantError("canonical Slot is not Identity V2")
-        scope_payload = dict(metadata.get("scope", {}) or {})
-        subject_payload = scope_payload.get("canonical_subject")
-        if not isinstance(subject_payload, dict):
+        raw_scope = metadata.get("scope")
+        if not isinstance(raw_scope, dict):
             raise CanonicalMemoryInvariantError("Identity V2 Slot is missing canonical subject payload")
-        subject = ScopeRef.from_dict(subject_payload)
+        try:
+            memory_scope = MemoryScope.from_dict(raw_scope)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise CanonicalMemoryInvariantError("Identity V2 Slot scope is invalid") from exc
+        self._validate_scope_authority(obj, metadata, memory_scope)
+        subject = memory_scope.canonical_subject
+        if subject is None:
+            raise CanonicalMemoryInvariantError("Identity V2 Slot is missing canonical subject payload")
         subject_key = str(metadata.get("canonical_subject") or "")
         if not subject_key or subject.key != subject_key:
             raise CanonicalMemoryInvariantError("Identity V2 Slot canonical subject is inconsistent")
@@ -120,6 +129,18 @@ class CanonicalMemoryRepository:
             raise CanonicalMemoryInvariantError(f"slot claim URI is not a canonical claim: {uri}")
         if metadata.get("identity_algorithm_version") != IDENTITY_ALGORITHM_V2:
             raise CanonicalMemoryInvariantError(f"canonical Claim is not Identity V2: {uri}")
+        raw_scope = metadata.get("scope")
+        if not isinstance(raw_scope, dict):
+            raise CanonicalMemoryInvariantError(f"canonical Claim scope is invalid: {uri}")
+        try:
+            memory_scope = MemoryScope.from_dict(raw_scope)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise CanonicalMemoryInvariantError(f"canonical Claim scope is invalid: {uri}") from exc
+        self._validate_scope_authority(obj, metadata, memory_scope)
+        if memory_scope.canonical_subject is None:
+            raise CanonicalMemoryInvariantError(f"canonical Claim subject is missing: {uri}")
+        if memory_scope.canonical_subject.key != str(metadata.get("canonical_subject") or ""):
+            raise CanonicalMemoryInvariantError(f"canonical Claim subject payload is inconsistent: {uri}")
         persisted_revision = int(metadata.get("revision", 0))
         revisions = tuple(MemoryRevision.from_dict(item) for item in metadata.get("revisions", []) or [])
         claim = MemoryClaim(
@@ -145,3 +166,22 @@ class CanonicalMemoryRepository:
         if persisted_current is not None and int(persisted_current) != claim.current.revision:
             raise CanonicalMemoryInvariantError(f"claim {claim.claim_id} current revision pointer is inconsistent")
         return claim
+
+    def _validate_scope_authority(
+        self,
+        obj: ContextObject,
+        metadata: dict[str, Any],
+        memory_scope: MemoryScope,
+    ) -> None:
+        tenant_id = str(getattr(obj, "tenant_id", None) or "default")
+        if memory_scope.visibility.tenant_id != tenant_id or memory_scope.authority.inferred:
+            raise CanonicalMemoryInvariantError("canonical scope visibility or authority is invalid")
+        if not memory_scope.authority.principal_ids and not memory_scope.authority.service_ids:
+            return
+        asserted_by = str(metadata.get("asserted_by") or "")
+        asserted_by_service = str(metadata.get("asserted_by_service") or "")
+        if (
+            asserted_by not in set(memory_scope.authority.principal_ids)
+            and asserted_by_service not in set(memory_scope.authority.service_ids)
+        ):
+            raise CanonicalMemoryInvariantError("canonical scope assertion authority is invalid")

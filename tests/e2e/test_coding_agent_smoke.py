@@ -8,6 +8,12 @@ from memoryos.api.http.app import MemoryOSASGI
 from memoryos.api.mcp.config import MCPServerConfig
 from memoryos.api.mcp.tools import MCPToolRouter
 from memoryos.api.sdk.client import MemoryOSClient
+from memoryos.api.trusted_context import (
+    ATTEST_USER_INPUT,
+    AUTHORITATIVE_REMEMBER,
+    DEFAULT_AGENT_CAPABILITIES,
+    TrustedRequestContext,
+)
 from memoryos.memory.extraction import FakeMemoryModelProvider, LLMMemoryExtractorBackend
 
 
@@ -30,7 +36,13 @@ async def _request(
         sent.append(message)
 
     await app(
-        {"type": "http", "method": method, "path": path, "headers": [], "query_string": query_string},
+        {
+            "type": "http",
+            "method": method,
+            "path": path,
+            "headers": [(b"authorization", b"Bearer test-token")],
+            "query_string": query_string,
+        },
         receive,
         send,
     )
@@ -84,7 +96,18 @@ def test_agent_session_to_memory_http_mcp_smoke(tmp_path) -> None:  # noqa: ANN0
         mode="server",
         memory_extractor=LLMMemoryExtractorBackend(provider),
     )
-    app = MemoryOSASGI(client)
+    app = MemoryOSASGI(
+        client,
+        api_token="test-token",
+        trusted_context=TrustedRequestContext(
+            tenant_id="default",
+            user_id="u1",
+            actor_kind="agent",
+            actor_id="claude_code",
+            capabilities=DEFAULT_AGENT_CAPABILITIES | frozenset({ATTEST_USER_INPUT, AUTHORITATIVE_REMEMBER}),
+            allowed_workspace_ids=frozenset({"project-a"}),
+        ),
+    )
 
     archived = asyncio.run(
         _request(
@@ -137,7 +160,12 @@ def test_agent_session_to_memory_http_mcp_smoke(tmp_path) -> None:  # noqa: ANN0
     )
     router = MCPToolRouter(
         client,
-        MCPServerConfig(root=str(tmp_path), user_id="u1", adapter_id="codex"),
+        MCPServerConfig(
+            root=str(tmp_path),
+            user_id="u1",
+            adapter_id="codex",
+            allowed_workspace_ids=frozenset({"project-a"}),
+        ),
     )
     mcp_search = router.call(
         "memoryos_search_context",

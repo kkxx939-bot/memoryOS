@@ -30,6 +30,7 @@ from memoryos.memory.canonical import (
     bind_field_evidence,
 )
 from memoryos.memory.canonical.evidence import ConstraintPolarity
+from memoryos.memory.canonical.literal_grounding import literal_value_supported
 from memoryos.memory.schema import MemoryCandidateDraft, MemoryType
 
 
@@ -111,7 +112,19 @@ def _constraint_validation(
     assert episode.origin.primary_scope is not None
     identity_fields = {"rule_topic": "redis_usage"}
     value_fields = {"canonical_value": canonical_value, **dict(extra_value_fields or {})}
-    evidence_refs = (EvidenceRef.from_event(episode.events[0], source_uri=episode.source_uris[0]),)
+    evidence_refs = [EvidenceRef.from_event(episode.events[0], source_uri=episode.source_uris[0])]
+    bindings = _explicit_bindings(identity_fields, value_fields, tuple(evidence_refs))
+    for field_name, value in dict(extra_value_fields or {}).items():
+        literal = str(value)
+        start = text.index(literal)
+        child = EvidenceRef.from_event(
+            episode.events[0],
+            source_uri=episode.source_uris[0],
+            span_start=start,
+            span_end=start + len(literal),
+        )
+        evidence_refs.append(child)
+        bindings[f"value.{field_name}"] = (child,)
     proposal = MemorySemanticProposal(
         proposal_id=f"p-{canonical_value}",
         memory_type="project_rule",
@@ -121,8 +134,8 @@ def _constraint_validation(
         epistemic_status=EpistemicStatus.EXPLICIT,
         suggested_scope_refs=(episode.origin.primary_scope,),
         related_memory_ids=(),
-        evidence_refs=evidence_refs,
-        field_evidence_refs=_explicit_bindings(identity_fields, value_fields, evidence_refs),
+        evidence_refs=tuple(evidence_refs),
+        field_evidence_refs=bindings,
         confidence=0.99,
         extractor_version="test",
         metadata={"source_role": "user", "system_identity_fields": ["rule_topic"]},
@@ -244,6 +257,57 @@ def test_evidence_ref_validates_event_hash_and_supported_fields() -> None:
     result = ProposalEvidenceValidator().validate(_proposal(episode), episode)
     assert result.valid
     assert result.unsupported_fields == ()
+
+
+@pytest.mark.parametrize(
+    ("value", "evidence"),
+    [
+        ("Redis", "redistribution is enabled"),
+        ("SQL", "NoSQL is selected"),
+        (1, "retry limit is 10"),
+    ],
+)
+def test_literal_grounding_rejects_identifier_substrings(value: object, evidence: str) -> None:
+    assert not literal_value_supported(value, (evidence,))
+
+
+def test_literal_grounding_splits_no_space_cjk_and_latin_identifiers() -> None:
+    assert literal_value_supported("Redis", ("项目使用Redis数据库",))
+    assert literal_value_supported("ＲＥＤＩＳ", ("项目使用redis数据库",))
+
+
+def test_literal_grounding_requires_exact_child_span_for_cjk_values() -> None:
+    assert not literal_value_supported("短期缓存", ("不要使用Redis，除非只是短期缓存",))
+    assert literal_value_supported("短期缓存", ("短期缓存",))
+
+
+def test_v3_replacement_target_binding_rejects_multiple_declared_targets() -> None:
+    _, _, validation, _ = _v3_case(
+        relation="supersedes",
+        related_memory_ids=("memory-1", "memory-2"),
+    )
+
+    assert validation.proposal.metadata["relation_target_binding_validated"] is False
+    assert validation.proposal.metadata["replacement_evidence_validated"] is False
+    assert "semantic_relation_structure_invalid" in validation.errors
+
+
+def test_v3_relation_target_representations_must_identify_one_claim_and_slot() -> None:
+    episode, proposal, _validation, _scope = _v3_case(
+        text="Formally change the database to PostgreSQL.",
+        relation="supersedes",
+        related_memory_ids=("memoryos://user/u1/memories/canonical/slots/slot-a/claims/claim-a",),
+    )
+    inconsistent = replace(
+        proposal,
+        related_claim_ids=("claim-b",),
+        related_slot_ids=("slot-a",),
+    )
+
+    validation = ProposalEvidenceValidator().validate(inconsistent, episode)
+
+    assert validation.proposal.metadata["relation_target_binding_validated"] is False
+    assert "semantic_relation_structure_invalid" in validation.errors
 
 
 def test_bad_event_hash_span_and_missing_core_support_cannot_be_explicit_fact() -> None:

@@ -9,6 +9,7 @@ from pathlib import Path
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_relation import ContextRelation
 from memoryos.contextdb.store.source_store import SourceStore
+from memoryos.core.ids import require_safe_path_segment
 
 
 @dataclass(frozen=True)
@@ -20,20 +21,41 @@ class CommittedCanonicalRead:
     from_before_image: bool = False
 
 
+def _tenant_artifact_root(source_store: SourceStore) -> Path | None:
+    root = getattr(source_store, "root", None)
+    tenant_id = getattr(source_store, "tenant_id", "default")
+    if root is None or not isinstance(tenant_id, str) or not tenant_id.strip():
+        return None
+    if tenant_id in {".", ".."} or "/" in tenant_id or "\\" in tenant_id:
+        return None
+    root_path = Path(root)
+    return root_path if tenant_id == "default" else root_path / "tenants" / tenant_id
+
+
 def read_committed_canonical(source_store: SourceStore, uri: str) -> CommittedCanonicalRead:
     """只读取已经完成事务提交的规范记忆。"""
 
     obj = source_store.read_object(uri)
     metadata = dict(obj.metadata or {})
-    idempotency_key = str(metadata.get("canonical_idempotency_key", ""))
-    transaction_id = str(metadata.get("canonical_transaction_id", ""))
-    root = getattr(source_store, "root", None)
-    if not idempotency_key or not transaction_id or root is None:
+    if metadata.get("canonical_kind") not in {"slot", "claim"}:
         return CommittedCanonicalRead(obj)
-    root_path = Path(root)
-    if (root_path / "system" / "transactions" / f"{idempotency_key}.json").exists():
+    try:
+        idempotency_key = require_safe_path_segment(
+            metadata.get("canonical_idempotency_key"),
+            "canonical idempotency key",
+        )
+        transaction_id = require_safe_path_segment(
+            metadata.get("canonical_transaction_id"),
+            "canonical transaction id",
+        )
+    except ValueError:
+        raise FileNotFoundError(f"canonical object has no committed transaction proof: {uri}") from None
+    artifact_root = _tenant_artifact_root(source_store)
+    if artifact_root is None:
+        raise FileNotFoundError(f"canonical object has no committed transaction proof: {uri}")
+    if (artifact_root / "system" / "transactions" / f"{idempotency_key}.json").exists():
         return CommittedCanonicalRead(obj)
-    outbox = root_path / "system" / "outbox" / f"{transaction_id}.json"
+    outbox = artifact_root / "system" / "outbox" / f"{transaction_id}.json"
     try:
         event = json.loads(outbox.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -55,8 +77,14 @@ def relation_is_committed(source_store: SourceStore, relation: ContextRelation) 
     """检查关系两端是否都已提交并且当前可见。"""
 
     metadata = dict(relation.metadata or {})
-    idempotency_key = str(metadata.get("canonical_idempotency_key", ""))
-    root = getattr(source_store, "root", None)
-    if not idempotency_key or root is None:
-        return True
-    return (Path(root) / "system" / "transactions" / f"{idempotency_key}.json").exists()
+    try:
+        idempotency_key = require_safe_path_segment(
+            metadata.get("canonical_idempotency_key"),
+            "canonical relation idempotency key",
+        )
+    except ValueError:
+        return False
+    artifact_root = _tenant_artifact_root(source_store)
+    if artifact_root is None:
+        return False
+    return (artifact_root / "system" / "transactions" / f"{idempotency_key}.json").exists()

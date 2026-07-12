@@ -234,6 +234,48 @@ class HybridSearch:
         fields = self._mapping(metadata.get("fields", {}))
         connect = self._mapping(metadata.get("connect", {}))
         admission = self._mapping(metadata.get("admission", {}))
+        if metadata.get("canonical_kind") in {"claim", "slot", "pending_proposal"}:
+            try:
+                from memoryos.memory.canonical.scope import MemoryScope
+
+                canonical_scope = MemoryScope.from_dict(scope)
+            except (KeyError, TypeError, ValueError):
+                return None
+            if canonical_scope.canonical_subject is None:
+                return None
+            if canonical_scope.visibility.tenant_id != str(tenant_id or "default"):
+                return None
+            if canonical_scope.authority.inferred:
+                return None
+            asserted_by = str(
+                metadata.get("asserted_by")
+                or (owner_user_id if metadata.get("canonical_kind") == "pending_proposal" else "")
+                or ""
+            )
+            asserted_by_service = str(metadata.get("asserted_by_service") or "")
+            if (
+                canonical_scope.authority.principal_ids
+                or canonical_scope.authority.service_ids
+            ) and not (
+                asserted_by in set(canonical_scope.authority.principal_ids)
+                or asserted_by_service in set(canonical_scope.authority.service_ids)
+            ):
+                return None
+            actual_scopes = {item.key for item in canonical_scope.applicability.all_of}
+        else:
+            raw_applicability = scope.get("applicability", {})
+            if raw_applicability is not None and not isinstance(raw_applicability, Mapping):
+                return None
+            applicability = self._mapping(raw_applicability or {})
+            raw_scope_items = applicability.get("all_of", [])
+            if not isinstance(raw_scope_items, list | tuple):
+                return None
+            try:
+                from memoryos.memory.canonical.scope import scope_keys_from_payloads
+
+                actual_scopes = set(scope_keys_from_payloads(raw_scope_items))
+            except (KeyError, TypeError, ValueError):
+                return None
         for filter_name, actual in (
             ("claim_state", metadata.get("state") or metadata.get("claim_state")),
             ("slot_id", metadata.get("slot_id")),
@@ -247,17 +289,6 @@ class HybridSearch:
                 return None
         required_scopes = set(filters.get("applicability_scope_keys", []) or [])
         if required_scopes:
-            raw_applicability = scope.get("applicability", {})
-            if not isinstance(raw_applicability, Mapping):
-                return None
-            applicability = self._mapping(raw_applicability)
-            if not isinstance(applicability.get("all_of", []), list | tuple):
-                return None
-            actual_scopes = {
-                f"{item.get('namespace', 'memoryos')}:{item.get('kind')}:{item.get('id')}"
-                for item in applicability.get("all_of", []) or []
-                if isinstance(item, dict) and item.get("kind") and item.get("id")
-            }
             if not actual_scopes.issubset(required_scopes):
                 return None
         project_id = str(scope.get("project_id") or fields.get("project_id") or "")

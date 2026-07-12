@@ -71,6 +71,25 @@ def _proposal(
         "modal_force": modal_force,
         "atomicity": atomicity,
     }
+    field_evidence_refs = {
+        **{f"identity.{key}": [atomic_ref] for key in identity_fields},
+        **{f"value.{key}": [atomic_ref] for key in value_fields},
+        **{f"semantic.{key}": [atomic_ref] for key in semantic},
+        "transition": [atomic_ref],
+    }
+    for prefix, fields in (("identity", identity_fields), ("value", value_fields)):
+        for key, field_value in fields.items():
+            literal = str(field_value)
+            if literal not in proposition:
+                continue
+            literal_start = source_text.index(literal, span_start, span_start + len(proposition))
+            child = {
+                "event_id": event_id,
+                "span_start": literal_start,
+                "span_end": literal_start + len(literal),
+            }
+            evidence_refs.append(child)
+            field_evidence_refs[f"{prefix}.{key}"] = [child]
     return {
         "proposal_id": proposal_id,
         "memory_type": memory_type,
@@ -82,12 +101,7 @@ def _proposal(
         "related_candidate_refs": related_candidate_refs or [],
         "evidence_refs": evidence_refs,
         "atomic_evidence_ref": atomic_ref,
-        "field_evidence_refs": {
-            **{f"identity.{key}": evidence_refs for key in identity_fields},
-            **{f"value.{key}": evidence_refs for key in value_fields},
-            **{f"semantic.{key}": evidence_refs for key in semantic},
-            "transition": evidence_refs,
-        },
+        "field_evidence_refs": field_evidence_refs,
         "confidence": 0.98,
         "source_role": "user",
     }
@@ -534,7 +548,14 @@ def test_preposed_exception_is_preserved_through_llm_canonical_pipeline(tmp_path
         modal_force="conditional_forbid",
     )
     candidate["value_fields"]["exception"] = exception
-    candidate["field_evidence_refs"]["value.exception"] = candidate["evidence_refs"]
+    exception_start = text.index(exception)
+    exception_ref = {
+        "event_id": "message:0",
+        "span_start": exception_start,
+        "span_end": exception_start + len(exception),
+    }
+    candidate["evidence_refs"].append(exception_ref)
+    candidate["field_evidence_refs"]["value.exception"] = [exception_ref]
     provider = FakeMemoryModelProvider(_response([candidate]))
     client = MemoryOSClient(str(tmp_path), memory_extractor=LLMMemoryExtractorBackend(provider))
     result = client.commit_agent_session(
@@ -613,14 +634,103 @@ def test_attributed_or_competing_subject_rule_cannot_become_active(tmp_path, tex
     assert not any(item["metadata"].get("memory_type") == "project_rule" for item in visible)
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "他说数据库使用 MySQL，但我不同意。",
+        "可能以后使用 Redis。",
+    ],
+)
+def test_v3_explicit_surface_contradiction_vetoes_mislabeled_current_decision(tmp_path, text: str) -> None:  # noqa: ANN001
+    value = "MySQL" if "MySQL" in text else "Redis"
+    workspace = {"namespace": "memoryos", "kind": "workspace", "id": "memoryos"}
+    candidate = _proposal(
+        "mislabeled-current",
+        "project_decision",
+        {"decision_topic": "数据库" if "数据库" in text else value},
+        value,
+        speech_act="confirmation",
+        commitment="confirmed",
+        temporal_scope="current",
+        scopes=[workspace],
+        source_text=text,
+        attribution="source_actor",
+        atomicity="atomic",
+    )
+    client = MemoryOSClient(
+        str(tmp_path),
+        memory_extractor=LLMMemoryExtractorBackend(FakeMemoryModelProvider(_response([candidate]))),
+    )
+
+    result = client.commit_agent_session(
+        user_id="u1",
+        session_id="semantic-veto",
+        project_id="memoryos",
+        messages=[{"role": "user", "content": text}],
+        connect_metadata=ConnectMetadata.default_agent("codex").to_dict(),
+    )
+
+    assert result.pending_count == 1
+    assert result.canonical_active_operation_count == 0
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "他说数据库使用 MySQL，我同意并正式决定使用 MySQL。",
+        "之前可能以后使用 Redis，但现在正式决定使用 Redis。",
+    ],
+)
+def test_v3_surface_veto_preserves_explicit_current_resolution(tmp_path, text: str) -> None:  # noqa: ANN001
+    value = "MySQL" if "MySQL" in text else "Redis"
+    workspace = {"namespace": "memoryos", "kind": "workspace", "id": "memoryos"}
+    candidate = _proposal(
+        "explicit-current",
+        "project_decision",
+        {"decision_topic": "数据库" if "数据库" in text else value},
+        value,
+        speech_act="confirmation",
+        commitment="confirmed",
+        temporal_scope="current",
+        scopes=[workspace],
+        source_text=text,
+        attribution="source_actor",
+        atomicity="atomic",
+    )
+    client = MemoryOSClient(
+        str(tmp_path),
+        memory_extractor=LLMMemoryExtractorBackend(FakeMemoryModelProvider(_response([candidate]))),
+    )
+
+    result = client.commit_agent_session(
+        user_id="u1",
+        session_id="semantic-resolution",
+        project_id="memoryos",
+        messages=[{"role": "user", "content": text}],
+        connect_metadata=ConnectMetadata.default_agent("codex").to_dict(),
+    )
+
+    assert result.pending_count == 0
+    assert result.canonical_active_operation_count == 1
+
+
 def test_canonical_memory_shares_workspace_subject_but_isolates_tenant_and_workspace(tmp_path) -> None:  # noqa: ANN001
     provider = FakeMemoryModelProvider("")
     client = MemoryOSClient(str(tmp_path), memory_extractor=LLMMemoryExtractorBackend(provider))
+    clients = {
+        "default": client,
+        "other": MemoryOSClient(
+            str(tmp_path),
+            memory_extractor=LLMMemoryExtractorBackend(provider),
+            tenant_id="other",
+        ),
+    }
     connect = ConnectMetadata.default_agent("codex").to_dict()
 
     def commit(user_id: str, session_id: str, project_id: str, text: str, *, tenant_id: str = "default") -> None:
+        bound_client = clients[tenant_id]
         value = "PostgreSQL" if "PostgreSQL" in text else "SQLite"
-        existing = client.search_context(
+        existing = bound_client.search_context(
             "",
             user_id=user_id,
             project_id=project_id,
@@ -654,7 +764,7 @@ def test_canonical_memory_shares_workspace_subject_but_isolates_tenant_and_works
                 )
             ]
         )
-        client.commit_agent_session(
+        bound_client.commit_agent_session(
             user_id=user_id,
             session_id=session_id,
             project_id=project_id,
@@ -677,7 +787,7 @@ def test_canonical_memory_shares_workspace_subject_but_isolates_tenant_and_works
     def active(user_id: str, project_id: str, tenant_id: str = "default") -> set[str]:
         return {
             item["metadata"]["canonical_value"]
-            for item in client.search_context(
+            for item in clients[tenant_id].search_context(
                 "",
                 user_id=user_id,
                 project_id=project_id,
@@ -714,7 +824,11 @@ def test_reachy_compatible_origin_forms_person_environment_preference(tmp_path) 
             ]
         )
     )
-    client = MemoryOSClient(str(tmp_path), memory_extractor=LLMMemoryExtractorBackend(provider))
+    client = MemoryOSClient(
+        str(tmp_path),
+        memory_extractor=LLMMemoryExtractorBackend(provider),
+        tenant_id="home",
+    )
     client.commit_agent_session(
         user_id="user_1",
         session_id="interaction_1",

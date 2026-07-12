@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from memoryos.adapters.agent_hooks.sanitizer import sanitize_error_text
+from memoryos.api.sdk.http_client import RemoteMemoryOSError
 
 
 class MCPErrorCode:
@@ -57,6 +58,15 @@ def ok_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def exception_payload(exc: Exception) -> dict[str, Any]:
+    if isinstance(exc, RemoteMemoryOSError):
+        details = {
+            "remote_code": exc.code,
+            "request_id": exc.request_id,
+            "operation": exc.operation,
+            "status_code": exc.status_code,
+        }
+        code = MCPErrorCode.PERMISSION_DENIED if exc.status_code in {401, 403} else MCPErrorCode.CLIENT_ERROR
+        return error_payload(code, str(exc), retryable=exc.retryable, details=details)
     if isinstance(exc, ToolValidationError | ValueError):
         return error_payload(MCPErrorCode.VALIDATION_ERROR, str(exc), retryable=False)
     if isinstance(exc, ToolPermissionError | PermissionError):

@@ -5,6 +5,7 @@ import json
 
 from memoryos.api.http.app import MemoryOSASGI
 from memoryos.api.sdk.client import MemoryOSClient
+from memoryos.api.trusted_context import ATTEST_USER_INPUT, DEFAULT_AGENT_CAPABILITIES, TrustedRequestContext
 from memoryos.connect import ConnectMetadata
 from memoryos.memory.extraction import FakeMemoryModelProvider, LLMMemoryExtractorBackend
 
@@ -41,9 +42,7 @@ def _project_rule_response(event_id: str, text: str, project_id: str, *, proposa
                     "value_fields": values,
                     "semantic": semantic,
                     "epistemic_status": "EXPLICIT",
-                    "suggested_scope_refs": [
-                        {"namespace": "memoryos", "kind": "workspace", "id": project_id}
-                    ],
+                    "suggested_scope_refs": [{"namespace": "memoryos", "kind": "workspace", "id": project_id}],
                     "evidence_refs": [atomic],
                     "atomic_evidence_ref": atomic,
                     "field_evidence_refs": bindings,
@@ -198,7 +197,18 @@ def test_http_session_append_finalize_recall_flow(tmp_path) -> None:  # noqa: AN
         mode="server",
         memory_extractor=LLMMemoryExtractorBackend(provider),
     )
-    app = MemoryOSASGI(client)
+    app = MemoryOSASGI(
+        client,
+        api_token="test-token",
+        trusted_context=TrustedRequestContext(
+            tenant_id="default",
+            user_id="u1",
+            actor_kind="agent",
+            actor_id="openclaw",
+            capabilities=DEFAULT_AGENT_CAPABILITIES | frozenset({ATTEST_USER_INPUT}),
+            allowed_workspace_ids=frozenset({"p1"}),
+        ),
+    )
 
     async def post(path: str, payload: dict) -> dict:
         sent = []
@@ -210,7 +220,16 @@ def test_http_session_append_finalize_recall_flow(tmp_path) -> None:  # noqa: AN
         async def send(message):  # noqa: ANN001, ANN202
             sent.append(message)
 
-        await app({"type": "http", "method": "POST", "path": path, "headers": []}, receive, send)
+        await app(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": path,
+                "headers": [(b"authorization", b"Bearer test-token")],
+            },
+            receive,
+            send,
+        )
         assert sent[0]["status"] == 200
         return json.loads(sent[1]["body"])
 
@@ -224,7 +243,7 @@ def test_http_session_append_finalize_recall_flow(tmp_path) -> None:  # noqa: AN
                 "user_id": "u1",
                 "project_id": "p1",
                 "session_id": "native",
-                    "prompt": text,
+                "prompt": text,
             },
         )
     )

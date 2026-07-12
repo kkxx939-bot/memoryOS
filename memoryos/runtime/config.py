@@ -19,10 +19,19 @@ class RuntimeConfig:
     retrieval: dict[str, Any] | None = None
     worker: dict[str, Any] | None = None
     http: dict[str, Any] | None = None
+    tenant_id: str = "default"
 
     def __post_init__(self) -> None:
         if self.mode not in {"local", "server", "remote_client"}:
             raise ValueError(f"unsupported runtime mode: {self.mode}")
+        if (
+            not isinstance(self.tenant_id, str)
+            or not self.tenant_id.strip()
+            or self.tenant_id in {".", ".."}
+            or "/" in self.tenant_id
+            or "\\" in self.tenant_id
+        ):
+            raise ValueError("tenant_id must be one safe non-empty path segment")
 
     @property
     def root_path(self) -> Path:
