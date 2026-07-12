@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import threading
 import uuid
 from collections.abc import Iterator
@@ -14,6 +13,9 @@ from pathlib import Path
 from typing import Any
 
 from memoryos.core.time import utc_now
+from memoryos.memory.canonical.event import canonical_digest
+from memoryos.operations.commit.effect_marker import atomic_write_json
+from memoryos.operations.commit.quarantine import quarantine_control_file
 
 try:  # pragma: no cover - supported production platforms provide fcntl.
     import fcntl
@@ -22,6 +24,10 @@ except ImportError:  # pragma: no cover
 
 
 CONSUMERS = ("projection", "behavior", "action_policy", "context")
+
+
+class CommitGroupIntegrityError(RuntimeError):
+    """A corrupt commit-group control file was quarantined."""
 
 
 @dataclass
@@ -33,6 +39,8 @@ class ConsumerStatus:
     completed_revision: int | None = None
     attempt_id: str = ""
     lease_expires_at: str = ""
+    next_retry_at: str = ""
+    terminal_status: str = ""
     result: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -44,6 +52,8 @@ class ConsumerStatus:
             "completed_revision": self.completed_revision,
             "attempt_id": self.attempt_id,
             "lease_expires_at": self.lease_expires_at,
+            "next_retry_at": self.next_retry_at,
+            "terminal_status": self.terminal_status,
             "result": dict(self.result),
         }
 
@@ -59,6 +69,8 @@ class ConsumerStatus:
             ),
             attempt_id=str(payload.get("attempt_id", "")),
             lease_expires_at=str(payload.get("lease_expires_at", "")),
+            next_retry_at=str(payload.get("next_retry_at", "")),
+            terminal_status=str(payload.get("terminal_status", "")),
             result=dict(payload.get("result", {}) or {}),
         )
 
@@ -81,6 +93,8 @@ class CommitGroupStatus:
     canonical_effects: dict[str, dict[str, Any]] = field(default_factory=dict)
     canonical_attempt_id: str = ""
     canonical_lease_expires_at: str = ""
+    canonical_next_retry_at: str = ""
+    canonical_terminal_status: str = ""
     consumers: dict[str, ConsumerStatus] = field(default_factory=lambda: {name: ConsumerStatus() for name in CONSUMERS})
     created_at: str = ""
     updated_at: str = ""
@@ -89,6 +103,15 @@ class CommitGroupStatus:
     def complete(self) -> bool:
         return self.canonical_status == "completed" and all(
             item.status == "completed" for item in self.consumers.values()
+        )
+
+    @property
+    def terminal(self) -> bool:
+        if self.canonical_status in {"dead_letter", "quarantine"}:
+            return True
+        return self.canonical_status == "completed" and all(
+            item.status in {"completed", "dead_letter", "quarantine"}
+            for item in self.consumers.values()
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -111,10 +134,13 @@ class CommitGroupStatus:
             },
             "canonical_attempt_id": self.canonical_attempt_id,
             "canonical_lease_expires_at": self.canonical_lease_expires_at,
+            "canonical_next_retry_at": self.canonical_next_retry_at,
+            "canonical_terminal_status": self.canonical_terminal_status,
             "consumers": {key: value.to_dict() for key, value in self.consumers.items()},
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "complete": self.complete,
+            "terminal": self.terminal,
         }
 
     @classmethod
@@ -145,6 +171,8 @@ class CommitGroupStatus:
             },
             canonical_attempt_id=str(payload.get("canonical_attempt_id", "")),
             canonical_lease_expires_at=str(payload.get("canonical_lease_expires_at", "")),
+            canonical_next_retry_at=str(payload.get("canonical_next_retry_at", "")),
+            canonical_terminal_status=str(payload.get("canonical_terminal_status", "")),
             consumers=statuses,
             created_at=str(payload.get("created_at", "")),
             updated_at=str(payload.get("updated_at", "")),
@@ -154,8 +182,11 @@ class CommitGroupStatus:
 class CommitGroupStore:
     """Create-only group identity with atomic, idempotent status updates."""
 
+    MAX_ATTEMPTS = 3
+
     def __init__(self, root: str | Path) -> None:
-        self.root = Path(root) / "system" / "commit_groups"
+        self.artifact_root = Path(root)
+        self.root = self.artifact_root / "system" / "commit_groups"
         self._fallback_locks: dict[str, threading.RLock] = {}
         self._fallback_guard = threading.Lock()
 
@@ -218,8 +249,18 @@ class CommitGroupStore:
         with self.group_lock(group_id):
             status = self._required_unlocked(group_id)
             if status.canonical_status == "completed" or (
-                status.canonical_status == "failed" and not status.canonical_retryable
+                status.canonical_status in {"dead_letter", "quarantine"}
+                or (status.canonical_status == "failed" and not status.canonical_retryable)
             ):
+                return False
+            if status.canonical_attempt_count >= self.MAX_ATTEMPTS:
+                status.canonical_status = "dead_letter"
+                status.canonical_retryable = False
+                status.canonical_terminal_status = "dead_letter"
+                status.updated_at = _now()
+                self._write(status)
+                return False
+            if self._retry_waiting(status.canonical_next_retry_at):
                 return False
             if status.canonical_status == "running" and self._lease_active(status.canonical_lease_expires_at):
                 return False
@@ -227,6 +268,8 @@ class CommitGroupStore:
             status.canonical_attempt_count += 1
             status.canonical_last_error = ""
             status.canonical_attempt_id = attempt_id
+            status.canonical_next_retry_at = ""
+            status.canonical_terminal_status = ""
             status.canonical_lease_expires_at = (
                 datetime.now(timezone.utc) + timedelta(seconds=max(1, lease_seconds))
             ).isoformat()
@@ -253,6 +296,8 @@ class CommitGroupStore:
             status.canonical_result = dict(result or {})
             status.canonical_attempt_id = ""
             status.canonical_lease_expires_at = ""
+            status.canonical_next_retry_at = ""
+            status.canonical_terminal_status = "done"
             status.updated_at = _now()
             self._write(status)
             return status
@@ -271,11 +316,20 @@ class CommitGroupStore:
                 raise RuntimeError("canonical commit attempt no longer owns the lease")
             if status.canonical_status == "completed":
                 return status
-            status.canonical_status = "failed"
-            status.canonical_last_error = str(error)[:1000]
-            status.canonical_retryable = retryable
+            exhausted = status.canonical_attempt_count >= self.MAX_ATTEMPTS
+            status.canonical_status = "failed" if retryable and not exhausted else "dead_letter"
+            status.canonical_last_error = str(error)[:200]
+            status.canonical_retryable = retryable and not exhausted
             status.canonical_attempt_id = ""
             status.canonical_lease_expires_at = ""
+            status.canonical_next_retry_at = _now() if status.canonical_retryable else ""
+            status.canonical_terminal_status = "" if status.canonical_retryable else "dead_letter"
+            if status.canonical_status == "dead_letter":
+                for item in status.consumers.values():
+                    if item.status not in {"completed", "quarantine"}:
+                        item.status = "dead_letter"
+                        item.retryable = False
+                        item.terminal_status = "dead_letter"
             status.updated_at = _now()
             self._write(status)
             return status
@@ -291,7 +345,18 @@ class CommitGroupStore:
         with self.group_lock(group_id):
             status = self._required_unlocked(group_id)
             item = self._consumer(status, consumer)
-            if item.status == "completed" or (item.status == "failed" and not item.retryable):
+            if item.status in {"completed", "dead_letter", "quarantine"} or (
+                item.status == "failed" and not item.retryable
+            ):
+                return False
+            if item.attempt_count >= self.MAX_ATTEMPTS:
+                item.status = "dead_letter"
+                item.retryable = False
+                item.terminal_status = "dead_letter"
+                status.updated_at = _now()
+                self._write(status)
+                return False
+            if self._retry_waiting(item.next_retry_at):
                 return False
             if item.status == "running" and self._lease_active(item.lease_expires_at):
                 return False
@@ -299,6 +364,8 @@ class CommitGroupStore:
             item.attempt_count += 1
             item.last_error = ""
             item.attempt_id = attempt_id
+            item.next_retry_at = ""
+            item.terminal_status = ""
             item.lease_expires_at = (datetime.now(timezone.utc) + timedelta(seconds=max(1, lease_seconds))).isoformat()
             status.updated_at = _now()
             self._write(status)
@@ -375,6 +442,8 @@ class CommitGroupStore:
             item.completed_revision = revision
             item.attempt_id = ""
             item.lease_expires_at = ""
+            item.next_retry_at = ""
+            item.terminal_status = "done"
             item.result = dict(result or {})
             status.updated_at = _now()
             self._write(status)
@@ -393,11 +462,14 @@ class CommitGroupStore:
             status = self._required_unlocked(group_id)
             item = self._consumer(status, consumer)
             self._assert_attempt(item, attempt_id)
-            item.status = "failed"
-            item.retryable = retryable
-            item.last_error = str(error)[:1000]
+            exhausted = item.attempt_count >= self.MAX_ATTEMPTS
+            item.status = "failed" if retryable and not exhausted else "dead_letter"
+            item.retryable = retryable and not exhausted
+            item.last_error = str(error)[:200]
             item.attempt_id = ""
             item.lease_expires_at = ""
+            item.next_retry_at = _now() if item.retryable else ""
+            item.terminal_status = "" if item.retryable else "dead_letter"
             status.updated_at = _now()
             self._write(status)
             return status
@@ -407,8 +479,10 @@ class CommitGroupStore:
             return []
         result = []
         for path in sorted(self.root.glob("*.json")):
-            status = CommitGroupStatus.from_dict(json.loads(path.read_text(encoding="utf-8")))
-            if not status.complete:
+            status = self._load_unlocked(path.stem)
+            if status is None:
+                continue
+            if not status.terminal:
                 result.append(status)
         return result
 
@@ -424,6 +498,7 @@ class CommitGroupStore:
                     current.canonical_last_error = "canonical commit lease expired before completion"
                     current.canonical_attempt_id = ""
                     current.canonical_lease_expires_at = ""
+                    current.canonical_next_retry_at = _now()
                     changed = True
                 for consumer, item in current.consumers.items():
                     if item.status == "running" and not self._lease_active(item.lease_expires_at):
@@ -432,6 +507,7 @@ class CommitGroupStore:
                         item.last_error = "consumer lease expired before completion"
                         item.attempt_id = ""
                         item.lease_expires_at = ""
+                        item.next_retry_at = _now()
                         recovered.append((status.group_id, consumer))
                         changed = True
                 if changed:
@@ -454,25 +530,39 @@ class CommitGroupStore:
         return status.consumers.setdefault(consumer, ConsumerStatus())
 
     def _write(self, status: CommitGroupStatus) -> None:
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         path = self.path(status.group_id)
-        tmp = path.with_suffix(path.suffix + f".{uuid.uuid4().hex}.tmp")
-        with tmp.open("x", encoding="utf-8") as handle:
-            handle.write(json.dumps(status.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, path)
-        descriptor = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        payload = status.to_dict()
+        payload["control_schema_version"] = "commit_group_control_v1"
+        payload["control_digest"] = canonical_digest(payload)
+        atomic_write_json(path, payload)
 
     def _load_unlocked(self, group_id: str) -> CommitGroupStatus | None:
         path = self.path(group_id)
         if not path.exists():
             return None
-        return CommitGroupStatus.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("commit group state must be a JSON object")
+            digest = payload.get("control_digest")
+            core = {key: value for key, value in payload.items() if key != "control_digest"}
+            if (
+                payload.get("control_schema_version") != "commit_group_control_v1"
+                or digest != canonical_digest(core)
+                or payload.get("group_id") != group_id
+            ):
+                raise ValueError("commit group state digest or identity is corrupt")
+            return CommitGroupStatus.from_dict(payload)
+        except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            quarantine_control_file(
+                self.artifact_root,
+                path,
+                kind="commit_group",
+                error=exc,
+                identifiers={"group_id": group_id},
+            )
+            raise CommitGroupIntegrityError("commit group state quarantined") from exc
 
     def _assert_attempt(self, item: ConsumerStatus, attempt_id: str | None) -> None:
         if attempt_id is not None and item.attempt_id != attempt_id:
@@ -489,6 +579,9 @@ class CommitGroupStore:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc) > datetime.now(timezone.utc)
 
+    def _retry_waiting(self, value: str) -> bool:
+        return self._lease_active(value)
+
     def _canonical_json(self, payload: dict[str, Any]) -> str:
         return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -497,7 +590,11 @@ class CommitGroupStore:
         """Serialize one commit group across processes without blocking unrelated groups."""
 
         lock_path = self.root / ".locks" / f"{group_id}.lock"
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lock_path.parent.chmod(0o700)
+        if not lock_path.exists():
+            lock_path.touch(mode=0o600)
+        lock_path.chmod(0o600)
         if fcntl is not None:
             with lock_path.open("a+", encoding="utf-8") as handle:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)

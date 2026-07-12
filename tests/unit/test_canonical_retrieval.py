@@ -32,6 +32,11 @@ from memoryos.memory.canonical import (
 from memoryos.memory.canonical.prefetch import ExistingMemoryPrefetcher
 from memoryos.memory.canonical.projection_state import ProjectionRecordStore
 from memoryos.memory.canonical.retrieval import CanonicalInvariantViolation
+from memoryos.operations.commit.effect_marker import (
+    atomic_write_json,
+    build_marker,
+    relation_effects_from_manifest,
+)
 from memoryos.operations.commit.operation_committer import OperationCommitter
 from memoryos.operations.model.context_diff import ContextDiff
 from memoryos.operations.model.context_operation import ContextOperation
@@ -497,8 +502,7 @@ def test_canonical_retrieval_supports_exact_vector_and_relation_expansion(tmp_pa
         memory_type="project_decision",
         scope=scope,
     )
-    relations.add_relation(
-        ContextRelation(
+    related = ContextRelation(
                 source_uri=postgres,
                 relation_type="alternative",
                 target_uri=cockroach,
@@ -506,9 +510,33 @@ def test_canonical_retrieval_supports_exact_vector_and_relation_expansion(tmp_pa
                     "tenant_id": "t1",
                     "owner_user_id": "u1",
                     "canonical_idempotency_key": "idem-claim-postgres-related-r1",
+                    "canonical_transaction_id": "tx-claim-postgres-related-r1",
                 },
             )
-        )
+    relations.add_relation(related)
+    relation_marker = (
+        tmp_path
+        / "tenants"
+        / "t1"
+        / "system"
+        / "transactions"
+        / "idem-claim-postgres-related-r1.json"
+    )
+    marker_payload = json.loads(relation_marker.read_text(encoding="utf-8"))
+    atomic_write_json(
+        relation_marker,
+        build_marker(
+            transaction_id=str(marker_payload["transaction_id"]),
+            idempotency_key=str(marker_payload["idempotency_key"]),
+            tenant_id="t1",
+            user_id="u1",
+            operation_ids=[str(item) for item in marker_payload["operation_ids"]],
+            object_effects=list(marker_payload["object_effects"]),
+            relation_effects=relation_effects_from_manifest({"expected": [related.to_dict()]}),
+            diff=dict(marker_payload["diff"]),
+            operations=list(marker_payload["operations"]),
+        ),
+    )
     hybrid = HybridSearch(index, vector_store=vectors, embedding_provider=embedding, source_store=source)
     retriever = CanonicalMemoryRetriever(source, index, relations, hybrid_search=hybrid)
 
@@ -537,6 +565,33 @@ def test_canonical_retrieval_supports_exact_vector_and_relation_expansion(tmp_pa
     assert any(item["retrieval_source"] == "canonical_relation_expansion" for item in expanded)
 
 
+def test_canonical_fallback_uses_token_boundaries_not_latin_substrings(tmp_path) -> None:  # noqa: ANN001
+    source = FileSystemSourceStore(tmp_path, tenant_id="t1")
+    index = InMemoryIndexStore()
+    projector = CanonicalMemoryProjector(source, index, tmp_path)
+    claim_uri = _write_claim(
+        source,
+        projector,
+        claim_id="redistribution",
+        value="redistribution strategy",
+        state="ACTIVE",
+        memory_type="project_decision",
+        scope=_scope(("workspace", "memoryos")),
+    )
+    retriever = CanonicalMemoryRetriever(source, index)
+    query = CanonicalMemoryQuery(
+        text="redis",
+        tenant_id="t1",
+        principal_id="u1",
+        applicability_scope_keys=("memoryos:workspace:memoryos",),
+        intent=CanonicalQueryIntent.CURRENT,
+    )
+
+    assert retriever.search(query) == []
+    exact_token = retriever.search(replace(query, text="redistribution"))
+    assert exact_token[0]["uri"] == claim_uri
+
+
 def test_stale_index_vector_and_projection_hits_are_filtered_by_canonical_revision(tmp_path) -> None:  # noqa: ANN001
     source = FileSystemSourceStore(tmp_path, tenant_id="t1")
     index = InMemoryIndexStore()
@@ -552,14 +607,14 @@ def test_stale_index_vector_and_projection_hits_are_filtered_by_canonical_revisi
     claim_uri, _slot_uri = _write_two_revision_claim(
         source,
         projector,
-        old_value="legacy-only-token",
-        new_value="current-only-token",
+        old_value="legacyuniquetoken",
+        new_value="currentuniquetoken",
         project_current=False,
     )
     hybrid = HybridSearch(index, vector_store=vectors, embedding_provider=embedding, source_store=source)
     retriever = CanonicalMemoryRetriever(source, index, hybrid_search=hybrid)
     query = CanonicalMemoryQuery(
-        text="legacy-only-token",
+        text="legacyuniquetoken",
         tenant_id="t1",
         principal_id="u1",
         applicability_scope_keys=("memoryos:workspace:memoryos",),
@@ -570,7 +625,7 @@ def test_stale_index_vector_and_projection_hits_are_filtered_by_canonical_revisi
     exact = retriever.search(replace(query, text="", claim_uris=(claim_uri,)))
     assert len(exact) == 1
     assert exact[0]["revision"] == 2
-    assert exact[0]["text"] == "current-only-token"
+    assert exact[0]["text"] == "currentuniquetoken"
     assert exact[0]["layer_texts"] == {}
 
     projector.project(claim_uri, 2)

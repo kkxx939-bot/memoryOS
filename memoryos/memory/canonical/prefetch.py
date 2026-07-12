@@ -83,7 +83,7 @@ class ExistingMemoryPrefetcher:
             if (monotonic() - started) * 1000 > self.timeout_ms:
                 break
             try:
-                committed = read_committed_canonical(self.source_store, hit.uri)
+                committed = read_committed_canonical(self.source_store, hit.uri, self.relation_store)
                 obj = committed.object
             except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
                 continue
@@ -147,7 +147,7 @@ class ExistingMemoryPrefetcher:
                             if self.relation_store is not None
                             else []
                         )
-                        if relation_is_committed(self.source_store, relation)
+                        if relation_is_committed(self.source_store, relation, self.relation_store)
                     ),
                 )
             )
@@ -161,7 +161,11 @@ class ExistingMemoryPrefetcher:
         exact_hits = []
         for uri in dict.fromkeys(exact_uris):
             try:
-                obj = read_committed_canonical(self.source_store, uri).object if self.source_store is not None else None
+                obj = (
+                    read_committed_canonical(self.source_store, uri, self.relation_store).object
+                    if self.source_store is not None
+                    else None
+                )
             except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
                 obj = None
             if obj is not None:

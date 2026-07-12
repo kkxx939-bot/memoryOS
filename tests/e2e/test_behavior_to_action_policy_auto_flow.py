@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from datetime import datetime, timedelta, timezone
 
 from memoryos.api.sdk.client import MemoryOSClient
@@ -10,7 +9,6 @@ from memoryos.behavior.update.behavior_case_writer import BehaviorCaseWriter
 from memoryos.connect import ConnectMetadata
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.model.context_uri import ContextURI
 from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.prediction.model.prediction_request import PredictionRequest
 
@@ -99,8 +97,9 @@ def test_behavior_to_action_policy_auto_flow(tmp_path) -> None:
     assert resource_uri in source_uris
     assert skill_uri in source_uris
 
-    archive_dir = ContextURI.parse(archive.archive_uri).to_source_path(tmp_path)
-    for filename in ("memory_diff.json", "behavior_diff.json", "action_policy_diff.json", "context_diff.json"):
-        payload = json.loads((archive_dir / filename).read_text(encoding="utf-8"))
+    persisted = client.session_archive_store.read_archive(archive.archive_uri)
+    outputs = client.session_archive_store.read_async_outputs(persisted)
+    for output_name in ("memory_diff", "behavior_diff", "action_policy_diff", "context_diff"):
+        payload = outputs[output_name]
         assert payload["status"] == "committed"
         assert "operations" in payload

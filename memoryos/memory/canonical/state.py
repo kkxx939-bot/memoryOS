@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from types import MappingProxyType
 from typing import Any
@@ -67,6 +68,16 @@ class ClaimState(str, Enum):
 CLAIM_STATES = frozenset(state.value for state in ClaimState)
 
 
+def _parse_timestamp(value: str, label: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"memory revision {label} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"memory revision {label} must include a timezone")
+    return parsed.astimezone(timezone.utc)
+
+
 def states_for(profile: TransitionProfile) -> frozenset[str]:  # noqa: ARG001
     return CLAIM_STATES
 
@@ -117,6 +128,12 @@ class MemoryRevision:
             object.__setattr__(self, "transaction_time", self.created_at)
         if not self.valid_from:
             object.__setattr__(self, "valid_from", self.created_at)
+        valid_from = _parse_timestamp(self.valid_from, "valid_from")
+        if self.valid_to is not None:
+            valid_to = _parse_timestamp(self.valid_to, "valid_to")
+            if valid_to <= valid_from:
+                raise ValueError("memory revision valid_to must be later than valid_from")
+        _parse_timestamp(self.transaction_time, "transaction_time")
 
     @property
     def historical_only(self) -> bool:
@@ -206,6 +223,10 @@ class MemoryClaim:
             expected_previous = index if index else None
             if revision.previous_revision is not None and revision.previous_revision != expected_previous:
                 raise RevisionSequenceError(self.claim_id, revision_numbers)
+            if index:
+                previous = self.revisions[index - 1]
+                if previous.valid_to is not None and previous.valid_to != revision.valid_from:
+                    raise ValueError("memory revision validity intervals must be contiguous")
 
     @property
     def latest_revision(self) -> MemoryRevision:
@@ -225,6 +246,12 @@ class MemoryClaim:
         revisions = list(self.revisions)
         if not revision.historical_only:
             current_index = revisions.index(self.current)
+            current_start = _parse_timestamp(self.current.valid_from, "valid_from")
+            incoming_start = _parse_timestamp(revision.valid_from, "valid_from")
+            if incoming_start <= current_start:
+                transaction_time = _parse_timestamp(revision.transaction_time, "transaction_time")
+                next_start = max(transaction_time, current_start + timedelta(microseconds=1))
+                revision = replace(revision, valid_from=next_start.isoformat())
             revisions[current_index] = replace(self.current, valid_to=revision.valid_from)
         revisions.append(revision)
         return MemoryClaim(

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import signal
 import time
 from pathlib import Path
@@ -10,7 +9,11 @@ from typing import Any
 
 from memoryos.api.sdk.client import MemoryOSClient
 from memoryos.core.time import utc_now
+from memoryos.operations.commit.effect_marker import atomic_write_json
+from memoryos.operations.commit.quarantine import list_quarantine_records
+from memoryos.workers.embedding_worker import EmbeddingWorker
 from memoryos.workers.memory_proposal_worker import MemoryProposalWorker
+from memoryos.workers.semantic_worker import SemanticWorker
 from memoryos.workers.session_commit_worker import SessionCommitWorker
 
 
@@ -22,7 +25,12 @@ class WorkerRunner:
         self.lease_seconds = max(1, lease_seconds)
         self.max_retries = max(1, max_retries)
         self.stopping = False
-        self.heartbeat = Path(client.root) / "system" / "worker-health.json"
+        self.artifact_root = (
+            Path(client.root)
+            if client.tenant_id == "default"
+            else Path(client.root) / "tenants" / client.tenant_id
+        )
+        self.heartbeat = self.artifact_root / "system" / "worker-health.json"
 
     def run(self, kind: str, *, once: bool = False) -> dict[str, Any]:
         self._install_signal_handlers()
@@ -37,6 +45,8 @@ class WorkerRunner:
 
     def run_once(self, kind: str) -> dict[str, Any]:
         result: dict[str, Any] = {"kind": kind, "timestamp": utc_now()}
+        if kind in {"recovery", "all"}:
+            result["recovery"] = self.client.recovery_worker.process_all()
         if kind in {"session-commit", "all"}:
             result["session_commit"] = SessionCommitWorker(self.client.session_commit_service).process_pending(
                 batch_size=self.batch_size,
@@ -51,8 +61,34 @@ class WorkerRunner:
                 lease_seconds=self.lease_seconds,
                 max_retries=self.max_retries,
             )
+        if kind in {"semantic", "all"}:
+            result["semantic"] = SemanticWorker(
+                self.client.source_store,
+                self.client.queue_store,
+            ).process_pending(
+                limit=self.batch_size,
+                lease_seconds=self.lease_seconds,
+                max_retries=self.max_retries,
+            )
+        if kind in {"embedding", "all"}:
+            if self.client.vector_store is None or self.client.embedding_provider is None:
+                result["embedding"] = {"status": "disabled", "processed": [], "failed": []}
+            else:
+                result["embedding"] = EmbeddingWorker(
+                    self.client.source_store,
+                    self.client.queue_store,
+                    self.client.vector_store,
+                    self.client.embedding_provider,
+                ).process_pending(
+                    limit=self.batch_size,
+                    lease_seconds=self.lease_seconds,
+                    max_retries=self.max_retries,
+                )
         if kind in {"maintenance", "all"}:
             result["maintenance"] = self.client.context_db.verify_consistency()
+        stats = getattr(self.client.queue_store, "stats", None)
+        result["queue_stats"] = stats() if callable(stats) else {}
+        result["quarantine_records"] = list_quarantine_records(self.artifact_root)
         return result
 
     def _install_signal_handlers(self) -> None:
@@ -63,6 +99,65 @@ class WorkerRunner:
         signal.signal(signal.SIGINT, stop)
 
     def _write_heartbeat(self, kind: str, result: dict[str, Any]) -> None:
-        self.heartbeat.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"status": "ready", "kind": kind, "updated_at": utc_now(), "last_result": result}
-        self.heartbeat.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        metrics = self._metrics(result)
+        status = (
+            "failed"
+            if metrics["component_errors"]
+            else "degraded"
+            if metrics["failed"] or metrics["dead_letter"] or metrics["quarantine"]
+            else "ready"
+        )
+        payload = {
+            "schema_version": "worker_health_v1",
+            "status": status,
+            "kind": kind,
+            "updated_at": utc_now(),
+            **metrics,
+            "pending": dict(result.get("queue_stats", {})),
+            "last_result": result,
+        }
+        atomic_write_json(self.heartbeat, payload)
+
+    def _metrics(self, result: dict[str, Any]) -> dict[str, Any]:
+        processed = succeeded = failed = retried = dead_letter = quarantine = 0
+        last_error = ""
+        component_errors = 0
+        for name, value in result.items():
+            if name in {"kind", "timestamp", "queue_stats", "maintenance"} or not isinstance(value, dict):
+                continue
+            try:
+                processed += self._count(value, "claimed") + self._count(value, "recovered_count")
+                succeeded += self._count(value, "committed") + self._count(value, "processed")
+                failed += self._count(value, "failed") + self._count(value, "failed_count")
+                dead_letter += self._count(value, "dead_letter")
+                quarantine += self._count(value, "quarantine") + self._count(value, "quarantine_count")
+                retried += max(0, self._count(value, "failed") - self._count(value, "dead_letter"))
+            except (TypeError, ValueError):
+                component_errors += 1
+                last_error = f"InvalidWorkerResult:{name}"
+            if value.get("last_error"):
+                last_error = str(value["last_error"])
+        queue_stats = dict(result.get("queue_stats", {}) or {})
+        dead_letter = max(dead_letter, int(queue_stats.get("dead_letter", 0) or 0))
+        quarantine = max(
+            quarantine,
+            int(queue_stats.get("quarantine", 0) or 0),
+            len(result.get("quarantine_records", []) or []),
+        )
+        return {
+            "processed": processed,
+            "succeeded": succeeded,
+            "failed": failed,
+            "retried": retried,
+            "dead_letter": dead_letter,
+            "quarantine": quarantine,
+            "last_error": last_error,
+            "component_errors": component_errors,
+        }
+
+    @staticmethod
+    def _count(payload: dict[str, Any], key: str) -> int:
+        value = payload.get(key, 0)
+        if isinstance(value, list):
+            return len(value)
+        return int(value or 0)

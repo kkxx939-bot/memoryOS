@@ -6,6 +6,7 @@ import math
 from dataclasses import dataclass, field
 
 from memoryos.contextdb.model.context_type import ContextType
+from memoryos.contextdb.model.context_uri import ContextURI
 from memoryos.core.ids import new_id, require_safe_path_segment
 from memoryos.core.time import utc_now
 from memoryos.operations.model.operation_action import OperationAction
@@ -36,6 +37,10 @@ class ContextOperation:
             self.action = OperationAction(self.action)
         if isinstance(self.status, str):
             self.status = OperationStatus(self.status)
+        if self.target_uri and self.target_uri.startswith("memoryos://"):
+            self.target_uri = str(ContextURI.parse(self.target_uri))
+        if self.source_uri and self.source_uri.startswith("memoryos://"):
+            self.source_uri = str(ContextURI.parse(self.source_uri))
         try:
             confidence = float(self.confidence)
         except (TypeError, ValueError) as exc:

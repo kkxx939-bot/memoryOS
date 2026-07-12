@@ -278,16 +278,15 @@ class PredictiveContextDatabaseTest(unittest.TestCase):
                 observations=[{"raw_text": "temperature 30"}],
             )
             queue = InMemoryQueueStore()
-            service = SessionCommitService(SessionArchiveStore(tmp), queue, allow_plan_only=True)
+            store = SessionArchiveStore(tmp)
+            service = SessionCommitService(store, queue, allow_plan_only=True)
             queued = service.sync_archive(archive)
             self.assertEqual(queued.status, "queued")
             done = service.async_commit(archive)
             self.assertTrue(done.done)
-            source = FileSystemSourceStore(tmp)
-            archive_dir = source._object_dir(archive.archive_uri)
-            self.assertTrue((archive_dir / ".done").exists())
-            self.assertTrue((archive_dir / "memory_diff.json").exists())
-            self.assertTrue(queue.lease("semantic", 1))
+            self.assertTrue(store.async_outputs_done_for_task(archive))
+            self.assertEqual(store.read_async_outputs(archive)["memory_diff"]["task_id"], archive.task_id)
+            self.assertEqual(queue.lease("semantic", lease_owner="test", limit=1), [])
 
 
 if __name__ == "__main__":

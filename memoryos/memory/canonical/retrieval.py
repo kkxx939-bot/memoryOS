@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import math
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -12,6 +15,7 @@ from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.model.lifecycle import LifecycleState
 from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
 from memoryos.contextdb.store.source_store import IndexStore, RelationStore, SourceStore
+from memoryos.contextdb.store.sqlite_index_store import lexical_match_count, lexical_terms
 from memoryos.memory.canonical.identity import IDENTITY_ALGORITHM_V2
 from memoryos.memory.canonical.projection_state import ProjectionRecord, ProjectionRecordStore
 from memoryos.memory.canonical.scope import MemoryScope
@@ -61,7 +65,14 @@ class CanonicalMemoryRetriever:
         self.relation_store = relation_store
         self.hybrid_search = hybrid_search
         root = getattr(source_store, "root", None)
-        self.projection_store = projection_store or (ProjectionRecordStore(Path(root)) if root is not None else None)
+        # FileSystemSourceStore.root is the shared storage root. Production
+        # callers inject a tenant-bound ProjectionRecordStore explicitly; the
+        # fallback must still match a directly constructed projector using the
+        # same root rather than deriving a second, incompatible location.
+        inferred_root = Path(root) if root is not None else None
+        self.projection_store = projection_store or (
+            ProjectionRecordStore(inferred_root) if inferred_root is not None else None
+        )
 
     def search(self, query: CanonicalMemoryQuery) -> list[dict[str, Any]]:
         intent = query.intent or self._intent_for_states(query.states) or self.classify_intent(query.text)
@@ -79,7 +90,7 @@ class CanonicalMemoryRetriever:
         validated_slots: dict[str, Any] = {}
         for hit in hits:
             try:
-                committed = read_committed_canonical(self.source_store, hit.uri)
+                committed = read_committed_canonical(self.source_store, hit.uri, self.relation_store)
                 obj = committed.object
             except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
                 continue
@@ -136,7 +147,7 @@ class CanonicalMemoryRetriever:
         exact_uris = list(query.claim_uris)
         for slot_uri in query.slot_uris:
             try:
-                slot = read_committed_canonical(self.source_store, slot_uri).object
+                slot = read_committed_canonical(self.source_store, slot_uri, self.relation_store).object
             except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
                 continue
             for claim_id in dict(slot.metadata or {}).get("claim_ids", []) or []:
@@ -150,7 +161,7 @@ class CanonicalMemoryRetriever:
                     {"uri": uri, "score": 100.0, "source": "canonical_exact", "metadata": {}},
                 )()
             )
-        terms = [term.casefold() for term in query.text.split() if term.strip()]
+        terms = lexical_terms(query.text)
         allowed_states = set(str(item) for item in filters.get("claim_state", []) or [])
         allowed_uris: set[str] = set()
         for obj in self.source_store.list_objects():
@@ -167,15 +178,17 @@ class CanonicalMemoryRetriever:
                 searchable_metadata = metadata
             else:
                 current = self._current_revision_payload(obj)
+                current_values = dict(current.get("value_fields", {}) or {})
                 searchable_metadata = {
-                    "canonical_value": metadata.get("canonical_value", ""),
+                    "canonical_value": current_values.get("canonical_value", current_values.get("value", "")),
                     "identity_fields": metadata.get("identity_fields", {}),
                     "memory_type": metadata.get("memory_type", ""),
                     "value_fields": current.get("value_fields", {}),
                     "qualifiers": current.get("qualifiers", {}),
                 }
-            haystack = " ".join((obj.title, str(searchable_metadata))).casefold()
-            score = sum(1.0 for term in terms if term in haystack) if terms else 0.1
+            title = obj.title if intent == CanonicalQueryIntent.HISTORY else ""
+            haystack = " ".join((title, str(searchable_metadata))).casefold()
+            score = float(lexical_match_count(query.text, haystack)) if terms else 0.1
             if score > 0:
                 hits.append(
                     type(
@@ -245,7 +258,7 @@ class CanonicalMemoryRetriever:
         if slot_uri in cache:
             return cache[slot_uri]
         try:
-            committed = read_committed_canonical(self.source_store, slot_uri)
+            committed = read_committed_canonical(self.source_store, slot_uri, self.relation_store)
             slot = committed.object
         except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
             cache[slot_uri] = None
@@ -267,7 +280,7 @@ class CanonicalMemoryRetriever:
         for claim_id in slot_metadata.get("claim_ids", []) or []:
             uri = f"{slot_uri}/claims/{claim_id}"
             try:
-                candidate = read_committed_canonical(self.source_store, uri).object
+                candidate = read_committed_canonical(self.source_store, uri, self.relation_store).object
             except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
                 missing_ids.append(str(claim_id))
                 continue
@@ -299,9 +312,11 @@ class CanonicalMemoryRetriever:
     def _is_slot_current(self, claim_obj: Any, slot: Any) -> bool:
         claim_metadata = dict(claim_obj.metadata or {})
         slot_metadata = dict(slot.metadata or {})
+        revision = self._current_revision_payload(claim_obj)
         return bool(
             claim_metadata.get("state") == "ACTIVE"
             and str(slot_metadata.get("active_claim_id") or "") == str(claim_metadata.get("claim_id") or "")
+            and self._revision_is_effective(revision)
         )
 
     def _hit_revision_is_current(
@@ -383,7 +398,11 @@ class CanonicalMemoryRetriever:
                 relation_metadata = dict(relation.get("metadata", {}) or {})
                 relation_revision = relation_metadata.get("source_revision")
                 try:
-                    obj = read_committed_canonical(self.source_store, related_uri).object
+                    obj = read_committed_canonical(
+                        self.source_store,
+                        related_uri,
+                        self.relation_store,
+                    ).object
                 except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
                     continue
                 if relation_revision is not None:
@@ -418,6 +437,13 @@ class CanonicalMemoryRetriever:
 
     def classify_intent(self, text: str) -> CanonicalQueryIntent:
         normalized = str(text).casefold()
+        negated = (
+            r"(?:no|not|without|do\s+not\s+(?:show|include)|don't\s+(?:show|include))\s+"
+            r"(?:history|historical|conflicts?|contradictions?|options?|alternatives?|candidates?)"
+            r"|(?:没有|无|不看|不要(?:显示|包含)?)(?:历史|冲突|矛盾|方案|候选|选项)"
+        )
+        if re.search(negated, normalized):
+            return CanonicalQueryIntent.CURRENT
         if any(token in normalized for token in ("history", "historical", "previous", "历史", "曾经", "之前")):
             return CanonicalQueryIntent.HISTORY
         if any(token in normalized for token in ("conflict", "contradiction", "冲突", "矛盾")):
@@ -544,7 +570,7 @@ class CanonicalMemoryRetriever:
                     tenant_id=obj.tenant_id,
                     owner_user_id=obj.owner_user_id,
                 )
-                if relation_is_committed(self.source_store, relation)
+                if relation_is_committed(self.source_store, relation, self.relation_store)
             ]
         slot_uri = obj.uri.rsplit("/claims/", 1)[0]
         revision_uri = f"{obj.uri}#revision-{revision}"
@@ -553,6 +579,12 @@ class CanonicalMemoryRetriever:
             if projection is not None
             else (revision if historical else canonical_source_revision)
         )
+        try:
+            normalized_score = float(score)
+        except (TypeError, ValueError):
+            normalized_score = 0.0
+        if not math.isfinite(normalized_score):
+            normalized_score = 0.0
         return {
             "uri": obj.uri,
             "revision_uri": revision_uri,
@@ -563,7 +595,7 @@ class CanonicalMemoryRetriever:
             "revision": revision,
             "source_revision": source_revision,
             "projection_revision": projection.projection_revision if projection is not None else None,
-            "score": float(score),
+            "score": normalized_score,
             "context_type": obj.context_type.value,
             "title": obj.title,
             "text": text,
@@ -651,6 +683,27 @@ class CanonicalMemoryRetriever:
             "relation": metadata.get("semantic_relation", ""),
         }
 
+    def _revision_is_effective(self, revision: dict[str, Any]) -> bool:
+        valid_from = revision.get("valid_from")
+        valid_to = revision.get("valid_to")
+        if not valid_from:
+            return False
+        try:
+            start = datetime.fromisoformat(str(valid_from).replace("Z", "+00:00"))
+            end = (
+                datetime.fromisoformat(str(valid_to).replace("Z", "+00:00"))
+                if valid_to
+                else None
+            )
+        except ValueError:
+            return False
+        if start.tzinfo is None or (end is not None and end.tzinfo is None):
+            return False
+        now = datetime.now(timezone.utc)
+        return start.astimezone(timezone.utc) <= now and (
+            end is None or now < end.astimezone(timezone.utc)
+        )
+
     def _one_current_per_slot(self, results: list[dict[str, Any]]) -> list[dict[str, Any]]:
         selected = []
         seen: set[str] = set()
@@ -686,7 +739,13 @@ class CanonicalMemoryRetriever:
             },
             CanonicalQueryIntent.CONFLICTS: {"CONFLICTED": 5.0},
         }[intent].get(state, 0.0)
-        return float(item.get("score", 0.0)) + state_bonus
+        try:
+            score = float(item.get("score", 0.0))
+        except (TypeError, ValueError):
+            score = 0.0
+        if not math.isfinite(score):
+            score = 0.0
+        return score + state_bonus
 
 
 __all__ = [

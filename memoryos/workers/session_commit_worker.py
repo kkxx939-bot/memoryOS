@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import os
+import uuid
+
 from memoryos.contextdb.session.session_commit import SessionCommitService
 from memoryos.contextdb.session.session_model import SessionArchive
+from memoryos.contextdb.store.source_store import QueueJob
 
 
 class SessionCommitWorker:
-    def __init__(self, service: SessionCommitService) -> None:
+    def __init__(self, service: SessionCommitService, *, worker_id: str | None = None) -> None:
         self.service = service
+        self.worker_id = worker_id or f"session-commit:{os.getpid()}:{uuid.uuid4().hex}"
 
     def process_archive(self, archive: SessionArchive) -> dict:
         result = self.service.async_commit(archive)
@@ -28,7 +33,12 @@ class SessionCommitWorker:
                 recovered += int(result.done)
             except (OSError, RuntimeError, ValueError, KeyError, TypeError):
                 failed += 1
-        jobs = self.service.queue_store.lease("session_commit", limit=batch_size, lease_seconds=lease_seconds)
+        jobs = self.service.queue_store.lease(
+            "session_commit",
+            lease_owner=self.worker_id,
+            limit=batch_size,
+            lease_seconds=lease_seconds,
+        )
         for job in jobs:
             try:
                 archive = self.service.archive_store.read_archive(
@@ -38,12 +48,12 @@ class SessionCommitWorker:
                 )
                 result = self.service.async_commit(archive)
                 if result.done:
-                    self.service.queue_store.ack(job.job_id)
+                    self.service.queue_store.ack(job)
                     committed += 1
                 else:
                     retryable = self._result_retryable(result.commit_group_status)
                     status = self._retry(
-                        job.job_id,
+                        job,
                         RuntimeError(result.status),
                         max_retries=max_retries,
                         retryable=retryable,
@@ -51,11 +61,11 @@ class SessionCommitWorker:
                     dead_letter += int(status == "dead_letter")
                     failed += 1
             except (ValueError, KeyError, TypeError) as exc:
-                status = self._retry(job.job_id, exc, max_retries=max_retries, retryable=False)
+                status = self._retry(job, exc, max_retries=max_retries, retryable=False)
                 dead_letter += int(status == "dead_letter")
                 failed += 1
             except (OSError, RuntimeError) as exc:
-                status = self._retry(job.job_id, exc, max_retries=max_retries, retryable=True)
+                status = self._retry(job, exc, max_retries=max_retries, retryable=True)
                 dead_letter += int(status == "dead_letter")
                 failed += 1
         return {
@@ -76,9 +86,11 @@ class SessionCommitWorker:
             for item in dict(payload.get("consumers", {}) or {}).values()
         )
 
-    def _retry(self, job_id: str, exc: Exception, *, max_retries: int, retryable: bool) -> str:
-        retry = getattr(self.service.queue_store, "retry", None)
-        if callable(retry):
-            return str(retry(job_id, exc.__class__.__name__, max_retries=max_retries, retryable=retryable))
-        self.service.queue_store.fail(job_id, exc.__class__.__name__)
-        return "failed"
+    def _retry(self, job: QueueJob, exc: Exception, *, max_retries: int, retryable: bool) -> str:
+        settled = self.service.queue_store.retry(
+            job,
+            exc.__class__.__name__,
+            max_retries=max_retries,
+            retryable=retryable,
+        )
+        return settled.status

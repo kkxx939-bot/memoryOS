@@ -2,18 +2,32 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import threading
 import uuid
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 from memoryos.contextdb.model.context_uri import ContextURI
 from memoryos.contextdb.session.session_model import SessionArchive
+from memoryos.core.ids import require_safe_path_segment
+from memoryos.core.time import utc_now
 from memoryos.memory.canonical.event import canonical_digest, canonical_json, canonicalize
+from memoryos.operations.commit.quarantine import quarantine_control_file
+
+try:  # pragma: no cover - production POSIX platforms provide fcntl.
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
 
 ARCHIVE_MANIFEST_SCHEMA_VERSION = "session_archive_manifest_v2"
 ARCHIVE_HEAD_SCHEMA_VERSION = "session_archive_head_v2"
+ASYNC_OUTPUT_MANIFEST_SCHEMA_VERSION = "session_async_output_manifest_v1"
+ASYNC_OUTPUT_HEAD_SCHEMA_VERSION = "session_async_output_head_v1"
 
 
 class EvidenceArchiveError(ValueError):
@@ -28,6 +42,14 @@ class EvidenceArchiveIntegrityError(EvidenceArchiveError):
     """Immutable evidence no longer matches its recorded digest."""
 
 
+class AsyncOutputIntegrityError(EvidenceArchiveIntegrityError):
+    """A published async-output generation is incomplete, mixed, or corrupt."""
+
+
+def canonical_digest_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
 class SessionArchiveStore:
     _COLLECTION_FILES = {
         "messages": "messages.jsonl",
@@ -40,14 +62,34 @@ class SessionArchiveStore:
         "tool_results": "tool_results.jsonl",
     }
 
-    def __init__(self, root: str | Path, tenant_id: str = "default") -> None:
+    _ASYNC_FILES = (
+        "abstract.md",
+        "overview.md",
+        "memory_diff.json",
+        "behavior_diff.json",
+        "action_policy_diff.json",
+        "context_diff.json",
+        "commit_group_status.json",
+    )
+
+    def __init__(
+        self,
+        root: str | Path,
+        tenant_id: str = "default",
+        *,
+        test_hook: Callable[[str, str], None] | None = None,
+    ) -> None:
         self.root = Path(root)
         self.tenant_id = tenant_id
+        self.test_hook = test_hook
+        self.last_async_output_error = ""
+        self._fallback_locks: dict[str, threading.RLock] = {}
+        self._fallback_guard = threading.Lock()
 
     def write_sync_archive(self, archive: SessionArchive) -> Path:
         tenant_id = self._archive_tenant(archive)
         directory = self._dir(archive.archive_uri, tenant_id=tenant_id)
-        directory.mkdir(parents=True, exist_ok=True)
+        self._secure_directory(directory)
 
         collections: dict[str, str] = {}
         for name in self._COLLECTION_FILES:
@@ -140,33 +182,132 @@ class SessionArchiveStore:
         tenant_id: str | None = None,
         commit_group_status: dict[str, Any] | None = None,
         complete: bool = True,
+        task_id: str | None = None,
+        created_at: str | None = None,
     ) -> Path:
         directory = self._dir(archive_uri, tenant_id=tenant_id)
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / ".abstract.md").write_text(abstract, encoding="utf-8")
-        (directory / ".overview.md").write_text(overview, encoding="utf-8")
-        self._write_json(directory / "memory_diff.json", memory_diff)
-        self._write_json(directory / "behavior_diff.json", behavior_diff)
-        self._write_json(directory / "action_policy_diff.json", action_policy_diff)
-        self._write_json(directory / "context_diff.json", context_diff)
-        if commit_group_status is not None:
-            self._write_json(directory / "commit_group_status.json", commit_group_status)
-        done_path = directory / ".done"
-        if complete:
-            done_path.write_text("done\n", encoding="utf-8")
-        else:
-            done_path.unlink(missing_ok=True)
-        return directory
+        resolved_task_id = require_safe_path_segment(
+            task_id or memory_diff.get("task_id"),
+            "async output task_id",
+        )
+        resolved_tenant = tenant_id or self.tenant_id
+        json_payloads = {
+            "memory_diff.json": memory_diff,
+            "behavior_diff.json": behavior_diff,
+            "action_policy_diff.json": action_policy_diff,
+            "context_diff.json": context_diff,
+            "commit_group_status.json": commit_group_status or {},
+        }
+        for filename, payload in json_payloads.items():
+            if not isinstance(payload, dict):
+                raise ValueError(f"{filename} must contain a JSON object")
+            if filename == "commit_group_status.json":
+                if complete and payload.get("task_id") != resolved_task_id:
+                    raise ValueError("commit group status does not match async output task")
+            elif payload.get("task_id") != resolved_task_id:
+                raise ValueError(f"{filename} does not match async output task")
+        resolved_created_at = str(
+            created_at
+            or (commit_group_status or {}).get("created_at")
+            or utc_now()
+        )
+        file_bytes = {
+            "abstract.md": abstract.encode("utf-8"),
+            "overview.md": overview.encode("utf-8"),
+            **{
+                filename: canonical_json(payload).encode("utf-8")
+                for filename, payload in json_payloads.items()
+            },
+        }
+        async_root = directory / "async_outputs"
+        generation = async_root / resolved_task_id
+        with self._async_output_lock(async_root):
+            existing_head = self._read_async_head_optional(async_root / "current.json")
+            if existing_head and existing_head.get("task_id") == resolved_task_id:
+                existing = self._read_async_generation(directory, existing_head, resolved_task_id)
+                desired_digests = {
+                    filename: canonical_digest_bytes(content)
+                    for filename, content in file_bytes.items()
+                }
+                existing_digests = {
+                    filename: str(details.get("digest") or "")
+                    for filename, details in dict(existing["manifest"].get("files", {}) or {}).items()
+                    if isinstance(details, dict)
+                }
+                if desired_digests != existing_digests:
+                    raise EvidenceArchiveConflictError(
+                        "published async output task cannot be overwritten with different bytes"
+                    )
+                return generation
+            generation.mkdir(parents=True, exist_ok=True, mode=0o700)
+            try:
+                generation.chmod(0o700)
+            except OSError:
+                pass
+            for filename in self._ASYNC_FILES:
+                self._write_bytes_atomic(generation / filename, file_bytes[filename])
+                self._notify_async(f"after_{filename}", resolved_task_id)
+            self._notify_async("after_files", resolved_task_id)
+            if not complete:
+                return generation
+            files = {
+                filename: {
+                    "digest": canonical_digest_bytes(file_bytes[filename]),
+                    "size": len(file_bytes[filename]),
+                }
+                for filename in self._ASYNC_FILES
+            }
+            manifest_core = {
+                "schema_version": ASYNC_OUTPUT_MANIFEST_SCHEMA_VERSION,
+                "archive_uri": archive_uri,
+                "task_id": resolved_task_id,
+                "tenant_id": resolved_tenant,
+                "files": files,
+                "complete": True,
+                "created_at": resolved_created_at,
+            }
+            manifest = {**manifest_core, "manifest_digest": canonical_digest(manifest_core)}
+            self._write_immutable_json(generation / "manifest.json", manifest)
+            self._notify_async("after_manifest", resolved_task_id)
+            current_key = (
+                str(existing_head.get("created_at") or ""),
+                str(existing_head.get("task_id") or ""),
+            ) if existing_head else ("", "")
+            requested_key = (resolved_created_at, resolved_task_id)
+            if existing_head and requested_key < current_key:
+                return generation
+            head_core = {
+                "schema_version": ASYNC_OUTPUT_HEAD_SCHEMA_VERSION,
+                "archive_uri": archive_uri,
+                "tenant_id": resolved_tenant,
+                "task_id": resolved_task_id,
+                "created_at": resolved_created_at,
+                "manifest_relative_path": f"{resolved_task_id}/manifest.json",
+                "manifest_digest": manifest["manifest_digest"],
+            }
+            head = {**head_core, "head_digest": canonical_digest(head_core)}
+            self._notify_async("before_current", resolved_task_id)
+            self._write_head(async_root / "current.json", head)
+            self._notify_async("after_current", resolved_task_id)
+        return generation
 
     def async_outputs_done_for_task(self, archive: SessionArchive) -> bool:
         directory = self._dir(archive.archive_uri, tenant_id=self._archive_tenant(archive))
-        if not (directory / ".done").exists():
-            return False
         try:
-            payload = json.loads((directory / "memory_diff.json").read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            self._read_async_generation_for_archive(directory, archive)
+        except FileNotFoundError:
+            self.last_async_output_error = ""
             return False
-        return payload.get("task_id") == archive.task_id
+        except AsyncOutputIntegrityError as exc:
+            self.last_async_output_error = type(exc).__name__
+            self._quarantine_async_output_controls(directory, archive, exc)
+            return False
+        self.last_async_output_error = ""
+        return True
+
+    def read_async_outputs(self, archive: SessionArchive) -> dict[str, Any]:
+        directory = self._dir(archive.archive_uri, tenant_id=self._archive_tenant(archive))
+        return self._read_async_generation_for_archive(directory, archive)
 
     def read_archive(
         self,
@@ -309,15 +450,17 @@ class SessionArchiveStore:
         self._write_create_only(path, canonical_json(payload).encode("utf-8"), compare_existing=True)
 
     def _write_create_only(self, path: Path, payload: bytes, *, compare_existing: bool) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        self._secure_directory(path.parent)
         temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
         try:
             with temporary.open("xb") as handle:
+                os.chmod(temporary, 0o600)
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
             try:
                 os.link(temporary, path)
+                os.chmod(path, 0o600)
                 self._fsync_directory(path.parent)
             except FileExistsError:
                 if compare_existing and path.read_bytes() != payload:
@@ -328,14 +471,184 @@ class SessionArchiveStore:
             temporary.unlink(missing_ok=True)
 
     def _write_head(self, path: Path, payload: dict[str, Any]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        self._secure_directory(path.parent)
         temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
         with temporary.open("x", encoding="utf-8") as handle:
+            os.chmod(temporary, 0o600)
             handle.write(canonical_json(payload))
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        os.chmod(path, 0o600)
         self._fsync_directory(path.parent)
+
+    def _write_bytes_atomic(self, path: Path, payload: bytes) -> None:
+        self._secure_directory(path.parent)
+        temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+        try:
+            with temporary.open("xb") as handle:
+                os.chmod(temporary, 0o600)
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+            try:
+                path.chmod(0o600)
+            except OSError:
+                pass
+            self._fsync_directory(path.parent)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @contextmanager
+    def _async_output_lock(self, async_root: Path) -> Iterator[None]:
+        self._secure_directory(async_root)
+        lock_path = async_root / ".publish.lock"
+        if fcntl is None:  # pragma: no cover
+            key = str(lock_path)
+            with self._fallback_guard:
+                lock = self._fallback_locks.setdefault(key, threading.RLock())
+            with lock:
+                yield
+            return
+        with lock_path.open("a+b") as handle:
+            try:
+                os.chmod(lock_path, 0o600)
+            except OSError:
+                pass
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def _read_async_generation_for_archive(
+        self,
+        directory: Path,
+        archive: SessionArchive,
+    ) -> dict[str, Any]:
+        head_path = directory / "async_outputs" / "current.json"
+        head = self._read_async_head_optional(head_path)
+        if head is None:
+            raise FileNotFoundError(head_path.name)
+        tenant_id = self._archive_tenant(archive)
+        if (
+            head.get("archive_uri") != archive.archive_uri
+            or head.get("tenant_id") != tenant_id
+            or head.get("task_id") != archive.task_id
+        ):
+            raise FileNotFoundError(archive.task_id)
+        return self._read_async_generation(directory, head, archive.task_id)
+
+    def _read_async_head_optional(self, path: Path) -> dict[str, Any] | None:
+        if not path.exists():
+            return None
+        try:
+            head = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise AsyncOutputIntegrityError("async output head is unreadable") from exc
+        if not isinstance(head, dict):
+            raise AsyncOutputIntegrityError("async output head must be a JSON object")
+        core = {key: value for key, value in head.items() if key != "head_digest"}
+        if (
+            head.get("schema_version") != ASYNC_OUTPUT_HEAD_SCHEMA_VERSION
+            or head.get("head_digest") != canonical_digest(core)
+        ):
+            raise AsyncOutputIntegrityError("async output head digest is corrupt")
+        task_id = require_safe_path_segment(head.get("task_id"), "async output head task_id")
+        if head.get("manifest_relative_path") != f"{task_id}/manifest.json":
+            raise AsyncOutputIntegrityError("async output head manifest path is invalid")
+        return head
+
+    def _read_async_generation(
+        self,
+        directory: Path,
+        head: dict[str, Any],
+        task_id: str,
+    ) -> dict[str, Any]:
+        safe_task = require_safe_path_segment(task_id, "async output task_id")
+        generation = directory / "async_outputs" / safe_task
+        manifest_path = generation / "manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise AsyncOutputIntegrityError("async output manifest is unreadable") from exc
+        if not isinstance(manifest, dict):
+            raise AsyncOutputIntegrityError("async output manifest must be a JSON object")
+        core = {key: value for key, value in manifest.items() if key != "manifest_digest"}
+        if (
+            manifest.get("schema_version") != ASYNC_OUTPUT_MANIFEST_SCHEMA_VERSION
+            or manifest.get("manifest_digest") != canonical_digest(core)
+            or manifest.get("manifest_digest") != head.get("manifest_digest")
+            or manifest.get("archive_uri") != head.get("archive_uri")
+            or manifest.get("tenant_id") != head.get("tenant_id")
+            or manifest.get("task_id") != safe_task
+            or manifest.get("complete") is not True
+        ):
+            raise AsyncOutputIntegrityError("async output manifest identity or digest is corrupt")
+        files = manifest.get("files")
+        if not isinstance(files, dict) or set(files) != set(self._ASYNC_FILES):
+            raise AsyncOutputIntegrityError("async output manifest file set is incomplete")
+        result: dict[str, Any] = {"head": head, "manifest": manifest}
+        for filename in self._ASYNC_FILES:
+            details = files.get(filename)
+            if not isinstance(details, dict):
+                raise AsyncOutputIntegrityError("async output file proof is invalid")
+            path = generation / filename
+            try:
+                raw = path.read_bytes()
+            except OSError as exc:
+                raise AsyncOutputIntegrityError("async output file is missing") from exc
+            if (
+                details.get("digest") != canonical_digest_bytes(raw)
+                or details.get("size") != len(raw)
+            ):
+                raise AsyncOutputIntegrityError("async output file digest is corrupt")
+            if filename.endswith(".json"):
+                try:
+                    payload = json.loads(raw.decode("utf-8"))
+                except (UnicodeError, json.JSONDecodeError) as exc:
+                    raise AsyncOutputIntegrityError("async output JSON is corrupt") from exc
+                if not isinstance(payload, dict) or payload.get("task_id") != safe_task:
+                    raise AsyncOutputIntegrityError("async output file task identity is mixed")
+                if filename == "commit_group_status.json" and (
+                    payload.get("archive_uri") != head.get("archive_uri")
+                    or payload.get("tenant_id") != head.get("tenant_id")
+                ):
+                    raise AsyncOutputIntegrityError("async output commit group identity is mixed")
+                result[filename.removesuffix(".json")] = payload
+            else:
+                result[filename.removesuffix(".md")] = raw.decode("utf-8")
+        return result
+
+    def _quarantine_async_output_controls(
+        self,
+        directory: Path,
+        archive: SessionArchive,
+        error: BaseException,
+    ) -> None:
+        artifact_root = (
+            self.root
+            if self._archive_tenant(archive) == "default"
+            else self.root / "tenants" / self._archive_tenant(archive)
+        )
+        controls = [
+            directory / "async_outputs" / "current.json",
+            directory / "async_outputs" / archive.task_id / "manifest.json",
+        ]
+        for path in controls:
+            if path.exists():
+                quarantine_control_file(
+                    artifact_root,
+                    path,
+                    kind="async_output",
+                    error=error,
+                    identifiers={"task_id": archive.task_id, "archive_uri_digest": canonical_digest(archive.archive_uri)},
+                )
+
+    def _notify_async(self, stage: str, task_id: str) -> None:
+        if self.test_hook is not None:
+            self.test_hook(stage, task_id)
 
     def _fsync_directory(self, directory: Path) -> None:
         descriptor = os.open(directory, os.O_RDONLY)
@@ -356,7 +669,23 @@ class SessionArchiveStore:
         return str(metadata.get("tenant_id") or scope.get("tenant_id") or self.tenant_id)
 
     def _write_json(self, path: Path, payload: Any) -> None:
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._write_bytes_atomic(
+            path,
+            json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"),
+        )
+
+    def _secure_directory(self, directory: Path) -> None:
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        current = directory
+        root = self.root.expanduser().resolve()
+        while current == root or root in current.resolve().parents:
+            try:
+                current.chmod(0o700)
+            except OSError:
+                pass
+            if current.resolve() == root:
+                break
+            current = current.parent
 
     def _read_json(self, path: Path) -> Any:
         try:

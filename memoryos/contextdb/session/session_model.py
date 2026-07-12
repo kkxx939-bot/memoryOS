@@ -54,11 +54,12 @@ class SessionArchive:
 
 
 class SessionCommitState(str, Enum):
+    OPEN = "OPEN"
     ARCHIVED = "ARCHIVED"
     QUEUED = "QUEUED"
     PROCESSING = "PROCESSING"
     COMMITTED = "COMMITTED"
-    FAILED = "FAILED"
+    FAILED_RETRYABLE = "FAILED_RETRYABLE"
     DEAD_LETTER = "DEAD_LETTER"
 
 

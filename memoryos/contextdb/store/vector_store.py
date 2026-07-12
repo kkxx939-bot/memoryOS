@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -26,12 +27,13 @@ class InMemoryVectorStore:
         self.rows: dict[str, tuple[list[float], dict]] = {}
 
     def upsert_vector(self, uri: str, embedding: list[float], metadata: dict | None = None) -> None:
-        self.rows[uri] = (list(embedding), metadata or {})
+        self.rows[uri] = (_finite_vector(embedding), metadata or {})
 
     def delete_vector(self, uri: str) -> None:
         self.rows.pop(uri, None)
 
     def search_vector(self, embedding: list[float], namespace: str, limit: int = 10) -> list[VectorHit]:
+        embedding = _finite_vector(embedding)
         hits = []
         for uri, (stored, metadata) in self.rows.items():
             if namespace and not uri.startswith(namespace):
@@ -50,3 +52,10 @@ class InMemoryVectorStore:
         if left_norm == 0 or right_norm == 0:
             return 0.0
         return max(0.0, min(1.0, dot / (left_norm * right_norm)))
+
+
+def _finite_vector(values: list[float]) -> list[float]:
+    result = [float(value) for value in values]
+    if not result or any(not math.isfinite(value) for value in result):
+        raise ValueError("vector values must be finite and non-empty")
+    return result

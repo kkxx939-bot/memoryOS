@@ -9,6 +9,8 @@ import urllib.error
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from memoryos.adapters.agent_hooks.base import HookResult
 from memoryos.adapters.agent_hooks.contracts import (
     ClaudeCodeOutputRenderer,
@@ -40,9 +42,9 @@ def test_transcript_reader_preserves_cursor_on_parse_failure(tmp_path: Path) -> 
     path = tmp_path / "transcript.jsonl"
     path.write_text('{"role":"user","content":"one"}\n', encoding="utf-8")
     reader = GenericJsonlTranscriptReader()
-    first = reader.read_since(str(path), None)
+    first = reader.read_since(str(path), None, allowed_roots=[tmp_path])
     path.write_text(path.read_text() + "invalid\n", encoding="utf-8")
-    second = reader.read_since(str(path), first.cursor)
+    second = reader.read_since(str(path), first.cursor, allowed_roots=[tmp_path])
     assert first.messages == [{"role": "user", "content": "one"}]
     assert second.parse_failed is True
     assert second.cursor == first.cursor
@@ -54,12 +56,12 @@ def test_transcript_reader_is_incremental_bounded_and_recovers_truncation(tmp_pa
     second_line = '{"role":"assistant","content":"two"}\n'
     path.write_text(first_line + second_line, encoding="utf-8")
     reader = GenericJsonlTranscriptReader(max_bytes=len(first_line) + 5)
-    first = reader.read_since(str(path), None)
-    second = reader.read_since(str(path), first.cursor)
+    first = reader.read_since(str(path), None, allowed_roots=[tmp_path])
+    second = reader.read_since(str(path), first.cursor, allowed_roots=[tmp_path])
     assert [item["content"] for item in first.messages] == ["one"]
     assert [item["content"] for item in second.messages] == ["two"]
     path.write_text('{"role":"user","content":"new"}\n', encoding="utf-8")
-    rotated = reader.read_since(str(path), second.cursor)
+    rotated = reader.read_since(str(path), second.cursor, allowed_roots=[tmp_path])
     assert rotated.truncated is True
     assert [item["content"] for item in rotated.messages] == ["new"]
 
@@ -75,12 +77,46 @@ def test_platform_transcript_readers_normalize_native_envelopes(tmp_path: Path) 
         json.dumps({"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": "codex"}}) + "\n",
         encoding="utf-8",
     )
-    assert ClaudeCodeTranscriptReader().read_since(str(claude_path), None).messages == [
+    assert ClaudeCodeTranscriptReader().read_since(
+        str(claude_path), None, allowed_roots=[tmp_path]
+    ).messages == [
         {"id": "c1", "role": "assistant", "content": "claude"}
     ]
-    assert CodexTranscriptReader().read_since(str(codex_path), None).messages == [
+    assert CodexTranscriptReader().read_since(
+        str(codex_path), None, allowed_roots=[tmp_path]
+    ).messages == [
         {"id": "", "role": "assistant", "content": "codex"}
     ]
+
+
+def test_transcript_reader_rejects_cross_workspace_symlink_and_oversize(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    foreign = tmp_path / "foreign"
+    workspace.mkdir()
+    foreign.mkdir()
+    foreign_transcript = foreign / "transcript.jsonl"
+    foreign_transcript.write_text('{"role":"user","content":"secret"}\n', encoding="utf-8")
+    symlink = workspace / "linked.jsonl"
+    symlink.symlink_to(foreign_transcript)
+    reader = GenericJsonlTranscriptReader(max_file_bytes=8)
+
+    with pytest.raises(PermissionError, match="outside"):
+        reader.read_since(str(foreign_transcript), None, allowed_roots=[workspace])
+    with pytest.raises(PermissionError, match="outside"):
+        reader.read_since(str(symlink), None, allowed_roots=[workspace])
+    with pytest.raises(OSError, match="maximum"):
+        reader.read_since(str(foreign_transcript), None, allowed_roots=[foreign])
+
+
+def test_local_project_identity_uses_realpath_not_basename(tmp_path: Path) -> None:
+    first = tmp_path / "first" / "same-name"
+    second = tmp_path / "second" / "same-name"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+
+    assert project_identity(str(first), str(first), None) != project_identity(
+        str(second), str(second), None
+    )
 
 
 def test_session_journal_dedupes_and_builds_append_only_commit(tmp_path: Path) -> None:

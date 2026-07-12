@@ -7,6 +7,7 @@ from typing import Any
 
 import memoryos
 from memoryos.action_policy.model.action_policy import ActionPolicy
+from memoryos.api.limits import MAX_RETRIEVAL_LIMIT, MAX_TOKEN_BUDGET
 from memoryos.api.mcp.config import MCPServerConfig
 from memoryos.api.mcp.errors import MCPErrorCode, ToolPermissionError, exception_payload, ok_payload
 from memoryos.api.mcp.schemas import (
@@ -140,7 +141,13 @@ class MCPToolRouter:
     def search_context(self, args: dict[str, Any]) -> dict[str, Any]:
         self.caller.require(READ_CONTEXT)
         query = required_str(args, "query")
-        limit = optional_int(args, "limit", 10, minimum=0, maximum=100)
+        limit = optional_int(
+            args,
+            "limit",
+            10,
+            minimum=0,
+            maximum=MAX_RETRIEVAL_LIMIT,
+        )
         metadata = normalize_agent_metadata(args.get("connect_metadata"), self.config)
         filter_metadata = agent_search_filter_metadata(args.get("connect_metadata"), self.config)
         context_type = args.get("context_type")
@@ -200,8 +207,20 @@ class MCPToolRouter:
     def assemble_context(self, args: dict[str, Any]) -> dict[str, Any]:
         self.caller.require(READ_CONTEXT)
         query = required_str(args, "query")
-        token_budget = optional_int(args, "token_budget", self.config.token_budget, minimum=0, maximum=200_000)
-        limit = optional_int(args, "limit", 20, minimum=0, maximum=200)
+        token_budget = optional_int(
+            args,
+            "token_budget",
+            self.config.token_budget,
+            minimum=0,
+            maximum=MAX_TOKEN_BUDGET,
+        )
+        limit = optional_int(
+            args,
+            "limit",
+            20,
+            minimum=0,
+            maximum=MAX_RETRIEVAL_LIMIT,
+        )
         context_types = optional_list(args, "context_types")
         search_scope = args.get("search_scope")
         project_id = str(args.get("project_id") or "")
@@ -252,6 +271,7 @@ class MCPToolRouter:
             session_id=session_id,
             messages=list(args.get("messages") or []),
             used_contexts=list(args.get("used_contexts") or []),
+            used_skills=list(args.get("used_skills") or []),
             tool_results=list(args.get("tool_results") or []),
             connect_metadata=metadata,
             async_commit=optional_bool(args, "async_commit", False),
@@ -262,6 +282,8 @@ class MCPToolRouter:
             **self._local_caller_kwargs(),
         )
         result_payload = _to_payload(result) or {"status": "accepted"}
+        if isinstance(result_payload, dict) and isinstance(result_payload.get("error"), dict):
+            return result_payload
         return ok_payload(
             {
                 "status": result_payload.get("status", "accepted"),

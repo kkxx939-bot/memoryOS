@@ -954,6 +954,8 @@ def test_llm_outage_archives_evidence_and_deferred_proposal_replays(tmp_path) ->
     source_text = "I confirm the storage backend is SQLite."
 
     class FailOnceProvider:
+        is_remote = False
+
         def __init__(self) -> None:
             self.calls = 0
 

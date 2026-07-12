@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import replace
@@ -674,23 +673,23 @@ def test_all_pending_session_result_reports_durable_substate(tmp_path) -> None: 
         index_store=index,
         relation_store=relations,
     )
+    archive_store = SessionArchiveStore(tmp_path, tenant_id="t1")
+    archive = _archive()
     service = SessionCommitService(
-        SessionArchiveStore(tmp_path, tenant_id="t1"),
+        archive_store,
         queue,
         committer=committer,
         memory_planner=planner,
     )
 
-    result = service.async_commit(_archive())
+    result = service.async_commit(archive)
 
     assert result.status == "done_with_pending"
     assert result.archive_committed is True
     assert result.canonical_active_operation_count == 0
     assert result.pending_count == 1
     assert result.pending_persisted is True
-    memory_diff = json.loads(
-        (tmp_path / "tenants/t1/users/u1/sessions/history/pending-session/memory_diff.json").read_text(encoding="utf-8")
-    )
+    memory_diff = archive_store.read_async_outputs(archive)["memory_diff"]
     assert memory_diff["archive_committed"] is True
     assert memory_diff["canonical_active_operation_count"] == 0
     assert memory_diff["pending_count"] == 1

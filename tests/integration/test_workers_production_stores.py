@@ -55,4 +55,4 @@ def test_worker_failure_does_not_ack_job(tmp_path) -> None:
     queue.enqueue(QueueJob(job_id="bad", queue_name="semantic", action="refresh", target_uri="memoryos://user/u1/missing"))
 
     assert SemanticWorker(source, queue).process_pending()["processed"] == []
-    assert _status(queue_path, "bad") == "failed"
+    assert _status(queue_path, "bad") == "pending"

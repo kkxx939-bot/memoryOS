@@ -18,6 +18,8 @@ class AgentHookConfig:
     flush_mode: str = "stop"
     tenant_id: str = "default"
     allowed_workspace_ids: frozenset[str] = frozenset()
+    transcript_roots: tuple[str, ...] = ()
+    max_transcript_bytes: int = 20_000_000
 
     def __post_init__(self) -> None:
         _validate_tenant_id(self.tenant_id)
@@ -44,6 +46,12 @@ class AgentHookConfig:
             allowed_workspace_ids=frozenset(
                 item.strip() for item in os.environ.get("MEMORYOS_WORKSPACE_IDS", "").split(",") if item.strip()
             ),
+            transcript_roots=tuple(
+                item.strip()
+                for item in os.environ.get("MEMORYOS_TRANSCRIPT_ROOTS", "").split(os.pathsep)
+                if item.strip()
+            ),
+            max_transcript_bytes=_env_int("MEMORYOS_MAX_TRANSCRIPT_BYTES", 20_000_000),
         )
 
 

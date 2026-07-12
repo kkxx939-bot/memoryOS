@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from memoryos.contextdb.model.context_object import ContextObject
-from memoryos.contextdb.store.source_store import SourceStore
+from memoryos.contextdb.store.source_store import RelationStore, SourceStore
 from memoryos.memory.canonical.identity import IDENTITY_ALGORITHM_V2, ResolvedMemoryIdentity
 from memoryos.memory.canonical.proposal import PendingMemoryProposal
 from memoryos.memory.canonical.scope import MemoryScope
@@ -23,8 +23,13 @@ from memoryos.memory.canonical.visibility import read_committed_canonical
 class CanonicalMemoryRepository:
     """Load committed Identity V2 state and validate every Slot/Claim invariant."""
 
-    def __init__(self, source_store: SourceStore) -> None:
+    def __init__(
+        self,
+        source_store: SourceStore,
+        relation_store: RelationStore | None = None,
+    ) -> None:
         self.source_store = source_store
+        self.relation_store = relation_store
 
     def load(self, identity: ResolvedMemoryIdentity) -> tuple[MemorySlot | None, tuple[MemoryClaim, ...]]:
         if identity.identity_algorithm_version != IDENTITY_ALGORITHM_V2:
@@ -40,7 +45,7 @@ class CanonicalMemoryRepository:
         return slot, claims
 
     def load_uri(self, slot_uri: str) -> tuple[MemorySlot, tuple[MemoryClaim, ...]]:
-        obj = read_committed_canonical(self.source_store, slot_uri).object
+        obj = read_committed_canonical(self.source_store, slot_uri, self.relation_store).object
         metadata = dict(obj.metadata or {})
         if metadata.get("canonical_kind") != "slot":
             raise CanonicalMemoryInvariantError(f"canonical Slot URI contains {metadata.get('canonical_kind')!r}")
@@ -123,7 +128,7 @@ class CanonicalMemoryRepository:
 
     def _load_claim(self, slot: MemorySlot, claim_id: str) -> MemoryClaim:
         uri = f"{slot.uri}/claims/{claim_id}"
-        obj = read_committed_canonical(self.source_store, uri).object
+        obj = read_committed_canonical(self.source_store, uri, self.relation_store).object
         metadata = dict(obj.metadata or {})
         if metadata.get("canonical_kind") != "claim":
             raise CanonicalMemoryInvariantError(f"slot claim URI is not a canonical claim: {uri}")

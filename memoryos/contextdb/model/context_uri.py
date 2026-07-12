@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urlsplit
 
 from memoryos.core.errors import InvalidContextURI
 
@@ -22,13 +22,40 @@ class ContextURI:
 
     @classmethod
     def parse(cls, value: str) -> ContextURI:
-        parsed = urlparse(str(value))
+        raw = str(value)
+        try:
+            parsed = urlsplit(raw)
+            username = parsed.username
+            password = parsed.password
+            port = parsed.port
+        except ValueError as exc:
+            raise InvalidContextURI("ContextURI authority is malformed") from exc
         if parsed.scheme != "memoryos" or not parsed.netloc:
             raise InvalidContextURI(f"Expected memoryos:// URI, got {value!r}")
-        segments = tuple(segment for segment in parsed.path.split("/") if segment)
+        if parsed.query or parsed.fragment:
+            raise InvalidContextURI("ContextURI query and fragment components are forbidden")
+        if username or password or port is not None:
+            raise InvalidContextURI("ContextURI authority must not contain credentials or a port")
+        if not parsed.path.startswith("/"):
+            raise InvalidContextURI("ContextURI path must be absolute")
+        raw_segments = parsed.path[1:].split("/")
+        if raw_segments and raw_segments[-1] == "":
+            raw_segments.pop()
+        if not raw_segments or any(segment == "" for segment in raw_segments):
+            raise InvalidContextURI("ContextURI contains an empty path segment")
+        segments_list: list[str] = []
+        encoded_segments: list[str] = []
+        for raw_segment in raw_segments:
+            if _has_invalid_percent_escape(raw_segment):
+                raise InvalidContextURI("ContextURI contains invalid percent encoding")
+            segment = unquote(raw_segment, errors="strict")
+            _validate_segment(segment)
+            segments_list.append(segment)
+            encoded_segments.append(quote(segment, safe="-._~"))
+        segments = tuple(segments_list)
         for segment in segments:
             _validate_segment(segment)
-        authority = parsed.netloc
+        authority = parsed.netloc.casefold()
         if authority == "user":
             if len(segments) < 2:
                 raise InvalidContextURI("User URI must be memoryos://user/{user_id}/...")
@@ -38,7 +65,8 @@ class ContextURI:
                 raise InvalidContextURI(f"{authority} URI must include a path")
         else:
             raise InvalidContextURI(f"Unsupported URI authority: {authority}")
-        return cls(raw=str(value), authority=authority, segments=segments)
+        canonical = f"memoryos://{authority}/{'/'.join(encoded_segments)}"
+        return cls(raw=canonical, authority=authority, segments=segments)
 
     @property
     def user_id(self) -> str | None:
@@ -69,3 +97,17 @@ class ContextURI:
 
     def __str__(self) -> str:
         return self.raw
+
+
+def _has_invalid_percent_escape(value: str) -> bool:
+    index = 0
+    while index < len(value):
+        if value[index] != "%":
+            index += 1
+            continue
+        if index + 2 >= len(value) or any(
+            character not in "0123456789abcdefABCDEF" for character in value[index + 1 : index + 3]
+        ):
+            return True
+        index += 3
+    return False

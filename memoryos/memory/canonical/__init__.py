@@ -37,6 +37,7 @@ from memoryos.memory.canonical.projection import (
     ProjectionResult,
 )
 from memoryos.memory.canonical.projection_state import (
+    ProjectionIntegrityError,
     ProjectionRecord,
     ProjectionRecordStore,
     ProjectionStatus,
@@ -167,6 +168,7 @@ __all__ = [
     "CanonicalMemoryProjector",
     "MemoryProjectionWorker",
     "ProjectionResult",
+    "ProjectionIntegrityError",
     "ProjectionRecord",
     "ProjectionRecordStore",
     "ProjectionStatus",

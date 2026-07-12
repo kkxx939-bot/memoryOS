@@ -4,16 +4,26 @@ from __future__ import annotations
 
 import json
 import os
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
 from memoryos.core.ids import require_safe_path_segment
+from memoryos.memory.canonical.event import canonical_digest
+from memoryos.operations.commit.effect_marker import atomic_write_json
+from memoryos.operations.commit.quarantine import QuarantineRecord, quarantine_control_file
 from memoryos.operations.model.context_operation import ContextOperation
 
 
 class RedoIntegrityError(RuntimeError):
     """The durable redo phase does not match the current SourceStore effect."""
+
+
+class RedoControlFileError(RedoIntegrityError):
+    """One or more corrupt redo files were moved out of the live scan path."""
+
+    def __init__(self, records: list[QuarantineRecord]) -> None:
+        super().__init__("corrupt redo control file quarantined")
+        self.records = records
 
 
 @dataclass(frozen=True)
@@ -37,6 +47,17 @@ class RedoEntry:
 
 
 class RedoLog:
+    SCHEMA_VERSION = "transaction_redo_v1"
+    PHASES = {
+        "begin",
+        "started",
+        "source_written",
+        "index_written",
+        "audit_written",
+        "diff_written",
+        "committed",
+    }
+
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
         self.redo_dir = self.root / "system" / "redo"
@@ -50,16 +71,24 @@ class RedoLog:
         relation_manifest: dict | None = None,
     ) -> Path:
         operation_id = require_safe_path_segment(operation.operation_id, "operation_id")
-        self.redo_dir.mkdir(parents=True, exist_ok=True)
+        if phase not in self.PHASES:
+            raise ValueError(f"unsupported redo phase: {phase}")
+        self.redo_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         path = self.redo_dir / f"{operation_id}.json"
-        tmp = path.with_suffix(path.suffix + f".{uuid.uuid4().hex}.tmp")
-        payload = {**operation.to_dict(), "redo_phase": phase}
+        payload = {
+            **operation.to_dict(),
+            "control_schema_version": self.SCHEMA_VERSION,
+            "redo_operation_id": operation.operation_id,
+            "redo_user_id": operation.user_id,
+            "redo_tenant_id": str(operation.payload.get("tenant_id") or "default"),
+            "redo_phase": phase,
+        }
         if source_effect is not None:
             payload["redo_source_effect"] = source_effect
         if relation_manifest is not None:
             payload["redo_relation_manifest"] = relation_manifest
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, path)
+        payload["redo_digest"] = canonical_digest(payload)
+        atomic_write_json(path, payload)
         return path
 
     def advance(
@@ -74,7 +103,7 @@ class RedoLog:
         if source_effect is None or relation_manifest is None:
             path = self.redo_dir / f"{operation_id}.json"
             if path.exists():
-                payload = json.loads(path.read_text(encoding="utf-8"))
+                payload = self._read_payload(path)
                 stored_effect = payload.get("redo_source_effect")
                 if source_effect is None and isinstance(stored_effect, dict):
                     source_effect = stored_effect
@@ -93,6 +122,11 @@ class RedoLog:
         path = self.redo_dir / f"{operation_id}.json"
         if path.exists():
             path.unlink()
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
 
     def pending(self) -> list[ContextOperation]:
         return [entry.operation for entry in self.pending_entries()]
@@ -101,8 +135,21 @@ class RedoLog:
         if not self.redo_dir.exists():
             return []
         entries: list[RedoEntry] = []
+        quarantined: list[QuarantineRecord] = []
         for path in sorted(self.redo_dir.glob("*.json")):
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            try:
+                payload = self._read_payload(path)
+            except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                quarantined.append(
+                    quarantine_control_file(
+                        self.root,
+                        path,
+                        kind="redo",
+                        error=exc,
+                        identifiers={"file_id": path.stem},
+                    )
+                )
+                continue
             source_effect = payload.get("redo_source_effect")
             relation_manifest = payload.get("redo_relation_manifest")
             entries.append(
@@ -115,4 +162,36 @@ class RedoLog:
                     ),
                 )
             )
+        if quarantined:
+            raise RedoControlFileError(quarantined)
         return entries
+
+    def _read_payload(self, path: Path) -> dict:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("redo control file must be a JSON object")
+        digest = payload.get("redo_digest")
+        core = {key: value for key, value in payload.items() if key != "redo_digest"}
+        if (
+            payload.get("control_schema_version") != self.SCHEMA_VERSION
+            or not isinstance(digest, str)
+            or digest != canonical_digest(core)
+            or payload.get("redo_phase") not in self.PHASES
+        ):
+            raise ValueError("redo control file integrity check failed")
+        operation = ContextOperation.from_dict(payload)
+        if (
+            path.stem != operation.operation_id
+            or payload.get("redo_operation_id") != operation.operation_id
+            or payload.get("redo_user_id") != operation.user_id
+            or payload.get("redo_tenant_id")
+            != str(operation.payload.get("tenant_id") or "default")
+        ):
+            raise ValueError("redo control file crosses its operation boundary")
+        source_effect = payload.get("redo_source_effect")
+        relation_manifest = payload.get("redo_relation_manifest")
+        if source_effect is not None and not isinstance(source_effect, dict):
+            raise ValueError("redo Source effect must be an object")
+        if relation_manifest is not None and not isinstance(relation_manifest, dict):
+            raise ValueError("redo Relation manifest must be an object")
+        return payload

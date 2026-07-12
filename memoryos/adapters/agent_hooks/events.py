@@ -146,10 +146,16 @@ class AgentHookEvent:
             "timestamp",
             "metadata",
             "used_contexts",
+            "used_skills",
             "tool_results",
+            "scope",
+            "provenance",
         }
         metadata = dict(data.get("metadata", {})) if isinstance(data.get("metadata"), dict) else {}
         metadata.update({key: value for key, value in data.items() if key not in known})
+        for key in ("used_contexts", "used_skills", "tool_results", "scope", "provenance"):
+            if key in data:
+                metadata[key] = data[key]
         if git_remote:
             metadata["git_remote"] = git_remote
         return cls(
@@ -250,8 +256,8 @@ EVENT_TYPE_MAP = {
 def project_identity(repo_root: str | None, cwd: str | None, git_remote: str | None = None) -> str:
     identity = _normalize_git_remote(git_remote or "")
     if not identity:
-        path = Path(repo_root or cwd or "").expanduser()
-        identity = f"local-repository:{path.name.lower()}"
+        path = Path(repo_root or cwd or ".").expanduser().resolve()
+        identity = f"local-repository-realpath:{path.as_posix()}"
     return "project-" + hashlib.sha256(identity.encode()).hexdigest()[:24]
 
 

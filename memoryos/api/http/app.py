@@ -13,7 +13,9 @@ from urllib.parse import parse_qs
 
 from memoryos.action_policy.model.action_policy import ActionPolicy
 from memoryos.adapters.agent_hooks.events import AgentEventType, AgentHookEvent, NormalizedAgentEvent
+from memoryos.adapters.agent_hooks.sanitizer import sanitize_error_text
 from memoryos.adapters.agent_hooks.session_service import AgentSessionService
+from memoryos.api.limits import MAX_RETRIEVAL_LIMIT, MAX_TOKEN_BUDGET, bounded_int
 from memoryos.api.sdk.client import MemoryOSClient
 from memoryos.api.trusted_context import (
     AUTHORITATIVE_FORGET,
@@ -54,9 +56,21 @@ def handle(
         return client.assemble_context(
             _required_str(payload, "query", route),
             user_id=payload.get("user_id"),
-            token_budget=int(payload.get("token_budget", 2000)),
+            token_budget=bounded_int(
+                payload.get("token_budget"),
+                default=2000,
+                minimum=0,
+                maximum=MAX_TOKEN_BUDGET,
+                label="token_budget",
+            ),
             context_types=payload.get("context_types"),
-            limit=int(payload.get("limit", 20)),
+            limit=bounded_int(
+                payload.get("limit"),
+                default=20,
+                minimum=0,
+                maximum=MAX_RETRIEVAL_LIMIT,
+                label="limit",
+            ),
             connect_metadata=payload.get("connect_metadata"),
             search_scope=payload.get("search_scope"),
             retrieval_views=payload.get("retrieval_views"),
@@ -76,6 +90,7 @@ def handle(
             session_id=_required_str(payload, "session_id", route),
             messages=payload.get("messages"),
             used_contexts=payload.get("used_contexts"),
+            used_skills=payload.get("used_skills"),
             tool_results=payload.get("tool_results"),
             connect_metadata=payload.get("connect_metadata"),
             async_commit=bool(payload.get("async_commit", True)),
@@ -92,6 +107,10 @@ def handle(
             "task_id": result.task_id,
             "archive_uri": result.archive_uri,
             "done": result.done,
+            "state": result.state.value,
+            "commit_group_id": result.commit_group_id,
+            "canonical_committed": result.canonical_committed,
+            "commit_group_status": result.commit_group_status,
         }
     raise KeyError(f"Unknown route: {route}")
 
@@ -361,7 +380,7 @@ class MemoryOSASGI:
         return {
             "error": {
                 "code": code,
-                "message": str(exc)[:300],
+                "message": sanitize_error_text(str(exc) or type(exc).__name__),
                 "retryable": retryable,
                 "request_id": request_id,
                 "operation": "http_request",
@@ -419,7 +438,13 @@ def _search_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "user_id": payload.get("user_id"),
         "context_type": payload.get("context_type"),
-        "limit": int(payload.get("limit", 10)),
+        "limit": bounded_int(
+            payload.get("limit"),
+            default=10,
+            minimum=0,
+            maximum=MAX_RETRIEVAL_LIMIT,
+            label="limit",
+        ),
         "connect_metadata": payload.get("connect_metadata"),
         "search_scope": payload.get("search_scope"),
         "retrieval_views": payload.get("retrieval_views"),

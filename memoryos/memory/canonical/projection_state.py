@@ -1,4 +1,4 @@
-"""Durable, revision-bound state for canonical-memory projections."""
+"""Durable, attempt-owned state for canonical-memory projections."""
 
 from __future__ import annotations
 
@@ -14,17 +14,24 @@ from enum import Enum
 from pathlib import Path
 
 from memoryos.core.time import utc_now
+from memoryos.operations.commit.quarantine import quarantine_control_file
 
-try:  # pragma: no cover - all supported production platforms provide fcntl.
+try:  # pragma: no cover - all supported production POSIX platforms provide fcntl.
     import fcntl
 except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
 
 
 def _as_int(value: object) -> int:
-    if isinstance(value, bool | int | float | str):
+    if isinstance(value, bool):
+        raise ValueError("projection revision must be an integer")
+    if isinstance(value, int | float | str):
         return int(value)
     raise ValueError("projection revision must be an integer")
+
+
+class ProjectionIntegrityError(RuntimeError):
+    """Raised when projection control state or an equal-revision effect conflicts."""
 
 
 class ProjectionStatus(str, Enum):
@@ -45,16 +52,20 @@ class ProjectionStepStatus(str, Enum):
 
 @dataclass(frozen=True)
 class ProjectionRecord:
-    """A durable projection attempt that never lives inside a canonical object."""
+    """One immutable-identity projection attempt with mutable owned progress."""
 
     claim_uri: str
     slot_uri: str
     source_revision: int
     projection_revision: int
+    projection_attempt_id: str
+    input_effect_hash: str
+    publish_token: str
     l0_uri: str
     l1_uri: str
     l2_uri: str
     manifest_uri: str
+    relations_uri: str = ""
     current_claim_revision: int = 0
     index_status: str = ProjectionStepStatus.PENDING.value
     vector_status: str = ProjectionStepStatus.PENDING.value
@@ -68,22 +79,33 @@ class ProjectionRecord:
     failure_reason: str = ""
     retryable: bool = True
     current: bool = False
-    schema_version: str = "canonical_projection_v2"
+    schema_version: str = "canonical_projection_v3"
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> ProjectionRecord:
+        if str(payload.get("schema_version", "")) != "canonical_projection_v3":
+            raise ProjectionIntegrityError("unsupported projection record schema")
+        attempt_id = str(payload.get("projection_attempt_id", ""))
+        effect_hash = str(payload.get("input_effect_hash", ""))
+        publish_token = str(payload.get("publish_token", ""))
+        if not attempt_id or not effect_hash or not publish_token:
+            raise ProjectionIntegrityError("projection record is missing attempt ownership")
         return cls(
             claim_uri=str(payload["claim_uri"]),
             slot_uri=str(payload["slot_uri"]),
             source_revision=_as_int(payload["source_revision"]),
             projection_revision=_as_int(payload.get("projection_revision", payload["source_revision"])),
+            projection_attempt_id=attempt_id,
+            input_effect_hash=effect_hash,
+            publish_token=publish_token,
             l0_uri=str(payload.get("l0_uri", "")),
             l1_uri=str(payload.get("l1_uri", "")),
             l2_uri=str(payload.get("l2_uri", "")),
             manifest_uri=str(payload.get("manifest_uri", "")),
+            relations_uri=str(payload.get("relations_uri", "")),
             current_claim_revision=_as_int(payload.get("current_claim_revision", payload["source_revision"])),
             index_status=str(payload.get("index_status", ProjectionStepStatus.PENDING.value)),
             vector_status=str(payload.get("vector_status", ProjectionStepStatus.PENDING.value)),
@@ -97,7 +119,7 @@ class ProjectionRecord:
             failure_reason=str(payload.get("failure_reason", "")),
             retryable=bool(payload.get("retryable", True)),
             current=bool(payload.get("current", False)),
-            schema_version=str(payload.get("schema_version", "canonical_projection_v2")),
+            schema_version="canonical_projection_v3",
         )
 
     @property
@@ -118,7 +140,9 @@ class ProjectionRecord:
 
 
 class ProjectionRecordStore:
-    """Atomic sidecar store with a monotonic current-revision pointer per Claim."""
+    """Atomic attempt records plus a claim-scoped CAS current pointer."""
+
+    POINTER_SCHEMA = "canonical_projection_current_v3"
 
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
@@ -133,52 +157,50 @@ class ProjectionRecordStore:
         slot_uri: str,
         source_revision: int,
         projection_revision: int,
+        input_effect_hash: str,
         l0_uri: str,
         l1_uri: str,
         l2_uri: str,
         manifest_uri: str,
+        relations_uri: str = "",
         current_claim_revision: int | None = None,
+        projection_attempt_id: str | None = None,
     ) -> ProjectionRecord:
+        if not input_effect_hash:
+            raise ValueError("projection input effect hash is required")
+        attempt_id = projection_attempt_id or uuid.uuid4().hex
+        if not attempt_id or any(character not in "0123456789abcdef" for character in attempt_id.casefold()):
+            raise ValueError("projection attempt id must be a hexadecimal safe segment")
+        existing_attempts = self.attempts(claim_uri, source_revision)
         now = utc_now()
-        existing = self.load(claim_uri, source_revision)
-        if existing is None:
-            record = ProjectionRecord(
-                claim_uri=claim_uri,
-                slot_uri=slot_uri,
-                source_revision=source_revision,
-                projection_revision=projection_revision,
-                l0_uri=l0_uri,
-                l1_uri=l1_uri,
-                l2_uri=l2_uri,
-                manifest_uri=manifest_uri,
-                current_claim_revision=int(current_claim_revision or source_revision),
-                status=ProjectionStatus.RUNNING.value,
-                attempt_count=1,
-                created_at=now,
-                updated_at=now,
-            )
-        else:
-            record = replace(
-                existing,
-                slot_uri=slot_uri,
-                projection_revision=projection_revision,
-                l0_uri=l0_uri,
-                l1_uri=l1_uri,
-                l2_uri=l2_uri,
-                manifest_uri=manifest_uri,
-                current_claim_revision=int(current_claim_revision or source_revision),
-                status=ProjectionStatus.RUNNING.value,
-                attempt_count=existing.attempt_count + 1,
-                updated_at=now,
-                failure_reason="",
-                retryable=True,
-                current=False,
-            )
-        self.save(record)
-        return record
+        record = ProjectionRecord(
+            claim_uri=claim_uri,
+            slot_uri=slot_uri,
+            source_revision=source_revision,
+            projection_revision=projection_revision,
+            projection_attempt_id=attempt_id,
+            input_effect_hash=input_effect_hash,
+            publish_token=uuid.uuid4().hex,
+            l0_uri=l0_uri,
+            l1_uri=l1_uri,
+            l2_uri=l2_uri,
+            manifest_uri=manifest_uri,
+            relations_uri=relations_uri,
+            current_claim_revision=int(current_claim_revision or source_revision),
+            status=ProjectionStatus.RUNNING.value,
+            attempt_count=len(existing_attempts) + 1,
+            created_at=now,
+            updated_at=now,
+        )
+        return self.save(record)
 
     def save(self, record: ProjectionRecord) -> ProjectionRecord:
-        self._write_json_atomic(self.record_path(record.claim_uri, record.source_revision), record.to_dict())
+        path = self.attempt_path(record.claim_uri, record.source_revision, record.projection_attempt_id)
+        if path.exists():
+            existing = ProjectionRecord.from_dict(self._read_json(path))
+            if self._identity(existing) != self._identity(record):
+                raise ProjectionIntegrityError("projection attempt identity changed")
+        self._write_json_atomic(path, record.to_dict())
         return record
 
     def update(
@@ -195,6 +217,13 @@ class ProjectionRecordStore:
         retryable: bool | None = None,
         current: bool | None = None,
     ) -> ProjectionRecord:
+        persisted = self.load(
+            record.claim_uri,
+            record.source_revision,
+            projection_attempt_id=record.projection_attempt_id,
+        )
+        if persisted is None or self._identity(persisted) != self._identity(record):
+            raise ProjectionIntegrityError("projection attempt no longer owns its record")
         updated = replace(
             record,
             index_status=record.index_status if index_status is None else index_status,
@@ -211,6 +240,9 @@ class ProjectionRecordStore:
         return self.save(updated)
 
     def fail(self, record: ProjectionRecord, reason: str, *, retryable: bool = True) -> ProjectionRecord:
+        current = self.load_current(record.claim_uri)
+        if current is not None and current.projection_attempt_id == record.projection_attempt_id:
+            return current
         return self.update(
             record,
             status=ProjectionStatus.FAILED.value,
@@ -220,6 +252,9 @@ class ProjectionRecordStore:
         )
 
     def stale(self, record: ProjectionRecord, reason: str) -> ProjectionRecord:
+        current = self.load_current(record.claim_uri)
+        if current is not None and current.projection_attempt_id == record.projection_attempt_id:
+            return current
         return self.update(
             record,
             status=ProjectionStatus.STALE.value,
@@ -228,17 +263,22 @@ class ProjectionRecordStore:
             current=False,
         )
 
-    def promote(self, record: ProjectionRecord) -> ProjectionRecord:
-        """Promote only monotonically; a late old revision can never replace a newer one."""
+    def promote(self, record: ProjectionRecord, *, replace_same_effect: bool = False) -> ProjectionRecord:
+        """CAS one completed attempt into current; caller must hold ``claim_lock``."""
 
-        pointer = self._read_json_optional(self.current_path(record.claim_uri)) or {}
-        current_revision = _as_int(pointer.get("source_revision", 0) or 0)
-        if current_revision > record.source_revision:
-            return self.stale(record, "newer projection revision is already current")
-        if current_revision and current_revision != record.source_revision:
-            previous = self.load(record.claim_uri, current_revision)
-            if previous is not None and previous.current:
-                self.save(replace(previous, current=False, updated_at=utc_now()))
+        current = self.load_current(record.claim_uri)
+        if current is not None:
+            if current.source_revision > record.source_revision:
+                return self.stale(record, "newer projection revision is already current")
+            if current.source_revision == record.source_revision:
+                if current.input_effect_hash != record.input_effect_hash:
+                    raise ProjectionIntegrityError("same projection revision has a different input effect")
+                if current.projection_attempt_id == record.projection_attempt_id:
+                    return current
+                if not replace_same_effect:
+                    self.stale(record, "equivalent projection attempt is already current")
+                    return current
+
         completed = self.save(
             replace(
                 record,
@@ -249,57 +289,141 @@ class ProjectionRecordStore:
                 updated_at=utc_now(),
             )
         )
+        pointer_core: dict[str, object] = {
+            "schema_version": self.POINTER_SCHEMA,
+            "claim_uri": completed.claim_uri,
+            "slot_uri": completed.slot_uri,
+            "source_revision": completed.source_revision,
+            "projection_revision": completed.projection_revision,
+            "projection_attempt_id": completed.projection_attempt_id,
+            "input_effect_hash": completed.input_effect_hash,
+            "publish_token": completed.publish_token,
+            "record_path": str(self.attempt_path_for(completed)),
+            "updated_at": completed.updated_at,
+        }
         self._write_json_atomic(
-            self.current_path(record.claim_uri),
-            {
-                "claim_uri": record.claim_uri,
-                "slot_uri": record.slot_uri,
-                "source_revision": record.source_revision,
-                "projection_revision": record.projection_revision,
-                "record_path": str(self.record_path(record.claim_uri, record.source_revision)),
-                "updated_at": completed.updated_at,
-            },
+            self.current_path(completed.claim_uri),
+            {**pointer_core, "pointer_digest": self._digest(pointer_core)},
         )
+        if current is not None and current.projection_attempt_id != completed.projection_attempt_id:
+            self.save(replace(current, current=False, updated_at=utc_now()))
         return completed
 
-    def clear_current_if(self, claim_uri: str, source_revision: int, *, reason: str) -> None:
-        pointer_path = self.current_path(claim_uri)
-        pointer = self._read_json_optional(pointer_path) or {}
-        if _as_int(pointer.get("source_revision", 0) or 0) != int(source_revision):
-            return
-        pointer_path.unlink(missing_ok=True)
-        record = self.load(claim_uri, source_revision)
+    def clear_current_if(
+        self,
+        claim_uri: str,
+        source_revision: int,
+        *,
+        projection_attempt_id: str,
+        publish_token: str,
+        reason: str,
+    ) -> bool:
+        pointer = self._read_pointer_optional(claim_uri)
+        if pointer is None:
+            return False
+        if (
+            _as_int(pointer.get("source_revision", 0)) != int(source_revision)
+            or str(pointer.get("projection_attempt_id", "")) != projection_attempt_id
+            or str(pointer.get("publish_token", "")) != publish_token
+        ):
+            return False
+        self.current_path(claim_uri).unlink(missing_ok=True)
+        record = self.load(claim_uri, source_revision, projection_attempt_id=projection_attempt_id)
         if record is not None:
-            self.stale(record, reason)
+            self.save(
+                replace(
+                    record,
+                    status=ProjectionStatus.STALE.value,
+                    failure_reason=str(reason)[:1000],
+                    retryable=False,
+                    current=False,
+                    updated_at=utc_now(),
+                )
+            )
+        return True
 
-    def load(self, claim_uri: str, source_revision: int) -> ProjectionRecord | None:
-        payload = self._read_json_optional(self.record_path(claim_uri, source_revision))
-        return ProjectionRecord.from_dict(payload) if payload is not None else None
+    def load(
+        self,
+        claim_uri: str,
+        source_revision: int,
+        *,
+        projection_attempt_id: str | None = None,
+    ) -> ProjectionRecord | None:
+        if projection_attempt_id is not None:
+            path = self.attempt_path(claim_uri, source_revision, projection_attempt_id)
+            if not path.exists():
+                return None
+            record = ProjectionRecord.from_dict(self._read_json(path))
+            self._validate_location(record, claim_uri, source_revision, projection_attempt_id)
+            return record
+        current = self.load_current(claim_uri, source_revision=source_revision)
+        if current is not None:
+            return current
+        attempts = self.attempts(claim_uri, source_revision)
+        return max(attempts, key=lambda item: (item.updated_at, item.projection_attempt_id), default=None)
+
+    def attempts(self, claim_uri: str, source_revision: int) -> list[ProjectionRecord]:
+        directory = self._revision_dir(claim_uri, source_revision)
+        if not directory.exists():
+            return []
+        result: list[ProjectionRecord] = []
+        for path in sorted(directory.glob("attempt-*.json")):
+            record = ProjectionRecord.from_dict(self._read_json(path))
+            self._validate_location(record, claim_uri, source_revision, record.projection_attempt_id)
+            result.append(record)
+        return result
 
     def load_current(self, claim_uri: str, *, source_revision: int | None = None) -> ProjectionRecord | None:
-        pointer = self._read_json_optional(self.current_path(claim_uri))
+        pointer = self._read_pointer_optional(claim_uri)
         if pointer is None:
             return None
-        revision = _as_int(pointer.get("source_revision", 0) or 0)
+        revision = _as_int(pointer.get("source_revision", 0))
         if source_revision is not None and revision != int(source_revision):
             return None
-        record = self.load(claim_uri, revision)
-        if record is None or not record.current or not record.usable:
-            return None
+        attempt_id = str(pointer.get("projection_attempt_id", ""))
+        record = self.load(claim_uri, revision, projection_attempt_id=attempt_id)
+        if (
+            record is None
+            or not record.current
+            or not record.usable
+            or record.input_effect_hash != str(pointer.get("input_effect_hash", ""))
+            or record.publish_token != str(pointer.get("publish_token", ""))
+            or str(self.attempt_path_for(record)) != str(pointer.get("record_path", ""))
+        ):
+            raise ProjectionIntegrityError("projection current pointer does not match its attempt record")
         return record
 
-    def record_path(self, claim_uri: str, source_revision: int) -> Path:
-        return self._claim_dir(claim_uri) / "revisions" / f"rev-{int(source_revision)}.json"
+    def record_path(
+        self,
+        claim_uri: str,
+        source_revision: int,
+        projection_attempt_id: str | None = None,
+    ) -> Path:
+        if projection_attempt_id is not None:
+            return self.attempt_path(claim_uri, source_revision, projection_attempt_id)
+        record = self.load(claim_uri, source_revision)
+        if record is None:
+            return self._revision_dir(claim_uri, source_revision) / "missing.json"
+        return self.attempt_path_for(record)
+
+    def attempt_path(self, claim_uri: str, source_revision: int, projection_attempt_id: str) -> Path:
+        return self._revision_dir(claim_uri, source_revision) / f"attempt-{projection_attempt_id}.json"
+
+    def attempt_path_for(self, record: ProjectionRecord) -> Path:
+        return self.attempt_path(record.claim_uri, record.source_revision, record.projection_attempt_id)
 
     def current_path(self, claim_uri: str) -> Path:
         return self._claim_dir(claim_uri) / "current.json"
 
     @contextmanager
     def claim_lock(self, claim_uri: str) -> Iterator[None]:
-        """Serialize publication across workers without serializing unrelated Claims."""
+        """Serialize publication across processes without serializing unrelated Claims."""
 
         lock_path = self._claim_dir(claim_uri) / ".projection.lock"
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self._secure_directory(lock_path.parent)
+        if not lock_path.exists():
+            lock_path.touch(mode=0o600)
+        os.chmod(lock_path, 0o600)
         if fcntl is not None:
             with lock_path.open("a+", encoding="utf-8") as handle:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
@@ -313,32 +437,108 @@ class ProjectionRecordStore:
         with lock:  # pragma: no cover
             yield
 
+    def _revision_dir(self, claim_uri: str, source_revision: int) -> Path:
+        return self._claim_dir(claim_uri) / "revisions" / f"rev-{int(source_revision)}"
+
     def _claim_dir(self, claim_uri: str) -> Path:
         digest = hashlib.sha256(claim_uri.encode("utf-8")).hexdigest()
         return self.state_root / digest[:2] / digest
 
-    def _read_json_optional(self, path: Path) -> dict[str, object] | None:
+    def _read_pointer_optional(self, claim_uri: str) -> dict[str, object] | None:
+        path = self.current_path(claim_uri)
+        if not path.exists():
+            return None
+        pointer = self._read_json(path)
+        if str(pointer.get("schema_version", "")) != self.POINTER_SCHEMA:
+            raise ProjectionIntegrityError("unsupported projection current pointer schema")
+        claimed = str(pointer.get("pointer_digest", ""))
+        core = {key: value for key, value in pointer.items() if key != "pointer_digest"}
+        if not claimed or claimed != self._digest(core):
+            raise ProjectionIntegrityError("projection current pointer digest mismatch")
+        return pointer
+
+    def _read_json(self, path: Path) -> dict[str, object]:
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return None
         except (OSError, json.JSONDecodeError) as exc:
-            raise RuntimeError(f"invalid projection state: {path.name}") from exc
+            if path.exists():
+                quarantine_control_file(
+                    self.root,
+                    path,
+                    kind="projection_record",
+                    error=exc,
+                    identifiers={"record_id": path.stem},
+                )
+            raise ProjectionIntegrityError(f"invalid projection state: {path.name}") from exc
         if not isinstance(value, dict):
-            raise RuntimeError(f"invalid projection state: {path.name}")
+            quarantine_control_file(
+                self.root,
+                path,
+                kind="projection_record",
+                error=ValueError("projection state is not an object"),
+                identifiers={"record_id": path.stem},
+            )
+            raise ProjectionIntegrityError(f"invalid projection state: {path.name}")
         return value
 
     def _write_json_atomic(self, path: Path, payload: Mapping[str, object]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        self._secure_directory(path.parent)
         tmp = path.with_suffix(path.suffix + f".{uuid.uuid4().hex}.tmp")
-        tmp.write_text(
-            json.dumps(dict(payload), ensure_ascii=False, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        with tmp.open("x", encoding="utf-8") as handle:
+            handle.write(json.dumps(dict(payload), ensure_ascii=False, indent=2, sort_keys=True))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
         os.replace(tmp, path)
+        os.chmod(path, 0o600)
+        descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _secure_directory(self, directory: Path) -> None:
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        current = directory
+        stop = self.root.parent
+        while current != stop and (current == self.root or self.root in current.parents):
+            os.chmod(current, 0o700)
+            if current == self.root:
+                break
+            current = current.parent
+
+    def _digest(self, payload: Mapping[str, object]) -> str:
+        raw = json.dumps(dict(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _identity(self, record: ProjectionRecord) -> tuple[object, ...]:
+        return (
+            record.claim_uri,
+            record.slot_uri,
+            record.source_revision,
+            record.projection_revision,
+            record.projection_attempt_id,
+            record.input_effect_hash,
+            record.publish_token,
+        )
+
+    def _validate_location(
+        self,
+        record: ProjectionRecord,
+        claim_uri: str,
+        source_revision: int,
+        projection_attempt_id: str,
+    ) -> None:
+        if (
+            record.claim_uri != claim_uri
+            or record.source_revision != int(source_revision)
+            or record.projection_attempt_id != projection_attempt_id
+        ):
+            raise ProjectionIntegrityError("projection record path identity mismatch")
 
 
 __all__ = [
+    "ProjectionIntegrityError",
     "ProjectionRecord",
     "ProjectionRecordStore",
     "ProjectionStatus",

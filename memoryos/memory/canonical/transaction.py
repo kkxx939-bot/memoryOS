@@ -162,6 +162,7 @@ class MemoryTransactionPlanner:
                 [
                     tenant_id,
                     episode_id,
+                    commit_group_id,
                     proposal.fingerprint,
                     transition.slot.slot_id,
                     identity_version,
@@ -259,6 +260,7 @@ class MemoryTransactionPlanner:
             [
                 tenant_id,
                 episode_id,
+                commit_group_id,
                 proposal.fingerprint,
                 transition.slot.slot_id,
                 transition.slot.revision,

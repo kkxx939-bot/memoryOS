@@ -135,7 +135,9 @@ class SessionCommitService:
             ],
         )
         if group.canonical_status != "completed":
-            if group.canonical_status == "failed" and not group.canonical_retryable:
+            if group.canonical_status in {"dead_letter", "quarantine"} or (
+                group.canonical_status == "failed" and not group.canonical_retryable
+            ):
                 return self._write_incomplete_outputs(
                     archive,
                     group,
@@ -167,7 +169,7 @@ class SessionCommitService:
                 self._enqueue_memory_proposal(archive, exc)
                 group = self.commit_group_store.fail_canonical(
                     group_id,
-                    f"{type(exc).__name__}: {exc.error_type}",
+                    exc.error_type,
                     retryable=exc.retryable,
                     attempt_id=canonical_attempt_id,
                 )
@@ -187,7 +189,7 @@ class SessionCommitService:
             except (OSError, TimeoutError, RevisionConflictError) as exc:
                 self.commit_group_store.fail_canonical(
                     group_id,
-                    f"{type(exc).__name__}: {exc}",
+                    type(exc).__name__,
                     retryable=True,
                     attempt_id=canonical_attempt_id,
                 )
@@ -195,7 +197,7 @@ class SessionCommitService:
             except (KeyError, TypeError, ValueError, RuntimeError) as exc:
                 self.commit_group_store.fail_canonical(
                     group_id,
-                    f"{type(exc).__name__}: {exc}",
+                    type(exc).__name__,
                     retryable=False,
                     attempt_id=canonical_attempt_id,
                 )
@@ -265,8 +267,6 @@ class SessionCommitService:
             commit_group_status=group.to_dict(),
             complete=group.complete,
         )
-        if group.complete:
-            self._enqueue_refresh_consumers(archive, group_id)
         return self._result(archive, group)
 
     def _commit_memory_with_reconcile_retry(
@@ -343,8 +343,10 @@ class SessionCommitService:
         existing = status.consumers[consumer]
         if existing.status == "completed":
             return dict(existing.result) or {"status": "completed"}
-        if existing.status == "failed" and not existing.retryable:
-            return {"status": "failed", "error": existing.last_error, "retryable": False}
+        if existing.status in {"dead_letter", "quarantine"} or (
+            existing.status == "failed" and not existing.retryable
+        ):
+            return {"status": existing.status, "error": existing.last_error, "retryable": False}
         attempt_id = uuid.uuid4().hex
         if not self.commit_group_store.claim_consumer(
             group_id,
@@ -365,14 +367,19 @@ class SessionCommitService:
             if failures:
                 raise DerivedConsumerError(consumer, failures)
         except (OSError, TimeoutError, RuntimeError, ValueError, KeyError, TypeError) as exc:
-            self.commit_group_store.fail_consumer(
+            failed = self.commit_group_store.fail_consumer(
                 group_id,
                 consumer,
-                f"{type(exc).__name__}: {exc}",
+                type(exc).__name__,
                 retryable=True,
                 attempt_id=attempt_id,
             )
-            return {"status": "failed", "error": type(exc).__name__, "retryable": True}
+            item = failed.consumers[consumer]
+            return {
+                "status": item.status,
+                "error": item.last_error,
+                "retryable": item.retryable,
+            }
         current = self.commit_group_store.load(group_id)
         assert current is not None
         self.commit_group_store.complete_consumer(
@@ -454,18 +461,6 @@ class SessionCommitService:
             )
         )
 
-    def _enqueue_refresh_consumers(self, archive: SessionArchive, group_id: str) -> None:
-        for queue_name in ("semantic", "embedding", "reindex"):
-            self.queue_store.enqueue(
-                QueueJob(
-                    job_id=f"{queue_name}_{stable_hash([group_id, queue_name], length=32)}",
-                    queue_name=queue_name,
-                    action=f"{queue_name}_refresh",
-                    target_uri=archive.archive_uri,
-                    payload={"task_id": archive.task_id, "commit_group_id": group_id},
-                )
-            )
-
     def _write_incomplete_outputs(
         self,
         archive: SessionArchive,
@@ -498,7 +493,11 @@ class SessionCommitService:
         return self._result(archive, group)
 
     def _result(self, archive: SessionArchive, group: CommitGroupStatus) -> SessionCommitResult:
-        failed_consumers = [name for name, item in group.consumers.items() if item.status == "failed"]
+        failed_consumers = [
+            name
+            for name, item in group.consumers.items()
+            if item.status in {"failed", "dead_letter", "quarantine"}
+        ]
         memory_result = dict(group.canonical_result or {})
         pending_count = int(memory_result.get("pending_count", 0) or 0)
         active_count = int(memory_result.get("canonical_active_operation_count", 0) or 0)
@@ -513,14 +512,28 @@ class SessionCommitService:
             status = "canonical_committed"
         else:
             status = "canonical_pending"
+        terminal_failure = group.canonical_status in {"dead_letter", "quarantine"} or any(
+            item.status in {"dead_letter", "quarantine"} for item in group.consumers.values()
+        )
+        retryable_failure = (
+            group.canonical_status == "failed" and group.canonical_retryable
+        ) or any(
+            item.status == "failed" and item.retryable for item in group.consumers.values()
+        )
         return SessionCommitResult(
             task_id=archive.task_id,
             archive_uri=archive.archive_uri,
             status=status,
             done=group.complete,
-            state=SessionCommitState.COMMITTED
-            if group.canonical_status == "completed"
-            else SessionCommitState.PROCESSING,
+            state=(
+                SessionCommitState.DEAD_LETTER
+                if terminal_failure
+                else SessionCommitState.FAILED_RETRYABLE
+                if retryable_failure
+                else SessionCommitState.COMMITTED
+                if group.canonical_status == "completed"
+                else SessionCommitState.PROCESSING
+            ),
             commit_group_id=group.group_id,
             canonical_committed=group.canonical_status == "completed",
             commit_group_status=group.to_dict(),

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import uuid
 from collections.abc import Iterator, Sequence
@@ -23,8 +24,10 @@ class SQLiteLockStore:
         self.path = Path(path)
         self.owner = owner
         self.sqlite_timeout_seconds = max(0.001, float(sqlite_timeout_seconds))
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.path.parent, 0o700)
         self._init_db()
+        os.chmod(self.path, 0o600)
 
     def acquire(self, lock_key: str, ttl_seconds: int = 30) -> LockToken:
         now = datetime.now(timezone.utc)

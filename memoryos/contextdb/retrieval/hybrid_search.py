@@ -92,6 +92,8 @@ class HybridSearch:
         if self.vector_store is not None and self.embedding_provider is not None:
             try:
                 embedding = self.embedding_provider.embed(query)
+                if not embedding or any(not math.isfinite(float(value)) for value in embedding):
+                    raise ValueError("embedding provider returned non-finite values")
                 vector_limit = limit
                 if self.source_store is not None and "allowed_uris" in filters:
                     vector_limit = max(limit, len(self.source_store.list_objects()))

@@ -238,7 +238,7 @@ class ActionContextBuilder:
             return None
         if isinstance(obj.metadata, Mapping) and dict(obj.metadata).get("canonical_kind") == "claim":
             try:
-                committed = read_committed_canonical(self.source_store, uri)
+                committed = read_committed_canonical(self.source_store, uri, self.relation_store)
             except (FileNotFoundError, IsADirectoryError, NotADirectoryError, TypeError, ValueError):
                 return None
             if committed.from_before_image:
@@ -373,7 +373,11 @@ class ActionContextBuilder:
         if obj.context_type == ContextType.MEMORY and isinstance(obj.metadata, Mapping):
             if dict(obj.metadata).get("canonical_kind") == "claim":
                 try:
-                    committed = read_committed_canonical(self.source_store, uri)
+                    committed = read_committed_canonical(
+                        self.source_store,
+                        uri,
+                        self.relation_store,
+                    )
                 except (FileNotFoundError, IsADirectoryError, NotADirectoryError, TypeError, ValueError):
                     return None
                 if committed.from_before_image:

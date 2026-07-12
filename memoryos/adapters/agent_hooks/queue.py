@@ -8,7 +8,7 @@ import tempfile
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 from memoryos.adapters.agent_hooks.sanitizer import sanitize_error_text
 from memoryos.core.time import utc_now
@@ -31,6 +31,10 @@ HOOK_ALLOWED_TOOLS = {
     "memoryos_commit_session",
     "memoryos_health",
 }
+
+
+class PendingQueueIntegrityError(RuntimeError):
+    """A persisted hook queue cannot be trusted and has been quarantined."""
 
 
 @dataclass
@@ -189,34 +193,62 @@ class PendingQueue:
         items: list[PendingItem] = []
         try:
             lines = self.path.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            return []
-        for line in lines:
+        except (OSError, UnicodeError) as exc:
+            self._quarantine_corrupt_queue(exc)
+        for line_number, line in enumerate(lines, start=1):
             if not line.strip():
                 continue
             try:
                 payload = json.loads(line)
+                if not isinstance(payload, dict):
+                    raise TypeError("pending queue row must be a JSON object")
                 items.append(PendingItem(**payload))
-            except Exception:
-                continue
+            except (json.JSONDecodeError, TypeError, ValueError):
+                self._quarantine_corrupt_queue(
+                    PendingQueueIntegrityError(
+                        f"pending hook queue contains an invalid row at line {line_number}"
+                    )
+                )
         return items
+
+    def _quarantine_corrupt_queue(self, error: BaseException) -> NoReturn:
+        # Local import keeps the lightweight hook package out of the canonical
+        # commit module's import cycle.
+        from memoryos.operations.commit.quarantine import quarantine_control_file
+
+        if self.path.exists():
+            quarantine_control_file(
+                self.path.parent,
+                self.path,
+                kind="hook_queue",
+                error=error,
+                identifiers={"tenant_id": self.tenant_id, "user_id": self.user_id},
+            )
+        raise PendingQueueIntegrityError("pending hook queue is corrupt and was quarantined") from error
 
     def _owns(self, item: PendingItem) -> bool:
         return item.tenant_id == self.tenant_id and item.user_id == self.user_id
 
     def _write_items(self, items: list[PendingItem]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.path.parent, 0o700)
         text = "\n".join(json.dumps(asdict(item), ensure_ascii=False, sort_keys=True) for item in items)
         fd, tmp_name = tempfile.mkstemp(prefix=self.path.name, suffix=".tmp", dir=str(self.path.parent))
         with os.fdopen(fd, "w", encoding="utf-8") as fp:
+            os.fchmod(fp.fileno(), 0o600)
             fp.write(text + ("\n" if text else ""))
         os.replace(tmp_name, self.path)
+        os.chmod(self.path, 0o600)
 
     def _locked_update(self, update) -> int:  # noqa: ANN001
         lock_backend = _lock_backend()
         if lock_backend is None:
             raise RuntimeError("PendingQueue requires fcntl or msvcrt file locking")
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.path.parent, 0o700)
+        if not self.lock_path.exists():
+            self.lock_path.touch(mode=0o600)
+        os.chmod(self.lock_path, 0o600)
         with self.lock_path.open("w", encoding="utf-8") as lock_file:
             _lock_file(lock_file, lock_backend)
             try:
@@ -228,9 +260,13 @@ class PendingQueue:
                 _unlock_file(lock_file, lock_backend)
 
     def _append_dead_letter(self, item: PendingItem) -> None:
-        self.dead_letter_path.parent.mkdir(parents=True, exist_ok=True)
+        self.dead_letter_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.dead_letter_path.parent, 0o700)
         with self.dead_letter_path.open("a", encoding="utf-8") as fp:
+            os.chmod(self.dead_letter_path, 0o600)
             fp.write(json.dumps(asdict(item), ensure_ascii=False, sort_keys=True) + "\n")
+            fp.flush()
+            os.fsync(fp.fileno())
 
 
 def _safe_error(exc: Exception) -> str:

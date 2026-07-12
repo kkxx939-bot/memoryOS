@@ -30,8 +30,19 @@ class QueueJob:
     payload: dict = field(default_factory=dict)
     status: str = "pending"
     leased_until: str | None = None
+    lease_token: str = ""
+    lease_generation: int = 0
+    lease_owner: str = ""
     retry_count: int = 0
     last_error: str = ""
+
+
+class LeaseLostError(RuntimeError):
+    """Raised when a queue worker no longer owns the leased job it is settling."""
+
+
+class QueueIdempotencyConflictError(ValueError):
+    """Raised when one queue job id is reused for a different immutable identity."""
 
 
 @dataclass(frozen=True)
@@ -90,15 +101,38 @@ class RelationStore(Protocol):
 
 
 class QueueStore(Protocol):
-    def enqueue(self, job: QueueJob) -> None:
+    def enqueue(self, job: QueueJob) -> QueueJob:
         """处理 enqueue 这一步。"""
         ...
 
-    def lease(self, queue_name: str, limit: int = 10, lease_seconds: int = 60) -> list[QueueJob]: ...
+    def lease(
+        self,
+        queue_name: str,
+        *,
+        lease_owner: str,
+        limit: int = 10,
+        lease_seconds: int = 60,
+        job_ids: Sequence[str] | None = None,
+    ) -> list[QueueJob]: ...
 
-    def ack(self, job_id: str) -> None: ...
+    def ack(self, job: QueueJob) -> QueueJob: ...
 
-    def fail(self, job_id: str, error: str) -> None: ...
+    def fail(self, job: QueueJob, error: str) -> QueueJob: ...
+
+    def retry(
+        self,
+        job: QueueJob,
+        error: str,
+        *,
+        max_retries: int = 3,
+        retryable: bool = True,
+    ) -> QueueJob: ...
+
+    def quarantine(self, job: QueueJob, error: str) -> QueueJob: ...
+
+    def get(self, job_id: str) -> QueueJob | None: ...
+
+    def stats(self) -> dict[str, int]: ...
 
 
 class LockStore(Protocol):

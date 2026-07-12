@@ -6,7 +6,6 @@ import unittest
 from pathlib import Path
 
 from memoryos.action_policy.model.action_policy import ActionPolicy
-from memoryos.contextdb.model.context_uri import ContextURI
 from memoryos.contextdb.session.planners.memory_commit_planner import MemoryCommitPlanner
 from memoryos.contextdb.session.session_archive import SessionArchiveStore
 from memoryos.contextdb.session.session_commit import SessionCommitService
@@ -120,10 +119,11 @@ class SessionCommitGeneratesDiffsTest(unittest.TestCase):
         )
         self.store.write_sync_archive(archive)
         self.service.async_commit(archive)
-        directory = ContextURI.parse(self.archive_uri).to_source_path(self.root)
-        memory_diff = json.loads((directory / "memory_diff.json").read_text(encoding="utf-8"))
-        behavior_diff = json.loads((directory / "behavior_diff.json").read_text(encoding="utf-8"))
-        action_policy_diff = json.loads((directory / "action_policy_diff.json").read_text(encoding="utf-8"))
+        persisted = self.store.read_archive(self.archive_uri)
+        outputs = self.store.read_async_outputs(persisted)
+        memory_diff = outputs["memory_diff"]
+        behavior_diff = outputs["behavior_diff"]
+        action_policy_diff = outputs["action_policy_diff"]
         self.assertEqual(memory_diff["status"], "committed")
         self.assertEqual(behavior_diff["status"], "committed")
         self.assertEqual(action_policy_diff["status"], "committed")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -12,8 +13,10 @@ from memoryos.contextdb.model.context_relation import ContextRelation
 class SQLiteRelationStore:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.path.parent, 0o700)
         self._init_db()
+        os.chmod(self.path, 0o600)
 
     def add_relation(self, relation: ContextRelation) -> None:
         tenant_id = str(relation.metadata.get("tenant_id", "default"))

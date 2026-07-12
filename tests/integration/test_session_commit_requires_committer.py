@@ -23,10 +23,10 @@ class SessionCommitRequiresCommitterTest(unittest.TestCase):
             service = SessionCommitService(SessionArchiveStore(tmp), InMemoryQueueStore())
             with self.assertRaises(RuntimeError):
                 service.async_commit(archive)
-            plan_service = SessionCommitService(SessionArchiveStore(tmp), InMemoryQueueStore(), allow_plan_only=True)
+            plan_store = SessionArchiveStore(tmp)
+            plan_service = SessionCommitService(plan_store, InMemoryQueueStore(), allow_plan_only=True)
             plan_service.async_commit(archive)
-            path = Path(tmp) / "tenants/default/users/u1/sessions/history/s1/memory_diff.json"
-            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["status"], "planned")
+            self.assertEqual(plan_store.read_async_outputs(archive)["memory_diff"]["status"], "planned")
 
     def test_committer_and_client_produce_committed_diffs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -34,10 +34,11 @@ class SessionCommitRequiresCommitterTest(unittest.TestCase):
             source = FileSystemSourceStore(root)
             index = InMemoryIndexStore()
             committer = OperationCommitter(source, index, str(root))
-            service = SessionCommitService(SessionArchiveStore(root), InMemoryQueueStore(), committer=committer)
+            store = SessionArchiveStore(root)
+            service = SessionCommitService(store, InMemoryQueueStore(), committer=committer)
             archive = SessionArchive(user_id="u1", session_id="s1", archive_uri="memoryos://user/u1/sessions/history/s1", messages=[{"content": "记住我喜欢 26 度"}])
             service.async_commit(archive)
-            payload = json.loads((root / "tenants/default/users/u1/sessions/history/s1/memory_diff.json").read_text(encoding="utf-8"))
+            payload = store.read_async_outputs(archive)["memory_diff"]
             self.assertEqual(payload["status"], "committed")
             client = MemoryOSClient(str(root))
             policy = ActionPolicy(user_id="u1", scene_key="hot", action="turn_on_ac", memory_anchor_uri="memoryos://user/u1/memories/anchors/hot")
@@ -55,7 +56,10 @@ class SessionCommitRequiresCommitterTest(unittest.TestCase):
                 async_commit=True,
             )
             self.assertEqual(result.prediction_result.memory_operations, [])
-            diff = json.loads((root / "tenants/default/users/u1/sessions/history/s2/memory_diff.json").read_text(encoding="utf-8"))
+            persisted = client.session_archive_store.read_archive(
+                "memoryos://user/u1/sessions/history/s2"
+            )
+            diff = client.session_archive_store.read_async_outputs(persisted)["memory_diff"]
             self.assertEqual(diff["status"], "committed")
 
 

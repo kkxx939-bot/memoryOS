@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import json
+import os
+import secrets
 import sqlite3
+from collections.abc import Sequence
 from datetime import timedelta
 from pathlib import Path
 
-from memoryos.contextdb.store.source_store import QueueJob
+from memoryos.contextdb.store.source_store import (
+    LeaseLostError,
+    QueueIdempotencyConflictError,
+    QueueJob,
+)
 from memoryos.core.time import utc_now
 
 
@@ -15,101 +22,254 @@ class SQLiteQueueStore:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.path.parent, 0o700)
         self._init_db()
 
-    def enqueue(self, job: QueueJob) -> None:
+    def enqueue(self, job: QueueJob) -> QueueJob:
+        """Create one immutable queue identity or return its existing state."""
+
+        if job.status != "pending" or job.lease_token or job.lease_owner or job.lease_generation:
+            raise ValueError("new queue jobs must be unleased and pending")
         now = utc_now()
+        payload_json = self._canonical_payload(job.payload)
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute("SELECT * FROM queue_jobs WHERE job_id = ?", (job.job_id,)).fetchone()
+            if existing is not None:
+                if self._identity(existing) != (job.queue_name, job.action, job.target_uri, payload_json):
+                    conn.rollback()
+                    raise QueueIdempotencyConflictError(
+                        f"queue job id is already bound to another payload: {job.job_id}"
+                    )
+                conn.commit()
+                return self._row_to_job(existing)
             conn.execute(
                 """
                 INSERT INTO queue_jobs(job_id, queue_name, action, target_uri, payload_json, status, leased_until, retry_count, created_at, updated_at, last_error)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(job_id) DO NOTHING
                 """,
                 (
                     job.job_id,
                     job.queue_name,
                     job.action,
                     job.target_uri,
-                    json.dumps(job.payload, ensure_ascii=False),
-                    job.status,
-                    job.leased_until,
-                    job.retry_count,
+                    payload_json,
+                    "pending",
+                    None,
+                    0,
                     now,
                     now,
-                    job.last_error,
+                    "",
                 ),
             )
+            row = conn.execute("SELECT * FROM queue_jobs WHERE job_id = ?", (job.job_id,)).fetchone()
+            conn.commit()
+        assert row is not None
+        return self._row_to_job(row)
 
-    def lease(self, queue_name: str, limit: int = 10, lease_seconds: int = 60) -> list[QueueJob]:
-        now = utc_now()
+    def lease(
+        self,
+        queue_name: str,
+        *,
+        lease_owner: str,
+        limit: int = 10,
+        lease_seconds: int = 60,
+        job_ids: Sequence[str] | None = None,
+    ) -> list[QueueJob]:
+        """Atomically select and claim only jobs owned by this write transaction."""
+
+        if not isinstance(lease_owner, str) or not lease_owner.strip():
+            raise ValueError("lease_owner must be non-empty")
+        if limit <= 0:
+            return []
+        now = self._now_dt().isoformat()
         leased_until = (self._now_dt() + timedelta(seconds=max(1, lease_seconds))).isoformat()
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            id_filter = ""
+            params: list[object] = [queue_name, now]
+            selected_ids = tuple(dict.fromkeys(str(item) for item in (job_ids or ()) if str(item)))
+            if job_ids is not None:
+                if not selected_ids:
+                    conn.commit()
+                    return []
+                id_filter = f" AND job_id IN ({','.join('?' for _ in selected_ids)})"
+                params.extend(selected_ids)
+            params.append(limit)
             rows = conn.execute(
-                """
+                f"""
                 SELECT * FROM queue_jobs
                 WHERE queue_name = ?
                   AND (status = 'pending' OR (status = 'leased' AND leased_until <= ?))
+                  {id_filter}
                 ORDER BY created_at
                 LIMIT ?
                 """,
-                (queue_name, now, limit),
+                params,
             ).fetchall()
-            jobs = [self._row_to_job(row, status="leased", leased_until=leased_until) for row in rows]
-            for job in jobs:
-                conn.execute(
-                    "UPDATE queue_jobs SET status = 'leased', leased_until = ?, updated_at = ? WHERE job_id = ? AND status IN ('pending', 'leased')",
-                    (leased_until, now, job.job_id),
-                )
+            jobs: list[QueueJob] = []
+            for row in rows:
+                token = secrets.token_urlsafe(32)
+                updated = conn.execute(
+                    """
+                    UPDATE queue_jobs
+                    SET status = 'leased', leased_until = ?, lease_token = ?,
+                        lease_generation = lease_generation + 1, lease_owner = ?, updated_at = ?
+                    WHERE job_id = ?
+                      AND queue_name = ?
+                      AND (status = 'pending' OR (status = 'leased' AND leased_until <= ?))
+                    RETURNING *
+                    """,
+                    (leased_until, token, lease_owner, now, row["job_id"], queue_name, now),
+                ).fetchone()
+                if updated is not None:
+                    jobs.append(self._row_to_job(updated))
+            conn.commit()
         return jobs
 
-    def ack(self, job_id: str) -> None:
-        with self._connect() as conn:
-            conn.execute("UPDATE queue_jobs SET status = 'done', updated_at = ?, leased_until = NULL WHERE job_id = ?", (utc_now(), job_id))
+    def ack(self, job: QueueJob) -> QueueJob:
+        return self._settle(
+            job,
+            """
+            UPDATE queue_jobs
+            SET status = 'done', updated_at = ?, leased_until = NULL,
+                lease_token = '', lease_owner = ''
+            WHERE job_id = ? AND status = 'leased' AND lease_token = ?
+              AND lease_generation = ? AND lease_owner = ? AND leased_until > ?
+            RETURNING *
+            """,
+            (),
+        )
 
-    def fail(self, job_id: str, error: str) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                "UPDATE queue_jobs SET status = 'failed', retry_count = retry_count + 1, last_error = ?, updated_at = ?, leased_until = NULL WHERE job_id = ?",
-                (error, utc_now(), job_id),
-            )
+    def fail(self, job: QueueJob, error: str) -> QueueJob:
+        return self._settle(
+            job,
+            """
+            UPDATE queue_jobs
+            SET status = 'dead_letter', retry_count = retry_count + 1,
+                last_error = ?, updated_at = ?, leased_until = NULL,
+                lease_token = '', lease_owner = ''
+            WHERE job_id = ? AND status = 'leased' AND lease_token = ?
+              AND lease_generation = ? AND lease_owner = ? AND leased_until > ?
+            RETURNING *
+            """,
+            (str(error)[:500],),
+        )
 
-    def retry(self, job_id: str, error: str, *, max_retries: int = 3, retryable: bool = True) -> str:
+    def retry(
+        self,
+        job: QueueJob,
+        error: str,
+        *,
+        max_retries: int = 3,
+        retryable: bool = True,
+    ) -> QueueJob:
+        return self._settle(
+            job,
+            """
+            UPDATE queue_jobs
+            SET status = CASE
+                    WHEN ? = 1 AND retry_count + 1 < ? THEN 'pending'
+                    ELSE 'dead_letter'
+                END,
+                retry_count = retry_count + 1, last_error = ?, updated_at = ?,
+                leased_until = NULL, lease_token = '', lease_owner = ''
+            WHERE job_id = ? AND status = 'leased' AND lease_token = ?
+              AND lease_generation = ? AND lease_owner = ? AND leased_until > ?
+            RETURNING *
+            """,
+            (int(bool(retryable)), max(1, int(max_retries)), str(error)[:500]),
+        )
+
+    def quarantine(self, job: QueueJob, error: str) -> QueueJob:
+        return self._settle(
+            job,
+            """
+            UPDATE queue_jobs
+            SET status = 'quarantine', retry_count = retry_count + 1,
+                last_error = ?, updated_at = ?, leased_until = NULL,
+                lease_token = '', lease_owner = ''
+            WHERE job_id = ? AND status = 'leased' AND lease_token = ?
+              AND lease_generation = ? AND lease_owner = ? AND leased_until > ?
+            RETURNING *
+            """,
+            (str(error)[:500],),
+        )
+
+    def extend(self, job: QueueJob, *, lease_seconds: int = 60) -> QueueJob:
+        leased_until = (self._now_dt() + timedelta(seconds=max(1, lease_seconds))).isoformat()
+        return self._settle(
+            job,
+            """
+            UPDATE queue_jobs
+            SET leased_until = ?, updated_at = ?
+            WHERE job_id = ? AND status = 'leased' AND lease_token = ?
+              AND lease_generation = ? AND lease_owner = ? AND leased_until > ?
+            RETURNING *
+            """,
+            (leased_until,),
+        )
+
+    def get(self, job_id: str) -> QueueJob | None:
         with self._connect() as conn:
-            row = conn.execute("SELECT retry_count FROM queue_jobs WHERE job_id = ?", (job_id,)).fetchone()
-            retry_count = int(row["retry_count"] if row else 0) + 1
-            status = "pending" if retryable and retry_count < max_retries else "dead_letter"
-            conn.execute(
-                "UPDATE queue_jobs SET status = ?, retry_count = ?, last_error = ?, updated_at = ?, leased_until = NULL WHERE job_id = ?",
-                (status, retry_count, error[:500], utc_now(), job_id),
-            )
-        return status
+            row = conn.execute("SELECT * FROM queue_jobs WHERE job_id = ?", (job_id,)).fetchone()
+        return self._row_to_job(row) if row is not None else None
+
+    def _settle(self, job: QueueJob, sql: str, prefix: tuple[object, ...]) -> QueueJob:
+        self._validate_lease(job)
+        now = self._now_dt().isoformat()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                sql,
+                (
+                    *prefix,
+                    now,
+                    job.job_id,
+                    job.lease_token,
+                    job.lease_generation,
+                    job.lease_owner,
+                    now,
+                )
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                raise LeaseLostError(
+                    f"queue lease lost for {job.job_id} generation {job.lease_generation}"
+                )
+            conn.commit()
+        return self._row_to_job(row)
 
     def stats(self) -> dict[str, int]:
         with self._connect() as conn:
             rows = conn.execute("SELECT status, COUNT(*) AS count FROM queue_jobs GROUP BY status").fetchall()
         return {str(row["status"]): int(row["count"]) for row in rows}
 
-    def _row_to_job(self, row: sqlite3.Row, status: str | None = None, leased_until: str | None = None) -> QueueJob:
+    def _row_to_job(self, row: sqlite3.Row) -> QueueJob:
         return QueueJob(
             job_id=row["job_id"],
             queue_name=row["queue_name"],
             action=row["action"],
             target_uri=row["target_uri"],
             payload=json.loads(row["payload_json"] or "{}"),
-            status=status or row["status"],
-            leased_until=leased_until if leased_until is not None else row["leased_until"],
+            status=row["status"],
+            leased_until=row["leased_until"],
+            lease_token=row["lease_token"],
+            lease_generation=int(row["lease_generation"]),
+            lease_owner=row["lease_owner"],
             retry_count=int(row["retry_count"]),
             last_error=row["last_error"] or "",
         )
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
+        conn = sqlite3.connect(self.path, timeout=30, isolation_level=None)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 30000")
         return conn
 
     def _init_db(self) -> None:
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS queue_jobs (
@@ -127,6 +287,49 @@ class SQLiteQueueStore:
                 )
                 """
             )
+            columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(queue_jobs)")}
+            migrations = {
+                "lease_token": "TEXT NOT NULL DEFAULT ''",
+                "lease_generation": "INTEGER NOT NULL DEFAULT 0",
+                "lease_owner": "TEXT NOT NULL DEFAULT ''",
+            }
+            for column, declaration in migrations.items():
+                if column not in columns:
+                    conn.execute(f"ALTER TABLE queue_jobs ADD COLUMN {column} {declaration}")
+            conn.execute("UPDATE queue_jobs SET status = 'dead_letter' WHERE status = 'failed'")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS queue_jobs_claim_idx "
+                "ON queue_jobs(queue_name, status, leased_until, created_at)"
+            )
+            conn.commit()
+        os.chmod(self.path, 0o600)
+
+    def _validate_lease(self, job: QueueJob) -> None:
+        if (
+            job.status != "leased"
+            or not job.lease_token
+            or not job.lease_owner
+            or job.lease_generation < 1
+            or not job.leased_until
+        ):
+            raise LeaseLostError(f"queue job has no valid lease proof: {job.job_id}")
+
+    def _canonical_payload(self, payload: object) -> str:
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    def _identity(self, row: sqlite3.Row) -> tuple[str, str, str, str]:
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+        except json.JSONDecodeError as exc:
+            raise QueueIdempotencyConflictError(
+                f"existing queue payload is corrupt: {row['job_id']}"
+            ) from exc
+        return (
+            str(row["queue_name"]),
+            str(row["action"]),
+            str(row["target_uri"]),
+            self._canonical_payload(payload),
+        )
 
     def _now_dt(self):
         from datetime import datetime, timezone

@@ -57,7 +57,12 @@ class BaseAgentHookAdapter:
             tenant_id=config.tenant_id,
             user_id=config.user_id,
         )
-        self.session_service = AgentSessionService(config.root, tenant_id=config.tenant_id)
+        self.session_service = AgentSessionService(
+            config.root,
+            tenant_id=config.tenant_id,
+            transcript_roots=config.transcript_roots,
+            max_transcript_bytes=config.max_transcript_bytes,
+        )
 
     def assemble_context(self, event: AgentHookEvent, *, token_budget: int | None = None) -> HookResult:
         normalized = self._append_event(event)
@@ -117,12 +122,23 @@ class BaseAgentHookAdapter:
                     )
                 )
                 return HookResult(ok=True, session_id=event.session_id, queued=queued, error=result["error"])
-            self.session_service.finalize(normalized.session_key)
             result_payload = result.get("result", result)
+            state = str(result_payload.get("state") or "").upper()
             status = str(result_payload.get("status", result.get("status", ""))).lower()
-            committed = status in {"done", "committed"}
-            queued = status in {"queued", "processing"}
-            self.session_service.finalize(normalized.session_key, commit_state="COMMITTED" if committed else "QUEUED")
+            committed = state == "COMMITTED" or status in {"done", "done_with_pending", "committed"}
+            queued = state in {"QUEUED", "PROCESSING"} or status in {"queued", "processing"}
+            commit_state = (
+                "COMMITTED"
+                if committed
+                else "DEAD_LETTER"
+                if state == "DEAD_LETTER"
+                else "FAILED_RETRYABLE"
+                if state == "FAILED_RETRYABLE"
+                else "PROCESSING"
+                if state == "PROCESSING"
+                else "QUEUED"
+            )
+            self.session_service.finalize(normalized.session_key, commit_state=commit_state)
             return HookResult(
                 ok=True,
                 session_id=event.session_id,
@@ -131,7 +147,7 @@ class BaseAgentHookAdapter:
                 metadata={
                     "project_id": normalized.project_id,
                     "session_key": normalized.session_key,
-                    "state": status.upper(),
+                    "state": commit_state,
                 },
             )
         except Exception as exc:

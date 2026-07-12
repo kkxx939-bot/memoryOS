@@ -130,6 +130,8 @@ class MemoryOSClient:
         self.engine = container.engine
         self.executor = container.executor
         self.memory_projection_worker = container.memory_projection_worker
+        self.recovery_service = container.recovery_service
+        self.recovery_worker = container.recovery_worker
 
     def predict(self, request: PredictionRequest, policies: list[ActionPolicy] | None = None) -> PredictionResult:
         """处理 predict 这一步。"""
@@ -375,7 +377,7 @@ class MemoryOSClient:
         obj = self.context_db.read_object(uri)
         committed = None
         if caller is not None and dict(obj.metadata or {}).get("canonical_kind"):
-            committed = read_committed_canonical(self.source_store, uri)
+            committed = read_committed_canonical(self.source_store, uri, self.relation_store)
             obj = committed.object
         if caller is not None:
             self._require_exact_read_visibility(uri, obj, caller)
@@ -670,7 +672,7 @@ class MemoryOSClient:
             caller.require(READ_CONTEXT)
             caller.assert_identity(user_id=user_id, tenant_id=tenant_id)
             project_id = caller.bind_read_workspace(project_id)
-        records = CanonicalMemoryRepository(self.source_store).list_pending(
+        records = CanonicalMemoryRepository(self.source_store, self.relation_store).list_pending(
             tenant_id=tenant_id,
             owner_user_id=user_id,
             lifecycle_states=tuple(lifecycle_states or ()),
@@ -701,7 +703,7 @@ class MemoryOSClient:
             raise ValueError("expected_lifecycle_revision must be positive")
         if not expected_proposal_fingerprint or not command_id:
             raise ValueError("pending review requires proposal fingerprint and command_id")
-        repository = CanonicalMemoryRepository(self.source_store)
+        repository = CanonicalMemoryRepository(self.source_store, self.relation_store)
         pending = repository.load_pending(
             pending_uri,
             tenant_id=tenant_id,
@@ -826,7 +828,7 @@ class MemoryOSClient:
             identity_algorithm_version=str(metadata.get("identity_algorithm_version") or IDENTITY_ALGORITHM_V2),
             canonical_subject=canonical_subject,
         )
-        slot, claims = CanonicalMemoryRepository(self.source_store).load(identity)
+        slot, claims = CanonicalMemoryRepository(self.source_store, self.relation_store).load(identity)
         if slot is None:
             raise FileNotFoundError(slot_uri)
         claim = next(item for item in claims if item.claim_id == identity.claim_id)
@@ -1025,13 +1027,40 @@ class MemoryOSClient:
         return results
 
     def health(self) -> dict[str, Any]:
-        heartbeat = Path(self.root) / "system" / "worker-health.json"
+        artifact_root = (
+            Path(self.root)
+            if self.tenant_id == "default"
+            else Path(self.root) / "tenants" / self.tenant_id
+        )
+        heartbeat = artifact_root / "system" / "worker-health.json"
+        worker_health: dict[str, Any] = {}
+        if heartbeat.exists():
+            try:
+                payload = json.loads(heartbeat.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    worker_health = {
+                        key: payload.get(key)
+                        for key in (
+                            "status",
+                            "updated_at",
+                            "processed",
+                            "succeeded",
+                            "failed",
+                            "retried",
+                            "dead_letter",
+                            "quarantine",
+                            "last_error",
+                        )
+                    }
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                worker_health = {"status": "failed", "last_error": "InvalidWorkerHealth"}
         queue_stats: dict[str, int] = getattr(self.queue_store, "stats", lambda: {})()
         return {
             "source_store": "ready",
             "index_store": "ready",
             "queue_store": "ready",
-            "worker": "ready" if heartbeat.exists() else "stopped",
+            "worker": str(worker_health.get("status") or "stopped"),
+            "worker_health": worker_health,
             "memory_extractor": "ready"
             if self.session_commit_service.memory_planner.extractor is not None
             else "disabled",
@@ -1058,6 +1087,7 @@ class MemoryOSClient:
         session_id: str,
         messages: list[dict[str, Any]] | None = None,
         used_contexts: list[dict[str, Any]] | None = None,
+        used_skills: list[dict[str, Any]] | None = None,
         tool_results: list[dict[str, Any]] | None = None,
         connect_metadata: dict[str, Any] | None = None,
         async_commit: bool = True,
@@ -1110,6 +1140,7 @@ class MemoryOSClient:
                 "archive_uri": archive_uri,
                 "messages": normalized_messages,
                 "used_contexts": used_contexts or [],
+                "used_skills": used_skills or [],
                 "tool_results": normalized_tool_results,
                 "metadata": {
                     "connect": normalized_metadata,
@@ -1124,6 +1155,7 @@ class MemoryOSClient:
             archive_uri=archive_uri,
             messages=normalized_messages,
             used_contexts=used_contexts or [],
+            used_skills=used_skills or [],
             tool_results=normalized_tool_results,
             metadata={
                 "connect": normalized_metadata,
@@ -1134,6 +1166,12 @@ class MemoryOSClient:
             },
             task_id=task_id,
         )
+        archive_tenant = str(normalized_scope.get("tenant_id") or "default")
+        archive_store = getattr(self, "session_archive_store", None)
+        if archive_store is not None and archive_store.archive_exists(archive_uri, tenant_id=archive_tenant):
+            existing = archive_store.read_archive(archive_uri, tenant_id=archive_tenant)
+            if existing.task_id == task_id:
+                archive = existing
         return self.context_db.commit_session(archive, async_commit=async_commit)
 
     def _require_exact_read_visibility(
@@ -1341,7 +1379,13 @@ def _supported_kwargs(function: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
 
 
 def _trace_root(client: Any) -> Path:
-    return Path(str(getattr(client, "root", "/tmp/memoryos-test"))) / "recall-traces"
+    root = Path(str(getattr(client, "root", "/tmp/memoryos-test")))
+    tenant_id = str(getattr(client, "tenant_id", "default"))
+    return (
+        root / "recall-traces"
+        if tenant_id == "default"
+        else root / "tenants" / tenant_id / "recall-traces"
+    )
 
 
 def _scope_keys(scopes: list[dict[str, Any]] | None) -> list[str]:

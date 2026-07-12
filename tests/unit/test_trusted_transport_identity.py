@@ -6,6 +6,7 @@ import multiprocessing
 import sys
 import threading
 import types
+import uuid
 from pathlib import Path
 from typing import Any, cast
 
@@ -37,6 +38,11 @@ from memoryos.contextdb.model.lifecycle import LifecycleState
 from memoryos.contextdb.store.local_stores import FileSystemSourceStore
 from memoryos.contextdb.store.sqlite_index_store import SQLiteIndexStore
 from memoryos.contextdb.store.sqlite_relation_store import SQLiteRelationStore
+from memoryos.operations.commit.effect_marker import (
+    atomic_write_json,
+    build_marker,
+    object_effect_from_store,
+)
 from memoryos.operations.model.context_diff import ContextDiff
 from memoryos.operations.model.operation_status import OperationStatus
 
@@ -81,6 +87,8 @@ def _live_event(event_id: str, *, transcript_path: str | None = None):  # noqa: 
         hook_name="after_turn",
         session_id="concurrent-session",
         user_id="u1",
+        cwd=str(Path(transcript_path).parent) if transcript_path else None,
+        repo_root=str(Path(transcript_path).parent) if transcript_path else None,
         messages=[{"role": "assistant", "content": event_id}],
         metadata={"project_id": "workspace-a", "transcript_path": transcript_path},
         tenant_id="default",
@@ -612,8 +620,22 @@ def test_exact_read_uses_committed_visibility_and_recorded_sibling_layer(tmp_pat
     client.context_db.seed_object(obj)
     client.source_store.write_content(sibling_l0, "committed L0")
     marker = tmp_path / "system" / "transactions" / "idem-1.json"
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text("{}", encoding="utf-8")
+    atomic_write_json(
+        marker,
+        build_marker(
+            transaction_id="tx-1",
+            idempotency_key="idem-1",
+            tenant_id="default",
+            user_id="u1",
+            operation_ids=["op-exact-read"],
+            object_effects=[
+                object_effect_from_store(client.source_store, uri, operation_type="ADD")
+            ],
+            relation_effects=[],
+            diff={"diff_id": "diff-exact-read", "user_id": "u1", "operations": []},
+            operations=[{"operation_id": "op-exact-read"}],
+        ),
+    )
 
     assert client.read(uri, layer="L0", caller=caller)["content"] == "committed L0"
 
@@ -797,10 +819,10 @@ def test_archive_and_recall_trace_exact_reads_bind_owner_and_tenant(tmp_path: Pa
     assert trace["scope"]["user_id"] == "u1"
     assert trace["scope"]["tenant_id"] == "default"
 
-    unowned_trace_id = "missing-tenant"
+    unowned_trace_id = str(uuid.uuid4())
     trace_path = tmp_path / "recall-traces" / f"{unowned_trace_id}.json"
     trace_path.write_text(json.dumps({"scope": {"user_id": "u1"}}), encoding="utf-8")
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(ValueError, match="recall trace is invalid"):
         client.recall_trace(unowned_trace_id, caller=caller)
 
 

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
+from memoryos.contextdb.model.context_uri import ContextURI
 from memoryos.core.time import utc_now
 
 
@@ -15,6 +17,16 @@ class ContextRelation:
     weight: float = 1.0
     metadata: dict = field(default_factory=dict)
     created_at: str = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        if self.source_uri.startswith("memoryos://"):
+            object.__setattr__(self, "source_uri", str(ContextURI.parse(self.source_uri)))
+        if self.target_uri.startswith("memoryos://"):
+            object.__setattr__(self, "target_uri", str(ContextURI.parse(self.target_uri)))
+        weight = float(self.weight)
+        if not math.isfinite(weight):
+            raise ValueError("relation weight must be finite")
+        object.__setattr__(self, "weight", weight)
 
     def to_dict(self) -> dict:
         return {

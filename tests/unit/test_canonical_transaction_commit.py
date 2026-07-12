@@ -23,6 +23,7 @@ from memoryos.contextdb.store.local_stores import (
     InMemoryQueueStore,
     InMemoryRelationStore,
 )
+from memoryos.contextdb.store.source_store import QueueJob
 from memoryos.contextdb.transaction.recovery import RecoveryService
 from memoryos.memory.canonical import (
     Atomicity,
@@ -55,7 +56,9 @@ from memoryos.memory.canonical import (
     bind_field_evidence,
 )
 from memoryos.memory.canonical.reconcile import MemorySemanticReconciler
+from memoryos.operations.commit.effect_marker import atomic_write_json
 from memoryos.operations.commit.operation_committer import OperationCommitter
+from memoryos.operations.commit.outbox_envelope import OutboxIntegrityError
 from memoryos.operations.commit.redo_log import RedoIntegrityError
 from memoryos.operations.model.context_operation import ContextOperation
 from memoryos.operations.model.operation_action import OperationAction
@@ -108,11 +111,11 @@ class FailOnceQueue(InMemoryQueueStore):
         super().__init__()
         self.fail_next = True
 
-    def enqueue(self, job) -> None:  # noqa: ANN001
+    def enqueue(self, job: QueueJob) -> QueueJob:
         if self.fail_next:
             self.fail_next = False
             raise OSError("injected queue outage")
-        super().enqueue(job)
+        return super().enqueue(job)
 
 
 class CrashOnceRelationStore(InMemoryRelationStore):
@@ -464,7 +467,7 @@ def test_canonical_transaction_marker_rejects_same_key_with_changed_request_and_
     assert {obj.uri: obj.to_dict() for obj in source.list_objects()} == before_objects
 
 
-def test_canonical_marker_v3_and_v2_accept_fresh_operation_and_relation_timestamps(tmp_path) -> None:  # noqa: ANN001
+def test_effect_marker_accepts_fresh_timestamps_and_rejects_legacy_schema(tmp_path) -> None:  # noqa: ANN001
     source, _index, _queue, _relations, committer, episode, scope = _setup(tmp_path)
     proposal = _proposal(episode, "marker-fresh-replan", "SQLite", "confirmation", "confirmed")
     _identity, _, plan = _plan(source, episode, scope, proposal)
@@ -489,7 +492,7 @@ def test_canonical_marker_v3_and_v2_accept_fresh_operation_and_relation_timestam
     committer.commit("u1", first)
     marker_path = committer._transaction_marker(str(first[0].payload["idempotency_key"]))
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
-    assert marker["schema_version"] == "canonical_transaction_marker_v3"
+    assert marker["schema_version"] == "effect_marker_v1"
     before_audit = (_artifact_root(tmp_path) / "system" / "audit" / "u1.jsonl").read_text(encoding="utf-8")
 
     fresh = plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=episode.episode_id)
@@ -511,17 +514,12 @@ def test_canonical_marker_v3_and_v2_accept_fresh_operation_and_relation_timestam
     assert {item.operation_id for item in repeated.operations} == {item.operation_id for item in first}
     assert (_artifact_root(tmp_path) / "system" / "audit" / "u1.jsonl").read_text(encoding="utf-8") == before_audit
 
-    stored_diff = committer._transaction_marker_diff(marker_path)
+    original_marker = deepcopy(marker)
     marker["schema_version"] = "canonical_transaction_marker_v2"
-    marker["request_fingerprint"] = committer._canonical_transaction_request_fingerprint_v2(
-        stored_diff.operations
-    )
-    marker["effect_fingerprint"] = committer._canonical_transaction_effect_fingerprint_v2(
-        stored_diff.operations
-    )
-    marker_path.write_text(json.dumps(marker, ensure_ascii=False), encoding="utf-8")
-    repeated_v2 = committer.commit("u1", fresh)
-    assert {item.operation_id for item in repeated_v2.operations} == {item.operation_id for item in first}
+    atomic_write_json(marker_path, marker)
+    with pytest.raises(ValueError, match="cannot prove its durable effect"):
+        committer.commit("u1", fresh)
+    atomic_write_json(marker_path, original_marker)
 
     forged = deepcopy(fresh)
     forged_claim = next(
@@ -1094,28 +1092,52 @@ def test_canonical_recovery_rejects_same_revision_with_divergent_source_effect(t
     operations = plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=episode.episode_id)
     transaction_id = str(operations[0].payload["transaction_id"])
     idempotency_key = str(operations[0].payload["idempotency_key"])
+    before_images = committer._capture_canonical_state(operations)
+    before_by_uri = {
+        str(snapshot["uri"]): snapshot["object"]
+        for snapshot in before_images
+    }
+    relation_manifests = {
+        operation.operation_id: committer._build_canonical_relation_manifest(
+            operation,
+            before_by_uri.get(str(operation.target_uri or "")),
+        )
+        for operation in operations
+    }
     committer._write_outbox_event(
         transaction_id,
         idempotency_key,
         operations,
         status="prepared",
-        before_images=committer._capture_canonical_state(operations),
+        before_images=before_images,
+        relation_manifests=relation_manifests,
     )
     for operation in operations:
-        committer.redo.begin(operation, phase="started")
+        committer.redo.begin(
+            operation,
+            phase="started",
+            relation_manifest=relation_manifests[operation.operation_id],
+        )
     first = operations[0]
     committer._apply_canonical_source(first)
-    committer.redo.advance(first, phase="source_written")
+    first_manifest = relation_manifests[first.operation_id]
+    committer.redo.advance(
+        first,
+        phase="source_written",
+        source_effect=committer._capture_canonical_source_effect(first, first_manifest),
+        relation_manifest=first_manifest,
+    )
     first_payload = first.payload["context_object"]
     tampered = source.read_object(str(first_payload["uri"]))
     tampered.title = "tampered at the same revision"
     source.write_object(tampered, content=str(first.payload.get("content", "")))
 
-    with pytest.raises(RevisionConflictError, match="divergent object at desired revision"):
-        committer.resume_canonical_batch("u1", committer.redo.pending_entries())
+    recovery = RecoveryService(committer.redo, committer).recover("u1")
 
     assert not (_artifact_root(tmp_path) / "system" / "transactions" / f"{idempotency_key}.json").exists()
-    assert committer.redo.pending_entries()
+    assert recovery.recovered_count == 0
+    assert recovery.quarantine_count >= 1
+    assert committer.redo.pending_entries() == []
 
 
 def test_session_commit_revision_conflict_rereads_and_reconciles_same_proposal(tmp_path) -> None:  # noqa: ANN001
@@ -2078,13 +2100,26 @@ def test_confirmed_pending_supplement_commits_revision_before_linked_resolution(
     ).lifecycle_state == LifecycleState.CONFIRMED
 
     monkeypatch.setattr(source, "write_object", original_write)
-    committed = committer.commit("u1", list(resolved_plan.operations))
+    with pytest.raises(OutboxIntegrityError, match="terminal state"):
+        committer.commit("u1", list(resolved_plan.operations))
+    retry_plan = formation.plan_confirmed_pending_resolution(
+        pending_uri,
+        confirmed,
+        archive=confirmed_archive,
+        episode=confirmed_episode,
+        tenant_id="t1",
+        owner_user_id="u1",
+        commit_group_id="supplement-resolution-retry",
+        retrieval_views=["project:memoryos:decisions"],
+    )
+    resolution_operation = retry_plan.operations[-1]
+    committed = committer.commit("u1", list(retry_plan.operations))
     assert {operation.operation_id for operation in committed.operations} == {
-        operation.operation_id for operation in resolved_plan.operations
+        operation.operation_id for operation in retry_plan.operations
     }
-    repeated = committer.commit("u1", list(resolved_plan.operations))
+    repeated = committer.commit("u1", list(retry_plan.operations))
     assert {operation.operation_id for operation in repeated.operations} == {
-        operation.operation_id for operation in resolved_plan.operations
+        operation.operation_id for operation in retry_plan.operations
     }
 
     updated = next(

@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import inspect
 import logging
+import math
 from collections.abc import Sequence
 from typing import Any
 
+from memoryos.api.limits import MAX_RETRIEVAL_LIMIT, MAX_TOKEN_BUDGET, bounded_int
 from memoryos.contextdb.context_db import ContextDB
 from memoryos.contextdb.layers.context_packer import ContextPacker
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.model.lifecycle import LifecycleState
 from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
 from memoryos.contextdb.retrieval.token_budget import HeuristicTokenCounter, TokenCounter
+from memoryos.contextdb.store.sqlite_index_store import lexical_match_count, lexical_terms
 from memoryos.memory.canonical.retrieval import (
     CanonicalMemoryQuery,
     CanonicalMemoryRetriever,
@@ -54,8 +57,15 @@ class ContextAssembler:
         source_store = getattr(context_db, "source_store", None)
         index_store = getattr(context_db, "index_store", None)
         relation_store = getattr(context_db, "relation_store", None)
+        projection_store = getattr(context_db, "projection_store", None)
         self.canonical_retriever = (
-            CanonicalMemoryRetriever(source_store, index_store, relation_store, hybrid_search=self.hybrid_search)
+            CanonicalMemoryRetriever(
+                source_store,
+                index_store,
+                relation_store,
+                hybrid_search=self.hybrid_search,
+                projection_store=projection_store,
+            )
             if source_store is not None and index_store is not None
             else None
         )
@@ -83,7 +93,13 @@ class ContextAssembler:
         """按给定条件查找匹配结果。"""
 
         parsed_type = self._context_type(context_type)
-        requested_limit = max(0, limit)
+        requested_limit = bounded_int(
+            limit,
+            default=10,
+            minimum=0,
+            maximum=MAX_RETRIEVAL_LIMIT,
+            label="limit",
+        )
         if search_scope or retrieval_views:
             results = self._search_memory_views(
                 query,
@@ -304,6 +320,21 @@ class ContextAssembler:
         query_intent: str | None = None,
     ) -> dict[str, Any]:
         """处理 assemble 这一步。"""
+
+        limit = bounded_int(
+            limit,
+            default=20,
+            minimum=0,
+            maximum=MAX_RETRIEVAL_LIMIT,
+            label="limit",
+        )
+        token_budget = bounded_int(
+            token_budget,
+            default=2000,
+            minimum=0,
+            maximum=MAX_TOKEN_BUDGET,
+            label="token_budget",
+        )
 
         contexts: list[dict[str, Any]] = []
         if context_types:
@@ -559,7 +590,7 @@ class ContextAssembler:
         return bool(views & set(allowed_views))
 
     def _view_score(self, query: str, item: dict[str, Any]) -> float:
-        terms = [term.lower() for term in str(query).split() if term.strip()]
+        terms = lexical_terms(query)
         if not terms:
             return 0.1
         haystack = " ".join(
@@ -569,7 +600,7 @@ class ContextAssembler:
                 str(item.get("metadata", {})),
             ]
         ).lower()
-        return sum(1.0 for term in terms if term in haystack)
+        return float(lexical_match_count(query, haystack))
 
     def _rerank(self, query: str, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if self.reranker is None or not items:
@@ -584,9 +615,15 @@ class ContextAssembler:
             return items
 
     def _hit_payload(self, hit: Any) -> dict[str, Any]:
+        try:
+            score = float(hit.score)
+        except (TypeError, ValueError):
+            score = 0.0
+        if not math.isfinite(score):
+            score = 0.0
         payload: dict[str, Any] = {
             "uri": str(hit.uri),
-            "score": float(hit.score),
+            "score": score,
             "context_type": str(hit.context_type),
             "title": str(getattr(hit, "title", "")),
             "text": str(getattr(hit, "title", "")),

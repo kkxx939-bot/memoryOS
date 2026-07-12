@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import uuid
 from collections.abc import Callable
 
 from memoryos.contextdb.store.source_store import QueueStore, SourceStore
@@ -17,16 +19,32 @@ class EmbeddingWorker:
         vector_store: VectorStore,
         embedding_provider: EmbeddingProvider | None = None,
         namespace_builder: Callable[[str], str] | None = None,
+        worker_id: str | None = None,
     ) -> None:
         self.source_store = source_store
         self.queue_store = queue_store
         self.vector_store = vector_store
         self.embedding_provider = embedding_provider or HashingEmbeddingProvider()
         self.namespace_builder = namespace_builder
+        self.worker_id = worker_id or f"embedding:{os.getpid()}:{uuid.uuid4().hex}"
 
-    def process_pending(self, limit: int = 10) -> dict:
+    def process_pending(
+        self,
+        limit: int = 10,
+        *,
+        lease_seconds: int = 60,
+        max_retries: int = 3,
+    ) -> dict:
         processed = []
-        for job in self.queue_store.lease("embedding", limit=limit):
+        failed: list[str] = []
+        dead_letter: list[str] = []
+        jobs = self.queue_store.lease(
+            "embedding",
+            lease_owner=self.worker_id,
+            limit=limit,
+            lease_seconds=lease_seconds,
+        )
+        for job in jobs:
             try:
                 content = self.source_store.read_content(job.target_uri)
                 embedding = self.embedding_provider.embed(content)
@@ -41,8 +59,21 @@ class EmbeddingWorker:
                     metadata["namespace"] = self.namespace_builder(job.target_uri)
                 self.vector_store.upsert_vector(job.target_uri, embedding, metadata=metadata)
             except Exception as exc:
-                self.queue_store.fail(job.job_id, str(exc))
+                settled = self.queue_store.retry(
+                    job,
+                    type(exc).__name__,
+                    max_retries=max_retries,
+                    retryable=isinstance(exc, OSError),
+                )
+                failed.append(job.job_id)
+                if settled.status == "dead_letter":
+                    dead_letter.append(job.job_id)
                 continue
-            self.queue_store.ack(job.job_id)
+            self.queue_store.ack(job)
             processed.append(job.job_id)
-        return {"processed": processed}
+        return {
+            "claimed": len(jobs),
+            "processed": processed,
+            "failed": failed,
+            "dead_letter": dead_letter,
+        }

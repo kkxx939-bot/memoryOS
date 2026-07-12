@@ -10,7 +10,7 @@ from typing import Any, cast
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.lifecycle import LifecycleState
 from memoryos.contextdb.session.session_model import SessionArchive
-from memoryos.contextdb.store.source_store import SourceStore
+from memoryos.contextdb.store.source_store import RelationStore, SourceStore
 from memoryos.core.ids import stable_hash
 from memoryos.memory.canonical.admission import (
     ProposalAdmissionDecision,
@@ -402,8 +402,15 @@ class CandidateProposalAdapter:
 class CanonicalMemoryFormationService:
     """串起证据校验、准入、身份解析、状态转换和事务规划。"""
 
-    def __init__(self, source_store: SourceStore | None, *, alias_registry: AliasRegistry | None = None) -> None:
+    def __init__(
+        self,
+        source_store: SourceStore | None,
+        *,
+        relation_store: RelationStore | None = None,
+        alias_registry: AliasRegistry | None = None,
+    ) -> None:
         self.source_store = source_store
+        self.relation_store = relation_store
         self.validator = ProposalEvidenceValidator()
         self.normalizer = MemorySemanticNormalizer()
         registry = MemoryTypeRegistry()
@@ -556,7 +563,10 @@ class CanonicalMemoryFormationService:
         slot: MemorySlot | None = None
         claims: tuple[MemoryClaim, ...] = ()
         if self.source_store is not None or staged_objects:
-            repository = CanonicalMemoryRepository(cast(SourceStore, self._planning_source(staged_objects)))
+            repository = CanonicalMemoryRepository(
+                cast(SourceStore, self._planning_source(staged_objects)),
+                self.relation_store,
+            )
             slot, claims = repository.load(identity)
         target_state_error = self._related_active_target_error(normalized, slot, claims)
         if target_state_error:
@@ -689,7 +699,10 @@ class CanonicalMemoryFormationService:
             tenant_id=episode.tenant_id,
             owner_user_id=archive.user_id,
         )
-        repository = CanonicalMemoryRepository(cast(SourceStore, self._planning_source(staged_objects)))
+        repository = CanonicalMemoryRepository(
+            cast(SourceStore, self._planning_source(staged_objects)),
+            self.relation_store,
+        )
         slot, claims = repository.load(identity)
         if slot is None or slot.active_claim_id is None:
             return proposal
@@ -791,7 +804,7 @@ class CanonicalMemoryFormationService:
 
         if self.source_store is None:
             raise RuntimeError("pending lifecycle transitions require a SourceStore")
-        current = CanonicalMemoryRepository(self.source_store).load_pending(
+        current = CanonicalMemoryRepository(self.source_store, self.relation_store).load_pending(
             pending_uri,
             tenant_id=tenant_id,
             owner_user_id=owner_user_id,
@@ -926,7 +939,7 @@ class CanonicalMemoryFormationService:
             raise RuntimeError("pending resolution requires a SourceStore")
         if archive.user_id != owner_user_id or episode.tenant_id != tenant_id:
             raise PermissionError("pending resolution archive boundary does not match owner or tenant")
-        repository = CanonicalMemoryRepository(self.source_store)
+        repository = CanonicalMemoryRepository(self.source_store, self.relation_store)
         pending = repository.load_pending(
             pending_uri,
             tenant_id=tenant_id,
@@ -1105,7 +1118,10 @@ class CanonicalMemoryFormationService:
         )
         if self.source_store is not None:
             try:
-                existing_record = CanonicalMemoryRepository(self.source_store).load_pending(
+                existing_record = CanonicalMemoryRepository(
+                    self.source_store,
+                    self.relation_store,
+                ).load_pending(
                     record.uri,
                     tenant_id=episode.tenant_id,
                     owner_user_id=archive.user_id,
@@ -1221,6 +1237,11 @@ class CanonicalMemoryFormationService:
                 if service.source_store is None:
                     raise FileNotFoundError(uri)
                 return service.source_store.read_object(uri)
+
+            def read_content(self, uri: str) -> str:
+                if service.source_store is None:
+                    raise FileNotFoundError(uri)
+                return service.source_store.read_content(uri)
 
             def list_objects(self) -> list[ContextObject]:
                 persisted = service.source_store.list_objects() if service.source_store is not None else []

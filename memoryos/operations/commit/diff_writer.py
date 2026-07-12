@@ -18,8 +18,22 @@ class DiffWriter:
     def write(self, diff: ContextDiff) -> Path:
         diff_id = require_safe_path_segment(diff.diff_id, "diff_id")
         path = self.root / "system" / "diffs" / f"{diff_id}.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(path.parent, 0o700)
         tmp = path.with_suffix(path.suffix + f".{uuid.uuid4().hex}.tmp")
-        tmp.write_text(json.dumps(diff.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, path)
+        try:
+            with tmp.open("x", encoding="utf-8") as handle:
+                os.chmod(tmp, 0o600)
+                handle.write(json.dumps(diff.to_dict(), ensure_ascii=False, indent=2))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+            os.chmod(path, 0o600)
+            descriptor = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        finally:
+            tmp.unlink(missing_ok=True)
         return path

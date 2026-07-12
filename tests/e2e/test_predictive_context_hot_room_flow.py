@@ -10,7 +10,6 @@ from memoryos.connect import ConnectMetadata
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_relation import ContextRelation
 from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.model.context_uri import ContextURI
 from memoryos.prediction.model.prediction_request import PredictionRequest
 from memoryos.skill.tool_registry import ToolRegistry
 
@@ -136,14 +135,12 @@ def test_predictive_context_hot_room_flow_uses_production_entrypoint(tmp_path) -
     assert prediction.action_context.packed_context["load_plan"]
     assert "dropped_contexts" in prediction.action_context.packed_context
 
-    archive_dir = ContextURI.parse("memoryos://user/u1/sessions/history/ep-hot-room-production").to_source_path(
-        tmp_path
-    )
     archived = client.session_archive_store.read_archive("memoryos://user/u1/sessions/history/ep-hot-room-production")
     assert archived.observations
     action_result = archived.action_results[0]["action_result"]
     assert action_result["status"] == "success"
     assert action_result["tool_name"] == "ac.turn_on"
-    for filename in ("memory_diff.json", "behavior_diff.json", "action_policy_diff.json", "context_diff.json"):
-        payload = json.loads((archive_dir / filename).read_text(encoding="utf-8"))
+    outputs = client.session_archive_store.read_async_outputs(archived)
+    for output_name in ("memory_diff", "behavior_diff", "action_policy_diff", "context_diff"):
+        payload = outputs[output_name]
         assert payload["status"] == "committed"

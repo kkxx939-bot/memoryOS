@@ -104,13 +104,13 @@ def test_commit_session_async_true_does_not_leave_worker_session_commit_job(tmp_
     assert result.pending_count > 0
     assert result.pending_persisted is True
     assert result.canonical_active_operation_count == 0
-    assert queue.lease("session_commit", 1) == []
+    assert queue.lease("session_commit", lease_owner="test", limit=1) == []
     assert committer.calls
     committed_once = sum(len(operations) for _, operations in committer.calls)
     assert committed_once > 0
     assert sum(1 for job in queue.jobs.values() if job.queue_name == "session_commit") == 0
     call_count_after_commit = len(committer.calls)
-    assert queue.lease("session_commit", 1) == []
+    assert queue.lease("session_commit", lease_owner="test", limit=1) == []
     assert len(committer.calls) == call_count_after_commit
 
 
@@ -129,7 +129,7 @@ def test_commit_session_async_true_retry_same_task_does_not_recommit_operations(
     assert second.pending_count == first.pending_count
     assert second.pending_persisted is True
     assert len(committer.calls) == call_count_after_first
-    assert queue.lease("session_commit", 1) == []
+    assert queue.lease("session_commit", lease_owner="test", limit=1) == []
 
 
 def test_commit_session_async_false_keeps_sync_archive_pending_job(tmp_path) -> None:
@@ -140,7 +140,7 @@ def test_commit_session_async_false_keeps_sync_archive_pending_job(tmp_path) -> 
 
     assert result.status == "queued"
     assert result.done is False
-    pending = queue.lease("session_commit", 1)
+    pending = queue.lease("session_commit", lease_owner="test", limit=1)
     assert [job.job_id for job in pending] == [result.task_id]
     assert committer.calls == []
 
@@ -157,7 +157,7 @@ def test_session_commit_worker_processes_real_pending_archive_once(tmp_path) -> 
     archive = _archive()
     queued = service.sync_archive(archive)
 
-    pending = queue.lease("session_commit", 1)
+    pending = queue.lease("session_commit", lease_owner="test", limit=1)
     assert [job.job_id for job in pending] == [queued.task_id]
     result = SessionCommitWorker(service).process_archive(archive)
 
@@ -165,8 +165,8 @@ def test_session_commit_worker_processes_real_pending_archive_once(tmp_path) -> 
     assert committer.calls
     committed_once = sum(len(operations) for _, operations in committer.calls)
     assert committed_once > 0
-    queue.ack(pending[0].job_id)
-    assert queue.lease("session_commit", 1) == []
+    queue.ack(pending[0])
+    assert queue.lease("session_commit", lease_owner="test", limit=1) == []
 
 
 def test_process_observation_async_true_returns_commit_result_without_session_commit_job(tmp_path) -> None:
@@ -187,7 +187,7 @@ def test_process_observation_async_true_returns_commit_result_without_session_co
     assert result.session_commit_result.status == "done"
     assert result.session_commit_result.done is True
     assert result.archive_uri == "memoryos://user/u1/sessions/history/ep1"
-    assert queue.lease("session_commit", 1) == []
+    assert queue.lease("session_commit", lease_owner="test", limit=1) == []
 
 
 def test_process_observation_async_false_returns_queued_commit_result_and_worker_job(tmp_path) -> None:
@@ -209,7 +209,7 @@ def test_process_observation_async_false_returns_queued_commit_result_and_worker
     assert result.session_commit_result.status == "queued"
     assert result.session_commit_result.done is False
     assert result.archive_uri == "memoryos://user/u1/sessions/history/ep1"
-    pending = queue.lease("session_commit", 1)
+    pending = queue.lease("session_commit", lease_owner="test", limit=1)
     assert [job.job_id for job in pending] == [result.session_commit_result.task_id]
 
 

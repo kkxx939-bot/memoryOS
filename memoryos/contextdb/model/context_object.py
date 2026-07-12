@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 from memoryos.contextdb.model.context_layer import ContextLayers
 from memoryos.contextdb.model.context_relation import ContextRelation
 from memoryos.contextdb.model.context_type import ContextType
+from memoryos.contextdb.model.context_uri import ContextURI
 from memoryos.contextdb.model.lifecycle import LifecycleState
 
 
@@ -29,12 +31,16 @@ class ContextObject:
     schema_version: str = "context_object_v1"
 
     def __post_init__(self) -> None:
+        self.uri = str(ContextURI.parse(self.uri))
         if isinstance(self.context_type, str):
             self.context_type = ContextType(self.context_type)
         if isinstance(self.lifecycle_state, str):
             self.lifecycle_state = LifecycleState(self.lifecycle_state)
         for field_name in ("hotness", "semantic_hotness", "behavior_support_hotness"):
-            value = max(0.0, min(1.0, float(getattr(self, field_name))))
+            value = float(getattr(self, field_name))
+            if not math.isfinite(value):
+                raise ValueError(f"{field_name} must be finite")
+            value = max(0.0, min(1.0, value))
             setattr(self, field_name, value)
 
     def to_dict(self) -> dict:

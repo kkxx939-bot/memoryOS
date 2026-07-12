@@ -17,7 +17,7 @@ from memoryos.adapters.agent_hooks.config import AgentHookConfig
 from memoryos.adapters.agent_hooks.cursor import CursorHookAdapter
 from memoryos.adapters.agent_hooks.events import AgentHookEvent
 from memoryos.adapters.agent_hooks.mcp_client import AgentHookMCPClient
-from memoryos.adapters.agent_hooks.queue import PendingItem, PendingQueue
+from memoryos.adapters.agent_hooks.queue import PendingItem, PendingQueue, PendingQueueIntegrityError
 from memoryos.adapters.agent_hooks.sanitizer import sanitize_changed_files, sanitize_payload, summarize_tool_result
 
 
@@ -46,6 +46,18 @@ class SecretFailHookMCPClient:
             "boom Authorization: Bearer sk-test OPENAI_API_KEY=sk-env "
             "api_key=raw token=tok password=pw secret=hidden /Users/gulf/project /home/gulf/x /tmp/raw"
         )
+
+
+class QueuedHookMCPClient(FakeHookMCPClient):
+    def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append((name, arguments))
+        if name == "memoryos_commit_session":
+            return {
+                "status": "queued",
+                "result": {"status": "queued", "state": "QUEUED"},
+                "error": None,
+            }
+        return super().call_tool(name, arguments)
 
 
 def _config(tmp_path: Path, adapter_id: str = "codex") -> AgentHookConfig:
@@ -148,6 +160,26 @@ def test_codex_stop_commits_and_flushes_queue(tmp_path: Path) -> None:
     assert result["flushed"]["flushed"] == 1
     assert queue.list_items() == []
     assert fake.calls[0][1]["async_commit"] is True
+
+
+def test_remote_queued_session_is_never_recorded_as_committed(tmp_path: Path) -> None:
+    adapter = CodexHookAdapter(_config(tmp_path), mcp_client=QueuedHookMCPClient())
+
+    result = adapter.handle(
+        "Stop",
+        {"event_id": "queued-stop", "session_id": "queued-session", "messages": []},
+    ).to_dict()
+
+    assert result["committed"] is False
+    assert result["queued"] is True
+    assert result["metadata"]["state"] == "QUEUED"
+    normalized = AgentHookEvent.from_payload(
+        {"event_id": "queued-stop", "session_id": "queued-session", "messages": []},
+        adapter_id="codex",
+        hook_name="Stop",
+        user_id="u1",
+    ).normalize()
+    assert adapter.session_service._state(normalized.session_key)["status"] == "QUEUED"
 
 
 def test_codex_precompact_assembles_and_commits(tmp_path: Path) -> None:
@@ -263,6 +295,11 @@ def test_pending_queue_idempotency_retry_success_and_corrupt_file(tmp_path: Path
     failed = queue.flush(FakeHookMCPClient(fail_commit=True))
     succeeded = queue.flush(FakeHookMCPClient())
     path.write_text("{bad json\n" + path.read_text(encoding="utf-8"), encoding="utf-8")
+    with pytest.raises(PendingQueueIntegrityError, match="quarantined"):
+        queue.enqueue(PendingItem(event_id="e2", session_id="s2", adapter_id="codex", hook_name="Stop", payload={}))
+    quarantined = list((tmp_path / "system" / "quarantine" / "hook_queue").glob("*.original"))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_text(encoding="utf-8").startswith("{bad json")
     queue.enqueue(PendingItem(event_id="e2", session_id="s2", adapter_id="codex", hook_name="Stop", payload={}))
 
     assert failed["failed"] == 1

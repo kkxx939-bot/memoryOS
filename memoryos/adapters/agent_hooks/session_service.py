@@ -40,7 +40,14 @@ except ImportError:  # pragma: no cover - POSIX only.
 class AgentSessionService:
     """负责 AgentSessionService 这部分逻辑。"""
 
-    def __init__(self, root: str, tenant_id: str = "default") -> None:
+    def __init__(
+        self,
+        root: str,
+        tenant_id: str = "default",
+        *,
+        transcript_roots: tuple[str, ...] = (),
+        max_transcript_bytes: int = 20_000_000,
+    ) -> None:
         if (
             not isinstance(tenant_id, str)
             or not tenant_id.strip()
@@ -55,12 +62,14 @@ class AgentSessionService:
             if tenant_id == "default"
             else Path(root) / "tenants" / tenant_id / "agent-sessions" / "live"
         )
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.root.chmod(0o700)
+        self.transcript_roots = tuple(Path(item).expanduser().resolve() for item in transcript_roots)
         self.readers = {
-            "claude_code": ClaudeCodeTranscriptReader(),
-            "codex": CodexTranscriptReader(),
+            "claude_code": ClaudeCodeTranscriptReader(max_file_bytes=max_transcript_bytes),
+            "codex": CodexTranscriptReader(max_file_bytes=max_transcript_bytes),
         }
-        self.default_reader = GenericJsonlTranscriptReader()
+        self.default_reader = GenericJsonlTranscriptReader(max_file_bytes=max_transcript_bytes)
 
     def append_event(self, event: NormalizedAgentEvent) -> bool:
         self._require_event_tenant(event)
@@ -115,7 +124,22 @@ class AgentSessionService:
             cursor = TranscriptCursor(int(raw_cursor.get("offset", 0)), raw_cursor.get("inode"))
             reader = self.readers.get(event.adapter_id, self.default_reader)
             try:
-                delta = reader.read_since(event.transcript_path, cursor)
+                workspace_roots = tuple(
+                    dict.fromkeys(
+                        str(item)
+                        for item in (
+                            event.repo_root,
+                            event.cwd,
+                            *self.transcript_roots,
+                        )
+                        if item
+                    )
+                )
+                delta = reader.read_since(
+                    event.transcript_path,
+                    cursor,
+                    allowed_roots=workspace_roots,
+                )
             except OSError as exc:
                 error_message = sanitize_error_text(str(exc))
                 state["transcript_error"] = {
@@ -183,6 +207,10 @@ class AgentSessionService:
         self._require_state_boundary(self._state(event.session_key), event)
         messages: list[dict[str, Any]] = []
         tool_results: list[dict[str, Any]] = []
+        used_contexts: list[dict[str, Any]] = []
+        used_skills: list[dict[str, Any]] = []
+        explicit_scope: dict[str, Any] = {}
+        explicit_provenance: dict[str, Any] = {}
         for item in self._events_locked(event.session_key):
             self._require_row_boundary(item, event)
             prompt = item.get("prompt")
@@ -191,7 +219,28 @@ class AgentSessionService:
             messages.extend(row for row in item.get("messages", []) if isinstance(row, dict))
             if isinstance(item.get("tool_call"), dict):
                 tool_results.append({"event_id": item.get("event_id"), **item["tool_call"]})
+            metadata = dict(item.get("metadata", {}) or {})
+            used_contexts.extend(
+                dict(value)
+                for value in metadata.get("used_contexts", []) or []
+                if isinstance(value, dict)
+            )
+            used_skills.extend(
+                dict(value)
+                for value in metadata.get("used_skills", []) or []
+                if isinstance(value, dict)
+            )
+            tool_results.extend(
+                dict(value)
+                for value in metadata.get("tool_results", []) or []
+                if isinstance(value, dict)
+            )
+            if isinstance(metadata.get("scope"), dict):
+                explicit_scope.update(metadata["scope"])
+            if isinstance(metadata.get("provenance"), dict):
+                explicit_provenance.update(metadata["provenance"])
         scope = {
+            **explicit_scope,
             "user_id": event.user_id,
             "tenant_id": event.tenant_id,
             "project_id": event.project_id,
@@ -200,6 +249,7 @@ class AgentSessionService:
             "session_key": event.session_key,
         }
         provenance = {
+            **explicit_provenance,
             "native_session_id": event.native_session_id,
             "event_id": event.event_id,
             "agent_name": event.metadata.get("agent_name", event.adapter_id),
@@ -214,7 +264,8 @@ class AgentSessionService:
             "project_id": event.project_id,
             "messages": sanitize_payload(messages),
             "tool_results": sanitize_payload(tool_results),
-            "used_contexts": sanitize_payload(event.metadata.get("used_contexts", [])),
+            "used_contexts": sanitize_payload(used_contexts),
+            "used_skills": sanitize_payload(used_skills),
             "scope": scope,
             "provenance": provenance,
         }
@@ -228,7 +279,9 @@ class AgentSessionService:
         with self._session_guard(session_key):
             state = self._state(session_key)
             self._require_state_tenant(state)
-            state.update({"status": "ARCHIVED", "checkpointed_at": utc_now()})
+            if str(state.get("status") or "OPEN") in {"OPEN", "ARCHIVED"}:
+                state["status"] = "ARCHIVED"
+            state["checkpointed_at"] = utc_now()
             self._write_state(session_key, state)
             return {
                 "session_key": session_key,
@@ -241,8 +294,19 @@ class AgentSessionService:
             state = self._state(session_key)
             self._require_state_tenant(state)
             event_count = len(self._events_locked(session_key))
-            if state.get("status") == "COMMITTED":
-                return {"session_key": session_key, "event_count": event_count, "status": "COMMITTED"}
+            current = str(state.get("status") or "ARCHIVED")
+            requested = str(commit_state).upper()
+            allowed = {
+                "OPEN": {"ARCHIVED"},
+                "ARCHIVED": {"ARCHIVED", "QUEUED", "PROCESSING", "COMMITTED"},
+                "QUEUED": {"QUEUED", "PROCESSING", "COMMITTED", "FAILED_RETRYABLE", "DEAD_LETTER"},
+                "PROCESSING": {"PROCESSING", "COMMITTED", "FAILED_RETRYABLE", "DEAD_LETTER"},
+                "FAILED_RETRYABLE": {"FAILED_RETRYABLE", "QUEUED", "PROCESSING", "DEAD_LETTER"},
+                "COMMITTED": {"COMMITTED"},
+                "DEAD_LETTER": {"DEAD_LETTER"},
+            }
+            if requested not in allowed.get(current, set()):
+                raise ValueError(f"illegal session state transition: {current} -> {requested}")
             state.update({"status": commit_state, "finalized_at": utc_now()})
             self._write_state(session_key, state)
             return {"session_key": session_key, "event_count": event_count, "status": commit_state}
@@ -270,7 +334,11 @@ class AgentSessionService:
         backend = _lock_backend()
         if backend is None:
             raise RuntimeError("AgentSessionService requires fcntl or msvcrt file locking")
-        with self._lock_path(session_key).open("a+b") as lock_file:
+        lock_path = self._lock_path(session_key)
+        if not lock_path.exists():
+            lock_path.touch(mode=0o600)
+        lock_path.chmod(0o600)
+        with lock_path.open("a+b") as lock_file:
             _lock_file(lock_file, backend)
             try:
                 yield
@@ -362,7 +430,9 @@ class AgentSessionService:
             "updated_at": utc_now(),
         }
         if mark_archived:
-            updated["status"] = "ARCHIVED"
+            current = str(updated.get("status") or "OPEN")
+            if current in {"OPEN", "ARCHIVED"}:
+                updated["status"] = "ARCHIVED"
         return updated
 
     def _write_events(self, session_key: str, rows: list[dict[str, Any]]) -> None:
@@ -370,8 +440,13 @@ class AgentSessionService:
         temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         text = "\n".join(json.dumps(row, ensure_ascii=False, default=str) for row in rows)
         try:
-            temporary.write_text(text + ("\n" if text else ""), encoding="utf-8")
+            with temporary.open("x", encoding="utf-8") as handle:
+                os.chmod(temporary, 0o600)
+                handle.write(text + ("\n" if text else ""))
+                handle.flush()
+                os.fsync(handle.fileno())
             os.replace(temporary, path)
+            os.chmod(path, 0o600)
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -379,8 +454,13 @@ class AgentSessionService:
         path = self._state_path(session_key)
         temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         try:
-            temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+            with temporary.open("x", encoding="utf-8") as handle:
+                os.chmod(temporary, 0o600)
+                handle.write(json.dumps(state, ensure_ascii=False, indent=2))
+                handle.flush()
+                os.fsync(handle.fileno())
             os.replace(temporary, path)
+            os.chmod(path, 0o600)
         finally:
             temporary.unlink(missing_ok=True)
 

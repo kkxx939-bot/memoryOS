@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -23,16 +24,41 @@ class TranscriptDelta:
 
 
 class TranscriptReader(Protocol):
-    def read_since(self, transcript_path: str, cursor: TranscriptCursor | None) -> TranscriptDelta: ...
+    def read_since(
+        self,
+        transcript_path: str,
+        cursor: TranscriptCursor | None,
+        *,
+        allowed_roots: Sequence[str | Path] = (),
+    ) -> TranscriptDelta: ...
 
 
 class GenericJsonlTranscriptReader:
-    def __init__(self, max_bytes: int = 2_000_000) -> None:
+    def __init__(self, max_bytes: int = 2_000_000, max_file_bytes: int = 20_000_000) -> None:
         self.max_bytes = max_bytes
+        self.max_file_bytes = max_file_bytes
 
-    def read_since(self, transcript_path: str, cursor: TranscriptCursor | None) -> TranscriptDelta:
-        path = Path(transcript_path)
+    def read_since(
+        self,
+        transcript_path: str,
+        cursor: TranscriptCursor | None,
+        *,
+        allowed_roots: Sequence[str | Path] = (),
+    ) -> TranscriptDelta:
+        roots = tuple(Path(root).expanduser().resolve() for root in allowed_roots)
+        if not roots:
+            raise PermissionError("transcript read requires an explicit workspace root")
+        requested = Path(transcript_path).expanduser()
+        if not requested.is_absolute():
+            requested = roots[0] / requested
+        path = requested.resolve(strict=True)
+        if not any(_within(path, root) for root in roots):
+            raise PermissionError("transcript path is outside the authorized workspace roots")
+        if not path.is_file():
+            raise PermissionError("transcript path must resolve to a regular file")
         stat = path.stat()
+        if stat.st_size > self.max_file_bytes:
+            raise OSError("transcript exceeds configured maximum file size")
         previous = cursor or TranscriptCursor()
         offset = previous.offset
         truncated = stat.st_size < offset or (previous.inode is not None and previous.inode != stat.st_ino)
@@ -64,6 +90,14 @@ class GenericJsonlTranscriptReader:
 
     def _normalize_item(self, item: dict[str, Any]) -> dict[str, Any]:
         return item
+
+
+def _within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
 
 
 class ClaudeCodeTranscriptReader(GenericJsonlTranscriptReader):

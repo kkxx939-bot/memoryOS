@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from memoryos.contextdb.context_db import ContextDB
 from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
+from memoryos.contextdb.session.commit_group import CommitGroupStore
 from memoryos.contextdb.session.planners import ActionPolicyCommitPlanner, BehaviorCommitPlanner, MemoryCommitPlanner
 from memoryos.contextdb.session.session_archive import SessionArchiveStore
 from memoryos.contextdb.session.session_commit import SessionCommitService
@@ -16,8 +17,10 @@ from memoryos.contextdb.store.sqlite_lock_store import SQLiteLockStore
 from memoryos.contextdb.store.sqlite_queue_store import SQLiteQueueStore
 from memoryos.contextdb.store.sqlite_relation_store import SQLiteRelationStore
 from memoryos.contextdb.store.vector_store import VectorStore
+from memoryos.contextdb.transaction.recovery import RecoveryService
 from memoryos.memory.canonical.identity import AliasRegistry
 from memoryos.memory.canonical.projection import CanonicalMemoryProjector, MemoryProjectionWorker
+from memoryos.memory.canonical.projection_state import ProjectionRecordStore
 from memoryos.operations.commit.operation_committer import OperationCommitter
 from memoryos.prediction.model.prediction_ledger import PredictionLedger
 from memoryos.prediction.pipeline.executor import ActionExecutor
@@ -26,6 +29,7 @@ from memoryos.providers.embedding import EmbeddingProvider
 from memoryos.providers.rerank import Reranker
 from memoryos.runtime.config import RuntimeConfig
 from memoryos.skill.tool_registry import ToolRegistry
+from memoryos.workers.recovery_worker import RecoveryWorker
 
 
 @dataclass
@@ -48,6 +52,8 @@ class RuntimeContainer:
     engine: PredictionEngine
     executor: ActionExecutor
     memory_projection_worker: MemoryProjectionWorker
+    recovery_service: RecoveryService
+    recovery_worker: RecoveryWorker
 
 
 def build_runtime_container(
@@ -71,11 +77,15 @@ def build_runtime_container(
     ):
         raise TypeError("memory_extractor must be an LLM MemorySemanticProposal backend")
     root_path = config.root_path
+    root_path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    root_path.chmod(0o700)
     source = source_store or FileSystemSourceStore(root_path, tenant_id=config.tenant_id)
     source_tenant = getattr(source, "tenant_id", config.tenant_id)
     if str(source_tenant) != config.tenant_id:
         raise ValueError("SourceStore tenant does not match RuntimeConfig tenant_id")
     tenant_root = root_path if config.tenant_id == "default" else root_path / "tenants" / config.tenant_id
+    tenant_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tenant_root.chmod(0o700)
     index_root = tenant_root / "indexes"
     index = index_store or SQLiteIndexStore(index_root / "context.sqlite3")
     relation = relation_store or SQLiteRelationStore(index_root / "relations.sqlite3")
@@ -99,17 +109,22 @@ def build_runtime_container(
         queue_store=queue,
         tenant_id=config.tenant_id,
     )
-    session_archive_store = SessionArchiveStore(root_path)
+    session_archive_store = SessionArchiveStore(root_path, tenant_id=config.tenant_id)
+    projection_store = ProjectionRecordStore(tenant_root)
     memory_projection_worker = MemoryProjectionWorker(
         CanonicalMemoryProjector(
             source,
             index,
             tenant_root,
+            relation_store=relation,
             vector_store=configured_vector_store,
             embedding_provider=configured_embedding,
+            record_store=projection_store,
         ),
         queue,
     )
+    recovery_service = RecoveryService(committer.redo, committer)
+    recovery_worker = RecoveryWorker(recovery_service)
     session_commit_service = SessionCommitService(
         session_archive_store,
         queue,
@@ -125,6 +140,7 @@ def build_runtime_container(
         behavior_planner=BehaviorCommitPlanner(index_store=index, source_store=source),
         action_policy_planner=ActionPolicyCommitPlanner(index_store=index, source_store=source),
         projection_worker=memory_projection_worker,
+        commit_group_store=CommitGroupStore(tenant_root),
     )
     context_db = ContextDB(
         source,
@@ -133,6 +149,7 @@ def build_runtime_container(
         queue_store=queue,
         session_commit_service=session_commit_service,
         committer=committer,
+        projection_store=projection_store,
     )
     engine = PredictionEngine(
         index,
@@ -160,4 +177,6 @@ def build_runtime_container(
         engine=engine,
         executor=ActionExecutor(tool_registry),
         memory_projection_worker=memory_projection_worker,
+        recovery_service=recovery_service,
+        recovery_worker=recovery_worker,
     )

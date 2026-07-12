@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import sqlite3
 from collections.abc import Mapping
@@ -51,8 +52,10 @@ class SQLiteIndexStore:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self.fts_enabled = True
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.path.parent, 0o700)
         self._init_db()
+        os.chmod(self.path, 0o600)
 
     def upsert_index(self, obj: ContextObject, content: str = "") -> None:
         """写入检索文本以及租户、用户、状态和作用域等过滤字段。"""

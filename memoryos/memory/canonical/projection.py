@@ -14,9 +14,17 @@ from typing import Any
 
 from memoryos.contextdb.model.context_layer import ContextLayers
 from memoryos.contextdb.model.context_object import ContextObject
-from memoryos.contextdb.store.source_store import IndexStore, QueueJob, QueueStore, SourceStore
+from memoryos.contextdb.store.source_store import (
+    IndexStore,
+    QueueJob,
+    QueueStore,
+    RelationStore,
+    SourceStore,
+)
 from memoryos.contextdb.store.vector_store import VectorStore
+from memoryos.memory.canonical.event import canonical_digest, canonical_json
 from memoryos.memory.canonical.projection_state import (
+    ProjectionIntegrityError,
     ProjectionRecord,
     ProjectionRecordStore,
     ProjectionStatus,
@@ -24,6 +32,12 @@ from memoryos.memory.canonical.projection_state import (
 )
 from memoryos.memory.canonical.scope import MemoryScope
 from memoryos.memory.canonical.visibility import read_committed_canonical
+from memoryos.operations.commit.outbox_envelope import (
+    OUTBOX_EVENT_TYPE,
+    OutboxIntegrityError,
+    validate_outbox,
+)
+from memoryos.operations.commit.quarantine import quarantine_control_file
 from memoryos.providers.embedding import EmbeddingProvider, HashingEmbeddingProvider
 
 
@@ -33,6 +47,12 @@ class ProjectionResult:
     source_revision: int
     status: str
     record_path: str = ""
+    projection_attempt_id: str = ""
+    input_effect_hash: str = ""
+
+
+class ProjectionOutboxIntegrityError(RuntimeError):
+    """A projection outbox control file is corrupt or missing."""
 
 
 class CanonicalMemoryProjector:
@@ -47,6 +67,7 @@ class CanonicalMemoryProjector:
         index_store: IndexStore,
         root: str | Path,
         *,
+        relation_store: RelationStore | None = None,
         vector_store: VectorStore | None = None,
         embedding_provider: EmbeddingProvider | None = None,
         record_store: ProjectionRecordStore | None = None,
@@ -56,6 +77,7 @@ class CanonicalMemoryProjector:
         self.source_store = source_store
         self.index_store = index_store
         self.root = Path(root)
+        self.relation_store = relation_store
         self.vector_store = vector_store
         self.embedding_provider = embedding_provider or HashingEmbeddingProvider()
         self.record_store = record_store or ProjectionRecordStore(self.root)
@@ -69,7 +91,19 @@ class CanonicalMemoryProjector:
         *,
         force: bool = False,
     ) -> ProjectionResult:
-        committed = read_committed_canonical(self.source_store, claim_uri)
+        try:
+            committed = read_committed_canonical(
+                self.source_store,
+                claim_uri,
+                self.relation_store,
+            )
+        except FileNotFoundError as exc:
+            current = self.record_store.load_current(claim_uri)
+            if current is not None:
+                raise ProjectionIntegrityError(
+                    "same revision has a different input effect or invalid commit proof"
+                ) from exc
+            raise
         obj = committed.object
         metadata = dict(obj.metadata or {})
         current_revision = int(metadata.get("revision", 0))
@@ -98,33 +132,33 @@ class CanonicalMemoryProjector:
             return ProjectionResult(claim_uri, current_revision, "skipped_invalid_scope")
         requested = current_revision if source_revision is None else int(source_revision)
         if requested < current_revision:
-            stale_record = self.record_store.load(claim_uri, requested)
-            if stale_record is not None and stale_record.current:
-                self._remove_record_current(stale_record)
-                self.record_store.clear_current_if(
-                    claim_uri,
-                    requested,
-                    reason="canonical revision advanced before stale task was consumed",
-                )
-                stale_record = self.record_store.load(claim_uri, requested)
-                if stale_record is not None:
-                    self._emit(stale_record)
+            with self.record_store.claim_lock(claim_uri):
+                stale_current = self.record_store.load_current(claim_uri, source_revision=requested)
+                if stale_current is not None:
+                    self._remove_view_currents(stale_current)
+                    self.record_store.clear_current_if(
+                        claim_uri,
+                        requested,
+                        projection_attempt_id=stale_current.projection_attempt_id,
+                        publish_token=stale_current.publish_token,
+                        reason="canonical revision advanced beyond this projection",
+                    )
             return ProjectionResult(claim_uri, requested, "skipped_stale")
         if requested > current_revision:
             raise ValueError("projection source revision is newer than canonical claim")
-        slot_uri = claim_uri.rsplit("/claims/", 1)[0]
-        current_claim_revision = int(metadata.get("current_revision", requested))
+
+        input_effect_hash = self._input_effect_hash(obj, requested)
         existing = self.record_store.load_current(claim_uri, source_revision=requested)
         if existing is not None and not force:
+            if existing.input_effect_hash != input_effect_hash:
+                raise ProjectionIntegrityError("same projection revision has a different input effect")
             self._emit(existing)
-            return ProjectionResult(
-                claim_uri,
-                requested,
-                "projected",
-                str(self.record_store.record_path(claim_uri, requested)),
-            )
+            return self._result(existing, "projected")
 
-        base = f"{claim_uri}/projections/rev-{requested}"
+        slot_uri = claim_uri.rsplit("/claims/", 1)[0]
+        current_claim_revision = int(metadata.get("current_revision", requested))
+        attempt_id = uuid.uuid4().hex
+        base = f"{claim_uri}/projections/rev-{requested}/attempt-{attempt_id}"
         l0_uri = f"{base}/l0.md"
         l1_uri = f"{base}/l1.md"
         l2_uri = f"{base}/l2.json"
@@ -135,21 +169,15 @@ class CanonicalMemoryProjector:
             slot_uri=slot_uri,
             source_revision=requested,
             projection_revision=requested,
+            projection_attempt_id=attempt_id,
+            input_effect_hash=input_effect_hash,
             l0_uri=l0_uri,
             l1_uri=l1_uri,
             l2_uri=l2_uri,
+            relations_uri=relations_uri,
             manifest_uri=manifest_uri,
             current_claim_revision=current_claim_revision,
         )
-        if force:
-            record = self.record_store.update(
-                record,
-                index_status=ProjectionStepStatus.PENDING.value,
-                vector_status=ProjectionStepStatus.PENDING.value,
-                relation_status=ProjectionStepStatus.PENDING.value,
-                scope_status=ProjectionStepStatus.PENDING.value,
-                taxonomy_status=ProjectionStepStatus.PENDING.value,
-            )
         published_view_currents = False
         self._notify("after_read", claim_uri, requested)
         try:
@@ -159,39 +187,57 @@ class CanonicalMemoryProjector:
             self.source_store.write_content(l0_uri, l0)
             self.source_store.write_content(l1_uri, l1)
             self.source_store.write_content(l2_uri, l2)
-            if record.relation_status != ProjectionStepStatus.COMPLETED.value:
-                record = self.record_store.update(record, relation_status=ProjectionStepStatus.RUNNING.value)
-                try:
-                    self.source_store.write_content(
-                        relations_uri,
-                        json.dumps(
-                            {
-                                "claim_uri": claim_uri,
-                                "slot_uri": slot_uri,
-                                "source_revision": requested,
-                                "relations": [relation.to_dict() for relation in obj.relations],
-                            },
-                            ensure_ascii=False,
-                            indent=2,
-                            sort_keys=True,
-                        ),
-                    )
-                except Exception:
-                    record = self.record_store.update(
-                        record,
-                        relation_status=ProjectionStepStatus.FAILED.value,
-                    )
-                    raise
+            record = self.record_store.update(record, relation_status=ProjectionStepStatus.RUNNING.value)
+            self.source_store.write_content(
+                relations_uri,
+                json.dumps(
+                    {
+                        "claim_uri": claim_uri,
+                        "slot_uri": slot_uri,
+                        "source_revision": requested,
+                        "projection_attempt_id": record.projection_attempt_id,
+                        "input_effect_hash": record.input_effect_hash,
+                        "relations": [relation.to_dict() for relation in obj.relations],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                ),
+            )
+            record = self.record_store.update(record, relation_status=ProjectionStepStatus.COMPLETED.value)
+            vector_embedding: list[float] | None = None
+            if self.vector_store is None:
+                record = self.record_store.update(record, vector_status=ProjectionStepStatus.SKIPPED.value)
+            else:
+                record = self.record_store.update(record, vector_status=ProjectionStepStatus.RUNNING.value)
+                vector_embedding = self.embedding_provider.embed("\n".join((l0, l1)))
+            self._notify("after_artifacts", claim_uri, requested)
 
             with self.record_store.claim_lock(claim_uri):
-                if not self._is_current(claim_uri, requested, metadata):
-                    stale = self.record_store.stale(record, "canonical revision changed before publication")
+                if not self._is_current(claim_uri, requested, input_effect_hash):
+                    stale = self.record_store.stale(record, "canonical revision or effect changed before publication")
                     return self._result(stale, "skipped_stale")
-                newer = self.record_store.load_current(claim_uri)
-                if newer is not None and newer.source_revision > requested:
-                    stale = self.record_store.stale(record, "newer projection revision is already current")
-                    return self._result(stale, "skipped_stale")
+                current = self.record_store.load_current(claim_uri)
+                if current is not None:
+                    if current.source_revision > requested:
+                        stale = self.record_store.stale(record, "newer projection revision is already current")
+                        return self._result(stale, "skipped_stale")
+                    if current.source_revision == requested:
+                        if current.input_effect_hash != input_effect_hash:
+                            raise ProjectionIntegrityError("same projection revision has a different input effect")
+                        if current.projection_attempt_id != record.projection_attempt_id and not force:
+                            self.record_store.stale(record, "equivalent projection attempt is already current")
+                            self._emit(current)
+                            return self._result(current, "projected")
 
+                owned = self.record_store.load(
+                    claim_uri,
+                    requested,
+                    projection_attempt_id=record.projection_attempt_id,
+                )
+                if owned is None or owned.status != ProjectionStatus.RUNNING.value:
+                    raise ProjectionIntegrityError("projection attempt lost publication eligibility")
+                record = owned
                 self._notify("before_publish", claim_uri, requested)
                 projection_obj = self._projection_object(
                     obj,
@@ -199,61 +245,34 @@ class CanonicalMemoryProjector:
                     record,
                     layers=ContextLayers(l0_uri=l0_uri, l1_uri=l1_uri, l2_uri=l2_uri),
                 )
-                content = "\n".join((l0, l1, l2))
-                if record.index_status != ProjectionStepStatus.COMPLETED.value:
-                    record = self.record_store.update(record, index_status=ProjectionStepStatus.RUNNING.value)
+                if self.vector_store is not None:
+                    assert vector_embedding is not None
                     try:
-                        self.index_store.upsert_index(projection_obj, content=content)
-                    except Exception:
-                        record = self.record_store.update(record, index_status=ProjectionStepStatus.FAILED.value)
-                        raise
-                    record = self.record_store.update(record, index_status=ProjectionStepStatus.COMPLETED.value)
-
-                if self.vector_store is None:
-                    if record.vector_status != ProjectionStepStatus.SKIPPED.value:
-                        record = self.record_store.update(record, vector_status=ProjectionStepStatus.SKIPPED.value)
-                elif record.vector_status != ProjectionStepStatus.COMPLETED.value:
-                    record = self.record_store.update(record, vector_status=ProjectionStepStatus.RUNNING.value)
-                    try:
-                        self._project_vector(projection_obj, "\n".join((l0, l1)), requested)
+                        self._publish_vector(projection_obj, vector_embedding, record)
                     except Exception:
                         record = self.record_store.update(record, vector_status=ProjectionStepStatus.FAILED.value)
                         raise
                     record = self.record_store.update(record, vector_status=ProjectionStepStatus.COMPLETED.value)
 
-                if record.relation_status != ProjectionStepStatus.COMPLETED.value:
-                    record = self.record_store.update(
-                        record,
-                        relation_status=ProjectionStepStatus.COMPLETED.value,
-                    )
-                if record.scope_status != ProjectionStepStatus.COMPLETED.value:
-                    record = self.record_store.update(record, scope_status=ProjectionStepStatus.RUNNING.value)
-                    try:
-                        self._write_scope_views(projection_obj, record)
-                    except Exception:
-                        record = self.record_store.update(
-                            record,
-                            scope_status=ProjectionStepStatus.FAILED.value,
-                        )
-                        raise
-                    record = self.record_store.update(record, scope_status=ProjectionStepStatus.COMPLETED.value)
-                if record.taxonomy_status != ProjectionStepStatus.COMPLETED.value:
-                    record = self.record_store.update(record, taxonomy_status=ProjectionStepStatus.RUNNING.value)
-                    try:
-                        self._write_taxonomy_view(projection_obj, record)
-                    except Exception:
-                        record = self.record_store.update(
-                            record,
-                            taxonomy_status=ProjectionStepStatus.FAILED.value,
-                        )
-                        raise
-                    record = self.record_store.update(record, taxonomy_status=ProjectionStepStatus.COMPLETED.value)
+                record = self.record_store.update(record, index_status=ProjectionStepStatus.RUNNING.value)
+                try:
+                    self.index_store.upsert_index(projection_obj, content="\n".join((l0, l1, l2)))
+                except Exception:
+                    record = self.record_store.update(record, index_status=ProjectionStepStatus.FAILED.value)
+                    raise
+                record = self.record_store.update(record, index_status=ProjectionStepStatus.COMPLETED.value)
+                self._notify("after_index", claim_uri, requested)
 
-                if not self._is_current(claim_uri, requested, metadata):
-                    self._remove_published_current(projection_obj, record)
-                    stale = self.record_store.stale(record, "canonical revision changed during publication")
+                record = self.record_store.update(record, scope_status=ProjectionStepStatus.RUNNING.value)
+                self._write_scope_views(projection_obj, record)
+                record = self.record_store.update(record, scope_status=ProjectionStepStatus.COMPLETED.value)
+                record = self.record_store.update(record, taxonomy_status=ProjectionStepStatus.RUNNING.value)
+                self._write_taxonomy_view(projection_obj, record)
+                record = self.record_store.update(record, taxonomy_status=ProjectionStepStatus.COMPLETED.value)
+
+                if not self._is_current(claim_uri, requested, input_effect_hash):
+                    stale = self.record_store.stale(record, "canonical revision or effect changed during publication")
                     return self._result(stale, "skipped_stale")
-
                 completed_preview = self.record_store.update(
                     record,
                     status=ProjectionStatus.COMPLETED.value,
@@ -270,36 +289,42 @@ class CanonicalMemoryProjector:
                         sort_keys=True,
                     ),
                 )
+                self._notify("before_view_publish", claim_uri, requested)
+                self._publish_view_currents(completed_preview)
                 published_view_currents = True
-                self._publish_view_currents(record)
-                record = self.record_store.promote(completed_preview)
-                if not record.current:
-                    self._remove_published_current(projection_obj, record)
-                    return self._result(record, "skipped_stale")
+                self._notify("after_view_publish", claim_uri, requested)
+                record = self.record_store.promote(completed_preview, replace_same_effect=force)
+                if record.projection_attempt_id != completed_preview.projection_attempt_id:
+                    self._remove_view_currents(completed_preview)
+                    return self._result(record, "projected")
                 self._notify("after_publish", claim_uri, requested)
-                if not self._is_current(claim_uri, requested, metadata):
-                    self._remove_published_current(projection_obj, record)
+                if not self._is_current(claim_uri, requested, input_effect_hash):
+                    self._remove_view_currents(record)
                     self.record_store.clear_current_if(
                         claim_uri,
                         requested,
-                        reason="canonical revision changed after publication",
+                        projection_attempt_id=record.projection_attempt_id,
+                        publish_token=record.publish_token,
+                        reason="canonical revision or effect changed after publication",
                     )
-                    stale = self.record_store.load(claim_uri, requested) or record
+                    stale = self.record_store.load(
+                        claim_uri,
+                        requested,
+                        projection_attempt_id=record.projection_attempt_id,
+                    ) or record
                     return self._result(stale, "skipped_stale")
             return self._result(record, "projected")
         except Exception as exc:
-            latest = self.record_store.load(claim_uri, requested) or record
-            if latest.current:
-                removed = self._remove_record_current(latest)
-                if removed:
-                    latest = self._reset_removed_components(latest)
-                self.record_store.clear_current_if(
-                    claim_uri,
-                    requested,
-                    reason=f"projection failed after publication: {type(exc).__name__}",
-                )
-                latest = self.record_store.load(claim_uri, requested) or latest
-            elif published_view_currents:
+            latest = self.record_store.load(
+                claim_uri,
+                requested,
+                projection_attempt_id=record.projection_attempt_id,
+            ) or record
+            current = self.record_store.load_current(claim_uri)
+            if current is not None and current.projection_attempt_id == record.projection_attempt_id:
+                self._emit(current)
+                raise
+            if published_view_currents:
                 self._remove_view_currents(latest)
             failed = self.record_store.fail(latest, f"{type(exc).__name__}: {exc}", retryable=True)
             self._emit(failed)
@@ -403,15 +428,22 @@ class CanonicalMemoryProjector:
             **metadata,
             "projection_source_revision": record.source_revision,
             "projection_revision": record.projection_revision,
+            "projection_attempt_id": record.projection_attempt_id,
+            "projection_input_effect_hash": record.input_effect_hash,
+            "projection_publish_token": record.publish_token,
             "current_claim_revision": record.current_claim_revision,
             "projection_manifest_uri": record.manifest_uri,
-            "projection_record_path": str(self.record_store.record_path(record.claim_uri, record.source_revision)),
+            "projection_record_path": str(self.record_store.attempt_path_for(record)),
         }
         return projected
 
-    def _project_vector(self, obj: ContextObject, content: str, source_revision: int) -> None:
+    def _publish_vector(
+        self,
+        obj: ContextObject,
+        embedding: list[float],
+        record: ProjectionRecord,
+    ) -> None:
         assert self.vector_store is not None
-        embedding = self.embedding_provider.embed(content)
         self.vector_store.upsert_vector(
             obj.uri,
             embedding,
@@ -421,10 +453,13 @@ class CanonicalMemoryProjector:
                 "context_type": obj.context_type.value,
                 "claim_id": obj.metadata.get("claim_id"),
                 "slot_id": obj.metadata.get("slot_id"),
-                "source_revision": source_revision,
-                "projection_revision": source_revision,
+                "source_revision": record.source_revision,
+                "projection_revision": record.projection_revision,
+                "projection_attempt_id": record.projection_attempt_id,
+                "input_effect_hash": record.input_effect_hash,
+                "publish_token": record.publish_token,
                 "embedding_model": self.embedding_provider.model_name,
-                "schema_version": "canonical_vector_projection_v2",
+                "schema_version": "canonical_vector_projection_v3",
             },
         )
 
@@ -471,17 +506,32 @@ class CanonicalMemoryProjector:
 
     def _write_revisioned_view(self, directory: Path, payload: dict[str, Any]) -> None:
         revision = int(payload["source_revision"])
-        self._write_json_atomic(directory / f"rev-{revision}.json", payload)
+        attempt_id = str(payload["projection_attempt_id"])
+        self._write_json_atomic(directory / f"rev-{revision}-attempt-{attempt_id}.json", payload)
 
     def _publish_view_currents(self, record: ProjectionRecord) -> None:
-        for path in self.root.glob(f"views/**/rev-{record.source_revision}.json"):
+        pattern = f"views/**/rev-{record.source_revision}-attempt-{record.projection_attempt_id}.json"
+        for path in self.root.glob(pattern):
             payload = self._read_json_optional(path)
-            if payload is None or str(payload.get("claim_uri", "")) != record.claim_uri:
+            if (
+                payload is None
+                or str(payload.get("claim_uri", "")) != record.claim_uri
+                or str(payload.get("projection_attempt_id", "")) != record.projection_attempt_id
+                or str(payload.get("input_effect_hash", "")) != record.input_effect_hash
+            ):
                 continue
             current_path = path.parent / "current.json"
             current = self._read_json_optional(current_path) or {}
-            if int(current.get("source_revision", 0) or 0) <= record.source_revision:
-                self._write_json_atomic(current_path, payload)
+            current_revision = int(current.get("source_revision", 0) or 0)
+            if current_revision > record.source_revision:
+                continue
+            if (
+                current_revision == record.source_revision
+                and current
+                and str(current.get("input_effect_hash", "")) != record.input_effect_hash
+            ):
+                raise ProjectionIntegrityError("same revision view has a different input effect")
+            self._write_json_atomic(current_path, payload)
 
     def _view_reference(self, obj: ContextObject, record: ProjectionRecord) -> dict[str, Any]:
         metadata = dict(obj.metadata or {})
@@ -493,8 +543,11 @@ class CanonicalMemoryProjector:
             "claim_id": metadata.get("claim_id"),
             "source_revision": record.source_revision,
             "projection_revision": record.projection_revision,
+            "projection_attempt_id": record.projection_attempt_id,
+            "input_effect_hash": record.input_effect_hash,
+            "publish_token": record.publish_token,
             "current_claim_revision": record.current_claim_revision,
-            "projection_record_path": str(self.record_store.record_path(record.claim_uri, record.source_revision)),
+            "projection_record_path": str(self.record_store.attempt_path_for(record)),
         }
 
     def _taxonomy_path(self, metadata: dict[str, Any]) -> Path:
@@ -544,6 +597,9 @@ class CanonicalMemoryProjector:
                     "slot_uri": record.slot_uri,
                     "source_revision": record.source_revision,
                     "projection_revision": record.projection_revision,
+                    "projection_attempt_id": record.projection_attempt_id,
+                    "input_effect_hash": record.input_effect_hash,
+                    "publish_token": record.publish_token,
                     "projection_level": level,
                     "uri": uri,
                     "generator": self.GENERATOR,
@@ -559,9 +615,13 @@ class CanonicalMemoryProjector:
             "prompt_version": self.PROMPT_VERSION,
         }
 
-    def _is_current(self, claim_uri: str, revision: int, expected_metadata: dict[str, Any]) -> bool:
+    def _is_current(self, claim_uri: str, revision: int, expected_effect_hash: str) -> bool:
         try:
-            committed = read_committed_canonical(self.source_store, claim_uri)
+            committed = read_committed_canonical(
+                self.source_store,
+                claim_uri,
+                self.relation_store,
+            )
         except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
             return False
         if committed.from_before_image:
@@ -570,36 +630,8 @@ class CanonicalMemoryProjector:
         return bool(
             metadata.get("canonical_kind") == "claim"
             and int(metadata.get("revision", 0)) == revision
-            and str(metadata.get("claim_id", "")) == str(expected_metadata.get("claim_id", ""))
-            and str(metadata.get("slot_id", "")) == str(expected_metadata.get("slot_id", ""))
+            and self._input_effect_hash(committed.object, revision) == expected_effect_hash
         )
-
-    def _remove_published_current(self, obj: ContextObject, record: ProjectionRecord) -> None:
-        current = self.record_store.load_current(record.claim_uri)
-        if current is not None and current.source_revision > record.source_revision:
-            return
-        self.index_store.delete_index(obj.uri)
-        if self.vector_store is not None:
-            self.vector_store.delete_vector(obj.uri)
-        for path in self.root.glob("views/**/current.json"):
-            payload = self._read_json_optional(path)
-            if payload is None:
-                continue
-            if (
-                str(payload.get("claim_uri", "")) == record.claim_uri
-                and int(payload.get("source_revision", 0) or 0) == record.source_revision
-            ):
-                path.unlink(missing_ok=True)
-
-    def _remove_record_current(self, record: ProjectionRecord) -> bool:
-        current = self.record_store.load_current(record.claim_uri)
-        if current is not None and current.source_revision > record.source_revision:
-            return False
-        self.index_store.delete_index(record.claim_uri)
-        if self.vector_store is not None:
-            self.vector_store.delete_vector(record.claim_uri)
-        self._remove_view_currents(record)
-        return True
 
     def _remove_view_currents(self, record: ProjectionRecord) -> None:
         for path in self.root.glob("views/**/current.json"):
@@ -609,25 +641,28 @@ class CanonicalMemoryProjector:
             if (
                 str(payload.get("claim_uri", "")) == record.claim_uri
                 and int(payload.get("source_revision", 0) or 0) == record.source_revision
+                and str(payload.get("projection_attempt_id", "")) == record.projection_attempt_id
+                and str(payload.get("publish_token", "")) == record.publish_token
             ):
                 path.unlink(missing_ok=True)
 
-    def _reset_removed_components(self, record: ProjectionRecord) -> ProjectionRecord:
-        resettable = {ProjectionStepStatus.RUNNING.value, ProjectionStepStatus.COMPLETED.value}
-        return self.record_store.update(
-            record,
-            index_status=(
-                ProjectionStepStatus.PENDING.value if record.index_status in resettable else record.index_status
-            ),
-            vector_status=(
-                ProjectionStepStatus.PENDING.value if record.vector_status in resettable else record.vector_status
-            ),
-            scope_status=(
-                ProjectionStepStatus.PENDING.value if record.scope_status in resettable else record.scope_status
-            ),
-            taxonomy_status=(
-                ProjectionStepStatus.PENDING.value if record.taxonomy_status in resettable else record.taxonomy_status
-            ),
+    def _input_effect_hash(self, obj: ContextObject, source_revision: int) -> str:
+        try:
+            content = self.source_store.read_content(obj.layers.l2_uri or obj.uri)
+        except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+            content = ""
+        relations = sorted(
+            (relation.to_dict() for relation in obj.relations),
+            key=canonical_json,
+        )
+        return canonical_digest(
+            {
+                "claim_uri": obj.uri,
+                "source_revision": source_revision,
+                "object": obj.to_dict(),
+                "content": content,
+                "relations": relations,
+            }
         )
 
     def _notify(self, stage: str, claim_uri: str, revision: int) -> None:
@@ -640,7 +675,9 @@ class CanonicalMemoryProjector:
             record.claim_uri,
             record.source_revision,
             status,
-            str(self.record_store.record_path(record.claim_uri, record.source_revision)),
+            str(self.record_store.attempt_path_for(record)),
+            record.projection_attempt_id,
+            record.input_effect_hash,
         )
 
     def _emit(self, record: ProjectionRecord) -> None:
@@ -656,47 +693,94 @@ class CanonicalMemoryProjector:
             value = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             return None
-        except (OSError, json.JSONDecodeError):
-            return None
-        return value if isinstance(value, dict) else None
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ProjectionIntegrityError(f"invalid projection view state: {path.name}") from exc
+        if not isinstance(value, dict):
+            raise ProjectionIntegrityError(f"invalid projection view state: {path.name}")
+        return value
 
     def _write_json_atomic(self, path: Path, payload: dict[str, Any]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(path.parent, 0o700)
         tmp = path.with_suffix(path.suffix + f".{uuid.uuid4().hex}.tmp")
-        tmp.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        with tmp.open("x", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
         os.replace(tmp, path)
+        os.chmod(path, 0o600)
+        descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
 
 class MemoryProjectionWorker:
     """Consume durable MemoryCommitted outbox entries idempotently."""
 
-    def __init__(self, projector: CanonicalMemoryProjector, queue_store: QueueStore) -> None:
+    def __init__(
+        self,
+        projector: CanonicalMemoryProjector,
+        queue_store: QueueStore,
+        *,
+        worker_id: str | None = None,
+    ) -> None:
         self.projector = projector
         self.queue_store = queue_store
+        self.worker_id = worker_id or f"memory-projection:{os.getpid()}:{uuid.uuid4().hex}"
+        self.last_quarantined: list[str] = []
 
-    def process_pending(self, limit: int = 10) -> dict[str, list[str]]:
+    def process_pending(
+        self,
+        limit: int = 10,
+        *,
+        lease_seconds: int = 60,
+        max_retries: int = 3,
+    ) -> dict[str, list[str]]:
+        self.last_quarantined = []
         self.dispatch_outbox()
         processed: list[str] = []
         stale: list[str] = []
         failed: list[str] = []
-        for job in self.queue_store.lease("memory_projection", limit=limit):
+        dead_letter: list[str] = []
+        quarantine: list[str] = []
+        jobs = self.queue_store.lease(
+            "memory_projection",
+            lease_owner=self.worker_id,
+            limit=limit,
+            lease_seconds=lease_seconds,
+        )
+        for job in jobs:
             try:
                 outbox = self._read_outbox(Path(str(job.payload["outbox_path"])))
                 self._project_event(outbox, job.job_id, stale)
-            except Exception as exc:
-                retry = getattr(self.queue_store, "retry", None)
-                if callable(retry):
-                    retry(job.job_id, str(exc), max_retries=3, retryable=True)
-                else:
-                    self.queue_store.fail(job.job_id, str(exc))
+            except ProjectionOutboxIntegrityError as exc:
+                self.queue_store.quarantine(job, type(exc).__name__)
                 failed.append(job.job_id)
+                quarantine.append(job.job_id)
                 continue
-            self.queue_store.ack(job.job_id)
+            except Exception as exc:
+                settled = self.queue_store.retry(
+                    job,
+                    type(exc).__name__,
+                    max_retries=max_retries,
+                    retryable=True,
+                )
+                failed.append(job.job_id)
+                if settled.status == "dead_letter":
+                    dead_letter.append(job.job_id)
+                continue
+            self.queue_store.ack(job)
             processed.append(job.job_id)
-        return {"processed": processed, "stale": stale, "failed": failed}
+        return {
+            "processed": processed,
+            "stale": stale,
+            "failed": failed,
+            "dead_letter": dead_letter,
+            "quarantine": [*self.last_quarantined, *quarantine],
+        }
 
     def process_commit_group(
         self,
@@ -709,37 +793,78 @@ class MemoryProjectionWorker:
         processed: list[str] = []
         stale: list[str] = []
         failed: list[str] = []
-        outbox_root = self.projector.root / "system" / "outbox"
-        paths = (
-            [outbox_root / f"{transaction_id}.json" for transaction_id in transaction_ids]
-            if transaction_ids
-            else sorted(outbox_root.glob("*.json"))
-            if outbox_root.exists()
-            else []
+        quarantine: list[str] = []
+        self.last_quarantined = []
+        self.dispatch_outbox()
+        if transaction_ids:
+            job_ids = tuple(f"outbox_{transaction_id}" for transaction_id in transaction_ids)
+        else:
+            outbox_root = self.projector.root / "system" / "outbox"
+            selected: list[str] = []
+            for path in sorted(outbox_root.glob("*.json")) if outbox_root.exists() else []:
+                try:
+                    event = self._read_outbox(path)
+                except (OSError, ValueError, json.JSONDecodeError):
+                    continue
+                if str(event.get("commit_group_id", "")) == group_id:
+                    selected.append(f"outbox_{path.stem}")
+            job_ids = tuple(selected)
+        if not job_ids:
+            return {
+                "processed": processed,
+                "stale": stale,
+                "failed": failed,
+                "quarantine": self.last_quarantined,
+            }
+        jobs = self.queue_store.lease(
+            "memory_projection",
+            lease_owner=self.worker_id,
+            limit=len(job_ids),
+            lease_seconds=60,
+            job_ids=job_ids,
         )
-        for path in paths:
-            event_id = path.stem
+        for job in jobs:
             try:
-                outbox = self._read_outbox(path)
+                outbox = self._read_outbox(Path(str(job.payload["outbox_path"])))
                 if str(outbox.get("commit_group_id", "")) != group_id:
                     if transaction_ids:
                         raise ValueError("projection outbox is not bound to the requested commit group")
                     continue
-                job_id = f"outbox_{event_id}"
-                self._project_event(outbox, job_id, stale)
-                self.queue_store.ack(job_id)
-                processed.append(job_id)
+                self._project_event(outbox, job.job_id, stale)
+                self.queue_store.ack(job)
+                processed.append(job.job_id)
+            except ProjectionOutboxIntegrityError as exc:
+                self.queue_store.quarantine(job, type(exc).__name__)
+                failed.append(f"{job.job_id}:{type(exc).__name__}")
+                quarantine.append(job.job_id)
             except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
-                failed.append(f"{event_id}:{type(exc).__name__}")
-        return {"processed": processed, "stale": stale, "failed": failed}
+                self.queue_store.retry(job, type(exc).__name__, max_retries=3, retryable=True)
+                failed.append(f"{job.job_id}:{type(exc).__name__}")
+        return {
+            "processed": processed,
+            "stale": stale,
+            "failed": failed,
+            "quarantine": [*self.last_quarantined, *quarantine],
+        }
 
     def _read_outbox(self, path: Path) -> dict[str, Any]:
-        outbox = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(outbox, dict):
-            raise ValueError("projection outbox must be an object")
-        if outbox.get("event_type") != "MemoryCommitted" or outbox.get("status") != "committed":
-            raise ValueError("projection job references a non-committed outbox event")
-        return outbox
+        try:
+            return validate_outbox(
+                json.loads(path.read_text(encoding="utf-8")),
+                allowed_statuses={"committed"},
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError, OutboxIntegrityError) as exc:
+            if path.exists():
+                quarantine_control_file(
+                    self.projector.root,
+                    path,
+                    kind="outbox",
+                    error=exc,
+                    identifiers={"transaction_id": path.stem},
+                )
+            raise ProjectionOutboxIntegrityError(
+                "projection job references an invalid committed outbox event"
+            ) from exc
 
     def _project_event(self, outbox: dict[str, Any], job_id: str, stale: list[str]) -> None:
         for item in outbox.get("claim_revisions", []) or []:
@@ -756,16 +881,35 @@ class MemoryProjectionWorker:
             return dispatched
         for path in sorted(outbox_root.glob("*.json")):
             try:
-                event = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+                event = validate_outbox(json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, UnicodeError, json.JSONDecodeError, OutboxIntegrityError) as exc:
+                quarantine_control_file(
+                    self.projector.root,
+                    path,
+                    kind="outbox",
+                    error=exc,
+                    identifiers={"transaction_id": path.stem},
+                )
+                self.last_quarantined.append(path.stem)
                 continue
-            if event.get("event_type") != "MemoryCommitted" or event.get("status") != "committed":
+            if event.get("event_type") != OUTBOX_EVENT_TYPE or event.get("status") != "committed":
                 continue
             transaction_id = str(event.get("transaction_id", ""))
             if not transaction_id:
                 continue
             claim_revisions = event.get("claim_revisions", []) or []
-            target_uri = str(claim_revisions[0].get("uri", "")) if claim_revisions else ""
+            operations = [item for item in event.get("operations", []) or [] if isinstance(item, dict)]
+            target_uri = next(
+                (
+                    str(payload.get("uri", ""))
+                    for item in operations
+                    if isinstance((payload := item.get("payload", {}).get("context_object")), dict)
+                    and dict(payload.get("metadata", {}) or {}).get("canonical_kind") == "slot"
+                ),
+                str(claim_revisions[0].get("uri", "")).rsplit("/claims/", 1)[0]
+                if claim_revisions
+                else transaction_id,
+            )
             self.queue_store.enqueue(
                 QueueJob(
                     job_id=f"outbox_{transaction_id}",

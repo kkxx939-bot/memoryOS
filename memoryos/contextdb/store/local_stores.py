@@ -16,7 +16,14 @@ from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_relation import ContextRelation
 from memoryos.contextdb.model.context_uri import ContextURI
 from memoryos.contextdb.model.lifecycle import LifecycleState
-from memoryos.contextdb.store.source_store import IndexHit, LockLostError, LockToken, QueueJob
+from memoryos.contextdb.store.source_store import (
+    IndexHit,
+    LeaseLostError,
+    LockLostError,
+    LockToken,
+    QueueIdempotencyConflictError,
+    QueueJob,
+)
 from memoryos.contextdb.store.sqlite_index_store import lexical_match_count, lexical_relevance, lexical_terms
 
 
@@ -46,7 +53,7 @@ class FileSystemSourceStore:
         if ContextURI.parse(obj.uri).authority == "user" and str(obj.tenant_id or "default") != self.tenant_id:
             raise PermissionError("ContextObject tenant does not match SourceStore tenant")
         directory = self._object_dir(obj.uri)
-        directory.mkdir(parents=True, exist_ok=True)
+        self._ensure_private_directory(directory)
         self._write_atomic(directory / ".meta.json", json.dumps(obj.to_dict(), ensure_ascii=False, indent=2))
         relations = {"uri": obj.uri, "relations": [relation.to_dict() for relation in obj.relations]}
         self._write_atomic(directory / ".relations.json", json.dumps(relations, ensure_ascii=False, indent=2))
@@ -59,11 +66,13 @@ class FileSystemSourceStore:
 
     def write_content(self, uri: str, content: str | bytes) -> None:
         path = self._content_path(uri)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_private_directory(path.parent)
         if isinstance(content, bytes):
             tmp = path.with_suffix(path.suffix + f".{uuid.uuid4().hex}.tmp")
             tmp.write_bytes(content)
+            os.chmod(tmp, 0o600)
             os.replace(tmp, path)
+            os.chmod(path, 0o600)
         else:
             self._write_atomic(path, content)
 
@@ -105,10 +114,36 @@ class FileSystemSourceStore:
         return path / "content.md"
 
     def _write_atomic(self, path: Path, content: str) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_private_directory(path.parent)
         tmp = path.with_suffix(path.suffix + f".{uuid.uuid4().hex}.tmp")
-        tmp.write_text(content, encoding="utf-8")
-        os.replace(tmp, path)
+        try:
+            with tmp.open("x", encoding="utf-8") as handle:
+                os.chmod(tmp, 0o600)
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+            os.chmod(path, 0o600)
+            descriptor = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    def _ensure_private_directory(self, directory: Path) -> None:
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        current = directory
+        root = self.root
+        while current == root or root in current.parents:
+            try:
+                current.chmod(0o700)
+            except OSError:
+                pass
+            if current == root:
+                break
+            current = current.parent
 
 
 class InMemoryIndexStore:
@@ -294,52 +329,185 @@ class InMemoryRelationStore:
 class InMemoryQueueStore:
     def __init__(self) -> None:
         self.jobs: dict[str, QueueJob] = {}
+        self._guard = threading.RLock()
 
-    def enqueue(self, job: QueueJob) -> None:
-        self.jobs.setdefault(job.job_id, job)
+    def enqueue(self, job: QueueJob) -> QueueJob:
+        if job.status != "pending" or job.lease_token or job.lease_owner or job.lease_generation:
+            raise ValueError("new queue jobs must be unleased and pending")
+        with self._guard:
+            existing = self.jobs.get(job.job_id)
+            if existing is not None:
+                if self._identity(existing) != self._identity(job):
+                    raise QueueIdempotencyConflictError(
+                        f"queue job id is already bound to another payload: {job.job_id}"
+                    )
+                return existing
+            pending = QueueJob(
+                job_id=job.job_id,
+                queue_name=job.queue_name,
+                action=job.action,
+                target_uri=job.target_uri,
+                payload=dict(job.payload),
+            )
+            self.jobs[job.job_id] = pending
+            return pending
 
-    def lease(self, queue_name: str, limit: int = 10, lease_seconds: int = 60) -> list[QueueJob]:
-        leased = []
-        for job in self.jobs.values():
-            if job.queue_name == queue_name and job.status == "pending":
-                leased.append(QueueJob(**{**job.__dict__, "status": "leased"}))
-            if len(leased) >= limit:
-                break
-        for job in leased:
-            self.jobs[job.job_id] = job
+    def lease(
+        self,
+        queue_name: str,
+        *,
+        lease_owner: str,
+        limit: int = 10,
+        lease_seconds: int = 60,
+        job_ids: Sequence[str] | None = None,
+    ) -> list[QueueJob]:
+        if not isinstance(lease_owner, str) or not lease_owner.strip():
+            raise ValueError("lease_owner must be non-empty")
+        if limit <= 0:
+            return []
+        now = datetime.now(timezone.utc)
+        leased_until = (now + timedelta(seconds=max(1, lease_seconds))).isoformat()
+        allowed = set(job_ids) if job_ids is not None else None
+        leased: list[QueueJob] = []
+        with self._guard:
+            for job in self.jobs.values():
+                expired = job.status == "leased" and self._expired(job, now)
+                if (
+                    job.queue_name == queue_name
+                    and (allowed is None or job.job_id in allowed)
+                    and (job.status == "pending" or expired)
+                ):
+                    claimed = QueueJob(
+                        **{
+                            **job.__dict__,
+                            "status": "leased",
+                            "leased_until": leased_until,
+                            "lease_token": uuid.uuid4().hex,
+                            "lease_generation": job.lease_generation + 1,
+                            "lease_owner": lease_owner,
+                        }
+                    )
+                    self.jobs[job.job_id] = claimed
+                    leased.append(claimed)
+                if len(leased) >= limit:
+                    break
         return leased
 
-    def ack(self, job_id: str) -> None:
-        if job_id in self.jobs:
-            self.jobs[job_id] = QueueJob(**{**self.jobs[job_id].__dict__, "status": "done"})
+    def ack(self, job: QueueJob) -> QueueJob:
+        return self._settle(job, status="done")
 
-    def fail(self, job_id: str, error: str) -> None:
-        if job_id in self.jobs:
-            job = self.jobs[job_id]
-            self.jobs[job_id] = QueueJob(
-                **{**job.__dict__, "status": "failed", "retry_count": job.retry_count + 1, "last_error": error}
-            )
+    def fail(self, job: QueueJob, error: str) -> QueueJob:
+        return self._settle(
+            job,
+            status="dead_letter",
+            retry_count=job.retry_count + 1,
+            last_error=str(error)[:500],
+        )
 
-    def retry(self, job_id: str, error: str, *, max_retries: int = 3, retryable: bool = True) -> str:
-        job = self.jobs[job_id]
+    def retry(
+        self,
+        job: QueueJob,
+        error: str,
+        *,
+        max_retries: int = 3,
+        retryable: bool = True,
+    ) -> QueueJob:
         retry_count = job.retry_count + 1
         status = "pending" if retryable and retry_count < max_retries else "dead_letter"
-        self.jobs[job_id] = QueueJob(
-            **{
-                **job.__dict__,
-                "status": status,
-                "leased_until": None,
-                "retry_count": retry_count,
-                "last_error": error[:500],
-            }
+        return self._settle(
+            job,
+            status=status,
+            retry_count=retry_count,
+            last_error=str(error)[:500],
         )
-        return status
+
+    def quarantine(self, job: QueueJob, error: str) -> QueueJob:
+        return self._settle(
+            job,
+            status="quarantine",
+            retry_count=job.retry_count + 1,
+            last_error=str(error)[:500],
+        )
+
+    def extend(self, job: QueueJob, *, lease_seconds: int = 60) -> QueueJob:
+        with self._guard:
+            current = self._owned(job)
+            extended = QueueJob(
+                **{
+                    **current.__dict__,
+                    "leased_until": (
+                        datetime.now(timezone.utc) + timedelta(seconds=max(1, lease_seconds))
+                    ).isoformat(),
+                }
+            )
+            self.jobs[job.job_id] = extended
+        return extended
+
+    def get(self, job_id: str) -> QueueJob | None:
+        with self._guard:
+            return self.jobs.get(job_id)
 
     def stats(self) -> dict[str, int]:
         result: dict[str, int] = {}
-        for job in self.jobs.values():
-            result[job.status] = result.get(job.status, 0) + 1
+        with self._guard:
+            for job in self.jobs.values():
+                result[job.status] = result.get(job.status, 0) + 1
         return result
+
+    def _settle(
+        self,
+        job: QueueJob,
+        *,
+        status: str,
+        retry_count: int | None = None,
+        last_error: str | None = None,
+    ) -> QueueJob:
+        with self._guard:
+            current = self._owned(job)
+            settled = QueueJob(
+                **{
+                    **current.__dict__,
+                    "status": status,
+                    "leased_until": None,
+                    "lease_token": "",
+                    "lease_owner": "",
+                    "retry_count": current.retry_count if retry_count is None else retry_count,
+                    "last_error": current.last_error if last_error is None else last_error,
+                }
+            )
+            self.jobs[job.job_id] = settled
+            return settled
+
+    def _owned(self, job: QueueJob) -> QueueJob:
+        current = self.jobs.get(job.job_id)
+        now = datetime.now(timezone.utc)
+        if (
+            current is None
+            or current.status != "leased"
+            or current.lease_token != job.lease_token
+            or current.lease_generation != job.lease_generation
+            or current.lease_owner != job.lease_owner
+            or self._expired(current, now)
+        ):
+            raise LeaseLostError(
+                f"queue lease lost for {job.job_id} generation {job.lease_generation}"
+            )
+        return current
+
+    def _expired(self, job: QueueJob, now: datetime) -> bool:
+        if not job.leased_until:
+            return True
+        try:
+            expires = datetime.fromisoformat(job.leased_until.replace("Z", "+00:00"))
+        except ValueError:
+            return True
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        return expires.astimezone(timezone.utc) <= now
+
+    def _identity(self, job: QueueJob) -> tuple[str, str, str, str]:
+        payload = json.dumps(job.payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return job.queue_name, job.action, job.target_uri, payload
 
 
 class InMemoryLockStore:

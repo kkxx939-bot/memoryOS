@@ -28,6 +28,7 @@ from memoryos.memory.canonical.proposal import (
     TemporalScope,
     UtteranceMode,
 )
+from memoryos.memory.canonical.salience import EpisodeSalienceGate
 from memoryos.memory.canonical.scope import ScopeRef
 from memoryos.memory.schema import MemoryTypeSchema
 from memoryos.memory.view import adapter_id_from_archive
@@ -35,6 +36,8 @@ from memoryos.memory.view import adapter_id_from_archive
 
 class MemoryModelProvider(Protocol):
     """约定 MemoryModelProvider 需要提供的接口。"""
+
+    is_remote: bool
 
     def complete(self, prompt: str) -> str: ...
 
@@ -481,6 +484,21 @@ class LLMMemoryExtractorBackend:
     ) -> MemoryExtractionBatchResult:
         """Parse a trusted envelope while isolating each candidate failure."""
 
+        privacy = EpisodeSalienceGate().evaluate(episode)
+        if privacy.privacy_risk and self._provider_is_remote():
+            return MemoryExtractionBatchResult(
+                (),
+                (
+                    RejectedMemoryCandidate(
+                        index=-1,
+                        proposal_id="",
+                        reason="privacy_risk_blocked_before_remote_provider",
+                        security_flags=("privacy_egress_blocked",),
+                    ),
+                ),
+                ("privacy_egress_blocked",),
+            )
+
         prompt = self.prompt_builder.build(
             archive,
             schemas,
@@ -535,6 +553,11 @@ class LLMMemoryExtractorBackend:
             proposals.append(proposal)
         flags = tuple(dict.fromkeys(flag for item in rejected for flag in item.security_flags))
         return MemoryExtractionBatchResult(tuple(proposals), tuple(rejected), flags)
+
+    def _provider_is_remote(self) -> bool:
+        """Unknown providers are remote by default; local providers must opt in explicitly."""
+
+        return getattr(self.provider, "is_remote", True) is not False
 
     def _proposal_from_raw(
         self,
@@ -1005,6 +1028,7 @@ class FakeMemoryModelProvider:
 
     response: str
     prompts: list[str] | None = None
+    is_remote: bool = False
 
     def complete(self, prompt: str) -> str:
         if self.prompts is not None:

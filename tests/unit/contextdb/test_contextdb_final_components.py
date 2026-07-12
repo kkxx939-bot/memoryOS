@@ -47,10 +47,10 @@ class ContextDBFinalComponentsTest(unittest.TestCase):
             from memoryos.contextdb.store import QueueJob
 
             queue.enqueue(QueueJob(job_id="j1", queue_name="semantic", action="refresh", target_uri=obj.uri))
-            leased = queue.lease("semantic", 1)
+            leased = queue.lease("semantic", lease_owner="test", limit=1)
             self.assertEqual(leased[0].job_id, "j1")
-            queue.ack("j1")
-            self.assertEqual(queue.lease("semantic", 1), [])
+            queue.ack(leased[0])
+            self.assertEqual(queue.lease("semantic", lease_owner="test", limit=1), [])
 
     def test_resource_skill_hierarchical_retrieval_and_vector_store(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

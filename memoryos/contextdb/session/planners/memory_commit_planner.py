@@ -71,7 +71,11 @@ class RuleMemoryCommitPlanner:
             relation_store,
             hybrid_search=hybrid_search,
         )
-        self.formation = CanonicalMemoryFormationService(source_store, alias_registry=alias_registry)
+        self.formation = CanonicalMemoryFormationService(
+            source_store,
+            relation_store=relation_store,
+            alias_registry=alias_registry,
+        )
 
     def plan(self, archive: SessionArchive) -> MemoryPlanningResult:
         """处理 plan 这一步。"""

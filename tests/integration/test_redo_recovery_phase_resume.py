@@ -335,6 +335,7 @@ class RedoRecoveryPhaseResumeTest(unittest.TestCase):
                     [operation],
                     status="committed",
                 )
+                committer.source_store.write_object(obj)
                 committer._write_transaction_marker(
                     committer._transaction_marker("same-idempotency"),
                     ContextDiff(
@@ -597,7 +598,8 @@ class RedoRecoveryPhaseResumeTest(unittest.TestCase):
             self.assertEqual(source.read_object(uri).title, "initial")
             self.assertEqual(len(relations.relations), 1)
             self.assertFalse((root / "system" / "operations" / f"{update.operation_id}.json").exists())
-            self.assertTrue(committer.redo.pending_entries())
+            self.assertEqual(committer.redo.pending_entries(), [])
+            self.assertTrue(list((root / "system" / "quarantine" / "redo").glob("*.json")))
 
             committer.redo.begin(update, phase="started", relation_manifest=manifest)
             recovered = RecoveryService(committer.redo, committer).recover("u1")
@@ -884,7 +886,8 @@ class RedoRecoveryPhaseResumeTest(unittest.TestCase):
 
             self.assertEqual(result.recovered_count, 0)
             self.assertNotIn(obj.uri, index.indexed_uris())
-            self.assertTrue((root / "system" / "redo" / f"{operation.operation_id}.json").exists())
+            self.assertFalse((root / "system" / "redo" / f"{operation.operation_id}.json").exists())
+            self.assertTrue(list((root / "system" / "quarantine" / "redo").glob("*.json")))
             self.assertFalse((root / "system" / "operations" / f"{operation.operation_id}.json").exists())
             self.assertFalse(list((root / "system" / "diffs").glob("*.json")))
 
@@ -1082,7 +1085,8 @@ class RedoRecoveryPhaseResumeTest(unittest.TestCase):
             self.assertEqual(recovered.recovered_count, 0)
             self.assertNotIn(old.uri, index.indexed_uris())
             self.assertNotIn(desired.uri, index.indexed_uris())
-            self.assertTrue((root / "system" / "redo" / f"{operation.operation_id}.json").exists())
+            self.assertFalse((root / "system" / "redo" / f"{operation.operation_id}.json").exists())
+            self.assertTrue(list((root / "system" / "quarantine" / "redo").glob("*.json")))
 
     def test_recovery_never_claims_another_users_redo_entry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-
 from memoryos.contextdb.session.planners.action_policy_commit_planner import ActionPolicyCommitPlanner
 from memoryos.contextdb.session.planners.behavior_commit_planner import BehaviorCommitPlanner
 from memoryos.contextdb.session.planners.memory_commit_planner import MemoryCommitPlanner
@@ -117,17 +115,16 @@ def test_session_diff_reports_planned_fallback_pending_contract(tmp_path) -> Non
         messages=[{"role": "user", "content": "Project rule: MemoryOS must keep schema metadata in memory diffs."}],
         metadata={"project_id": "memoryos", "connect": {"adapter_id": "codex"}},
     )
+    store = SessionArchiveStore(tmp_path)
     service = SessionCommitService(
-        SessionArchiveStore(tmp_path),
+        store,
         InMemoryQueueStore(),
         memory_planner=MemoryCommitPlanner(extractor=RuleFallbackExtractor()),
         allow_plan_only=True,
     )
 
     service.async_commit(archive)
-    payload = json.loads(
-        (tmp_path / "tenants/default/users/u1/sessions/history/s1/memory_diff.json").read_text(encoding="utf-8")
-    )
+    payload = store.read_async_outputs(archive)["memory_diff"]
     operation = next(
         item for item in payload["operations"] if item["payload"]["memory_type"] == "project_rule"
     )

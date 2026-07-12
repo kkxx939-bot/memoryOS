@@ -138,6 +138,30 @@ def test_semantic_extractor_runs_before_rule_based_salience_telemetry(text: str)
     assert planned.operations == ()
 
 
+def test_remote_provider_never_receives_secret_bearing_prompt() -> None:
+    prompts: list[str] = []
+
+    class CapturingRemoteProvider:
+        is_remote = True
+
+        def complete(self, prompt: str) -> str:
+            prompts.append(prompt)
+            return json.dumps({"candidates": []})
+
+    archive = _archive("Remember this: OPENAI_API_KEY=sk-live-secret")
+    episode = SessionArchiveEpisodeAdapter().adapt(archive)
+    result = LLMMemoryExtractorBackend(CapturingRemoteProvider()).extract_batch_with_context(
+        archive,
+        MemoryTypeRegistry().list(),
+        existing_memories=(),
+        episode=episode,
+    )
+
+    assert prompts == []
+    assert result.accepted == ()
+    assert result.security_flags == ("privacy_egress_blocked",)
+
+
 def test_opaque_existing_candidate_ref_maps_to_internal_ids_without_exposing_uri() -> None:
     archive = _archive("I confirm my answers preference: concise answers.")
     episode = SessionArchiveEpisodeAdapter().adapt(archive)

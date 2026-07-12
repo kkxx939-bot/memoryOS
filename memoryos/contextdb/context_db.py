@@ -11,6 +11,7 @@ from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.session.session_model import SessionArchive, SessionCommitResult
 from memoryos.contextdb.store.index_consistency import IndexConsistencyService
 from memoryos.contextdb.store.source_store import IndexHit, IndexStore, QueueStore, RelationStore, SourceStore
+from memoryos.memory.canonical.projection_state import ProjectionRecordStore
 from memoryos.operations.commit.operation_committer import OperationCommitter
 from memoryos.operations.model.context_diff import ContextDiff
 from memoryos.operations.model.context_operation import ContextOperation
@@ -29,6 +30,7 @@ class ContextDB:
         queue_store: QueueStore | None = None,
         session_commit_service=None,
         committer: OperationCommitter | None = None,
+        projection_store: ProjectionRecordStore | None = None,
     ) -> None:
         self.source_store = source_store
         self.index_store = index_store
@@ -36,6 +38,7 @@ class ContextDB:
         self.queue_store = queue_store
         self.session_commit_service = session_commit_service
         self.committer = committer
+        self.projection_store = projection_store
 
     def read_object(self, uri: str) -> ContextObject:
         return self.source_store.read_object(uri)

@@ -48,6 +48,7 @@ class HTTPMemoryOSClient:
         self.read_timeout = max(0.05, read_timeout)
         self.timeout = max(connect_timeout, read_timeout)
         self.retries = max(0, min(retries, 3))
+        self._opener = urllib.request.build_opener(_SameOriginRedirectHandler())
 
     def request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         body = json.dumps(payload or {}).encode() if payload is not None else None
@@ -64,7 +65,7 @@ class HTTPMemoryOSClient:
         request = urllib.request.Request(self.base_url + path, data=body, headers=headers, method=method)
         for attempt in range(self.retries + 1):
             try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                with self._opener.open(request, timeout=self.timeout) as response:
                     decoded = json.loads(response.read().decode())
                     return decoded if isinstance(decoded, dict) else {"data": decoded}
             except urllib.error.HTTPError as exc:
@@ -213,6 +214,30 @@ def _request_id() -> str:
     import uuid
 
     return str(uuid.uuid4())
+
+
+class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Allow redirects only when scheme, host, and effective port are unchanged."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001, ANN201
+        if _origin(req.full_url) != _origin(newurl):
+            raise urllib.error.HTTPError(
+                req.full_url,
+                code,
+                "cross-origin redirect blocked",
+                headers,
+                fp,
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _origin(url: str) -> tuple[str, str, int | None]:
+    parsed = urllib.parse.urlsplit(url)
+    scheme = parsed.scheme.casefold()
+    port = parsed.port
+    if port is None:
+        port = 443 if scheme == "https" else 80 if scheme == "http" else None
+    return scheme, (parsed.hostname or "").casefold(), port
 
 
 def _raise_remote_error(response: dict[str, Any]) -> None:

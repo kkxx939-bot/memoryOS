@@ -35,6 +35,7 @@ class ModelResponse:
 class ChatProvider(Protocol):
     provider_name: str
     model: str
+    is_remote: bool
 
     def complete(self, request: ChatRequest | str) -> ModelResponse | str: ...
 
