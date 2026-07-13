@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -143,6 +144,38 @@ class SQLiteIndexStore:
     def indexed_uris(self) -> list[str]:
         with self._connect() as conn:
             return [str(row["uri"]) for row in conn.execute("SELECT uri FROM contexts").fetchall()]
+
+    def get_index_metadata(self, uri: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT tenant_id, owner_user_id, context_type, claim_state, slot_id, memory_type, "
+                "metadata_json, content_text "
+                "FROM contexts WHERE uri = ?",
+                (uri,),
+            ).fetchone()
+        if row is None:
+            return None
+        metadata = self._mapping(json.loads(row["metadata_json"] or "{}"))
+        return {
+            **metadata,
+            "tenant_id": str(row["tenant_id"]),
+            "owner_user_id": str(row["owner_user_id"]),
+            "context_type": str(row["context_type"]),
+            "claim_state": str(row["claim_state"]),
+            "slot_id": str(row["slot_id"]),
+            "memory_type": str(row["memory_type"]),
+            "index_content_digest": self._content_digest(str(row["content_text"])),
+        }
+
+    @staticmethod
+    def _content_digest(content: str) -> str:
+        encoded = json.dumps(
+            content,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
     def clear(self) -> None:
         with self._connect() as conn:

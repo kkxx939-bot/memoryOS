@@ -60,8 +60,8 @@ def generate_l0_for_object(obj: Any, content: str = "") -> str:
             return f"资源上下文：{title}；用于判断动作执行所需资源是否可用。"
         if context_type == ContextType.SKILL:
             return f"技能上下文：{title}；用于判断候选动作是否具备可执行能力。"
-    except Exception:
-        pass
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return l0_abstract(content or str(getattr(obj, "title", "")) or "context")
     return l0_abstract(content or str(getattr(obj, "title", "")) or "context")
 
 
@@ -152,6 +152,9 @@ def generate_l1_for_object(obj: Any, content: str = "") -> str:
                     f"metadata: {metadata}",
                 ],
             )
-    except Exception:
-        pass
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return l1_overview(
+            str(getattr(obj, "title", "Context")),
+            [content[:240] if content else "No content available."],
+        )
     return l1_overview(str(getattr(obj, "title", "Context")), [content[:240] if content else "No content available."])

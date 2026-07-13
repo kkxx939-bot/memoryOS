@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from collections.abc import Sequence
@@ -16,10 +17,24 @@ from memoryos.contextdb.model.lifecycle import LifecycleState
 from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
 from memoryos.contextdb.store.source_store import IndexStore, RelationStore, SourceStore
 from memoryos.contextdb.store.sqlite_index_store import lexical_match_count, lexical_terms
+from memoryos.memory.canonical.event import canonical_digest, canonical_json
 from memoryos.memory.canonical.identity import IDENTITY_ALGORITHM_V2
-from memoryos.memory.canonical.projection_state import ProjectionRecord, ProjectionRecordStore
+from memoryos.memory.canonical.projection_state import (
+    ProjectionIntegrityError,
+    ProjectionRecord,
+    ProjectionRecordStore,
+)
 from memoryos.memory.canonical.scope import MemoryScope
-from memoryos.memory.canonical.visibility import read_committed_canonical, relation_is_committed
+from memoryos.memory.canonical.state import (
+    CanonicalMemoryInvariantError,
+    materialized_current_revision_payload,
+)
+from memoryos.memory.canonical.visibility import (
+    CommittedCanonicalSnapshot,
+    capture_committed_canonical_snapshot,
+    committed_content,
+    committed_relations,
+)
 
 
 class CanonicalInvariantViolation(RuntimeError):
@@ -75,6 +90,11 @@ class CanonicalMemoryRetriever:
         )
 
     def search(self, query: CanonicalMemoryQuery) -> list[dict[str, Any]]:
+        snapshot = capture_committed_canonical_snapshot(
+            self.source_store,
+            self.relation_store,
+            kinds=("slot", "claim"),
+        )
         intent = query.intent or self._intent_for_states(query.states) or self.classify_intent(query.text)
         allowed_states = set(query.states or self._states_for(intent))
         filters: dict[str, Any] = {
@@ -84,23 +104,25 @@ class CanonicalMemoryRetriever:
         }
         if query.memory_types:
             filters["memory_type"] = query.memory_types
-        hits = self._recall(query, filters, intent)
+        hits = self._recall(query, filters, intent, snapshot)
         results: list[dict[str, Any]] = []
         result_uris: set[str] = set()
         validated_slots: dict[str, Any] = {}
         for hit in hits:
             try:
-                committed = read_committed_canonical(self.source_store, hit.uri, self.relation_store)
+                committed = snapshot.get(hit.uri)
+                if committed is None:
+                    continue
                 obj = committed.object
             except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
                 continue
             if not self._accepted_base(obj, query):
                 continue
-            slot = self._validated_slot(obj, query, validated_slots)
+            slot = self._validated_slot(obj, query, validated_slots, snapshot)
             if slot is None:
                 continue
             if intent == CanonicalQueryIntent.HISTORY:
-                historical = self._history_payloads(obj, slot, hit.score, query, allowed_states)
+                historical = self._history_payloads(obj, slot, hit.score, query, allowed_states, snapshot)
                 results.extend(historical)
                 result_uris.update(str(item["uri"]) for item in historical)
                 continue
@@ -109,7 +131,7 @@ class CanonicalMemoryRetriever:
                 continue
             if intent == CanonicalQueryIntent.CURRENT and not self._is_slot_current(obj, slot):
                 continue
-            projection = self._current_projection(obj)
+            projection = self._current_projection(obj, snapshot)
             if not self._hit_revision_is_current(hit, obj, projection):
                 continue
             results.append(
@@ -119,6 +141,7 @@ class CanonicalMemoryRetriever:
                     state,
                     projection=projection,
                     revision_payload=self._current_revision_payload(obj),
+                    snapshot=snapshot,
                 )
             )
             result_uris.add(obj.uri)
@@ -131,6 +154,7 @@ class CanonicalMemoryRetriever:
                     allowed_states,
                     intent,
                     validated_slots,
+                    snapshot,
                 )
             )
         results.sort(key=lambda item: self._rank(item, intent), reverse=True)
@@ -143,11 +167,15 @@ class CanonicalMemoryRetriever:
         query: CanonicalMemoryQuery,
         filters: dict[str, Any],
         intent: CanonicalQueryIntent,
+        snapshot: CommittedCanonicalSnapshot,
     ) -> list[Any]:
         exact_uris = list(query.claim_uris)
         for slot_uri in query.slot_uris:
             try:
-                slot = read_committed_canonical(self.source_store, slot_uri, self.relation_store).object
+                committed_slot = snapshot.get(slot_uri)
+                if committed_slot is None:
+                    continue
+                slot = committed_slot.object
             except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
                 continue
             for claim_id in dict(slot.metadata or {}).get("claim_ids", []) or []:
@@ -164,7 +192,19 @@ class CanonicalMemoryRetriever:
         terms = lexical_terms(query.text)
         allowed_states = set(str(item) for item in filters.get("claim_state", []) or [])
         allowed_uris: set[str] = set()
-        for obj in self.source_store.list_objects():
+        candidate_uris = tuple(
+            uri
+            for uri, committed in snapshot.records.items()
+            if dict(committed.object.metadata or {}).get("canonical_kind") == "claim"
+        )
+        for uri in candidate_uris:
+            try:
+                committed = snapshot.get(uri)
+                if committed is None:
+                    continue
+                obj = committed.object
+            except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+                continue
             if not self._accepted_base(obj, query):
                 continue
             metadata = dict(obj.metadata or {})
@@ -212,6 +252,7 @@ class CanonicalMemoryRetriever:
                 filters=recall_filters,
                 context_type=ContextType.MEMORY,
                 limit=max(query.limit * 5, 20),
+                source_snapshot={uri: snapshot.records[uri].object for uri in allowed_uris},
             )
             if self.hybrid_search is not None
             else self.index_store.search(
@@ -237,6 +278,16 @@ class CanonicalMemoryRetriever:
             return False
         if metadata.get("identity_algorithm_version") != IDENTITY_ALGORITHM_V2:
             return False
+        try:
+            current = materialized_current_revision_payload(metadata)
+        except CanonicalMemoryInvariantError as exc:
+            raise CanonicalInvariantViolation(str(exc)) from exc
+        if (
+            metadata.get("state") != current.get("state")
+            or metadata.get("epistemic_status") != current.get("epistemic_status")
+            or metadata.get("semantic_relation") != current.get("relation")
+        ):
+            raise CanonicalInvariantViolation("canonical Claim current-state mirror is inconsistent")
         if str(obj.tenant_id or "default") != query.tenant_id:
             return False
         if query.memory_types and str(metadata.get("memory_type", "")) not in query.memory_types:
@@ -252,21 +303,24 @@ class CanonicalMemoryRetriever:
         claim_obj: Any,
         query: CanonicalMemoryQuery,
         cache: dict[str, Any],
+        snapshot: CommittedCanonicalSnapshot,
     ) -> Any | None:
         metadata = dict(claim_obj.metadata or {})
         slot_uri = str(metadata.get("slot_uri") or claim_obj.uri.rsplit("/claims/", 1)[0])
         if slot_uri in cache:
             return cache[slot_uri]
         try:
-            committed = read_committed_canonical(self.source_store, slot_uri, self.relation_store)
+            committed = snapshot.get(slot_uri)
+            if committed is None:
+                cache[slot_uri] = None
+                return None
             slot = committed.object
         except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
             cache[slot_uri] = None
             return None
         slot_metadata = dict(slot.metadata or {})
         if (
-            committed.from_before_image
-            or slot_metadata.get("canonical_kind") != "slot"
+            slot_metadata.get("canonical_kind") != "slot"
             or slot_metadata.get("identity_algorithm_version") != IDENTITY_ALGORITHM_V2
             or str(slot.tenant_id or "default") != query.tenant_id
             or not self._visible(slot_metadata, query)
@@ -280,7 +334,11 @@ class CanonicalMemoryRetriever:
         for claim_id in slot_metadata.get("claim_ids", []) or []:
             uri = f"{slot_uri}/claims/{claim_id}"
             try:
-                candidate = read_committed_canonical(self.source_store, uri, self.relation_store).object
+                committed_candidate = snapshot.get(uri)
+                if committed_candidate is None:
+                    missing_ids.append(str(claim_id))
+                    continue
+                candidate = committed_candidate.object
             except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
                 missing_ids.append(str(claim_id))
                 continue
@@ -335,12 +393,21 @@ class CanonicalMemoryRetriever:
             advertised = hit_metadata.get("source_revision")
         if advertised is not None and int(advertised) != current_revision:
             return False
-        return bool(
-            projection is not None
-            and projection.current
-            and projection.source_revision == current_revision
-            and projection.projection_revision == current_revision
-        )
+        if (
+            projection is None
+            or not projection.current
+            or projection.source_revision != current_revision
+            or projection.projection_revision != current_revision
+        ):
+            return False
+        expected = {
+            ("projection_attempt_id",): projection.projection_attempt_id,
+            ("input_effect_hash", "projection_input_effect_hash"): projection.input_effect_hash,
+            ("publish_token", "projection_publish_token"): projection.publish_token,
+            ("projected_content_digest", "projection_content_digest"): projection.projected_content_digest,
+            ("projected_relation_digest", "projection_relation_digest"): projection.projected_relation_digest,
+        }
+        return all(any(hit_metadata.get(key) == value for key in aliases) for aliases, value in expected.items())
 
     def _history_payloads(
         self,
@@ -349,9 +416,10 @@ class CanonicalMemoryRetriever:
         score: float,
         query: CanonicalMemoryQuery,
         allowed_states: set[str],
+        snapshot: CommittedCanonicalSnapshot,
     ) -> list[dict[str, Any]]:
         metadata = dict(obj.metadata or {})
-        current_revision = int(metadata.get("current_revision", metadata.get("revision", 0)) or 0)
+        current_revision = int(materialized_current_revision_payload(metadata)["revision"])
         current_claim = self._is_slot_current(obj, slot)
         results = []
         for item in metadata.get("revisions", []) or []:
@@ -372,6 +440,7 @@ class CanonicalMemoryRetriever:
                     projection=projection,
                     revision_payload=dict(item),
                     historical=True,
+                    snapshot=snapshot,
                 )
             )
         return results
@@ -384,9 +453,8 @@ class CanonicalMemoryRetriever:
         allowed_states: set[str],
         intent: CanonicalQueryIntent,
         validated_slots: dict[str, Any],
+        snapshot: CommittedCanonicalSnapshot,
     ) -> list[dict[str, Any]]:
-        if self.relation_store is None:
-            return []
         expanded = []
         for item in primary:
             for relation in item.get("relations", []) or []:
@@ -398,11 +466,10 @@ class CanonicalMemoryRetriever:
                 relation_metadata = dict(relation.get("metadata", {}) or {})
                 relation_revision = relation_metadata.get("source_revision")
                 try:
-                    obj = read_committed_canonical(
-                        self.source_store,
-                        related_uri,
-                        self.relation_store,
-                    ).object
+                    committed_related = snapshot.get(related_uri)
+                    if committed_related is None:
+                        continue
+                    obj = committed_related.object
                 except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
                     continue
                 if relation_revision is not None:
@@ -415,7 +482,7 @@ class CanonicalMemoryRetriever:
                         continue
                 if not self._accepted_base(obj, query):
                     continue
-                slot = self._validated_slot(obj, query, validated_slots)
+                slot = self._validated_slot(obj, query, validated_slots, snapshot)
                 if slot is None:
                     continue
                 state = str(dict(obj.metadata or {}).get("state", ""))
@@ -428,8 +495,9 @@ class CanonicalMemoryRetriever:
                     obj,
                     max(0.0, float(item.get("score", 0.0)) * 0.75),
                     state,
-                    projection=self._current_projection(obj),
+                    projection=self._current_projection(obj, snapshot),
                     revision_payload=self._current_revision_payload(obj),
+                    snapshot=snapshot,
                 )
                 payload["retrieval_source"] = "canonical_relation_expansion"
                 expanded.append(payload)
@@ -526,6 +594,7 @@ class CanonicalMemoryRetriever:
         *,
         projection: ProjectionRecord | None,
         revision_payload: dict[str, Any],
+        snapshot: CommittedCanonicalSnapshot,
         historical: bool = False,
     ) -> dict[str, Any]:
         canonical_metadata = dict(obj.metadata or {})
@@ -561,17 +630,12 @@ class CanonicalMemoryRetriever:
                     else "",
                 }
             )
-        relations = []
-        if self.relation_store is not None:
-            relations = [
-                relation.to_dict()
-                for relation in self.relation_store.relations_of(
-                    obj.uri,
-                    tenant_id=obj.tenant_id,
-                    owner_user_id=obj.owner_user_id,
-                )
-                if relation_is_committed(self.source_store, relation, self.relation_store)
-            ]
+        committed = snapshot.get(obj.uri)
+        if committed is None:
+            raise CanonicalInvariantViolation(
+                f"canonical snapshot lost Claim during payload materialization: {obj.uri}"
+            )
+        relations = [relation.to_dict() for relation in committed_relations(committed)]
         slot_uri = obj.uri.rsplit("/claims/", 1)[0]
         revision_uri = f"{obj.uri}#revision-{revision}"
         source_revision = (
@@ -587,6 +651,8 @@ class CanonicalMemoryRetriever:
             normalized_score = 0.0
         return {
             "uri": obj.uri,
+            "tenant_id": str(obj.tenant_id or "default"),
+            "owner_user_id": obj.owner_user_id,
             "revision_uri": revision_uri,
             "retrieval_identity": revision_uri if historical else obj.uri,
             "slot_uri": slot_uri,
@@ -617,7 +683,7 @@ class CanonicalMemoryRetriever:
     def _layer_texts(self, projection: ProjectionRecord | None) -> dict[str, str]:
         if projection is None or not projection.usable:
             return {}
-        values = {}
+        values: dict[str, str] = {}
         for name, uri in (
             ("L0", projection.l0_uri),
             ("L1", projection.l1_uri),
@@ -629,15 +695,24 @@ class CanonicalMemoryRetriever:
                 values[name] = self.source_store.read_content(uri)
             except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
                 return {}
+        if set(values) != {"L0", "L1", "L2"} or projection.projected_content_digest != canonical_digest(values):
+            return {}
         return values
 
-    def _current_projection(self, obj: Any) -> ProjectionRecord | None:
+    def _current_projection(
+        self,
+        obj: Any,
+        snapshot: CommittedCanonicalSnapshot,
+    ) -> ProjectionRecord | None:
         if self.projection_store is None:
             return None
         metadata = dict(obj.metadata or {})
         revision = int(metadata.get("revision", 0))
-        current_claim_revision = int(metadata.get("current_revision", revision))
-        record = self.projection_store.load_current(obj.uri, source_revision=revision)
+        current_claim_revision = int(materialized_current_revision_payload(metadata)["revision"])
+        try:
+            record = self.projection_store.load_current(obj.uri, source_revision=revision)
+        except ProjectionIntegrityError:
+            return None
         if (
             record is None
             or record.projection_revision != revision
@@ -645,12 +720,76 @@ class CanonicalMemoryRetriever:
             or not self._projection_refs_match(record)
         ):
             return None
+        try:
+            committed = snapshot.get(obj.uri)
+            if committed is None:
+                return None
+            relations = sorted(
+                (relation.to_dict() for relation in committed_relations(committed)),
+                key=canonical_json,
+            )
+            expected_input = canonical_digest(
+                {
+                    "claim_uri": obj.uri,
+                    "source_revision": revision,
+                    "object": committed.object.to_dict(),
+                    "content": committed_content(committed),
+                    "relations": relations,
+                }
+            )
+            layers = {
+                "L0": self.source_store.read_content(record.l0_uri),
+                "L1": self.source_store.read_content(record.l1_uri),
+                "L2": self.source_store.read_content(record.l2_uri),
+            }
+            relation_payload = json.loads(self.source_store.read_content(record.relations_uri))
+            manifest = json.loads(self.source_store.read_content(record.manifest_uri))
+            index_metadata = self.index_store.get_index_metadata(obj.uri)
+        except (FileNotFoundError, IsADirectoryError, NotADirectoryError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        expected_identity = {
+            "source_revision": record.source_revision,
+            "projection_revision": record.projection_revision,
+            "projection_attempt_id": record.projection_attempt_id,
+            "input_effect_hash": record.input_effect_hash,
+            "publish_token": record.publish_token,
+            "projected_content_digest": record.projected_content_digest,
+            "projected_relation_digest": record.projected_relation_digest,
+        }
+        if (
+            record.input_effect_hash != expected_input
+            or record.projected_content_digest != canonical_digest(layers)
+            or not isinstance(relation_payload, dict)
+            or relation_payload.get("relations") != relations
+            or record.projected_relation_digest != canonical_digest(relations)
+            or index_metadata is None
+            or index_metadata.get("index_content_digest")
+            != canonical_digest("\n".join((layers["L0"], layers["L1"], layers["L2"])))
+            or any(manifest.get(field) != value for field, value in expected_identity.items())
+            or any(
+                index_metadata.get(
+                    {
+                        "source_revision": "projection_source_revision",
+                        "input_effect_hash": "projection_input_effect_hash",
+                        "publish_token": "projection_publish_token",
+                        "projected_content_digest": "projection_content_digest",
+                        "projected_relation_digest": "projection_relation_digest",
+                    }.get(field, field)
+                )
+                != value
+                for field, value in expected_identity.items()
+            )
+        ):
+            return None
         return record
 
     def _projection_for_revision(self, claim_uri: str, revision: int) -> ProjectionRecord | None:
         if self.projection_store is None:
             return None
-        record = self.projection_store.load(claim_uri, revision)
+        try:
+            record = self.projection_store.load(claim_uri, revision)
+        except ProjectionIntegrityError:
+            return None
         if (
             record is None
             or not record.usable
@@ -659,29 +798,52 @@ class CanonicalMemoryRetriever:
             or not self._projection_refs_match(record)
         ):
             return None
+        layers = self._layer_texts(record)
+        if not layers:
+            return None
+        try:
+            relation_payload = json.loads(self.source_store.read_content(record.relations_uri))
+            manifest = json.loads(self.source_store.read_content(record.manifest_uri))
+        except (FileNotFoundError, IsADirectoryError, NotADirectoryError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(relation_payload, dict) or not isinstance(manifest, dict):
+            return None
+        relations = relation_payload.get("relations")
+        expected_identity = {
+            "claim_uri": record.claim_uri,
+            "source_revision": record.source_revision,
+            "projection_revision": record.projection_revision,
+            "projection_attempt_id": record.projection_attempt_id,
+            "input_effect_hash": record.input_effect_hash,
+            "publish_token": record.publish_token,
+            "projected_content_digest": record.projected_content_digest,
+            "projected_relation_digest": record.projected_relation_digest,
+        }
+        if (
+            not isinstance(relations, list)
+            or record.projected_relation_digest != canonical_digest(relations)
+            or any(relation_payload.get(field) != value for field, value in expected_identity.items())
+            or any(manifest.get(field) != value for field, value in expected_identity.items())
+        ):
+            return None
         return record
 
     def _projection_refs_match(self, record: ProjectionRecord) -> bool:
         marker = f"/projections/rev-{record.source_revision}/"
-        return all(marker in uri for uri in (record.l0_uri, record.l1_uri, record.l2_uri, record.manifest_uri))
+        return all(
+            marker in uri
+            for uri in (
+                record.l0_uri,
+                record.l1_uri,
+                record.l2_uri,
+                record.relations_uri,
+                record.manifest_uri,
+            )
+        )
 
     def _current_revision_payload(self, obj: Any) -> dict[str, Any]:
         metadata = dict(obj.metadata or {})
-        revision = int(metadata.get("current_revision", metadata.get("revision", 0)) or 0)
-        matches = [
-            dict(item)
-            for item in metadata.get("revisions", []) or []
-            if isinstance(item, dict) and int(item.get("revision", 0)) == revision
-        ]
-        if matches:
-            return matches[-1]
-        return {
-            "revision": revision,
-            "state": metadata.get("state", ""),
-            "value_fields": {"canonical_value": metadata.get("canonical_value", obj.title)},
-            "epistemic_status": metadata.get("epistemic_status", ""),
-            "relation": metadata.get("semantic_relation", ""),
-        }
+        return materialized_current_revision_payload(metadata)
 
     def _revision_is_effective(self, revision: dict[str, Any]) -> bool:
         valid_from = revision.get("valid_from")
@@ -690,19 +852,13 @@ class CanonicalMemoryRetriever:
             return False
         try:
             start = datetime.fromisoformat(str(valid_from).replace("Z", "+00:00"))
-            end = (
-                datetime.fromisoformat(str(valid_to).replace("Z", "+00:00"))
-                if valid_to
-                else None
-            )
+            end = datetime.fromisoformat(str(valid_to).replace("Z", "+00:00")) if valid_to else None
         except ValueError:
             return False
         if start.tzinfo is None or (end is not None and end.tzinfo is None):
             return False
         now = datetime.now(timezone.utc)
-        return start.astimezone(timezone.utc) <= now and (
-            end is None or now < end.astimezone(timezone.utc)
-        )
+        return start.astimezone(timezone.utc) <= now and (end is None or now < end.astimezone(timezone.utc))
 
     def _one_current_per_slot(self, results: list[dict[str, Any]]) -> list[dict[str, Any]]:
         selected = []

@@ -11,7 +11,12 @@ from typing import Any
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_uri import ContextURI
 from memoryos.contextdb.model.lifecycle import LifecycleState
-from memoryos.contextdb.store.source_store import IndexHit, IndexStore, SourceStore
+from memoryos.contextdb.store.source_store import (
+    IndexHit,
+    IndexStore,
+    SourceStore,
+    is_canonical_memory_object,
+)
 from memoryos.memory.canonical.scope import MemoryScope, scope_key_from_payload
 from memoryos.operations.model.context_operation import ContextOperation
 from memoryos.operations.model.operation_action import OperationAction
@@ -486,7 +491,7 @@ class TargetResolver:
         if metadata.get("fields") is not None and not isinstance(metadata.get("fields"), dict):
             return "target_scope_invalid"
         target_scope = dict(raw_target_scope or {})
-        if metadata.get("canonical_kind") in {"claim", "slot", "pending_proposal"}:
+        if is_canonical_memory_object(target):
             try:
                 canonical_scope = MemoryScope.from_dict(target_scope)
             except (KeyError, TypeError, ValueError):

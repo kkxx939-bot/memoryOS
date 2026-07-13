@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from dataclasses import replace
 
@@ -44,6 +45,7 @@ from memoryos.memory.canonical import (
     scope_key_candidates_from_payload,
     scope_key_from_payload,
 )
+from memoryos.memory.canonical.current_head import publish_current_head_sets
 from memoryos.memory.canonical.reconcile import MemorySemanticReconciler
 from memoryos.memory.canonical.scope import scope_keys_from_payloads
 from memoryos.memory.canonical.state import MemoryRevision
@@ -64,6 +66,7 @@ def _write_committed_canonical_fixture(
 
     transaction_id = f"tx-{key}"
     idempotency_key = f"idem-{key}"
+    commit_group_id = f"fixture-group-{key}"
     operations: list[ContextOperation] = []
     for index, (raw_obj, content) in enumerate(entries):
         obj = raw_obj
@@ -74,7 +77,6 @@ def _write_committed_canonical_fixture(
             "canonical_transaction_id": transaction_id,
             "canonical_idempotency_key": idempotency_key,
         }
-        source.write_object(obj, content=content)
         operations.append(
             ContextOperation(
                 operation_id=f"op-{key}-{index}",
@@ -87,6 +89,7 @@ def _write_committed_canonical_fixture(
                     "canonical_memory": True,
                     "transaction_id": transaction_id,
                     "idempotency_key": idempotency_key,
+                    "commit_group_id": commit_group_id,
                     "tenant_id": obj.tenant_id,
                     "expected_revision": 0,
                     "context_object": obj.to_dict(),
@@ -107,9 +110,38 @@ def _write_committed_canonical_fixture(
         operations=operations,
         diff_id=f"diff-{transaction_id}",
     )
+    before_images = committer._capture_canonical_state(operations)
+    relation_manifests = {
+        operation.operation_id: committer._build_canonical_relation_manifest(operation, None)
+        for operation in operations
+    }
+    committer._ensure_canonical_planning_digest(operations)
+    committer._write_outbox_event(
+        transaction_id,
+        idempotency_key,
+        operations,
+        status="prepared",
+        before_images=before_images,
+        relation_manifests=relation_manifests,
+    )
+    for obj, content in entries:
+        source.write_object(obj, content=content)
+    committer._write_outbox_event(
+        transaction_id,
+        idempotency_key,
+        operations,
+        status="source_committed",
+        before_images=before_images,
+        relation_manifests=relation_manifests,
+    )
     marker = committer._transaction_marker(idempotency_key)
     committer._write_transaction_marker(marker, diff, operations)
     committer._validate_transaction_marker(marker, operations)
+    publish_current_head_sets(
+        committer.artifact_root,
+        marker,
+        json.loads(marker.read_text(encoding="utf-8")),
+    )
 
 
 def _explicit_bindings(
@@ -487,11 +519,11 @@ def test_duplicate_is_noop_and_contradiction_requires_review_without_changing_cu
     contradiction = replace(
         contradiction,
         related_claim_ids=(first.slot.active_claim_id,),
-            metadata={
-                **dict(contradiction.metadata),
-                "relation_target_binding_validated": True,
-                "semantic_relation_evidence_validated": True,
-            },
+        metadata={
+            **dict(contradiction.metadata),
+            "relation_target_binding_validated": True,
+            "semantic_relation_evidence_validated": True,
+        },
     )
     contradiction_identity = StableMemoryIdentityResolver().resolve(
         contradiction,

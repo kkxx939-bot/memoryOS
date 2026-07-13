@@ -8,8 +8,15 @@ from memoryos.action_policy.model.action_policy import ActionCandidate, ActionPo
 from memoryos.contextdb.layers.context_packer import ContextPacker
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.model.lifecycle import LifecycleState
-from memoryos.contextdb.store.source_store import IndexHit, IndexStore, RelationStore, SourceStore
-from memoryos.memory.canonical.visibility import read_committed_canonical
+from memoryos.contextdb.store.source_store import (
+    IndexHit,
+    IndexStore,
+    RelationStore,
+    SourceStore,
+    is_canonical_memory_object,
+    is_canonical_memory_uri,
+)
+from memoryos.memory.canonical.visibility import committed_content, read_committed_canonical
 from memoryos.prediction.model.action_context import ActionContext
 
 
@@ -233,15 +240,20 @@ class ActionContextBuilder:
         if self.source_store is None:
             return None
         try:
-            obj = self.source_store.read_object(uri)
+            if is_canonical_memory_uri(uri):
+                obj = read_committed_canonical(
+                    self.source_store,
+                    uri,
+                    self.relation_store,
+                ).object
+            else:
+                obj = self.source_store.read_object(uri)
         except (FileNotFoundError, IsADirectoryError, NotADirectoryError, TypeError, ValueError):
             return None
-        if isinstance(obj.metadata, Mapping) and dict(obj.metadata).get("canonical_kind") == "claim":
+        if is_canonical_memory_object(obj):
             try:
                 committed = read_committed_canonical(self.source_store, uri, self.relation_store)
             except (FileNotFoundError, IsADirectoryError, NotADirectoryError, TypeError, ValueError):
-                return None
-            if committed.from_before_image:
                 return None
             obj = committed.object
         if (
@@ -367,11 +379,18 @@ class ActionContextBuilder:
         if self.source_store is None:
             return None
         try:
-            obj = self.source_store.read_object(uri)
+            if is_canonical_memory_uri(uri):
+                obj = read_committed_canonical(
+                    self.source_store,
+                    uri,
+                    self.relation_store,
+                ).object
+            else:
+                obj = self.source_store.read_object(uri)
         except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
             return None
         if obj.context_type == ContextType.MEMORY and isinstance(obj.metadata, Mapping):
-            if dict(obj.metadata).get("canonical_kind") == "claim":
+            if is_canonical_memory_object(obj):
                 try:
                     committed = read_committed_canonical(
                         self.source_store,
@@ -379,8 +398,6 @@ class ActionContextBuilder:
                         self.relation_store,
                     )
                 except (FileNotFoundError, IsADirectoryError, NotADirectoryError, TypeError, ValueError):
-                    return None
-                if committed.from_before_image:
                     return None
                 obj = committed.object
         if obj.lifecycle_state in {LifecycleState.DELETED, LifecycleState.OBSOLETE}:
@@ -447,6 +464,16 @@ class ActionContextBuilder:
     def _read_best_layer(self, obj, section: str, token_budget_remaining: int = 1000, candidate_score: float = 0.0):
         if section == "action_policy":
             return obj.metadata, "metadata"
+        if (
+            self.source_store is not None
+            and dict(obj.metadata or {}).get("canonical_kind") == "claim"
+        ):
+            committed = read_committed_canonical(
+                self.source_store,
+                obj.uri,
+                self.relation_store,
+            )
+            return committed_content(committed), "committed_l2"
         if token_budget_remaining <= 120:
             preferred = [(obj.layers.l0_uri, "l0"), (obj.layers.l1_uri, "l1")]
         else:

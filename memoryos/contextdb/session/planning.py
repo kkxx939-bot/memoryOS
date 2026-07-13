@@ -34,7 +34,9 @@ class PrefetchSnapshot:
 
     uri: str
     revision: int
-    payload_json: str
+    object_digest: str
+    content_digest: str
+    relation_digest: str
 
 
 @dataclass(frozen=True)
@@ -42,7 +44,8 @@ class StagedObjectSnapshot:
     """A canonical object produced only inside this planning request."""
 
     uri: str
-    payload_json: str
+    revision: int
+    object_digest: str
 
 
 @dataclass(frozen=True)
@@ -68,6 +71,22 @@ class PlanningContext:
     extraction_security_flags: tuple[str, ...] = ()
     salience_fingerprint: str = ""
     salience_reasons: tuple[str, ...] = ()
+    salience_score: int = 0
+    salience_budget_cost: int = 0
+    salience_duplicate: bool = False
+    salience_privacy_risk: bool = False
+    salience_reservation_digest: str = ""
+    salience_factors: tuple[tuple[str, int, tuple[str, ...]], ...] = ()
+    proposal_set_digest: str = ""
+    planning_digest: str = ""
+    egress_decision: str = "LOCAL_ONLY"
+    egress_audit: tuple[tuple[str, str], ...] = ()
+    user_id: str = ""
+    extractor_version: str = ""
+    model_id: str = ""
+    prompt_version: str = ""
+    semantic_contract_version: str = ""
+    created_at: str = ""
 
     def assert_matches(
         self,
@@ -75,6 +94,7 @@ class PlanningContext:
         task_id: str,
         session_id: str,
         tenant_id: str,
+        user_id: str,
         archive_digest: str,
         manifest_digest: str,
     ) -> None:
@@ -91,6 +111,10 @@ class PlanningContext:
         if self.tenant_id != tenant_id:
             raise PlanningContextMismatchError(
                 f"planning context {self.planning_id} tenant does not match the archived request"
+            )
+        if self.user_id != user_id:
+            raise PlanningContextMismatchError(
+                f"planning context {self.planning_id} owner does not match the archived request"
             )
         if self.manifest_digest and manifest_digest and self.manifest_digest != manifest_digest:
             raise PlanningContextMismatchError(
@@ -115,4 +139,6 @@ class MemoryPlanningResult:
             "archive_digest": self.context.archive_digest,
             "operation_group_identity": self.context.operation_group_identity,
             "operation_count": len(self.operations),
+            "planning_digest": self.context.planning_digest,
+            "proposal_set_digest": self.context.proposal_set_digest,
         }

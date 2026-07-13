@@ -11,6 +11,7 @@ from memoryos.api.sdk.client import MemoryOSClient
 from memoryos.core.time import utc_now
 from memoryos.operations.commit.effect_marker import atomic_write_json
 from memoryos.operations.commit.quarantine import list_quarantine_records
+from memoryos.runtime.readiness import RuntimeNotReadyError
 from memoryos.workers.embedding_worker import EmbeddingWorker
 from memoryos.workers.memory_proposal_worker import MemoryProposalWorker
 from memoryos.workers.semantic_worker import SemanticWorker
@@ -18,7 +19,17 @@ from memoryos.workers.session_commit_worker import SessionCommitWorker
 
 
 class WorkerRunner:
-    def __init__(self, client: MemoryOSClient, *, poll_interval: float = 1.0, batch_size: int = 10, lease_seconds: int = 60, max_retries: int = 3) -> None:
+    _ORDINARY_KINDS = frozenset({"session-commit", "memory-proposal", "memory-projection", "semantic", "embedding"})
+
+    def __init__(
+        self,
+        client: MemoryOSClient,
+        *,
+        poll_interval: float = 1.0,
+        batch_size: int = 10,
+        lease_seconds: int = 60,
+        max_retries: int = 3,
+    ) -> None:
         self.client = client
         self.poll_interval = max(0.05, poll_interval)
         self.batch_size = max(1, batch_size)
@@ -26,9 +37,7 @@ class WorkerRunner:
         self.max_retries = max(1, max_retries)
         self.stopping = False
         self.artifact_root = (
-            Path(client.root)
-            if client.tenant_id == "default"
-            else Path(client.root) / "tenants" / client.tenant_id
+            Path(client.root) if client.tenant_id == "default" else Path(client.root) / "tenants" / client.tenant_id
         )
         self.heartbeat = self.artifact_root / "system" / "worker-health.json"
 
@@ -47,20 +56,33 @@ class WorkerRunner:
         result: dict[str, Any] = {"kind": kind, "timestamp": utc_now()}
         if kind in {"recovery", "all"}:
             result["recovery"] = self.client.recovery_worker.process_all()
+        if kind in self._ORDINARY_KINDS or kind == "all":
+            # Recovery never promotes a live runtime to READY.  In particular,
+            # ``all`` may repair artifacts, but callers must reconstruct the
+            # runtime so the complete startup proof is evaluated before any
+            # ordinary worker leases or writes durable work.
+            if self._stop_if_not_ready(result, allow_result=kind == "all"):
+                return result
         if kind in {"session-commit", "all"}:
             result["session_commit"] = SessionCommitWorker(self.client.session_commit_service).process_pending(
                 batch_size=self.batch_size,
                 lease_seconds=self.lease_seconds,
                 max_retries=self.max_retries,
             )
+            if self._stop_if_not_ready(result, allow_result=kind == "all"):
+                return result
         if kind in {"memory-projection", "all"}:
             result["memory_projection"] = self.client.memory_projection_worker.process_pending(limit=self.batch_size)
+            if self._stop_if_not_ready(result, allow_result=kind == "all"):
+                return result
         if kind in {"memory-proposal", "all"}:
             result["memory_proposal"] = MemoryProposalWorker(self.client.session_commit_service).process_pending(
                 batch_size=self.batch_size,
                 lease_seconds=self.lease_seconds,
                 max_retries=self.max_retries,
             )
+            if self._stop_if_not_ready(result, allow_result=kind == "all"):
+                return result
         if kind in {"semantic", "all"}:
             result["semantic"] = SemanticWorker(
                 self.client.source_store,
@@ -70,6 +92,8 @@ class WorkerRunner:
                 lease_seconds=self.lease_seconds,
                 max_retries=self.max_retries,
             )
+            if self._stop_if_not_ready(result, allow_result=kind == "all"):
+                return result
         if kind in {"embedding", "all"}:
             if self.client.vector_store is None or self.client.embedding_provider is None:
                 result["embedding"] = {"status": "disabled", "processed": [], "failed": []}
@@ -84,12 +108,35 @@ class WorkerRunner:
                     lease_seconds=self.lease_seconds,
                     max_retries=self.max_retries,
                 )
+            if self._stop_if_not_ready(result, allow_result=kind == "all"):
+                return result
         if kind in {"maintenance", "all"}:
             result["maintenance"] = self.client.context_db.verify_consistency()
         stats = getattr(self.client.queue_store, "stats", None)
         result["queue_stats"] = stats() if callable(stats) else {}
         result["quarantine_records"] = list_quarantine_records(self.artifact_root)
         return result
+
+    def _stop_if_not_ready(
+        self,
+        result: dict[str, Any],
+        *,
+        allow_result: bool,
+    ) -> bool:
+        """Stop an ``all`` pass immediately after a live fail-closed flip."""
+
+        try:
+            self.client.readiness.require_ready()
+        except RuntimeNotReadyError:
+            if not allow_result:
+                raise
+            result["status"] = "not_ready"
+            result["runtime"] = self.client.readiness.snapshot()
+            stats = getattr(self.client.queue_store, "stats", None)
+            result["queue_stats"] = stats() if callable(stats) else {}
+            result["quarantine_records"] = list_quarantine_records(self.artifact_root)
+            return True
+        return False
 
     def _install_signal_handlers(self) -> None:
         def stop(_signum: int, _frame: Any) -> None:
@@ -100,8 +147,11 @@ class WorkerRunner:
 
     def _write_heartbeat(self, kind: str, result: dict[str, Any]) -> None:
         metrics = self._metrics(result)
+        runtime = self.client.readiness.snapshot()
         status = (
-            "failed"
+            "not_ready"
+            if result.get("status") == "not_ready" or not runtime.get("ready")
+            else "failed"
             if metrics["component_errors"]
             else "degraded"
             if metrics["failed"] or metrics["dead_letter"] or metrics["quarantine"]
@@ -116,7 +166,7 @@ class WorkerRunner:
             "pending": dict(result.get("queue_stats", {})),
             "last_result": result,
         }
-        atomic_write_json(self.heartbeat, payload)
+        atomic_write_json(self.heartbeat, payload, artifact_root=self.artifact_root)
 
     def _metrics(self, result: dict[str, Any]) -> dict[str, Any]:
         processed = succeeded = failed = retried = dead_letter = quarantine = 0

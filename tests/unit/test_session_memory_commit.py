@@ -59,7 +59,7 @@ def test_project_rule_fallback_pending_keeps_shared_view_and_adapter_metadata() 
     assert operation.payload["canonical_pending_proposal"] is True
     assert operation.payload["admission"] == {
         "decision": "pending",
-        "reason": "PENDING_FALLBACK_REQUIRES_SEMANTIC_REVIEW",
+        "reason": "FALLBACK_REQUIRES_REEXTRACTION",
     }
     assert operation.payload["schema_version"] == "canonical_pending_proposal_v1"
     assert operation.target_uri and "/memories/pending/" in operation.target_uri
@@ -83,8 +83,12 @@ def test_committed_memory_context_object_keeps_schema_metadata(tmp_path) -> None
         messages=[{"role": "user", "content": "I prefer findings first during code reviews."}],
         metadata={"connect": {"adapter_id": "codex"}},
     )
-    operation = MemoryCommitPlanner(extractor=RuleFallbackExtractor()).plan(archive).operations[0]
     SessionArchiveStore(tmp_path).write_sync_archive(archive)
+    operation = MemoryCommitPlanner(
+        extractor=RuleFallbackExtractor(),
+        source_store=source,
+        index_store=index,
+    ).plan(archive).operations[0]
 
     diff = committer.commit("u1", [operation])
     obj = source.read_object(str(operation.target_uri))
@@ -98,7 +102,7 @@ def test_committed_memory_context_object_keeps_schema_metadata(tmp_path) -> None
     assert obj.metadata["memory_type"] == "preference"
     assert obj.metadata["admission"] == {
         "decision": "pending",
-        "reason": "PENDING_FALLBACK_REQUIRES_SEMANTIC_REVIEW",
+        "reason": "FALLBACK_REQUIRES_REEXTRACTION",
     }
     assert "user:u1:preferences" in obj.metadata["retrieval_views"]
     proposal_metadata = obj.metadata["proposal"]["metadata"]
@@ -140,7 +144,7 @@ def test_session_diff_reports_planned_fallback_pending_contract(tmp_path) -> Non
     assert operation["payload"]["memory_type"] == "project_rule"
     assert operation["payload"]["admission"] == {
         "decision": "pending",
-        "reason": "PENDING_FALLBACK_REQUIRES_SEMANTIC_REVIEW",
+        "reason": "FALLBACK_REQUIRES_REEXTRACTION",
     }
     assert operation["payload"]["schema_version"] == "canonical_pending_proposal_v1"
     assert "project:memoryos:rules" in operation["payload"]["retrieval_views"]

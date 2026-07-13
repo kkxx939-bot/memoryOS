@@ -15,6 +15,7 @@ from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.model.lifecycle import LifecycleState
 from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
 from memoryos.contextdb.retrieval.token_budget import HeuristicTokenCounter, TokenCounter
+from memoryos.contextdb.store.source_store import is_canonical_memory_object
 from memoryos.contextdb.store.sqlite_index_store import lexical_match_count, lexical_terms
 from memoryos.memory.canonical.retrieval import (
     CanonicalMemoryQuery,
@@ -22,6 +23,11 @@ from memoryos.memory.canonical.retrieval import (
     CanonicalQueryIntent,
 )
 from memoryos.memory.canonical.scope import MemoryScope, scope_keys_from_payloads
+from memoryos.memory.canonical.visibility import (
+    committed_content,
+    list_committed_canonical,
+    read_committed_canonical,
+)
 from memoryos.memory.retrieval_plan import MemoryRetrievalPlanner
 from memoryos.providers.rerank import Reranker
 
@@ -205,7 +211,7 @@ class ContextAssembler:
         if project_id:
             available_scopes.add(f"memoryos:workspace:{project_id}")
         allowed = []
-        for obj in source_store.list_objects():
+        for obj, _content in self._source_scan_records(include_candidates=include_candidates):
             metadata = dict(obj.metadata or {})
             reviewable_pending = bool(
                 include_candidates
@@ -529,7 +535,9 @@ class ContextAssembler:
             or ()
         )
         items: list[dict[str, Any]] = []
-        for obj in self.context_db.source_store.list_objects():
+        for obj, committed_l2 in self._source_scan_records(
+            include_candidates=plan.include_candidates
+        ):
             if obj.uri not in allowed_source_uris:
                 continue
             if obj.context_type != ContextType.MEMORY:
@@ -549,7 +557,7 @@ class ContextAssembler:
                 continue
             if user_id is not None and obj.owner_user_id != user_id:
                 continue
-            payload = self._object_payload(obj)
+            payload = self._object_payload(obj, committed_l2=committed_l2)
             if not self._matches_retrieval_plan(
                 payload, plan.retrieval_views, include_candidates=plan.include_candidates
             ):
@@ -561,11 +569,14 @@ class ContextAssembler:
         items.sort(key=lambda row: float(row.get("score", 0.0)), reverse=True)
         return items[:limit]
 
-    def _object_payload(self, obj: Any) -> dict[str, Any]:
-        try:
-            text = self.context_db.source_store.read_content(obj.layers.l2_uri or obj.uri)
-        except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
-            text = str(obj.metadata.get("summary", obj.title))
+    def _object_payload(self, obj: Any, *, committed_l2: str | None = None) -> dict[str, Any]:
+        if committed_l2 is not None:
+            text = committed_l2
+        else:
+            try:
+                text = self.context_db.source_store.read_content(obj.layers.l2_uri or obj.uri)
+            except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+                text = str(obj.metadata.get("summary", obj.title))
         return {
             "uri": obj.uri,
             "score": 0.0,
@@ -575,6 +586,28 @@ class ContextAssembler:
             "layer": "source_scan",
             "metadata": dict(obj.metadata or {}),
         }
+
+    def _source_scan_records(
+        self,
+        *,
+        include_candidates: bool,
+    ) -> tuple[tuple[Any, str | None], ...]:
+        source_store = getattr(self.context_db, "source_store", None)
+        if source_store is None:
+            return ()
+        records: list[tuple[Any, str | None]] = []
+        for obj in source_store.list_objects():
+            if is_canonical_memory_object(obj):
+                continue
+            records.append((obj, None))
+        if include_candidates:
+            for committed in list_committed_canonical(
+                source_store,
+                getattr(self.context_db, "relation_store", None),
+                kinds=("pending_proposal",),
+            ):
+                records.append((committed.object, committed_content(committed)))
+        return tuple(records)
 
     def _matches_retrieval_plan(
         self, item: dict[str, Any], allowed_views: list[str], *, include_candidates: bool
@@ -636,10 +669,21 @@ class ContextAssembler:
             payload["context_type"] = obj.context_type.value
             payload["title"] = obj.title
             payload["metadata"] = {**dict(payload["metadata"]), **dict(obj.metadata)}
-            try:
-                payload["text"] = self.context_db.source_store.read_content(obj.layers.l2_uri or obj.uri)
-            except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
-                payload["text"] = str(obj.metadata.get("summary", obj.title))
+            metadata = dict(obj.metadata or {})
+            if metadata.get("canonical_kind") in {"slot", "claim", "pending_proposal"}:
+                committed = read_committed_canonical(
+                    self.context_db.source_store,
+                    obj.uri,
+                    getattr(self.context_db, "relation_store", None),
+                )
+                payload["text"] = committed_content(committed)
+            else:
+                try:
+                    payload["text"] = self.context_db.source_store.read_content(
+                        obj.layers.l2_uri or obj.uri
+                    )
+                except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+                    payload["text"] = str(obj.metadata.get("summary", obj.title))
             payload["layer_texts"] = self._layer_texts(obj)
         except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
             return payload
@@ -710,6 +754,8 @@ class ContextAssembler:
         return self.token_counter.count(text)
 
     def _layer_texts(self, obj: Any) -> dict[str, str]:
+        if is_canonical_memory_object(obj):
+            return {}
         values: dict[str, str] = {}
         for name, uri in (("L2", obj.layers.l2_uri or obj.uri), ("L1", obj.layers.l1_uri), ("L0", obj.layers.l0_uri)):
             if not uri:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from typing import Any, cast
+from typing import Any
 
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.lifecycle import LifecycleState
@@ -22,13 +22,16 @@ from memoryos.memory.canonical.evidence import EvidenceRef, ProposalEvidenceVali
 from memoryos.memory.canonical.identity import (
     IDENTITY_ALGORITHM_V2,
     AliasRegistry,
+    ResolvedMemoryIdentity,
     StableMemoryIdentityResolver,
 )
 from memoryos.memory.canonical.proposal import (
     EpistemicStatus,
     MemorySemanticProposal,
+    NormalizedSemanticAssessment,
     PendingMemoryProposal,
     SemanticAssessment,
+    SemanticRelation,
 )
 from memoryos.memory.canonical.reconcile import MemorySemanticReconciler
 from memoryos.memory.canonical.repository import CanonicalMemoryRepository
@@ -42,12 +45,17 @@ from memoryos.memory.canonical.scope import (
     scope_from_external,
 )
 from memoryos.memory.canonical.semantic import MemorySemanticNormalizer, MemoryTypeEligibilityPolicy
-from memoryos.memory.canonical.state import MemoryClaim, MemorySlot
+from memoryos.memory.canonical.state import (
+    MemoryClaim,
+    MemorySlot,
+    materialized_current_revision_payload,
+)
 from memoryos.memory.canonical.transaction import MemoryTransactionPlanner
 from memoryos.memory.canonical.transition import (
     MemoryTransitionPolicy,
     PendingSemanticReconciliation,
 )
+from memoryos.memory.canonical.visibility import read_committed_pending
 from memoryos.memory.schema import MemoryCandidateDraft, MemoryType, MemoryTypeRegistry
 from memoryos.operations.model.context_operation import ContextOperation
 from memoryos.operations.model.operation_action import OperationAction
@@ -65,6 +73,7 @@ class CanonicalFormationResult:
     pending_lifecycle_state: str = ""
     pending_lifecycle_revision: int = 0
     pending_existing: bool = False
+    resolved_identity: ResolvedMemoryIdentity | None = None
 
 
 class CandidateProposalAdapter:
@@ -481,6 +490,7 @@ class CanonicalMemoryFormationService:
                 reason=CandidateProposalAdapter.FALLBACK_PENDING_REASON,
                 retrieval_views=retrieval_views or [],
                 commit_group_id=commit_group_id or "",
+                staged_objects=staged_objects,
             )
         raw_validation = self.validator.validate(proposal, episode)
         grounded = raw_validation.proposal
@@ -524,6 +534,7 @@ class CanonicalMemoryFormationService:
                 reason="PENDING_IDENTITY_RESOLUTION:missing_attribute_key",
                 retrieval_views=retrieval_views or [],
                 commit_group_id=commit_group_id or "",
+                staged_objects=staged_objects,
             )
         admission = self.admission.evaluate(
             validation,
@@ -551,6 +562,7 @@ class CanonicalMemoryFormationService:
                     reason=admission.reason,
                     retrieval_views=retrieval_views or [],
                     commit_group_id=commit_group_id or "",
+                    staged_objects=staged_objects,
                 )
             return CanonicalFormationResult((), admission.decision, admission.reason, normalized)
         normalized = self._separate_display_fields(normalized)
@@ -563,9 +575,10 @@ class CanonicalMemoryFormationService:
         slot: MemorySlot | None = None
         claims: tuple[MemoryClaim, ...] = ()
         if self.source_store is not None or staged_objects:
-            repository = CanonicalMemoryRepository(
-                cast(SourceStore, self._planning_source(staged_objects)),
+            repository = CanonicalMemoryRepository._for_planning(
+                self.source_store,
                 self.relation_store,
+                staged_objects or {},
             )
             slot, claims = repository.load(identity)
         target_state_error = self._related_active_target_error(normalized, slot, claims)
@@ -579,6 +592,7 @@ class CanonicalMemoryFormationService:
                 retrieval_views=retrieval_views or [],
                 commit_group_id=commit_group_id or "",
                 related_existing_memory_ids=normalized.all_related_memory_ids,
+                staged_objects=staged_objects,
             )
         reconciled = self.reconciler.reconcile(normalized, identity, slot=slot, claims=claims)
         try:
@@ -599,6 +613,27 @@ class CanonicalMemoryFormationService:
                 else self.transition.apply(normalized, identity, reconciled)
             )
         except PendingSemanticReconciliation as pending:
+            if (
+                pending.reason == "relation_requires_confirmation"
+                and reconciled.active_claim is not None
+                and isinstance(normalized.semantic, NormalizedSemanticAssessment)
+            ):
+                active = reconciled.active_claim
+                normalized = replace(
+                    normalized,
+                    semantic=replace(
+                        normalized.semantic,
+                        relation_to_existing=SemanticRelation.SUPERSEDES,
+                    ),
+                    related_memory_ids=(active.uri,),
+                    related_slot_ids=(identity.slot_id,),
+                    related_claim_ids=(active.claim_id,),
+                    metadata={
+                        **dict(normalized.metadata),
+                        "review_proposed_relation": SemanticRelation.SUPERSEDES.value,
+                        "review_proposed_target_claim_uri": active.uri,
+                    },
+                )
             related_existing = tuple(
                 dict.fromkeys(
                     (
@@ -625,6 +660,7 @@ class CanonicalMemoryFormationService:
                 retrieval_views=retrieval_views or [],
                 commit_group_id=commit_group_id or "",
                 related_existing_memory_ids=related_existing,
+                staged_objects=staged_objects,
             )
         plan = self.transactions.build(
             normalized,
@@ -642,7 +678,13 @@ class CanonicalMemoryFormationService:
             episode_id=episode.episode_id,
         )
         self._decorate_operations(operations, normalized, retrieval_views or [])
-        return CanonicalFormationResult(tuple(operations), admission.decision, admission.reason, normalized)
+        return CanonicalFormationResult(
+            tuple(operations),
+            admission.decision,
+            admission.reason,
+            normalized,
+            resolved_identity=identity,
+        )
 
     def _related_active_target_error(
         self,
@@ -699,9 +741,10 @@ class CanonicalMemoryFormationService:
             tenant_id=episode.tenant_id,
             owner_user_id=archive.user_id,
         )
-        repository = CanonicalMemoryRepository(
-            cast(SourceStore, self._planning_source(staged_objects)),
+        repository = CanonicalMemoryRepository._for_planning(
+            self.source_store,
             self.relation_store,
+            staged_objects or {},
         )
         slot, claims = repository.load(identity)
         if slot is None or slot.active_claim_id is None:
@@ -772,6 +815,7 @@ class CanonicalMemoryFormationService:
         reason: str,
         retrieval_views: list[str] | None = None,
         commit_group_id: str | None = None,
+        staged_objects: Mapping[str, ContextObject] | None = None,
     ) -> CanonicalFormationResult:
         """Persist a caller-admitted pending proposal without promoting it."""
 
@@ -785,6 +829,7 @@ class CanonicalMemoryFormationService:
             reason=reason,
             retrieval_views=retrieval_views or [],
             commit_group_id=commit_group_id or "",
+            staged_objects=staged_objects,
         )
 
     def plan_pending_lifecycle_transition(
@@ -799,6 +844,9 @@ class CanonicalMemoryFormationService:
         retry_increment: bool = False,
         updated_at: str = "",
         resolution_operations: tuple[ContextOperation, ...] = (),
+        review_command_id: str = "",
+        review_decision: str = "",
+        review_request_digest: str = "",
     ) -> ContextOperation:
         """Plan a review lifecycle update; the caller must commit the returned operation."""
 
@@ -823,6 +871,9 @@ class CanonicalMemoryFormationService:
             updated_at=updated_at,
             retry_increment=retry_increment,
             reason=reason,
+            review_command_id=review_command_id,
+            review_decision=review_decision,
+            review_request_digest=review_request_digest,
         )
         transition_from = current.lifecycle_state.value
         expected_lifecycle_revision = current.lifecycle_revision
@@ -842,6 +893,9 @@ class CanonicalMemoryFormationService:
                 updated.lifecycle_state.value,
                 updated.retry_count,
                 updated.lifecycle_revision,
+                review_command_id,
+                review_decision,
+                review_request_digest,
             ],
             length=40,
         )
@@ -865,6 +919,13 @@ class CanonicalMemoryFormationService:
                 "pending_proposal_id": updated.proposal_id,
                 "pending_lifecycle_state": updated.lifecycle_state.value,
                 "pending_lifecycle_reason": reason,
+                "pending_review_binding": {
+                    "command_id": review_command_id,
+                    "decision": review_decision.strip().upper(),
+                    "request_digest": review_request_digest,
+                }
+                if review_command_id or review_decision or review_request_digest
+                else {},
                 "expected_pending_lifecycle_state": transition_from,
                 "expected_pending_lifecycle_revision": expected_lifecycle_revision,
                 "expected_pending_updated_at": current.updated_at,
@@ -932,6 +993,9 @@ class CanonicalMemoryFormationService:
         commit_group_id: str,
         retrieval_views: list[str] | None = None,
         reason: str = "canonical_confirmation_committed",
+        review_command_id: str = "",
+        review_decision: str = "",
+        review_request_digest: str = "",
     ) -> CanonicalFormationResult:
         """Plan one canonical confirmation followed by a linked pending resolution."""
 
@@ -939,14 +1003,38 @@ class CanonicalMemoryFormationService:
             raise RuntimeError("pending resolution requires a SourceStore")
         if archive.user_id != owner_user_id or episode.tenant_id != tenant_id:
             raise PermissionError("pending resolution archive boundary does not match owner or tenant")
-        repository = CanonicalMemoryRepository(self.source_store, self.relation_store)
-        pending = repository.load_pending(
+        committed_pending = read_committed_pending(
+            self.source_store,
             pending_uri,
-            tenant_id=tenant_id,
-            owner_user_id=owner_user_id,
+            self.relation_store,
         )
+        pending = PendingMemoryProposal.from_context_object(committed_pending.object)
+        if (
+            str(committed_pending.object.tenant_id or "default") != tenant_id
+            or committed_pending.object.owner_user_id != owner_user_id
+        ):
+            raise FileNotFoundError(pending_uri)
         if pending.lifecycle_state != LifecycleState.CONFIRMED:
             raise ValueError("pending proposal must be CONFIRMED before canonical resolution")
+        head = dict(committed_pending.head or {})
+        receipt = dict(committed_pending.receipt or {})
+        confirm_operations = [
+            item
+            for item in receipt.get("operations", []) or []
+            if isinstance(item, dict)
+            and str(item.get("operation_id") or "") == str(head.get("current_operation_id") or "")
+            and str(item.get("target_uri") or "") == pending_uri
+        ]
+        if len(confirm_operations) != 1:
+            raise ValueError("CONFIRMED pending has no unique committed confirmation operation")
+        confirm_payload = dict(confirm_operations[0].get("payload", {}) or {})
+        if (
+            confirm_payload.get("pending_lifecycle_transition") is not True
+            or str(confirm_payload.get("pending_lifecycle_state") or "").upper() != "CONFIRMED"
+            or str(head.get("proposal_fingerprint") or "") != pending.proposal.fingerprint
+            or not str(head.get("receipt_digest") or "")
+        ):
+            raise ValueError("CONFIRMED pending lifecycle proof is not an authorization receipt")
         if pending.proposal.memory_type != confirmed_proposal.memory_type:
             raise ValueError("confirmed proposal memory type does not match pending proposal")
         comparable_pending = self._separate_display_fields(self.normalizer.normalize(pending.proposal))
@@ -1024,7 +1112,10 @@ class CanonicalMemoryFormationService:
             operation for operation in formed.operations if operation.payload.get("canonical_memory") is True
         )
         if formed.decision != ProposalAdmissionDecision.ACCEPT_FOR_RECONCILE or not canonical_operations:
-            raise ValueError("confirmed pending resolution requires a canonical state-changing transaction")
+            raise ValueError(
+                "confirmed pending resolution requires a canonical state-changing transaction: "
+                f"{formed.decision.value}:{formed.reason}"
+            )
         pending_identity = self.identity.resolve(
             pending.proposal,
             pending.scope,
@@ -1051,9 +1142,172 @@ class CanonicalMemoryFormationService:
             commit_group_id=commit_group_id,
             reason=reason,
             resolution_operations=canonical_operations,
+            review_command_id=review_command_id,
+            review_decision=review_decision,
+            review_request_digest=review_request_digest,
         )
+        resolution.payload["confirmation_receipt_digest"] = str(head["receipt_digest"])
+        resolution.payload["confirmation_operation_id"] = str(head["current_operation_id"])
+        resolution.payload["confirmation_lifecycle_revision"] = pending.lifecycle_revision
+        # Confirmation/application is a new deterministic authorization plan,
+        # not a replay of the LLM envelope that originally created pending.
+        # The committer publishes one immutable direct planning proof whose
+        # operation digest includes the review command and CONFIRM receipt.
+        for operation in (*canonical_operations, resolution):
+            operation.payload.pop("planning_task_id", None)
+            operation.payload.pop("planning_digest", None)
         return CanonicalFormationResult(
             (*canonical_operations, resolution),
+            formed.decision,
+            formed.reason,
+            formed.proposal,
+        )
+
+    def plan_pending_correction(
+        self,
+        pending_uri: str,
+        corrected_proposal: MemorySemanticProposal,
+        *,
+        archive: SessionArchive,
+        episode: EvidenceEpisode,
+        tenant_id: str,
+        owner_user_id: str,
+        commit_group_id: str,
+        retrieval_views: list[str] | None = None,
+        reason: str = "corrected_by_new_proposal",
+        review_command_id: str = "",
+        review_decision: str = "",
+        review_request_digest: str = "",
+    ) -> CanonicalFormationResult:
+        """Atomically commit a corrected proposal and terminalize its predecessor.
+
+        This is deliberately separate from review confirmation.  Reasons such
+        as missing evidence/schema/scope cannot be authorized by changing a
+        lifecycle flag; they require a different, independently validated
+        proposal in a new commit group.
+        """
+
+        if self.source_store is None:
+            raise RuntimeError("pending correction requires a SourceStore")
+        if archive.user_id != owner_user_id or episode.tenant_id != tenant_id:
+            raise PermissionError("pending correction archive boundary does not match owner or tenant")
+        committed = read_committed_pending(self.source_store, pending_uri, self.relation_store)
+        pending = PendingMemoryProposal.from_context_object(committed.object)
+        if (
+            str(committed.object.tenant_id or "default") != tenant_id
+            or committed.object.owner_user_id != owner_user_id
+        ):
+            raise FileNotFoundError(pending_uri)
+        if pending.lifecycle_state not in {LifecycleState.PENDING, LifecycleState.RETRYABLE}:
+            raise ValueError("only a live pending proposal can be replaced by a corrected proposal")
+        policy = pending.reason_policy
+        if not policy.requires_new_proposal:
+            raise ValueError("reviewable pending reasons must use structured review, not correction")
+        if not commit_group_id or commit_group_id == pending.request_identity:
+            raise ValueError("pending correction requires a new commit group")
+        if policy.requires_reextraction and archive.task_id == pending.request_identity:
+            raise ValueError("fallback correction requires re-extraction in a new task")
+        if corrected_proposal.fingerprint == pending.proposal.fingerprint:
+            raise ValueError("pending correction requires a new proposal fingerprint")
+
+        linked = replace(
+            corrected_proposal,
+            metadata={
+                **dict(corrected_proposal.metadata),
+                "corrects_pending_uri": pending_uri,
+                "corrects_pending_fingerprint": pending.proposal.fingerprint,
+                "correction_commit_group_id": commit_group_id,
+                "correction_reextracted": policy.requires_reextraction,
+            },
+        )
+        formed = self._plan(
+            linked,
+            archive=archive,
+            episode=episode,
+            retrieval_views=retrieval_views or list(pending.retrieval_views),
+            commit_group_id=commit_group_id,
+            confirmed_pending=None,
+        )
+        canonical_operations = tuple(
+            operation
+            for operation in formed.operations
+            if operation.payload.get("canonical_memory") is True
+        )
+        if formed.decision != ProposalAdmissionDecision.ACCEPT_FOR_RECONCILE or not canonical_operations:
+            raise ValueError("corrected proposal must independently pass validation and change canonical state")
+
+        transaction_ids = {str(item.payload.get("transaction_id") or "") for item in canonical_operations}
+        idempotency_keys = {str(item.payload.get("idempotency_key") or "") for item in canonical_operations}
+        slot_ids = {str(item.payload.get("slot_id") or "") for item in canonical_operations}
+        if (
+            len(transaction_ids) != 1
+            or "" in transaction_ids
+            or len(idempotency_keys) != 1
+            or "" in idempotency_keys
+            or len(slot_ids) != 1
+            or "" in slot_ids
+        ):
+            raise ValueError("corrected proposal must form exactly one canonical transaction")
+        corrected_claim_uris = tuple(
+            str(payload.get("uri") or "")
+            for operation in canonical_operations
+            if isinstance((payload := operation.payload.get("context_object")), dict)
+            and dict(payload.get("metadata", {}) or {}).get("canonical_kind") == "claim"
+            and dict(payload.get("metadata", {}) or {}).get("state") == "ACTIVE"
+        )
+        if not corrected_claim_uris:
+            raise ValueError("corrected proposal must produce a linked ACTIVE Claim")
+
+        terminal = self.plan_pending_lifecycle_transition(
+            pending_uri,
+            LifecycleState.REJECTED,
+            tenant_id=tenant_id,
+            owner_user_id=owner_user_id,
+            commit_group_id=commit_group_id,
+            reason=f"{reason}:{formed.proposal.fingerprint}",
+            review_command_id=review_command_id,
+            review_decision=review_decision,
+            review_request_digest=review_request_digest,
+        )
+        transaction_id = next(iter(transaction_ids))
+        idempotency_key = next(iter(idempotency_keys))
+        slot_id = next(iter(slot_ids))
+        terminal.payload.update(
+            {
+                "canonical_memory": True,
+                "canonical_pending_correction": True,
+                "transaction_id": transaction_id,
+                "idempotency_key": idempotency_key,
+                "slot_id": slot_id,
+                "identity_algorithm_version": IDENTITY_ALGORITHM_V2,
+                "corrected_proposal_id": formed.proposal.proposal_id,
+                "corrected_proposal_fingerprint": formed.proposal.fingerprint,
+                "corrected_claim_uris": list(corrected_claim_uris),
+                "predecessor_proposal_fingerprint": pending.proposal.fingerprint,
+                "correction_requires_reextraction": policy.requires_reextraction,
+                "correction_task_id": archive.task_id,
+            }
+        )
+        for operation in canonical_operations:
+            operation.payload.update(
+                {
+                    "corrects_pending_uri": pending_uri,
+                    "corrects_pending_fingerprint": pending.proposal.fingerprint,
+                    "correction_commit_group_id": commit_group_id,
+                }
+            )
+            payload = operation.payload.get("context_object")
+            if isinstance(payload, dict):
+                metadata = dict(payload.get("metadata", {}) or {})
+                metadata.update(
+                    {
+                        "corrects_pending_uri": pending_uri,
+                        "corrects_pending_fingerprint": pending.proposal.fingerprint,
+                    }
+                )
+                payload["metadata"] = metadata
+        return CanonicalFormationResult(
+            (*canonical_operations, terminal),
             formed.decision,
             formed.reason,
             formed.proposal,
@@ -1103,7 +1357,9 @@ class CanonicalMemoryFormationService:
         retrieval_views: list[str],
         commit_group_id: str,
         related_existing_memory_ids: tuple[str, ...] = (),
+        staged_objects: Mapping[str, ContextObject] | None = None,
     ) -> CanonicalFormationResult:
+        commit_group_id = commit_group_id or f"commit_group_{archive.task_id}"
         record = PendingMemoryProposal.create(
             proposal,
             memory_scope,
@@ -1116,6 +1372,27 @@ class CanonicalMemoryFormationService:
             retrieval_views=tuple(retrieval_views),
             created_at=archive.created_at,
         )
+        staged_obj = (staged_objects or {}).get(record.uri)
+        if staged_obj is not None:
+            staged_record = PendingMemoryProposal.from_context_object(
+                ContextObject.from_dict(staged_obj.to_dict())
+            )
+            if (
+                str(staged_obj.tenant_id or "default") != episode.tenant_id
+                or str(staged_obj.owner_user_id or "") != archive.user_id
+                or staged_record.proposal.fingerprint != record.proposal.fingerprint
+            ):
+                raise ValueError("request-local pending staging crosses its proposal boundary")
+            return CanonicalFormationResult(
+                (),
+                ProposalAdmissionDecision.PENDING,
+                reason,
+                proposal,
+                pending_uri=staged_record.uri,
+                pending_lifecycle_state=staged_record.lifecycle_state.value,
+                pending_lifecycle_revision=staged_record.lifecycle_revision,
+                pending_existing=True,
+            )
         if self.source_store is not None:
             try:
                 existing_record = CanonicalMemoryRepository(
@@ -1223,34 +1500,6 @@ class CanonicalMemoryFormationService:
             metadata.setdefault("asserted_by", actor_ids[0])
         return replace(proposal, metadata=metadata)
 
-    def _planning_source(self, staged_objects: Mapping[str, ContextObject] | None = None):  # noqa: ANN202
-        request_staging = dict(staged_objects or {})
-        service = self
-
-        class PlanningSource:
-            root = getattr(service.source_store, "root", None)
-            tenant_id = getattr(service.source_store, "tenant_id", "default")
-
-            def read_object(self, uri: str) -> ContextObject:
-                if uri in request_staging:
-                    return request_staging[uri]
-                if service.source_store is None:
-                    raise FileNotFoundError(uri)
-                return service.source_store.read_object(uri)
-
-            def read_content(self, uri: str) -> str:
-                if service.source_store is None:
-                    raise FileNotFoundError(uri)
-                return service.source_store.read_content(uri)
-
-            def list_objects(self) -> list[ContextObject]:
-                persisted = service.source_store.list_objects() if service.source_store is not None else []
-                merged = {obj.uri: obj for obj in persisted}
-                merged.update(request_staging)
-                return [merged[uri] for uri in sorted(merged)]
-
-        return PlanningSource()
-
     def _memory_scope(
         self,
         proposal: MemorySemanticProposal,
@@ -1335,10 +1584,20 @@ class CanonicalMemoryFormationService:
             metadata["extractor_version"] = proposal.extractor_version
             metadata["model_id"] = proposal.model_id
             metadata["prompt_version"] = proposal.prompt_version
-            metadata["display_fields"] = canonicalize(proposal.metadata.get("display_fields", {}) or {})
-            metadata["display_field_evidence_refs"] = canonicalize(
-                proposal.metadata.get("display_field_evidence_refs", {}) or {}
+            materialized_revision = (
+                materialized_current_revision_payload(metadata)
+                if metadata.get("canonical_kind") == "claim"
+                else {}
             )
+            materialized_qualifiers = dict(materialized_revision.get("qualifiers", {}) or {})
+            materialized_display = dict(materialized_qualifiers.get("display_fields", {}) or {})
+            materialized_display_evidence = dict(
+                materialized_qualifiers.get("display_field_evidence_refs", {}) or {}
+            )
+            # Top-level display metadata is a derived compatibility mirror.
+            # Projection/retrieval use the materialized revision as truth.
+            metadata["display_fields"] = canonicalize(materialized_display)
+            metadata["display_field_evidence_refs"] = canonicalize(materialized_display_evidence)
             metadata["proposal_identity_fields"] = dict(proposal.identity_fields)
             metadata["merge_key"] = str(metadata.get("claim_id") or metadata.get("slot_id") or "")
             metadata["source_adapter_id"] = str(proposal.metadata.get("source_adapter_id", ""))

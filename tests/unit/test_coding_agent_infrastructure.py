@@ -232,7 +232,7 @@ def test_http_client_exposes_remote_memory_health_and_trace_routes() -> None:
         "/health",
         "/v1/memories/remember",
         "/v1/memories/forget",
-        "/v1/memories/pending?user_id=u1&tenant_id=default&lifecycle_state=PENDING",
+        "/v1/memories/pending?user_id=u1&lifecycle_state=PENDING",
         "/v1/memories/pending/review",
         "/v1/context/read?uri=memoryos%3A%2F%2Fuser%2Fu1%2Fmemories%2Fx&layer=L1",
         "/v1/recall-traces/trace%2Fid",

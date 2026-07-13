@@ -6,10 +6,19 @@ from typing import Any
 
 import pytest
 
+from memoryos.api.sdk.client import MemoryOSClient
 from memoryos.contextdb.transaction.recovery import RecoveryService
 from memoryos.memory.canonical.event import canonical_digest
+from memoryos.memory.canonical.visibility import relation_is_committed
+from memoryos.operations.commit.effect_marker import validate_marker
 from memoryos.operations.commit.operation_committer import OperationCommitter
+from memoryos.operations.commit.outbox_envelope import (
+    build_outbox,
+    planned_effect_manifest,
+    validate_outbox,
+)
 from memoryos.operations.model.context_operation import ContextOperation
+from memoryos.runtime.readiness import RuntimeReadiness, RuntimeReadinessState
 from memoryos.workers.recovery_worker import RecoveryWorker
 from tests.unit.test_canonical_transaction_commit import (
     _artifact_root,
@@ -139,7 +148,7 @@ def test_broken_outbox_json_is_quarantined_and_preserved(tmp_path: Path) -> None
     assert worker.process_all()["quarantine_count"] == 0
 
 
-def test_committed_relation_tamper_invalidates_marker_and_is_quarantined(tmp_path: Path) -> None:
+def test_missing_derived_relation_does_not_invalidate_immutable_receipt(tmp_path: Path) -> None:
     source, _index, _queue, relations, committer, episode, scope = _setup(tmp_path)
     proposal = _proposal(episode, "relation-tamper", "SQLite", "confirmation", "confirmed")
     _identity, _, plan = _plan(source, episode, scope, proposal)
@@ -157,7 +166,91 @@ def test_committed_relation_tamper_invalidates_marker_and_is_quarantined(tmp_pat
 
     result = RecoveryWorker(RecoveryService(committer.redo, committer)).process_all()
     assert result["recovered_count"] == 0
-    assert result["quarantine_count"] >= 1
-    assert not marker.exists()
-    assert not outbox.exists()
+    assert result["quarantine_count"] == 0
+    assert marker.exists()
+    assert outbox.exists()
+    validate_marker(marker, source, tenant_id="t1", user_id="u1")
+    assert relation_is_committed(source, relation, relations) is True
     assert source.read_object(str(operations[0].target_uri))
+
+
+def test_committed_outbox_mismatch_never_quarantines_valid_immutable_receipt(
+    tmp_path: Path,
+) -> None:
+    source, _index, _queue, _relations, committer, episode, scope = _setup(tmp_path)
+    proposal = _proposal(episode, "committed-outbox-mismatch", "SQLite", "confirmation", "confirmed")
+    _identity, _, plan = _plan(source, episode, scope, proposal)
+    operations = plan.to_context_operations(
+        user_id="u1",
+        tenant_id="t1",
+        episode_id=episode.episode_id,
+    )
+    committer.commit("u1", operations)
+
+    transaction_id = str(operations[0].payload["transaction_id"])
+    idempotency_key = str(operations[0].payload["idempotency_key"])
+    receipt = committer._transaction_marker(idempotency_key)
+    outbox = committer._outbox_path(transaction_id)
+    receipt_bytes = receipt.read_bytes()
+    committed_outbox = json.loads(outbox.read_text(encoding="utf-8"))
+
+    forged_operations = [ContextOperation.from_dict(item) for item in committed_outbox["operations"]]
+    forged_operations[0].payload["content"] = (
+        str(forged_operations[0].payload.get("content", "")) + "-different-self-consistent-outbox"
+    )
+    relation_manifests = {
+        str(item["operation_id"]): dict(item.get("relation_manifest", {}) or {})
+        for item in committed_outbox["effect_manifests"]
+    }
+    forged_effects = [
+        planned_effect_manifest(operation, relation_manifests[operation.operation_id])
+        for operation in forged_operations
+    ]
+    forged_claim_revisions = []
+    for operation in forged_operations:
+        obj = dict(operation.payload.get("context_object", {}) or {})
+        metadata = dict(obj.get("metadata", {}) or {})
+        if metadata.get("canonical_kind") == "claim":
+            forged_claim_revisions.append(
+                {
+                    "uri": str(obj["uri"]),
+                    "claim_id": str(metadata["claim_id"]),
+                    "revision": int(metadata["revision"]),
+                }
+            )
+    forged_outbox = build_outbox(
+        transaction_id=transaction_id,
+        idempotency_key=idempotency_key,
+        tenant_id="t1",
+        user_id="u1",
+        operations=forged_operations,
+        status="committed",
+        before_images=list(committed_outbox["before_images"]),
+        effect_manifests=forged_effects,
+        claim_revisions=forged_claim_revisions,
+        commit_group_id=str(committed_outbox["commit_group_id"]),
+        receipt_path=str(committed_outbox["receipt_path"]),
+        receipt_digest=str(committed_outbox["receipt_digest"]),
+    )
+    validate_outbox(forged_outbox)
+    outbox.write_text(json.dumps(forged_outbox, ensure_ascii=False), encoding="utf-8")
+
+    readiness = RuntimeReadiness()
+    readiness.transition(RuntimeReadinessState.READY)
+    vars(source)["readiness"] = readiness
+    result = RecoveryWorker(RecoveryService(committer.redo, committer)).process_all()
+
+    assert result["failed_count"] >= 1
+    assert result["quarantine_count"] >= 1
+    assert readiness.state == RuntimeReadinessState.NOT_READY
+    assert receipt.exists()
+    assert receipt.read_bytes() == receipt_bytes
+    validate_marker(receipt, source, tenant_id="t1", user_id="u1")
+    assert not outbox.exists()
+    assert len(list((_artifact_root(tmp_path) / "system" / "quarantine" / "outbox").glob("*.original"))) == 1
+    assert not list((_artifact_root(tmp_path) / "system" / "quarantine" / "marker").glob("*.original"))
+
+    restarted = MemoryOSClient(str(tmp_path), tenant_id="t1")
+    assert restarted.readiness.state.value == "NOT_READY"
+    assert receipt.exists()
+    assert receipt.read_bytes() == receipt_bytes

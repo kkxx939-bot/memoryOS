@@ -24,14 +24,39 @@ class RetrievalService:
             pass
 
     def search(self, query: str, **kwargs: Any) -> tuple[list[dict[str, Any]], str]:
-        results = self.assembler.search(query, **kwargs)
+        self._require_ready()
+        try:
+            results = self.assembler.search(query, **kwargs)
+        except Exception:
+            # Canonical visibility marks the bound runtime NOT_READY before
+            # raising its typed integrity error.  Re-check at this public
+            # service boundary so callers receive the stable readiness
+            # contract while the original integrity error remains the cause.
+            self._require_ready()
+            raise
+        self._require_ready()
         trace_id = self._record(query, kwargs, results, [])
         return results, trace_id
 
     def assemble(self, query: str, **kwargs: Any) -> dict[str, Any]:
-        result = self.assembler.assemble(query, **kwargs)
-        trace_id = self._record(query, kwargs, list(result.get("contexts", [])), list(result.get("dropped_contexts", [])))
+        self._require_ready()
+        try:
+            result = self.assembler.assemble(query, **kwargs)
+        except Exception:
+            self._require_ready()
+            raise
+        self._require_ready()
+        trace_id = self._record(
+            query, kwargs, list(result.get("contexts", [])), list(result.get("dropped_contexts", []))
+        )
         return {**result, "trace_id": trace_id}
+
+    def _require_ready(self) -> None:
+        context_db = getattr(self.assembler, "context_db", None)
+        readiness = getattr(context_db, "readiness", None)
+        require_ready = getattr(readiness, "require_ready", None)
+        if callable(require_ready):
+            require_ready()
 
     def read_trace(self, trace_id: str) -> dict[str, Any]:
         try:
@@ -53,25 +78,38 @@ class RetrievalService:
             raise ValueError("recall trace is invalid")
         return value
 
-    def _record(self, query: str, kwargs: dict[str, Any], selected: list[dict[str, Any]], dropped: list[dict[str, Any]]) -> str:
+    def _record(
+        self, query: str, kwargs: dict[str, Any], selected: list[dict[str, Any]], dropped: list[dict[str, Any]]
+    ) -> str:
         trace_id = str(uuid.uuid4())
         trace = {
             "trace_id": trace_id,
             "created_at": utc_now(),
             "query": sanitize_text(query, max_text=1000),
             "scope": {
-                key: kwargs.get(key)
-                for key in ("tenant_id", "user_id", "project_id", "adapter_id", "search_scope")
+                key: kwargs.get(key) for key in ("tenant_id", "user_id", "project_id", "adapter_id", "search_scope")
             },
             "retrieval_views": kwargs.get("retrieval_views") or [],
             "metadata_filters": kwargs.get("connect_filters") or {},
             "candidate_count": len(selected) + len(dropped),
-            "lexical_candidates": [item.get("uri") for item in selected if item.get("retrieval_source") in {None, "", "index", "lexical", "hybrid"}],
-            "vector_candidates": [item.get("uri") for item in selected if item.get("retrieval_source") in {"vector", "hybrid"}],
-            "selected": [{"uri": item.get("uri"), "score": item.get("score"), "layer": item.get("layer")} for item in selected],
+            "lexical_candidates": [
+                item.get("uri")
+                for item in selected
+                if item.get("retrieval_source") in {None, "", "index", "lexical", "hybrid"}
+            ],
+            "vector_candidates": [
+                item.get("uri") for item in selected if item.get("retrieval_source") in {"vector", "hybrid"}
+            ],
+            "selected": [
+                {"uri": item.get("uri"), "score": item.get("score"), "layer": item.get("layer")} for item in selected
+            ],
             "dropped": dropped,
             "token_budget": kwargs.get("token_budget"),
             "rerank_enabled": getattr(self.assembler, "reranker", None) is not None,
         }
-        atomic_write_json(self.trace_root / f"{trace_id}.json", trace)
+        atomic_write_json(
+            self.trace_root / f"{trace_id}.json",
+            trace,
+            artifact_root=self.trace_root,
+        )
         return trace_id

@@ -55,6 +55,7 @@ class RedoLog:
         "index_written",
         "audit_written",
         "diff_written",
+        "head_published",
         "committed",
     }
 
@@ -88,7 +89,7 @@ class RedoLog:
         if relation_manifest is not None:
             payload["redo_relation_manifest"] = relation_manifest
         payload["redo_digest"] = canonical_digest(payload)
-        atomic_write_json(path, payload)
+        atomic_write_json(path, payload, artifact_root=self.root)
         return path
 
     def advance(
@@ -120,6 +121,8 @@ class RedoLog:
     def commit(self, operation_id: str) -> None:
         operation_id = require_safe_path_segment(operation_id, "operation_id")
         path = self.redo_dir / f"{operation_id}.json"
+        if path.is_symlink():
+            raise RedoIntegrityError("redo control file cannot be a symbolic link")
         if path.exists():
             path.unlink()
             directory_fd = os.open(path.parent, os.O_RDONLY)
@@ -167,6 +170,8 @@ class RedoLog:
         return entries
 
     def _read_payload(self, path: Path) -> dict:
+        if path.is_symlink():
+            raise ValueError("redo control file cannot be a symbolic link")
         payload = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
             raise ValueError("redo control file must be a JSON object")

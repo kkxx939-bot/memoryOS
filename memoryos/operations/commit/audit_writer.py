@@ -17,6 +17,8 @@ class AuditWriter:
     def record(self, user_id: str, event_type: str, payload: dict) -> Path:
         user_id = require_safe_path_segment(user_id, "user_id")
         path = self.root / "system" / "audit" / f"{user_id}.jsonl"
+        if path.is_symlink():
+            raise ValueError("audit control path cannot be a symbolic link")
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(path.parent, 0o700)
         operation_id = str(payload.get("operation_id", ""))
@@ -26,13 +28,19 @@ class AuditWriter:
                     continue
                 try:
                     existing = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+                except json.JSONDecodeError as exc:
+                    raise ValueError("audit control file contains malformed JSON") from exc
                 if existing.get("payload", {}).get("operation_id") == operation_id:
                     return path
         record = {"created_at": utc_now(), "user_id": user_id, "event_type": event_type, "payload": payload}
         encoded = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
-        descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+        flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags, 0o600)
+        except OSError as exc:
+            if path.is_symlink():
+                raise ValueError("audit control path cannot be a symbolic link") from exc
+            raise
         try:
             os.fchmod(descriptor, 0o600)
             os.write(descriptor, encoded)

@@ -10,6 +10,21 @@ from typing import Protocol
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_relation import ContextRelation
 
+CANONICAL_MEMORY_KINDS = frozenset({"slot", "claim", "pending_proposal"})
+CANONICAL_MEMORY_SCHEMA_VERSIONS = frozenset({"canonical_memory_v2", "canonical_pending_proposal_v1"})
+
+
+def is_canonical_memory_uri(uri: str) -> bool:
+    return "/memories/canonical/" in uri or "/memories/pending/" in uri
+
+
+def is_canonical_memory_object(obj: ContextObject) -> bool:
+    return (
+        str(dict(obj.metadata or {}).get("canonical_kind") or "") in CANONICAL_MEMORY_KINDS
+        or obj.schema_version in CANONICAL_MEMORY_SCHEMA_VERSIONS
+        or is_canonical_memory_uri(obj.uri)
+    )
+
 
 @dataclass(frozen=True)
 class IndexHit:
@@ -39,6 +54,10 @@ class QueueJob:
 
 class LeaseLostError(RuntimeError):
     """Raised when a queue worker no longer owns the leased job it is settling."""
+
+
+class QueueLeaseIdentityError(LeaseLostError):
+    """Raised when a leased queue job's immutable identity changes in storage."""
 
 
 class QueueIdempotencyConflictError(ValueError):
@@ -85,6 +104,8 @@ class IndexStore(Protocol):
 
     def search(self, query: str, filters: dict | None = None, limit: int = 10) -> list[IndexHit]: ...
 
+    def get_index_metadata(self, uri: str) -> dict | None: ...
+
 
 class RelationStore(Protocol):
     def add_relation(self, relation: ContextRelation) -> None: ...
@@ -98,6 +119,8 @@ class RelationStore(Protocol):
     ) -> list[ContextRelation]: ...
 
     def delete_relation(self, source_uri: str, relation_type: str, target_uri: str) -> None: ...
+
+    def all_relations(self) -> list[ContextRelation]: ...
 
 
 class QueueStore(Protocol):
@@ -128,11 +151,19 @@ class QueueStore(Protocol):
         retryable: bool = True,
     ) -> QueueJob: ...
 
+    def release(self, job: QueueJob, reason: str = "") -> QueueJob: ...
+
     def quarantine(self, job: QueueJob, error: str) -> QueueJob: ...
+
+    def quarantine_identity_conflict(self, job: QueueJob, error: str) -> QueueJob: ...
+
+    def extend(self, job: QueueJob, *, lease_seconds: int = 60) -> QueueJob: ...
 
     def get(self, job_id: str) -> QueueJob | None: ...
 
-    def stats(self) -> dict[str, int]: ...
+    def recover_expired_leases(self, *, queue_name: str | None = None) -> int: ...
+
+    def stats(self, *, queue_name: str | None = None) -> dict[str, int]: ...
 
 
 class LockStore(Protocol):

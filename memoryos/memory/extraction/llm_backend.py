@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -28,8 +29,15 @@ from memoryos.memory.canonical.proposal import (
     TemporalScope,
     UtteranceMode,
 )
-from memoryos.memory.canonical.salience import EpisodeSalienceGate
 from memoryos.memory.canonical.scope import ScopeRef
+from memoryos.memory.extraction.egress import EgressDecision, MemoryEgressPolicy
+from memoryos.memory.extraction.errors import (
+    MemoryExtractionCandidateValidationError,
+    MemoryExtractionConfigurationError,
+    MemoryExtractionMalformedEnvelopeError,
+    MemoryExtractionSecurityError,
+    classify_memory_extraction_failure,
+)
 from memoryos.memory.schema import MemoryTypeSchema
 from memoryos.memory.view import adapter_id_from_archive
 
@@ -218,7 +226,6 @@ class MemoryExtractionPromptBuilder:
             }
             for schema in schemas
         ]
-        messages = "\n".join(json.dumps(message, ensure_ascii=False, sort_keys=True) for message in archive.messages)
         existing = json.dumps(
             [
                 {
@@ -237,26 +244,24 @@ class MemoryExtractionPromptBuilder:
             ensure_ascii=False,
             sort_keys=True,
         )
-        events = []
-        legal_scopes = []
-        if episode is not None:
-            events = [
-                {
-                    "event_id": event.event_id,
-                    "event_type": event.event_type,
-                    "actor": event.actor.to_dict(),
-                    "subjects": [subject.to_dict() for subject in event.subjects],
-                    "event_digest": event.digest,
-                    "content_hash": EvidenceRef.from_event(event).content_hash,
-                    "content_path": event.content_path,
-                    "occurred_at": event.occurred_at.isoformat(),
-                    "ingested_at": (event.ingested_at or event.occurred_at).isoformat(),
-                    "sequence": event.sequence,
-                    "text": event.text(),
-                }
-                for event in episode.events
-            ]
-            legal_scopes = [scope.to_dict() for scope in episode.legal_scope_candidates()]
+        episode = episode or SessionArchiveEpisodeAdapter().adapt(archive)
+        events = [
+            {
+                "event_id": event.event_id,
+                "event_type": event.event_type,
+                "actor": event.actor.to_dict(),
+                "subjects": [subject.to_dict() for subject in event.subjects],
+                "event_digest": event.digest,
+                "content_hash": EvidenceRef.from_event(event).content_hash,
+                "content_path": event.content_path,
+                "occurred_at": event.occurred_at.isoformat(),
+                "ingested_at": (event.ingested_at or event.occurred_at).isoformat(),
+                "sequence": event.sequence,
+                "text": event.text(),
+            }
+            for event in episode.events
+        ]
+        legal_scopes = [scope.to_dict() for scope in episode.legal_scope_candidates()]
         return (
             "Extract durable memory semantic proposals as JSON using semantic contract v3. "
             "A durable memory is an evidence-backed fact, preference, rule, decision, entity, event, or reusable "
@@ -322,8 +327,7 @@ class MemoryExtractionPromptBuilder:
             f"LEGAL_SCOPES={json.dumps(legal_scopes, ensure_ascii=False, sort_keys=True)}\n"
             f"MEMORY_SCHEMAS={json.dumps(schema_payload, ensure_ascii=False, sort_keys=True)}\n"
             f"EXISTING_MEMORIES={existing}\n"
-            f"EPISODE_EVENTS={json.dumps(events, ensure_ascii=False, sort_keys=True)}\n"
-            f"MESSAGES={messages}"
+            f"EPISODE_EVENTS={json.dumps(events, ensure_ascii=False, sort_keys=True)}"
         )
 
 
@@ -338,9 +342,9 @@ class _MemoryExtractionJsonParser:
         try:
             payload = json.loads(text)
         except json.JSONDecodeError as exc:
-            raise ValueError(f"LLM memory response is not valid JSON: {exc}") from exc
+            raise MemoryExtractionMalformedEnvelopeError(f"LLM memory response is not valid JSON: {exc}") from exc
         if not isinstance(payload, dict | list):
-            raise ValueError("LLM memory response must be an object or list")
+            raise MemoryExtractionMalformedEnvelopeError("LLM memory response must be an object or list")
         return payload
 
 
@@ -350,6 +354,7 @@ class RejectedMemoryCandidate:
     proposal_id: str
     reason: str
     security_flags: tuple[str, ...] = ()
+    security_error: bool = False
 
 
 @dataclass(frozen=True)
@@ -357,6 +362,8 @@ class MemoryExtractionBatchResult:
     accepted: tuple[MemorySemanticProposal, ...]
     rejected: tuple[RejectedMemoryCandidate, ...] = ()
     security_flags: tuple[str, ...] = ()
+    egress_decision: str = EgressDecision.LOCAL_ONLY.value
+    egress_audit: dict[str, str] | None = None
 
 
 class LLMMemoryExtractorBackend:
@@ -364,6 +371,8 @@ class LLMMemoryExtractorBackend:
 
     semantic_proposal_backend = True
     llm_semantic_backend = True
+    egress_policy_enforced = True
+    handles_retries = True
     _PROPOSAL_FIELDS = {
         "proposal_id",
         "memory_type",
@@ -437,7 +446,14 @@ class LLMMemoryExtractorBackend:
         parser: _MemoryExtractionJsonParser | None = None,
         model_id: str | None = None,
         extractor_version: str = "llm_semantic_extractor_v3",
+        egress_policy: MemoryEgressPolicy | None = None,
+        max_attempts: int = 3,
+        retry_backoff_seconds: Sequence[float] = (0.0, 0.05, 0.2),
     ) -> None:
+        if not callable(getattr(provider, "complete", None)):
+            raise MemoryExtractionConfigurationError("memory model provider has no complete() method")
+        if max_attempts < 1:
+            raise MemoryExtractionConfigurationError("max_attempts must be positive")
         self.provider = provider
         self.prompt_builder = prompt_builder or MemoryExtractionPromptBuilder()
         self.parser = parser or _MemoryExtractionJsonParser()
@@ -445,6 +461,10 @@ class LLMMemoryExtractorBackend:
         self.extractor_version = extractor_version
         self.prompt_version = "memory_semantic_proposal_v3"
         self.semantic_contract_version = "v3"
+        self.egress_policy = egress_policy or MemoryEgressPolicy()
+        self.max_attempts = max_attempts
+        self.retry_backoff_seconds = tuple(float(item) for item in retry_backoff_seconds)
+        self.last_egress_audit: dict[str, str] | None = None
 
     def extract(
         self,
@@ -484,19 +504,39 @@ class LLMMemoryExtractorBackend:
     ) -> MemoryExtractionBatchResult:
         """Parse a trusted envelope while isolating each candidate failure."""
 
-        privacy = EpisodeSalienceGate().evaluate(episode)
-        if privacy.privacy_risk and self._provider_is_remote():
+        remote = self._provider_is_remote()
+        assessment = self.egress_policy.evaluate(
+            archive,
+            episode,
+            remote=remote,
+            existing_memories=existing_memories,
+        )
+        if remote and assessment.decision in {EgressDecision.DENY, EgressDecision.LOCAL_ONLY}:
+            denied_flags = (
+                ("privacy_egress_blocked",)
+                if any(item.value in {"secret", "restricted_scope"} for item in assessment.categories)
+                else ("egress_denied",)
+            )
+            self.last_egress_audit = {
+                "outbound_digest": "",
+                "decision": assessment.decision.value,
+                "provider": type(self.provider).__name__,
+                "model": str(self.model_id or ""),
+            }
             return MemoryExtractionBatchResult(
                 (),
                 (
                     RejectedMemoryCandidate(
                         index=-1,
                         proposal_id="",
-                        reason="privacy_risk_blocked_before_remote_provider",
-                        security_flags=("privacy_egress_blocked",),
+                        reason="remote_egress_policy_blocked_sensitive_archive",
+                        security_flags=denied_flags,
+                        security_error=True,
                     ),
                 ),
-                ("privacy_egress_blocked",),
+                denied_flags,
+                assessment.decision.value,
+                dict(self.last_egress_audit),
             )
 
         prompt = self.prompt_builder.build(
@@ -505,25 +545,33 @@ class LLMMemoryExtractorBackend:
             existing_memories=existing_memories,
             episode=episode,
         )
-        response = self.provider.complete(prompt)
-        payload = self.parser._load_json(response)
+        prompt = self.egress_policy.redact(prompt, assessment)
+        self.last_egress_audit = {
+            "outbound_digest": stable_hash([prompt], length=64),
+            "decision": assessment.decision.value,
+            "provider": type(self.provider).__name__,
+            "model": str(self.model_id or ""),
+        }
+        payload = self._complete_and_parse(prompt)
         if not isinstance(payload, dict):
-            raise ValueError("semantic memory extraction response must be an object with candidates")
+            raise MemoryExtractionMalformedEnvelopeError(
+                "semantic memory extraction response must be an object with candidates"
+            )
         if set(payload) != {"candidates"}:
             unknown = set(payload) - {"candidates"}
-            raise ValueError(f"memory extraction response contains unknown fields: {','.join(sorted(unknown))}")
+            raise MemoryExtractionMalformedEnvelopeError(
+                f"memory extraction response contains unknown fields: {','.join(sorted(unknown))}"
+            )
         raw_candidates = payload.get("candidates", [])
         if not isinstance(raw_candidates, list):
-            raise ValueError("memory extraction candidates must be a list")
+            raise MemoryExtractionMalformedEnvelopeError("memory extraction candidates must be a list")
         allowed = {schema.memory_type.value for schema in schemas}
         schemas_by_type = {schema.memory_type.value: schema for schema in schemas}
         proposals: list[MemorySemanticProposal] = []
         rejected: list[RejectedMemoryCandidate] = []
         proposal_ids: set[str] = set()
         legal_scopes = {scope.key: scope for scope in episode.legal_scope_candidates()}
-        existing_candidates = {
-            _existing_candidate_ref(index): item for index, item in enumerate(existing_memories)
-        }
+        existing_candidates = {_existing_candidate_ref(index): item for index, item in enumerate(existing_memories)}
         for index, raw in enumerate(raw_candidates):
             raw_id = str(raw.get("proposal_id") or "") if isinstance(raw, dict) else ""
             try:
@@ -540,24 +588,90 @@ class LLMMemoryExtractorBackend:
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 reason = str(exc)
+                flags = self._rejection_flags(reason)
+                security_flags = {
+                    "evidence_integrity_rejected",
+                    "source_authority_rejected",
+                    "scope_authority_rejected",
+                    "target_reference_rejected",
+                    "forbidden_output_field_rejected",
+                    "operation_control_rejected",
+                    "revision_control_rejected",
+                }
+                typed_error: MemoryExtractionCandidateValidationError | MemoryExtractionSecurityError
+                if security_flags.intersection(flags):
+                    typed_error = MemoryExtractionSecurityError(reason)
+                else:
+                    typed_error = MemoryExtractionCandidateValidationError(reason)
                 rejected.append(
                     RejectedMemoryCandidate(
                         index=index,
                         proposal_id=raw_id,
-                        reason=reason,
-                        security_flags=self._rejection_flags(reason),
+                        reason=str(typed_error),
+                        security_flags=flags,
+                        security_error=isinstance(typed_error, MemoryExtractionSecurityError),
                     )
                 )
                 continue
             proposal_ids.add(proposal.proposal_id)
             proposals.append(proposal)
         flags = tuple(dict.fromkeys(flag for item in rejected for flag in item.security_flags))
-        return MemoryExtractionBatchResult(tuple(proposals), tuple(rejected), flags)
+        return MemoryExtractionBatchResult(
+            tuple(proposals),
+            tuple(rejected),
+            flags,
+            assessment.decision.value,
+            dict(self.last_egress_audit),
+        )
+
+    def _complete_and_parse(self, prompt: str) -> dict | list:
+        """Retry only failures whose typed contract explicitly permits retry."""
+
+        last_error: Exception | None = None
+        for attempt in range(self.max_attempts):
+            try:
+                response = self.provider.complete(prompt)
+                if not isinstance(response, str):
+                    raise MemoryExtractionMalformedEnvelopeError("memory model provider response must be text")
+                payload = self.parser._load_json(response)
+                if not isinstance(payload, dict):
+                    raise MemoryExtractionMalformedEnvelopeError(
+                        "semantic memory extraction response must be an object with candidates"
+                    )
+                if set(payload) != {"candidates"}:
+                    unknown = set(payload) - {"candidates"}
+                    raise MemoryExtractionMalformedEnvelopeError(
+                        "memory extraction response contains unknown fields: " + ",".join(sorted(unknown))
+                    )
+                if not isinstance(payload.get("candidates"), list):
+                    raise MemoryExtractionMalformedEnvelopeError("memory extraction candidates must be a list")
+                return payload
+            except MemoryExtractionMalformedEnvelopeError as exc:
+                last_error = exc
+            except Exception as exc:
+                last_error = classify_memory_extraction_failure(exc)
+                if isinstance(last_error, MemoryExtractionConfigurationError):
+                    raise last_error from exc
+            if attempt + 1 >= self.max_attempts:
+                assert last_error is not None
+                raise last_error
+            delay = (
+                self.retry_backoff_seconds[min(attempt, len(self.retry_backoff_seconds) - 1)]
+                if self.retry_backoff_seconds
+                else 0.0
+            )
+            if delay > 0:
+                time.sleep(delay)
+        raise AssertionError("unreachable extraction retry state")
 
     def _provider_is_remote(self) -> bool:
         """Unknown providers are remote by default; local providers must opt in explicitly."""
 
         return getattr(self.provider, "is_remote", True) is not False
+
+    @property
+    def is_remote(self) -> bool:
+        return self._provider_is_remote()
 
     def _proposal_from_raw(
         self,
@@ -579,16 +693,18 @@ class LLMMemoryExtractorBackend:
             raise ValueError(f"candidate[{index}] contains unknown fields: {','.join(sorted(unknown))}")
         forbidden_paths = self._forbidden_nested_control_paths(raw)
         if forbidden_paths:
-            raise ValueError(
-                f"candidate[{index}] contains forbidden control fields: {','.join(forbidden_paths)}"
-            )
+            raise ValueError(f"candidate[{index}] contains forbidden control fields: {','.join(forbidden_paths)}")
         memory_type = str(raw.get("memory_type", ""))
         if memory_type not in allowed:
             raise ValueError(f"candidate[{index}] memory_type is not allowed: {memory_type}")
         identity_fields = raw.get("identity_fields", {})
         value_fields = raw.get("value_fields", {})
         semantic = raw.get("semantic", {})
-        if not isinstance(identity_fields, dict) or not isinstance(value_fields, dict) or not isinstance(semantic, dict):
+        if (
+            not isinstance(identity_fields, dict)
+            or not isinstance(value_fields, dict)
+            or not isinstance(semantic, dict)
+        ):
             raise ValueError(f"candidate[{index}] semantic fields must be objects")
         if (
             not identity_fields
@@ -652,9 +768,7 @@ class LLMMemoryExtractorBackend:
         )
         for field_name in (*sorted(f"semantic.{name}" for name in self._SEMANTIC_FIELDS), "transition"):
             if field_evidence_refs.get(field_name) != (atomic_evidence_ref,):
-                raise ValueError(
-                    f"candidate[{index}] {field_name} must bind only to atomic_evidence_ref"
-                )
+                raise ValueError(f"candidate[{index}] {field_name} must bind only to atomic_evidence_ref")
         raw_scopes = raw.get("suggested_scope_refs", []) or []
         if not isinstance(raw_scopes, list) or any(not isinstance(item, dict) for item in raw_scopes):
             raise ValueError(f"candidate[{index}] suggested_scope_refs must contain only objects")
@@ -675,9 +789,7 @@ class LLMMemoryExtractorBackend:
         relation = str(semantic.get("relation_to_existing", "unrelated")).strip().casefold()
         if relation in {"corrects", "supersedes", "supplements"}:
             if len(related_items) != 1:
-                raise ValueError(
-                    f"candidate[{index}] {relation} requires exactly one related active claim"
-                )
+                raise ValueError(f"candidate[{index}] {relation} requires exactly one related active claim")
             related_item = related_items[0]
             if (
                 related_item.state.upper() != "ACTIVE"
@@ -685,9 +797,7 @@ class LLMMemoryExtractorBackend:
                 or not related_item.claim_id
                 or related_item.memory_type != memory_type
             ):
-                raise ValueError(
-                    f"candidate[{index}] {relation} related target is not one compatible active claim"
-                )
+                raise ValueError(f"candidate[{index}] {relation} related target is not one compatible active claim")
         elif relation == "unrelated" and related_items:
             raise ValueError(f"candidate[{index}] unrelated relation cannot declare related targets")
         related_slot_ids = tuple(dict.fromkeys(item.slot_id for item in related_items if item.slot_id))
@@ -857,9 +967,7 @@ class LLMMemoryExtractorBackend:
         try:
             confidence = float(value)
         except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"candidate[{index}] confidence must be a finite number between 0 and 1"
-            ) from exc
+            raise ValueError(f"candidate[{index}] confidence must be a finite number between 0 and 1") from exc
         if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
             raise ValueError(f"candidate[{index}] confidence must be a finite number between 0 and 1")
         return confidence

@@ -74,6 +74,54 @@ class ConflictResolverTest(unittest.TestCase):
             any(item["type"] == ConflictType.POLICY_MEMORY_CONSTRAINS_ACTION.value for item in result.conflicts)
         )
 
+    def test_historical_only_tail_cannot_activate_a_current_policy_constraint(self) -> None:
+        global_scope = {
+            "applicability": {
+                "all_of": [{"namespace": "memoryos", "kind": "global", "id": "tenant"}]
+            }
+        }
+        policy_memory = self.op(
+            OperationAction.ADD,
+            target="rule",
+            payload={
+                "memory_type": "project_rule",
+                "context_object": {
+                    "metadata": {
+                        "canonical_kind": "claim",
+                        "memory_kind": "policy_memory",
+                        "state": "ACTIVE",
+                        "current_revision": 1,
+                        "revision": 2,
+                        "canonical_rule_type": "action_auto_execute",
+                        "related_action": "turn_on_ac",
+                        "scope": global_scope,
+                        "revisions": [
+                            {
+                                "revision": 1,
+                                "value_fields": {"canonical_value": "allowed"},
+                                "qualifiers": {},
+                            },
+                            {
+                                "revision": 2,
+                                "value_fields": {"canonical_value": "forbidden"},
+                                "qualifiers": {"non_current_historical": True},
+                            },
+                        ],
+                    }
+                },
+            },
+        )
+        action_update = self.op(
+            OperationAction.UPDATE,
+            target="policy",
+            payload={"action": "turn_on_ac", "scope": global_scope, "auto_execute_allowed": True},
+            context_type=ContextType.ACTION_POLICY,
+        )
+
+        self.resolver.resolve([policy_memory, action_update])
+
+        self.assertTrue(action_update.payload["auto_execute_allowed"])
+
     def test_lexical_rule_without_active_structured_relation_cannot_modify_action_policy(self) -> None:
         memory = self.op(
             OperationAction.ADD,

@@ -79,7 +79,7 @@ class ContextURI:
         return ContextURI.parse(f"memoryos://{self.authority}/{path}")
 
     def to_source_path(self, root: Path, tenant_id: str = "default") -> Path:
-        base = Path(root)
+        root_resolved = Path(root).resolve()
         if self.authority == "user":
             user_id = self.segments[0]
             relative = PurePosixPath("tenants") / tenant_id / "users" / user_id / PurePosixPath(*self.segments[1:])
@@ -89,11 +89,17 @@ class ContextURI:
             relative = PurePosixPath("skills") / PurePosixPath(*self.segments)
         else:
             raise InvalidContextURI(f"Unsupported URI authority: {self.authority}")
-        path = (base / Path(relative)).resolve()
-        root_resolved = base.resolve()
-        if root_resolved not in path.parents and path != root_resolved:
+        lexical_path = root_resolved / Path(relative)
+        if root_resolved not in lexical_path.parents and lexical_path != root_resolved:
             raise InvalidContextURI(f"URI escapes root: {self.raw}")
-        return path
+        resolved_path = lexical_path.resolve()
+        if resolved_path != lexical_path:
+            # Resolving an in-root alias is not sufficient: a tenant path may
+            # otherwise be redirected to another tenant while still remaining
+            # below the shared root.  Durable stores must address the exact
+            # lexical namespace derived from the URI.
+            raise InvalidContextURI(f"URI path traverses a symbolic link: {self.raw}")
+        return lexical_path
 
     def __str__(self) -> str:
         return self.raw

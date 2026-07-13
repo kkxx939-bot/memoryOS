@@ -11,6 +11,7 @@ from types import MappingProxyType
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_relation import ContextRelation
 from memoryos.core.ids import stable_hash
+from memoryos.memory.canonical.event import canonicalize, immutable_snapshot
 from memoryos.memory.canonical.evidence import EvidenceRef
 from memoryos.memory.canonical.identity import IDENTITY_ALGORITHM_V2
 from memoryos.memory.canonical.proposal import MemorySemanticProposal
@@ -60,10 +61,12 @@ class MemoryTransactionPlan:
     schema_version: str
     proposal_ids: tuple[str, ...]
     proposal_fingerprints: tuple[str, ...]
+    proposal_proofs: tuple[Mapping[str, object], ...]
     identity_algorithm_version: str = IDENTITY_ALGORITHM_V2
     canonical_subject_key: str = ""
     commit_group_id: str = ""
     planning_task_id: str = ""
+    created_at: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -75,6 +78,11 @@ class MemoryTransactionPlan:
         object.__setattr__(self, "evidence_refs", tuple(self.evidence_refs))
         object.__setattr__(self, "proposal_ids", tuple(self.proposal_ids))
         object.__setattr__(self, "proposal_fingerprints", tuple(self.proposal_fingerprints))
+        object.__setattr__(
+            self,
+            "proposal_proofs",
+            tuple(immutable_snapshot(dict(item)) for item in self.proposal_proofs),
+        )
         if not self.commit_group_id:
             object.__setattr__(self, "commit_group_id", f"commit_group_{self.idempotency_key}")
         if not self.planning_task_id:
@@ -104,6 +112,7 @@ class MemoryTransactionPlan:
                     user_id=user_id,
                     operation_id=operation_id,
                     source_episode_id=episode_id,
+                    created_at=self.created_at,
                     evidence=[ref.to_dict() for ref in self.evidence_refs],
                     payload={
                         "canonical_memory": True,
@@ -117,10 +126,12 @@ class MemoryTransactionPlan:
                         "expected_revisions": dict(self.expected_revisions),
                         "slot_id": str(metadata.get("slot_id") or self.slot_id),
                         "claim_id": str(metadata.get("claim_id") or ""),
+                        "memory_type": str(metadata.get("memory_type") or ""),
                         "policy_version": self.policy_version,
                         "schema_version": self.schema_version,
                         "proposal_ids": list(self.proposal_ids),
                         "proposal_fingerprints": list(self.proposal_fingerprints),
+                        "proposal_proofs": [canonicalize(item) for item in self.proposal_proofs],
                         "tenant_id": tenant_id,
                         "context_object": obj.to_dict(),
                         "content": planned.content,
@@ -157,6 +168,7 @@ class MemoryTransactionPlanner:
         planned: list[PlannedMemoryOperation] = []
         identity_version = transition.slot.identity_algorithm_version
         canonical_subject = transition.slot.canonical_subject_key
+        transaction_time = self._transaction_time(proposal, transition)
         if not changed:
             idempotency_key = stable_hash(
                 [
@@ -184,10 +196,12 @@ class MemoryTransactionPlanner:
                 schema_version=self.SCHEMA_VERSION,
                 proposal_ids=(proposal.proposal_id,),
                 proposal_fingerprints=(proposal.fingerprint,),
+                proposal_proofs=(proposal.to_dict(),),
                 identity_algorithm_version=identity_version,
                 canonical_subject_key=canonical_subject,
                 commit_group_id=commit_group_id,
                 planning_task_id=planning_task_id or proposal.proposal_id,
+                created_at=transaction_time,
             )
         for claim in transition.claims:
             if claim.claim_id not in changed:
@@ -210,6 +224,7 @@ class MemoryTransactionPlanner:
                     relation_type=transition.relation.value.lower(),
                     target_uri=target_uri,
                     metadata={"tenant_id": tenant_id, "owner_user_id": owner_user_id},
+                    created_at=transaction_time,
                 )
                 for target_uri in sorted(related_uris)
                 if target_uri != obj.uri
@@ -237,6 +252,7 @@ class MemoryTransactionPlanner:
             owner_user_id=owner_user_id,
             scope=scope_payload,
         )
+        slot_obj.updated_at = transaction_time
         planned.append(
             PlannedMemoryOperation(
                 context_object=slot_obj,
@@ -284,8 +300,33 @@ class MemoryTransactionPlanner:
             schema_version=self.SCHEMA_VERSION,
             proposal_ids=(proposal.proposal_id,),
             proposal_fingerprints=(proposal.fingerprint,),
+            proposal_proofs=(proposal.to_dict(),),
             identity_algorithm_version=identity_version,
             canonical_subject_key=canonical_subject,
             commit_group_id=commit_group_id,
             planning_task_id=planning_task_id or proposal.proposal_id,
+            created_at=transaction_time,
         )
+
+    @staticmethod
+    def _transaction_time(
+        proposal: MemorySemanticProposal,
+        transition: MemoryStateTransition,
+    ) -> str:
+        changed = set(transition.changed_claim_ids)
+        times = sorted(
+            claim.latest_revision.transaction_time
+            for claim in transition.claims
+            if claim.claim_id in changed and claim.latest_revision.transaction_time
+        )
+        if times:
+            return times[-1]
+        explicit = proposal.metadata.get("planning_timestamp")
+        if explicit:
+            return str(explicit)
+        evidence_times = sorted(
+            str(ref.ingested_at or ref.occurred_at)
+            for ref in proposal.evidence_refs
+            if ref.ingested_at or ref.occurred_at
+        )
+        return evidence_times[-1] if evidence_times else ""

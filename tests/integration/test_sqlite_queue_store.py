@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import multiprocessing as mp
 import queue
 import sqlite3
@@ -14,6 +15,7 @@ from memoryos.contextdb.store.source_store import (
     LeaseLostError,
     QueueIdempotencyConflictError,
     QueueJob,
+    QueueLeaseIdentityError,
 )
 from memoryos.contextdb.store.sqlite_queue_store import SQLiteQueueStore
 
@@ -192,8 +194,7 @@ def test_concurrent_retry_only_changes_current_generation_and_keeps_count(tmp_pa
     barrier = ctx.Barrier(2)
     results = ctx.Queue()
     processes = [
-        ctx.Process(target=_retry_at_barrier, args=(str(path), item, barrier, results))
-        for item in (stale, current)
+        ctx.Process(target=_retry_at_barrier, args=(str(path), item, barrier, results)) for item in (stale, current)
     ]
     for process in processes:
         process.start()
@@ -274,6 +275,106 @@ def test_duplicate_enqueue_never_revives_done_or_dead_letter(tmp_path: Path, sto
     store.retry(leased_dead, "permanent", max_retries=1, retryable=False)
     assert store.enqueue(dead_job).status == "dead_letter"
     assert store.lease("race", lease_owner="other", limit=10) == []
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_release_returns_unattempted_lease_without_retry_cost(
+    tmp_path: Path,
+    store_kind: str,
+) -> None:
+    store = InMemoryQueueStore() if store_kind == "memory" else SQLiteQueueStore(tmp_path / "queue.sqlite3")
+    store.enqueue(_job("released"))
+    first = store.lease("race", lease_owner="worker-a", limit=1)[0]
+
+    released = store.release(first, "batch aborted before attempt")
+
+    assert released.status == "pending"
+    assert released.retry_count == 0
+    assert released.lease_token == released.lease_owner == ""
+    second = store.lease("race", lease_owner="worker-b", limit=1)[0]
+    assert second.lease_generation == first.lease_generation + 1
+    with pytest.raises(LeaseLostError):
+        store.release(first, "stale worker")
+    store.ack(second)
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_expired_lease_recovery_and_stats_are_queue_scoped(
+    tmp_path: Path,
+    store_kind: str,
+) -> None:
+    store = InMemoryQueueStore() if store_kind == "memory" else SQLiteQueueStore(tmp_path / "queue.sqlite3")
+    projection = store.enqueue(_job("projection-expired", queue_name="memory_projection"))
+    unrelated = store.enqueue(_job("session-expired", queue_name="session_commit"))
+    projection_lease = store.lease(
+        projection.queue_name,
+        lease_owner="projection-worker",
+        job_ids=(projection.job_id,),
+    )[0]
+    unrelated_lease = store.lease(
+        unrelated.queue_name,
+        lease_owner="session-worker",
+        job_ids=(unrelated.job_id,),
+    )[0]
+    if isinstance(store, InMemoryQueueStore):
+        for lease in (projection_lease, unrelated_lease):
+            store.jobs[lease.job_id] = QueueJob(
+                **{
+                    **lease.__dict__,
+                    "leased_until": "1970-01-01T00:00:00+00:00",
+                }
+            )
+    else:
+        _expire(store.path, projection_lease.job_id)
+        _expire(store.path, unrelated_lease.job_id)
+
+    assert store.recover_expired_leases(queue_name="memory_projection") == 1
+
+    recovered = store.get(projection.job_id)
+    untouched = store.get(unrelated.job_id)
+    assert recovered is not None and recovered.status == "pending"
+    assert recovered.retry_count == 0
+    assert recovered.lease_token == recovered.lease_owner == ""
+    assert untouched is not None and untouched.status == "leased"
+    assert store.stats(queue_name="memory_projection") == {"pending": 1}
+    assert store.stats(queue_name="session_commit") == {"leased": 1}
+    assert store.stats() == {"pending": 1, "leased": 1}
+    with pytest.raises(LeaseLostError):
+        store.ack(projection_lease)
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_leased_identity_tamper_is_fenced_and_quarantined(
+    tmp_path: Path,
+    store_kind: str,
+) -> None:
+    store = InMemoryQueueStore() if store_kind == "memory" else SQLiteQueueStore(tmp_path / "queue.sqlite3")
+    store.enqueue(_job("identity-tamper", payload={"version": 1}))
+    leased = store.lease("race", lease_owner="worker-a", limit=1)[0]
+    forged_payload = {"version": 2}
+    if isinstance(store, InMemoryQueueStore):
+        store.jobs[leased.job_id] = QueueJob(
+            **{
+                **leased.__dict__,
+                "payload": forged_payload,
+            }
+        )
+    else:
+        with sqlite3.connect(store.path) as connection:
+            connection.execute(
+                "UPDATE queue_jobs SET payload_json = ? WHERE job_id = ?",
+                (json.dumps(forged_payload, sort_keys=True), leased.job_id),
+            )
+
+    with pytest.raises(QueueLeaseIdentityError):
+        store.ack(leased)
+    quarantined = store.quarantine_identity_conflict(
+        leased,
+        "immutable identity changed",
+    )
+    assert quarantined.status == "quarantine"
+    assert quarantined.retry_count == 1
+    assert quarantined.lease_token == quarantined.lease_owner == ""
 
 
 @pytest.mark.parametrize("store_kind", ["memory", "sqlite"])

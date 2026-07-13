@@ -77,8 +77,13 @@ def test_similar_behavior_retriever_excludes_pending_memory_relations(tmp_path) 
             },
         )
         pending.lifecycle_state = lifecycle_state
-        db.seed_object(pending, content="hot room unconfirmed memory")
-        db.add_relation(
+        # Deliberately construct an uncommitted raw pending artifact through
+        # the low-level stores.  The public ContextDB boundary correctly
+        # rejects this bypass; the retriever must still fail closed if such a
+        # crash/migration artifact is present underneath it.
+        db.source_store.write_object(pending, content="hot room unconfirmed memory")
+        db.index_store.upsert_index(pending, content="hot room unconfirmed memory")
+        db.relation_store.add_relation(
             ContextRelation(
                 source_uri=pattern.uri,
                 relation_type="anchored_by",

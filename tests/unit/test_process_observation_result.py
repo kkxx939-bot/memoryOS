@@ -108,6 +108,7 @@ def _client(
     client.engine = FakeEngine(prediction_result or _prediction_result())
     client.executor = FakeExecutor(action_result or _action_result())
     client.context_db = FakeContextDB(commit_result)
+    client.tenant_id = "default"
     return client
 
 
@@ -158,6 +159,16 @@ def test_process_observation_archive_commit_result_and_async_flag_are_visible() 
     assert async_commit is False
     assert result.session_commit_result is commit_result
     assert result.archive_uri == archive.archive_uri == "memoryos://archive/s1"
+
+
+def test_process_observation_binds_archive_to_client_tenant() -> None:
+    client = _client(commit_result={"status": "queued"})
+    client.tenant_id = "tenant-a"
+
+    client.process_observation(_request(), archive_session=True, async_commit=False)
+
+    archive, _async_commit = client.context_db.calls[0]
+    assert archive.metadata["tenant_id"] == "tenant-a"
 
 
 def test_process_observation_commit_status_is_visible_for_async_modes() -> None:

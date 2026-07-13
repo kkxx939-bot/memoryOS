@@ -47,7 +47,13 @@ def quarantine_control_file(
     identifiers: dict[str, object] | None = None,
 ) -> QuarantineRecord:
     root = artifact_root.expanduser().resolve()
-    source = path.expanduser().resolve()
+    requested = path.expanduser()
+    if not requested.is_absolute():
+        requested = requested.absolute()
+    # Resolve only the parent.  Resolving the final component would follow a
+    # forged control-file symlink and quarantine its target instead of the
+    # offending directory entry.
+    source = requested.parent.resolve() / requested.name
     try:
         relative = source.relative_to(root)
     except ValueError as exc:
@@ -72,7 +78,7 @@ def quarantine_control_file(
         pass
     destination = quarantine_root / f"{identity}-{uuid.uuid4().hex}.original"
     metadata_path = destination.with_suffix(".json")
-    if not source.exists():
+    if not source.exists() and not source.is_symlink():
         raise FileNotFoundError(path.name)
     os.replace(source, destination)
     try:
@@ -90,7 +96,7 @@ def quarantine_control_file(
     )
     payload = record.to_dict()
     payload["record_digest"] = canonical_digest(payload)
-    atomic_write_json(metadata_path, payload)
+    atomic_write_json(metadata_path, payload, artifact_root=root)
     return record
 
 

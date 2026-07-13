@@ -5,7 +5,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import cast
+from typing import TypedDict, cast
 
 import pytest
 
@@ -25,6 +25,7 @@ from memoryos.contextdb.store.local_stores import (
 )
 from memoryos.contextdb.store.source_store import QueueJob
 from memoryos.contextdb.transaction.recovery import RecoveryService
+from memoryos.core.ids import stable_hash
 from memoryos.memory.canonical import (
     Atomicity,
     Attribution,
@@ -56,12 +57,19 @@ from memoryos.memory.canonical import (
     bind_field_evidence,
 )
 from memoryos.memory.canonical.reconcile import MemorySemanticReconciler
+from memoryos.memory.canonical.review_command import PendingReviewCommandStore
 from memoryos.operations.commit.effect_marker import atomic_write_json
 from memoryos.operations.commit.operation_committer import OperationCommitter
 from memoryos.operations.commit.outbox_envelope import OutboxIntegrityError
 from memoryos.operations.commit.redo_log import RedoIntegrityError
 from memoryos.operations.model.context_operation import ContextOperation
 from memoryos.operations.model.operation_action import OperationAction
+
+
+class _ReviewCommandBinding(TypedDict):
+    review_command_id: str
+    review_decision: str
+    review_request_digest: str
 
 
 def _explicit_bindings(
@@ -314,6 +322,50 @@ def _supplement_proposal(
     )
 
 
+def _entity_aliases_proposal(
+    episode,
+    proposal_id: str,
+    aliases: list[str],
+    *,
+    target_claim=None,
+):  # noqa: ANN001, ANN202
+    base = _proposal(episode, proposal_id, "SQLite", "confirmation", "confirmed")
+    identity_fields = {
+        "entity_type": "database",
+        "canonical_entity_id": "sqlite",
+    }
+    value_fields = {
+        "canonical_value": "SQLite",
+        "name": "SQLite",
+        "aliases": aliases,
+    }
+    return replace(
+        base,
+        memory_type="entity",
+        identity_fields=identity_fields,
+        value_fields=value_fields,
+        semantic=replace(
+            base.semantic,
+            relation_to_existing=(
+                SemanticRelation.SUPPLEMENTS
+                if target_claim is not None
+                else SemanticRelation.UNRELATED
+            ),
+        ),
+        related_claim_ids=(target_claim.claim_id,) if target_claim is not None else (),
+        metadata={
+            **dict(base.metadata),
+            "system_identity_fields": sorted(identity_fields),
+            "system_value_fields": ["aliases"],
+        },
+        field_evidence_refs=_explicit_bindings(
+            identity_fields,
+            value_fields,
+            base.evidence_refs,
+        ),
+    )
+
+
 def _plan(  # noqa: ANN001, ANN202
     source,
     episode,
@@ -321,6 +373,7 @@ def _plan(  # noqa: ANN001, ANN202
     proposal,
     *,
     destructive_effect_authorized: bool = False,
+    commit_group_id: str = "",
 ):
     identity = StableMemoryIdentityResolver().resolve(proposal, scope, tenant_id="t1", owner_user_id="u1")
     slot, claims = CanonicalMemoryRepository(source).load(identity)
@@ -359,8 +412,183 @@ def _plan(  # noqa: ANN001, ANN202
         tenant_id="t1",
         owner_user_id="u1",
         episode_id=episode.episode_id,
+        commit_group_id=commit_group_id,
     )
     return identity, transition, plan
+
+
+def _reviewed_resolution_plan(  # noqa: ANN001, ANN202
+    source,
+    committer,
+    episode,
+    proposal,
+    *,
+    command_suffix: str = "review",
+):
+    """Build a real receipt-backed CONFIRM_AND_APPLY plan for commit tests."""
+
+    formation = CanonicalMemoryFormationService(
+        source,
+        relation_store=committer.relation_store,
+    )
+    archive = SessionArchiveStore(committer.root, tenant_id="t1").read_archive(
+        episode.source_uris[0],
+        tenant_id="t1",
+    )
+    pending_result = formation.plan_pending(
+        proposal,
+        archive=archive,
+        episode=episode,
+        reason="destructive_effect_requires_structured_review",
+        commit_group_id=f"pending-create:{command_suffix}",
+    )
+    if pending_result.operations:
+        committer.commit("u1", list(pending_result.operations))
+    pending_uri = str(pending_result.pending_uri or pending_result.operations[0].target_uri)
+    pending = CanonicalMemoryRepository(
+        source,
+        committer.relation_store,
+    ).load_pending(
+        pending_uri,
+        tenant_id="t1",
+        owner_user_id="u1",
+    )
+    command_id = f"command-{stable_hash([pending_uri, command_suffix], length=32)}"
+    command = PendingReviewCommandStore(committer.root, tenant_id="t1").begin(
+        command_id,
+        owner_user_id="u1",
+        pending_uri=pending_uri,
+        decision="CONFIRM_AND_APPLY",
+        expected_lifecycle_revision=pending.lifecycle_revision,
+        expected_proposal_fingerprint=pending.proposal.fingerprint,
+        reason="test structured review",
+    )
+    confirmation = formation.plan_pending_lifecycle_transition(
+        pending_uri,
+        LifecycleState.CONFIRMED,
+        tenant_id="t1",
+        owner_user_id="u1",
+        commit_group_id=f"pending-confirm:{command_suffix}",
+        reason=f"structured_review:{command_id}",
+        review_command_id=command_id,
+        review_decision="CONFIRM_AND_APPLY",
+        review_request_digest=str(command["request_digest"]),
+    )
+    committer.commit("u1", [confirmation])
+    confirmed = CanonicalMemoryRepository(
+        source,
+        committer.relation_store,
+    ).load_pending(
+        pending_uri,
+        tenant_id="t1",
+        owner_user_id="u1",
+    )
+    return formation.plan_confirmed_pending_resolution(
+        pending_uri,
+        confirmed.proposal,
+        archive=archive,
+        episode=episode,
+        tenant_id="t1",
+        owner_user_id="u1",
+        commit_group_id=f"pending-resolution:{command_suffix}",
+        reason=f"structured_review:{command_id}",
+        review_command_id=command_id,
+        review_decision="CONFIRM_AND_APPLY",
+        review_request_digest=str(command["request_digest"]),
+    )
+
+
+def _review_command_binding(  # noqa: ANN001, ANN202
+    committer,
+    pending,
+    *,
+    decision: str,
+    suffix: str,
+    reason: str = "test review",
+) -> _ReviewCommandBinding:
+    command_id = f"command-{stable_hash([pending.uri, decision, suffix], length=32)}"
+    command = PendingReviewCommandStore(committer.root, tenant_id="t1").begin(
+        command_id,
+        owner_user_id="u1",
+        pending_uri=pending.uri,
+        decision=decision,
+        expected_lifecycle_revision=pending.lifecycle_revision,
+        expected_proposal_fingerprint=pending.proposal.fingerprint,
+        reason=reason,
+    )
+    return {
+        "review_command_id": command_id,
+        "review_decision": decision,
+        "review_request_digest": str(command["request_digest"]),
+    }
+
+
+def test_append_unique_commit_preserves_old_evidence_and_accepts_new_evidence(tmp_path) -> None:  # noqa: ANN001
+    source, _index, _queue, _relations, committer, episode, scope = _setup(tmp_path)
+    initial = _entity_aliases_proposal(
+        episode,
+        "entity-aliases-initial",
+        ["sqlite"],
+    )
+    identity, _transition, first_plan = _plan(source, episode, scope, initial)
+    committer.commit(
+        "u1",
+        first_plan.to_context_operations(
+            user_id="u1",
+            tenant_id="t1",
+            episode_id=episode.episode_id,
+        ),
+    )
+    current = next(
+        claim
+        for claim in CanonicalMemoryRepository(source).load(identity)[1]
+        if claim.current.state == "ACTIVE"
+    )
+    prior_refs = current.current.field_evidence_refs["value.aliases"]
+
+    supplement_episode = _persisted_episode(
+        tmp_path,
+        SessionArchive(
+            user_id="u1",
+            session_id="append-unique-supplement",
+            archive_uri="memoryos://user/u1/sessions/history/append-unique-supplement",
+            messages=[
+                {
+                    "id": "m-append",
+                    "role": "user",
+                    "content": "Confirm SQLite is also known as SQLite3.",
+                }
+            ],
+            metadata={"tenant_id": "t1", "project_id": "memoryos"},
+        ),
+    )
+    supplement = _entity_aliases_proposal(
+        supplement_episode,
+        "entity-aliases-supplement",
+        ["sqlite3"],
+        target_claim=current,
+    )
+    supplement_plan = _reviewed_resolution_plan(
+        source,
+        committer,
+        supplement_episode,
+        supplement,
+        command_suffix="append-unique",
+    )
+    committer.commit(
+        "u1",
+        list(supplement_plan.operations),
+    )
+
+    updated = next(
+        claim
+        for claim in CanonicalMemoryRepository(source).load(identity)[1]
+        if claim.current.state == "ACTIVE"
+    )
+    refs = updated.current.field_evidence_refs["value.aliases"]
+    assert updated.current.value_fields["aliases"] == ["sqlite", "sqlite3"]
+    assert refs[: len(prior_refs)] == prior_refs
+    assert any(ref not in prior_refs for ref in refs)
 
 
 def test_expected_revision_idempotency_atomic_claim_switch_and_outbox(tmp_path) -> None:  # noqa: ANN001
@@ -406,24 +634,30 @@ def test_expected_revision_idempotency_atomic_claim_switch_and_outbox(tmp_path) 
         ),
     )
     confirmed = _replacement_proposal(replacement_episode, "p-confirm", "PostgreSQL", sqlite_claim)
-    _, transition, third_plan = _plan(
+    third_plan = _reviewed_resolution_plan(
         source,
+        committer,
         replacement_episode,
-        scope,
         confirmed,
-        destructive_effect_authorized=True,
+        command_suffix="atomic-claim-switch",
     )
-    assert len(third_plan.operations) == 3, "slot and both claim changes must share one transaction"
+    canonical_operations = [
+        operation
+        for operation in third_plan.operations
+        if operation.payload.get("canonical_pending_resolution") is not True
+    ]
+    assert len(canonical_operations) == 3, "slot and both claim changes must share one transaction"
+    desired_slot_revision = next(
+        int(operation.payload["context_object"]["metadata"]["revision"])
+        for operation in canonical_operations
+        if operation.payload["context_object"]["metadata"].get("canonical_kind") == "slot"
+    )
     committer.commit(
         "u1",
-        third_plan.to_context_operations(
-            user_id="u1",
-            tenant_id="t1",
-            episode_id=replacement_episode.episode_id,
-        ),
+        list(third_plan.operations),
     )
     slot, claims = CanonicalMemoryRepository(source).load(identity)
-    assert slot and slot.revision == transition.slot.revision
+    assert slot and slot.revision == desired_slot_revision
     assert {claim.canonical_value: claim.current.state for claim in claims} == {
         "sqlite": "SUPERSEDED",
         "postgresql": "ACTIVE",
@@ -492,7 +726,7 @@ def test_effect_marker_accepts_fresh_timestamps_and_rejects_legacy_schema(tmp_pa
     committer.commit("u1", first)
     marker_path = committer._transaction_marker(str(first[0].payload["idempotency_key"]))
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
-    assert marker["schema_version"] == "effect_marker_v1"
+    assert marker["schema_version"] == "memory_transaction_receipt_v2"
     before_audit = (_artifact_root(tmp_path) / "system" / "audit" / "u1.jsonl").read_text(encoding="utf-8")
 
     fresh = plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=episode.episode_id)
@@ -516,10 +750,14 @@ def test_effect_marker_accepts_fresh_timestamps_and_rejects_legacy_schema(tmp_pa
 
     original_marker = deepcopy(marker)
     marker["schema_version"] = "canonical_transaction_marker_v2"
-    atomic_write_json(marker_path, marker)
+    atomic_write_json(marker_path, marker, artifact_root=committer.artifact_root)
     with pytest.raises(ValueError, match="cannot prove its durable effect"):
         committer.commit("u1", fresh)
-    atomic_write_json(marker_path, original_marker)
+    atomic_write_json(
+        marker_path,
+        original_marker,
+        artifact_root=committer.artifact_root,
+    )
 
     forged = deepcopy(fresh)
     forged_claim = next(
@@ -646,6 +884,21 @@ def test_noncanonical_operations_cannot_mutate_canonical_slot_or_claim(tmp_path)
     with pytest.raises(ValueError, match="require a canonical transaction"):
         committer.commit("u1", [direct_update])
 
+    relation_manifest = committer._build_regular_relation_manifest(direct_update)
+    committer.redo.begin(direct_update, relation_manifest=relation_manifest)
+    with pytest.raises(RedoIntegrityError, match="canonical.*recovery"):
+        committer.resume(
+            "u1",
+            direct_update,
+            "begin",
+            relation_manifest=relation_manifest,
+        )
+    recovery = RecoveryService(committer.redo, committer).recover("u1")
+    assert recovery.failed_count == 1
+    assert recovery.quarantine_count == 1
+    assert committer.redo.pending_entries() == []
+    assert source.read_object(claim.uri).title == stored_claim.title
+
     stored_slot = source.read_object(identity.slot_uri)
     direct_delete = ContextOperation(
         user_id="u1",
@@ -666,6 +919,66 @@ def test_noncanonical_operations_cannot_mutate_canonical_slot_or_claim(tmp_path)
     unchanged_slot, unchanged_claims = CanonicalMemoryRepository(source).load(identity)
     assert unchanged_slot == slot
     assert unchanged_claims == claims
+
+
+def test_existing_canonical_metadata_at_noncanonical_uri_cannot_bypass_committer(
+    tmp_path,
+) -> None:  # noqa: ANN001
+    source, _index, _queue, _relations, committer, _episode, _scope = _setup(tmp_path)
+    uri = "memoryos://user/u1/memories/legacy-canonical-object"
+    raw = ContextObject(
+        uri=uri,
+        context_type=ContextType.MEMORY,
+        title="legacy canonical object",
+        owner_user_id="u1",
+        tenant_id="t1",
+        lifecycle_state=LifecycleState.ACTIVE,
+        schema_version="canonical_memory_v2",
+        metadata={"canonical_kind": "claim", "revision": 1, "state": "ACTIVE"},
+    )
+    source.write_object(raw, content="unproved canonical content")
+    operation = ContextOperation(
+        user_id="u1",
+        context_type=ContextType.MEMORY,
+        action=OperationAction.DELETE,
+        target_uri=uri,
+        operation_id="op_noncanonical_uri_canonical_delete",
+        payload={"tenant_id": "t1", "reason": "attempted regular deletion"},
+    )
+
+    with pytest.raises(ValueError, match="require a canonical transaction"):
+        committer.commit("u1", [operation])
+
+    assert source.read_object(uri).lifecycle_state == LifecycleState.ACTIVE
+
+    schema_only_uri = "memoryos://user/u1/memories/schema-only-canonical-add"
+    schema_only = ContextObject(
+        uri=schema_only_uri,
+        context_type=ContextType.MEMORY,
+        title="schema only canonical object",
+        owner_user_id="u1",
+        tenant_id="t1",
+        schema_version="canonical_memory_v2",
+        metadata={"revision": 1},
+    )
+    schema_only_add = ContextOperation(
+        user_id="u1",
+        context_type=ContextType.MEMORY,
+        action=OperationAction.ADD,
+        target_uri=schema_only_uri,
+        operation_id="op_noncanonical_uri_schema_only_add",
+        payload={
+            "tenant_id": "t1",
+            "context_object": schema_only.to_dict(),
+            "content": "unproved schema-only canonical content",
+        },
+    )
+
+    with pytest.raises(ValueError, match="require a canonical transaction"):
+        committer.commit("u1", [schema_only_add])
+
+    with pytest.raises(FileNotFoundError):
+        source.read_object(schema_only_uri)
 
 
 def test_all_canonical_groups_preflight_before_a_later_invalid_group_can_write(tmp_path) -> None:  # noqa: ANN001
@@ -854,6 +1167,103 @@ def test_canonical_preflight_rejects_owner_mismatch_and_outbox_prepare_failure_w
     assert not [obj for obj in source.list_objects() if obj.metadata.get("canonical_kind")]
 
 
+def test_canonical_commit_rejects_broken_outbox_control_symlink(tmp_path) -> None:  # noqa: ANN001
+    source, _index, _queue, _relations, committer, episode, scope = _setup(tmp_path)
+    proposal = _proposal(episode, "broken-outbox-link", "SQLite", "confirmation", "confirmed")
+    _identity, _transition, plan = _plan(source, episode, scope, proposal)
+    operations = plan.to_context_operations(
+        user_id="u1",
+        tenant_id="t1",
+        episode_id=episode.episode_id,
+    )
+    transaction_id = str(operations[0].payload["transaction_id"])
+    outbox_path = committer._outbox_path(transaction_id)
+    outbox_path.parent.mkdir(parents=True, exist_ok=True)
+    missing_target = tmp_path / "missing-outbox-control.json"
+    outbox_path.symlink_to(missing_target)
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        committer.commit("u1", operations)
+
+    assert outbox_path.is_symlink()
+    assert not missing_target.exists()
+
+
+def test_pending_commit_rejects_broken_receipt_control_symlink(tmp_path) -> None:  # noqa: ANN001
+    source, _index, _queue, _relations, committer, episode, _scope = _setup(tmp_path)
+    archive = SessionArchiveStore(tmp_path, tenant_id="t1").read_archive(
+        "memoryos://user/u1/sessions/history/s1",
+        tenant_id="t1",
+    )
+    proposal = _proposal(episode, "broken-pending-receipt", "SQLite", "confirmation", "confirmed")
+    pending = CanonicalMemoryFormationService(source).plan_pending(
+        proposal,
+        archive=archive,
+        episode=episode,
+        reason="manual_review",
+        retrieval_views=["project:memoryos:decisions"],
+        commit_group_id="broken-pending-receipt-group",
+    )
+    operation = pending.operations[0]
+    receipt_path = committer._operation_marker(operation.operation_id)
+    receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    missing_target = tmp_path / "missing-pending-receipt.json"
+    receipt_path.symlink_to(missing_target)
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        committer.commit("u1", [operation])
+
+    assert receipt_path.is_symlink()
+    assert not missing_target.exists()
+
+
+def test_final_state_rejects_forged_materialized_content_and_display_mirror(tmp_path) -> None:  # noqa: ANN001
+    source, _index, _queue, _relations, committer, episode, scope = _setup(tmp_path)
+    proposal = _proposal(episode, "p-materialized", "SQLite", "confirmation", "confirmed")
+    _identity, _, plan = _plan(source, episode, scope, proposal)
+    operations = plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=episode.episode_id)
+    claim_index = next(
+        index
+        for index, operation in enumerate(operations)
+        if operation.payload["context_object"]["metadata"]["canonical_kind"] == "claim"
+    )
+    slot_index = next(index for index in range(len(operations)) if index != claim_index)
+
+    forged_claim_content = deepcopy(operations)
+    forged_claim_content[claim_index].payload["content"] = '{"canonical_value":"forged"}'
+    with pytest.raises(ValueError, match="Claim content is not its materialized final state"):
+        committer.commit("u1", forged_claim_content)
+
+    forged_slot_content = deepcopy(operations)
+    forged_slot_content[slot_index].payload["content"] = '{"claim_ids":[]}'
+    with pytest.raises(ValueError, match="Slot content is not its materialized final state"):
+        committer.commit("u1", forged_slot_content)
+
+    forged_display = deepcopy(operations)
+    forged_display[claim_index].payload["context_object"]["metadata"]["display_fields"] = {
+        "summary": "forged display"
+    }
+    with pytest.raises(ValueError, match="Claim object mirror is inconsistent"):
+        committer.commit("u1", forged_display)
+
+    assert not [obj for obj in source.list_objects() if obj.metadata.get("canonical_kind")]
+    assert not list((_artifact_root(tmp_path) / "system" / "direct-planning-proofs").glob("*.json"))
+
+
+def test_direct_canonical_plan_rejects_a_caller_declared_planning_digest(tmp_path) -> None:  # noqa: ANN001
+    source, _index, _queue, _relations, committer, episode, scope = _setup(tmp_path)
+    proposal = _proposal(episode, "p-forged-plan", "SQLite", "confirmation", "confirmed")
+    _identity, _, plan = _plan(source, episode, scope, proposal)
+    operations = plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=episode.episode_id)
+    for operation in operations:
+        operation.payload["planning_digest"] = "f" * 64
+
+    with pytest.raises(ValueError, match="no valid immutable planning proof"):
+        committer.commit("u1", operations)
+
+    assert not list((_artifact_root(tmp_path) / "system" / "direct-planning-proofs").glob("*.json"))
+    assert not [obj for obj in source.list_objects() if obj.metadata.get("canonical_kind")]
+
 def test_canonical_envelope_validates_commit_user_target_uri_and_immutable_update_scope(tmp_path) -> None:  # noqa: ANN001
     source, _index, _queue, _relations, committer, episode, scope = _setup(tmp_path)
     proposal = _proposal(episode, "p-envelope", "SQLite", "confirmation", "confirmed")
@@ -946,10 +1356,14 @@ def test_canonical_artifact_keys_reject_escape_before_redo_or_source_effects(tmp
 def test_cross_tenant_canonical_marker_is_not_available_for_commit_backfill(tmp_path) -> None:  # noqa: ANN001
     source, index, _queue, relations, committer, episode, scope = _setup(tmp_path)
     proposal = _proposal(episode, "p-marker-tenant", "SQLite", "confirmation", "confirmed")
-    _identity, _, plan = _plan(source, episode, scope, proposal)
+    _identity, _, plan = _plan(
+        source,
+        episode,
+        scope,
+        proposal,
+        commit_group_id="tenant-marker-group",
+    )
     operations = plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=episode.episode_id)
-    for operation in operations:
-        operation.payload["commit_group_id"] = "tenant-marker-group"
     committer.commit("u1", operations)
 
     tenant_two = OperationCommitter(
@@ -1121,6 +1535,7 @@ def test_canonical_recovery_rejects_same_revision_with_divergent_source_effect(t
     first = operations[0]
     committer._apply_canonical_source(first)
     first_manifest = relation_manifests[first.operation_id]
+    committer._apply_canonical_relation_manifest(first, first_manifest)
     committer.redo.advance(
         first,
         phase="source_written",
@@ -1174,6 +1589,7 @@ def test_session_commit_revision_conflict_rereads_and_reconciles_same_proposal(t
         episode_id=postgres_episode.episode_id,
         session_id=postgres_archive.session_id,
         tenant_id="t1",
+        user_id="u1",
         proposal_inputs=(ProposalPlanningInput(postgres),),
         prefetch_snapshot=(),
         planned_against_revisions=tuple(sorted(stale_plan.expected_revisions.items())),
@@ -1181,6 +1597,7 @@ def test_session_commit_revision_conflict_rereads_and_reconciles_same_proposal(t
         scope_candidates=tuple(scope_ref.key for scope_ref in postgres_episode.legal_scope_candidates()),
         evidence_references=postgres.evidence_refs,
         operation_group_identity=f"commit_group_{postgres_archive.task_id}",
+        extractor_version="test-planner",
     )
     service = SessionCommitService(
         SessionArchiveStore(tmp_path),
@@ -1252,18 +1669,14 @@ def test_uncommitted_partial_switch_is_invisible_until_transaction_recovery(tmp_
         ),
     )
     confirmed = _replacement_proposal(replacement_episode, "postgres-confirm", "PostgreSQL", sqlite_claim)
-    _, _, switch_plan = _plan(
+    switch_plan = _reviewed_resolution_plan(
         source,
+        committer,
         replacement_episode,
-        scope,
         confirmed,
-        destructive_effect_authorized=True,
+        command_suffix="switch-crash",
     )
-    switch_operations = switch_plan.to_context_operations(
-        user_id="u1",
-        tenant_id="t1",
-        episode_id=replacement_episode.episode_id,
-    )
+    switch_operations = list(switch_plan.operations)
     source.crash_at = source.write_count + 2
     with pytest.raises(SystemExit, match="simulated switch crash"):
         committer.commit("u1", switch_operations)
@@ -1324,6 +1737,7 @@ def test_partial_canonical_conflict_replan_merges_diff_then_commits_pending_once
         "memoryos://user/u1/sessions/history/s1",
         tenant_id="t1",
     )
+    group_id = f"commit_group_{archive.task_id}"
     primary = _proposal(episode, "primary-sqlite", "SQLite", "confirmation", "confirmed")
     secondary_identity = {"decision_topic": "secondary storage backend"}
     secondary = _proposal(episode, "secondary-duckdb", "DuckDB", "confirmation", "confirmed")
@@ -1336,8 +1750,12 @@ def test_partial_canonical_conflict_replan_merges_diff_then_commits_pending_once
             secondary.evidence_refs,
         ),
     )
-    _primary_identity, _, primary_plan = _plan(source, episode, scope, primary)
-    _secondary_identity, _, secondary_plan = _plan(source, episode, scope, secondary)
+    _primary_identity, _, primary_plan = _plan(
+        source, episode, scope, primary, commit_group_id=group_id
+    )
+    _secondary_identity, _, secondary_plan = _plan(
+        source, episode, scope, secondary, commit_group_id=group_id
+    )
     primary_ops = primary_plan.to_context_operations(
         user_id="u1", tenant_id="t1", episode_id=episode.episode_id
     )
@@ -1372,6 +1790,7 @@ def test_partial_canonical_conflict_replan_merges_diff_then_commits_pending_once
         episode_id=episode.episode_id,
         session_id=archive.session_id,
         tenant_id="t1",
+        user_id="u1",
         proposal_inputs=(),
         prefetch_snapshot=(),
         planned_against_revisions=(),
@@ -1379,6 +1798,7 @@ def test_partial_canonical_conflict_replan_merges_diff_then_commits_pending_once
         scope_candidates=tuple(item.key for item in episode.legal_scope_candidates()),
         evidence_references=primary.evidence_refs,
         operation_group_identity=f"commit_group_{archive.task_id}",
+        extractor_version="test-planner",
     )
 
     class StaticReplanner:
@@ -1435,6 +1855,7 @@ def test_non_revision_partial_commit_backfills_canonical_and_pending_effects_for
         "memoryos://user/u1/sessions/history/s1",
         tenant_id="t1",
     )
+    group_id = f"commit_group_{archive.task_id}"
     primary = _proposal(episode, "non-revision-primary", "SQLite", "confirmation", "confirmed")
     secondary_identity = {"decision_topic": "secondary storage backend"}
     secondary = _proposal(episode, "non-revision-secondary", "DuckDB", "confirmation", "confirmed")
@@ -1447,17 +1868,18 @@ def test_non_revision_partial_commit_backfills_canonical_and_pending_effects_for
             secondary.evidence_refs,
         ),
     )
-    _primary_identity, _, primary_plan = _plan(source, episode, scope, primary)
-    _secondary_identity, _, secondary_plan = _plan(source, episode, scope, secondary)
+    _primary_identity, _, primary_plan = _plan(
+        source, episode, scope, primary, commit_group_id=group_id
+    )
+    _secondary_identity, _, secondary_plan = _plan(
+        source, episode, scope, secondary, commit_group_id=group_id
+    )
     primary_ops = primary_plan.to_context_operations(
         user_id="u1", tenant_id="t1", episode_id=episode.episode_id
     )
     secondary_ops = secondary_plan.to_context_operations(
         user_id="u1", tenant_id="t1", episode_id=episode.episode_id
     )
-    group_id = f"commit_group_{archive.task_id}"
-    for operation in [*primary_ops, *secondary_ops]:
-        operation.payload["commit_group_id"] = group_id
     pending = CanonicalMemoryFormationService(source).plan_pending(
         primary,
         archive=archive,
@@ -1543,14 +1965,12 @@ def test_restart_backfills_marker_before_replanning_without_repeating_source_or_
     )
     group_id = f"commit_group_{archive.task_id}"
     proposal = _proposal(episode, "marker-restart", "SQLite", "confirmation", "confirmed")
-    _identity, _, plan = _plan(source, episode, scope, proposal)
+    _identity, _, plan = _plan(source, episode, scope, proposal, commit_group_id=group_id)
     operations = plan.to_context_operations(
         user_id="u1",
         tenant_id="t1",
         episode_id=episode.episode_id,
     )
-    for operation in operations:
-        operation.payload["commit_group_id"] = group_id
     initial_service = SessionCommitService(archive_store, queue, committer=committer)
     initial_service.commit_group_store.create(
         group_id,
@@ -1574,6 +1994,7 @@ def test_restart_backfills_marker_before_replanning_without_repeating_source_or_
         episode_id=episode.episode_id,
         session_id=archive.session_id,
         tenant_id="t1",
+        user_id="u1",
         proposal_inputs=(),
         prefetch_snapshot=(),
         planned_against_revisions=(),
@@ -1581,6 +2002,7 @@ def test_restart_backfills_marker_before_replanning_without_repeating_source_or_
         scope_candidates=tuple(item.key for item in episode.legal_scope_candidates()),
         evidence_references=proposal.evidence_refs,
         operation_group_identity=group_id,
+        extractor_version="test-planner",
     )
     holder: dict[str, SessionCommitService] = {}
 
@@ -1619,14 +2041,12 @@ def test_regular_pending_redo_is_recovered_and_backfilled_when_retry_omits_opera
     )
     group_id = f"commit_group_{archive.task_id}"
     proposal = _proposal(episode, "regular-redo-backfill", "SQLite", "confirmation", "confirmed")
-    _identity, _, plan = _plan(source, episode, scope, proposal)
+    _identity, _, plan = _plan(source, episode, scope, proposal, commit_group_id=group_id)
     canonical_operations = plan.to_context_operations(
         user_id="u1",
         tenant_id="t1",
         episode_id=episode.episode_id,
     )
-    for operation in canonical_operations:
-        operation.payload["commit_group_id"] = group_id
     pending = CanonicalMemoryFormationService(source).plan_pending(
         proposal,
         archive=archive,
@@ -1775,12 +2195,30 @@ def test_regular_lifecycle_conflict_preflights_all_groups_then_replan_commits_ev
     )
     committer.commit("u1", list(pending.operations))
     pending_uri = str(pending.operations[0].target_uri)
+    current_pending = CanonicalMemoryRepository(source).load_pending(
+        pending_uri,
+        tenant_id="t1",
+        owner_user_id="u1",
+    )
+    stale_binding = _review_command_binding(
+        committer,
+        current_pending,
+        decision="REJECT",
+        suffix="stale-reviewer",
+    )
+    winning_binding = _review_command_binding(
+        committer,
+        current_pending,
+        decision="CONFIRM",
+        suffix="winning-reviewer",
+    )
     stale_rejection = formation.plan_pending_lifecycle_transition(
         pending_uri,
         LifecycleState.REJECTED,
         tenant_id="t1",
         owner_user_id="u1",
         commit_group_id="stale-reviewer",
+        **stale_binding,
     )
     confirmed = formation.plan_pending_lifecycle_transition(
         pending_uri,
@@ -1788,6 +2226,7 @@ def test_regular_lifecycle_conflict_preflights_all_groups_then_replan_commits_ev
         tenant_id="t1",
         owner_user_id="u1",
         commit_group_id="winning-reviewer",
+        **winning_binding,
     )
     committer.commit("u1", [confirmed])
     secondary_proposal = _proposal(
@@ -1853,6 +2292,7 @@ def test_regular_lifecycle_conflict_preflights_all_groups_then_replan_commits_ev
         episode_id=episode.episode_id,
         session_id=archive.session_id,
         tenant_id="t1",
+        user_id="u1",
         proposal_inputs=(),
         prefetch_snapshot=(),
         planned_against_revisions=(),
@@ -1860,6 +2300,18 @@ def test_regular_lifecycle_conflict_preflights_all_groups_then_replan_commits_ev
         scope_candidates=tuple(item.key for item in episode.legal_scope_candidates()),
         evidence_references=proposal.evidence_refs,
         operation_group_identity=f"commit_group_{archive.task_id}",
+        extractor_version="test-planner",
+    )
+    current_for_replan = CanonicalMemoryRepository(source).load_pending(
+        pending_uri,
+        tenant_id="t1",
+        owner_user_id="u1",
+    )
+    fresh_binding = _review_command_binding(
+        committer,
+        current_for_replan,
+        decision="REJECT",
+        suffix="fresh-reviewer",
     )
 
     class LifecycleReplanner:
@@ -1871,9 +2323,10 @@ def test_regular_lifecycle_conflict_preflights_all_groups_then_replan_commits_ev
                 LifecycleState.REJECTED,
                 tenant_id="t1",
                 owner_user_id="u1",
-                commit_group_id="fresh-reviewer",
-                reason="review_reconciled_after_cas_conflict",
-            )
+                    commit_group_id="fresh-reviewer",
+                    reason="review_reconciled_after_cas_conflict",
+                    **fresh_binding,
+                )
             self.operations = (*canonical_operations, *secondary_pending.operations, reject_primary)
             return MemoryPlanningResult(self.operations, context)
 
@@ -1967,10 +2420,14 @@ def test_confirmed_pending_supplement_commits_revision_before_linked_resolution(
         commitment=Commitment.WEAK,
     )
     formation = CanonicalMemoryFormationService(source)
-    pending = formation.plan(
+    # This test exercises the legal reviewable supplement path.  The ordinary
+    # weak/non-final semantic admission result is NEEDS_SCHEMA_REPAIR and must
+    # not be upgraded by CONFIRM; correction-policy tests cover that branch.
+    pending = formation.plan_pending(
         weak,
         archive=weak_archive,
         episode=weak_episode,
+        reason="low_confidence_review",
         retrieval_views=["project:memoryos:decisions"],
         commit_group_id="supplement-weak-group",
     )
@@ -1978,6 +2435,17 @@ def test_confirmed_pending_supplement_commits_revision_before_linked_resolution(
     assert pending.operations[0].payload["canonical_pending_proposal"] is True
     committer.commit("u1", list(pending.operations))
     pending_uri = str(pending.operations[0].target_uri)
+    pending_record = CanonicalMemoryRepository(source).load_pending(
+        pending_uri,
+        tenant_id="t1",
+        owner_user_id="u1",
+    )
+    review_binding = _review_command_binding(
+        committer,
+        pending_record,
+        decision="CONFIRM_AND_APPLY",
+        suffix="supplement-human-review",
+    )
     confirm_review = formation.plan_pending_lifecycle_transition(
         pending_uri,
         LifecycleState.CONFIRMED,
@@ -1985,6 +2453,7 @@ def test_confirmed_pending_supplement_commits_revision_before_linked_resolution(
         owner_user_id="u1",
         commit_group_id="supplement-human-review",
         reason="human_confirmed_with_followup_evidence",
+        **review_binding,
     )
     committer.commit("u1", [confirm_review])
 
@@ -2027,6 +2496,7 @@ def test_confirmed_pending_supplement_commits_revision_before_linked_resolution(
             owner_user_id="u1",
             commit_group_id="supplement-rewrite-attempt",
             retrieval_views=["project:memoryos:decisions"],
+            **review_binding,
         )
     changed_relation = replace(
         confirmed,
@@ -2042,6 +2512,7 @@ def test_confirmed_pending_supplement_commits_revision_before_linked_resolution(
             owner_user_id="u1",
             commit_group_id="supplement-relation-attempt",
             retrieval_views=["project:memoryos:decisions"],
+            **review_binding,
         )
     changed_modal = replace(
         confirmed,
@@ -2057,6 +2528,7 @@ def test_confirmed_pending_supplement_commits_revision_before_linked_resolution(
             owner_user_id="u1",
             commit_group_id="supplement-modal-attempt",
             retrieval_views=["project:memoryos:decisions"],
+            **review_binding,
         )
     resolved_plan = formation.plan_confirmed_pending_resolution(
         pending_uri,
@@ -2067,6 +2539,7 @@ def test_confirmed_pending_supplement_commits_revision_before_linked_resolution(
         owner_user_id="u1",
         commit_group_id="supplement-resolution-group",
         retrieval_views=["project:memoryos:decisions"],
+        **review_binding,
     )
     resolution_operation = resolved_plan.operations[-1]
     assert resolution_operation.payload["pending_lifecycle_resolution"] is True
@@ -2111,6 +2584,7 @@ def test_confirmed_pending_supplement_commits_revision_before_linked_resolution(
         owner_user_id="u1",
         commit_group_id="supplement-resolution-retry",
         retrieval_views=["project:memoryos:decisions"],
+        **review_binding,
     )
     resolution_operation = retry_plan.operations[-1]
     committed = committer.commit("u1", list(retry_plan.operations))

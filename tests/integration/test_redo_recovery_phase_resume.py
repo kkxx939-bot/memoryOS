@@ -329,13 +329,34 @@ class RedoRecoveryPhaseResumeTest(unittest.TestCase):
                     },
                     operation_id="same-canonical-operation",
                 )
+                before_images = committer._capture_canonical_state([operation])
+                before_by_uri = {
+                    str(item["uri"]): item.get("object")
+                    for item in before_images
+                }
+                relation_manifests = {
+                    operation.operation_id: committer._build_canonical_relation_manifest(
+                        operation,
+                        before_by_uri.get(str(operation.target_uri or "")),
+                    )
+                }
                 committer._write_outbox_event(
                     "same-transaction",
                     "same-idempotency",
                     [operation],
-                    status="committed",
+                    status="prepared",
+                    before_images=before_images,
+                    relation_manifests=relation_manifests,
                 )
                 committer.source_store.write_object(obj)
+                committer._write_outbox_event(
+                    "same-transaction",
+                    "same-idempotency",
+                    [operation],
+                    status="source_committed",
+                    before_images=before_images,
+                    relation_manifests=relation_manifests,
+                )
                 committer._write_transaction_marker(
                     committer._transaction_marker("same-idempotency"),
                     ContextDiff(
@@ -343,6 +364,12 @@ class RedoRecoveryPhaseResumeTest(unittest.TestCase):
                         operations=[operation],
                         diff_id=f"diff-{tenant_id}",
                     ),
+                    [operation],
+                    relation_manifests=relation_manifests,
+                )
+                committer._finalize_canonical_outbox(
+                    "same-transaction",
+                    "same-idempotency",
                     [operation],
                 )
                 return operation

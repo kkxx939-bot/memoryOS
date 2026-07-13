@@ -16,21 +16,29 @@ from memoryos.contextdb.session.planners import (
     MemoryCommitPlanner,
 )
 from memoryos.contextdb.session.planners.memory_commit_planner import MemoryExtractionBackendError
-from memoryos.contextdb.session.planning import PlanningContext
+from memoryos.contextdb.session.planning import MemoryPlanningResult, PlanningContext
 from memoryos.contextdb.session.session_archive import SessionArchiveStore
 from memoryos.contextdb.session.session_model import SessionArchive, SessionCommitResult, SessionCommitState
 from memoryos.contextdb.store.source_store import QueueJob, QueueStore
 from memoryos.core.ids import stable_hash
 from memoryos.memory.canonical.transaction import RevisionConflictError
+from memoryos.memory.canonical.visibility import read_committed_pending
 from memoryos.operations.commit.operation_committer import OperationCommitter
 from memoryos.operations.model.context_diff import ContextDiff
 from memoryos.operations.model.context_operation import ContextOperation
 
 
 class DerivedConsumerError(RuntimeError):
-    def __init__(self, consumer: str, failures: list[str]) -> None:
+    def __init__(
+        self,
+        consumer: str,
+        failures: list[str],
+        *,
+        retryable: bool = True,
+    ) -> None:
         self.consumer = consumer
         self.failures = tuple(failures)
+        self.retryable = retryable
         super().__init__(f"{consumer} consumer failed: {','.join(failures)}")
 
 
@@ -54,6 +62,18 @@ class SessionCommitService:
         self.queue_store = queue_store
         self.committer = committer
         self.memory_planner = memory_planner or MemoryCommitPlanner()
+        bind_runtime_stores = getattr(self.memory_planner, "bind_runtime_stores", None)
+        if committer is not None and callable(bind_runtime_stores):
+            binding_committer = getattr(committer, "delegate", committer)
+            required = ("source_store", "index_store", "relation_store", "root", "tenant_id")
+            if all(hasattr(binding_committer, name) for name in required):
+                bind_runtime_stores(
+                    binding_committer.source_store,
+                    binding_committer.index_store,
+                    binding_committer.relation_store,
+                    root=binding_committer.root,
+                    tenant_id=binding_committer.tenant_id,
+                )
         self.behavior_planner = behavior_planner or BehaviorCommitPlanner()
         self.action_policy_planner = action_policy_planner or ActionPolicyCommitPlanner()
         self.context_planner = context_planner or ContextCommitPlanner()
@@ -61,9 +81,27 @@ class SessionCommitService:
         self.projection_worker = projection_worker
         self.commit_group_store = commit_group_store or CommitGroupStore(archive_store.root)
 
+    def _require_runtime_ready(self) -> None:
+        committer = getattr(self.committer, "delegate", self.committer)
+        source_store = getattr(committer, "source_store", None)
+        if source_store is None:
+            source_store = getattr(self.memory_planner, "source_store", None)
+        readiness = getattr(source_store, "readiness", None)
+        require_ready = getattr(readiness, "require_ready", None)
+        if not callable(require_ready):
+            return
+        state = str(getattr(getattr(readiness, "state", None), "value", ""))
+        recovery_group = getattr(committer, "_startup_recovery_group", None)
+        recovery_group_get = getattr(recovery_group, "get", None)
+        if state == "RECOVERING" and callable(recovery_group_get) and recovery_group_get():
+            return
+        require_ready()
+
     def sync_archive(self, archive: SessionArchive, *, enqueue_commit_job: bool = True) -> SessionCommitResult:
         """先把原始会话证据写稳，再投递异步提交任务。"""
 
+        self._require_runtime_ready()
+        tenant_id = self._bind_archive_tenant(archive)
         self.archive_store.write_sync_archive(archive)
         if enqueue_commit_job:
             self.queue_store.enqueue(
@@ -75,7 +113,7 @@ class SessionCommitService:
                     payload={
                         "user_id": archive.user_id,
                         "session_id": archive.session_id,
-                        "tenant_id": self._tenant_id(archive),
+                        "tenant_id": tenant_id,
                         "archive_digest": str(getattr(archive, "archive_digest", "") or ""),
                         "manifest_digest": str(getattr(archive, "manifest_digest", "") or ""),
                     },
@@ -92,7 +130,8 @@ class SessionCommitService:
     def async_commit(self, archive: SessionArchive) -> SessionCommitResult:
         """根据已归档会话生成并提交记忆、行为和上下文变更。"""
 
-        tenant_id = self._tenant_id(archive)
+        self._require_runtime_ready()
+        tenant_id = self._bind_archive_tenant(archive)
         requested_manifest = str(archive.manifest_digest or "")
         if not self.archive_store.archive_exists(archive.archive_uri, tenant_id=tenant_id):
             self.archive_store.write_sync_archive(archive)
@@ -102,7 +141,7 @@ class SessionCommitService:
             tenant_id=tenant_id,
             manifest_digest=requested_manifest or None,
         )
-        tenant_id = self._tenant_id(archive)
+        tenant_id = self._bind_archive_tenant(archive)
         group_id = f"commit_group_{archive.task_id}"
         group = self.commit_group_store.create(
             group_id,
@@ -157,7 +196,33 @@ class SessionCommitService:
                 if self.committer is not None:
                     self._recover_pending_memory_effects(archive.user_id, group_id)
                     self._backfill_canonical_effects(group_id, archive.user_id)
-                memory_result = self.memory_planner.plan(archive)
+                plan_with_progress = getattr(self.memory_planner, "plan_with_progress", None)
+                if callable(plan_with_progress):
+                    memory_result = cast(
+                        MemoryPlanningResult,
+                        plan_with_progress(
+                            archive,
+                            progress=lambda phase, digest: self.commit_group_store.mark_canonical_phase(
+                                group_id,
+                                phase=phase,
+                                attempt_id=canonical_attempt_id,
+                                salience_reservation_digest=digest,
+                            ),
+                        ),
+                    )
+                else:
+                    memory_result = self.memory_planner.plan(archive)
+                if (
+                    len(memory_result.context.salience_reservation_digest) == 64
+                    and len(memory_result.context.planning_digest) == 64
+                ):
+                    self.commit_group_store.mark_canonical_phase(
+                        group_id,
+                        phase="planning_sealed",
+                        attempt_id=canonical_attempt_id,
+                        salience_reservation_digest=memory_result.context.salience_reservation_digest,
+                        planning_digest=memory_result.context.planning_digest,
+                    )
                 memory_ops = list(memory_result.operations)
                 memory_diff = self._commit_memory_with_reconcile_retry(
                     archive,
@@ -166,7 +231,8 @@ class SessionCommitService:
                     commit_group_id=group_id,
                 )
             except MemoryExtractionBackendError as exc:
-                self._enqueue_memory_proposal(archive, exc)
+                if exc.retryable:
+                    self._enqueue_memory_proposal(archive, exc)
                 group = self.commit_group_store.fail_canonical(
                     group_id,
                     exc.error_type,
@@ -180,7 +246,7 @@ class SessionCommitService:
                     overview,
                     memory_diff={
                         "status": "pending",
-                        "proposal_status": "queued",
+                        "proposal_status": "queued" if exc.retryable else "dead_letter",
                         "error": exc.error_type,
                         "operation_count": 0,
                         "operations": [],
@@ -195,6 +261,17 @@ class SessionCommitService:
                 )
                 raise
             except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+                self.commit_group_store.fail_canonical(
+                    group_id,
+                    type(exc).__name__,
+                    retryable=False,
+                    attempt_id=canonical_attempt_id,
+                )
+                raise
+            except Exception as exc:
+                # Unknown internal failures are configuration/code failures,
+                # not transport failures. Release the canonical lease before
+                # propagating so the group cannot remain indefinitely running.
                 self.commit_group_store.fail_canonical(
                     group_id,
                     type(exc).__name__,
@@ -268,6 +345,50 @@ class SessionCommitService:
             complete=group.complete,
         )
         return self._result(archive, group)
+
+    def resume_startup_commit_group(
+        self,
+        archive: SessionArchive,
+        *,
+        group_id: str,
+    ) -> SessionCommitResult:
+        """Resume one durable group without opening a RECOVERING write bypass."""
+
+        if self.committer is None:
+            raise RuntimeError("startup commit-group recovery requires OperationCommitter")
+        expected_group_id = f"commit_group_{archive.task_id}"
+        if group_id != expected_group_id:
+            raise RuntimeError("startup archive is detached from its commit-group identity")
+        group = self.commit_group_store.load(group_id)
+        tenant_id = self._bind_archive_tenant(archive)
+        if (
+            group is None
+            or group.task_id != archive.task_id
+            or group.archive_uri != archive.archive_uri
+            or group.user_id != archive.user_id
+            or group.tenant_id != tenant_id
+            or group.archive_digest != archive.archive_digest
+            or group.manifest_digest != archive.manifest_digest
+            or group.complete
+        ):
+            raise RuntimeError("startup archive is detached from its durable commit group")
+        if group.canonical_status != "completed":
+            envelope = self.committer.planning_envelopes.load_validated_payload(group.task_id)
+            if (
+                envelope.get("operation_group_identity") != group.group_id
+                or envelope.get("archive_uri") != group.archive_uri
+                or envelope.get("archive_digest") != group.archive_digest
+                or envelope.get("manifest_digest") != group.manifest_digest
+                or envelope.get("user_id") != group.user_id
+                or envelope.get("tenant_id") != group.tenant_id
+                or (
+                    group.planning_digest
+                    and envelope.get("planning_digest") != group.planning_digest
+                )
+            ):
+                raise RuntimeError("startup commit group is detached from durable planning")
+        with self.committer._durable_startup_recovery_scope(group_id):
+            return self.async_commit(archive)
 
     def _commit_memory_with_reconcile_retry(
         self,
@@ -365,13 +486,45 @@ class SessionCommitService:
             result = action()
             failures = [str(item) for item in result.get("failed", []) or []]
             if failures:
-                raise DerivedConsumerError(consumer, failures)
+                raise DerivedConsumerError(
+                    consumer,
+                    failures,
+                    retryable=bool(result.get("retryable", True)),
+                )
+        except DerivedConsumerError as exc:
+            failed = self.commit_group_store.fail_consumer(
+                group_id,
+                consumer,
+                type(exc).__name__,
+                retryable=exc.retryable,
+                attempt_id=attempt_id,
+            )
+            item = failed.consumers[consumer]
+            return {
+                "status": item.status,
+                "error": item.last_error,
+                "retryable": item.retryable,
+            }
         except (OSError, TimeoutError, RuntimeError, ValueError, KeyError, TypeError) as exc:
             failed = self.commit_group_store.fail_consumer(
                 group_id,
                 consumer,
                 type(exc).__name__,
                 retryable=True,
+                attempt_id=attempt_id,
+            )
+            item = failed.consumers[consumer]
+            return {
+                "status": item.status,
+                "error": item.last_error,
+                "retryable": item.retryable,
+            }
+        except Exception as exc:
+            failed = self.commit_group_store.fail_consumer(
+                group_id,
+                consumer,
+                type(exc).__name__,
+                retryable=False,
                 attempt_id=attempt_id,
             )
             item = failed.consumers[consumer]
@@ -406,20 +559,34 @@ class SessionCommitService:
         return result
 
     def _project_commit_group(self, group_id: str, memory_diff: dict[str, Any]) -> dict[str, Any]:
-        if self.projection_worker is None:
-            return {"status": "skipped", "processed": [], "stale": [], "failed": []}
         transaction_ids = tuple(
             dict.fromkeys(
                 str(operation.get("payload", {}).get("transaction_id", ""))
                 for operation in memory_diff.get("operations", []) or []
-                if isinstance(operation, dict) and operation.get("payload", {}).get("transaction_id")
+                if isinstance(operation, dict)
+                and operation.get("payload", {}).get("canonical_memory") is True
+                and operation.get("payload", {}).get("transaction_id")
             )
         )
+        if self.projection_worker is None:
+            if transaction_ids:
+                return {
+                    "status": "failed",
+                    "processed": [],
+                    "stale": [],
+                    "failed": ["projection_worker_unavailable"],
+                    "retryable": False,
+                }
+            return {"status": "skipped", "processed": [], "stale": [], "failed": []}
         result = self.projection_worker.process_commit_group(
             group_id,
             transaction_ids=transaction_ids,
         )
-        return {"status": "completed" if not result["failed"] else "failed", **result}
+        return {
+            "status": "completed" if not result["failed"] else "failed",
+            "transaction_ids": list(transaction_ids),
+            **result,
+        }
 
     def _commit_consumer_operations(
         self,
@@ -545,7 +712,29 @@ class SessionCommitService:
 
     def _tenant_id(self, archive: SessionArchive) -> str:
         metadata = dict(archive.metadata or {})
-        return str(metadata.get("tenant_id") or dict(metadata.get("scope", {}) or {}).get("tenant_id") or "default")
+        scope = dict(metadata.get("scope", {}) or {})
+        bound_tenant = str(self.archive_store.tenant_id)
+        claimed_tenants = tuple(
+            str(value)
+            for value in (metadata.get("tenant_id"), scope.get("tenant_id"))
+            if value not in (None, "")
+        )
+        if any(claimed != bound_tenant for claimed in claimed_tenants):
+            raise PermissionError("session archive tenant does not match the bound archive store")
+        return bound_tenant
+
+    def _bind_archive_tenant(self, archive: SessionArchive) -> str:
+        """Validate the trust boundary before I/O and materialize its tenant."""
+
+        tenant_id = self._tenant_id(archive)
+        metadata = dict(archive.metadata or {})
+        metadata["tenant_id"] = tenant_id
+        if "scope" in metadata:
+            scope = dict(metadata.get("scope", {}) or {})
+            scope["tenant_id"] = tenant_id
+            metadata["scope"] = scope
+        archive.metadata = metadata
+        return tenant_id
 
     def _max_revision_from_diff(self, diff: dict[str, Any]) -> int | None:
         revisions = []
@@ -752,9 +941,13 @@ class SessionCommitService:
             outstanding: set[str] = set()
             for uri in committed_pending:
                 try:
-                    obj = self.committer.source_store.read_object(uri)
+                    obj = read_committed_pending(
+                        self.committer.source_store,
+                        uri,
+                        getattr(self.committer, "relation_store", None),
+                    ).object
                 except (FileNotFoundError, IsADirectoryError, NotADirectoryError) as exc:
-                    raise RuntimeError("committed pending proposal is missing from SourceStore") from exc
+                    raise RuntimeError("committed pending proposal has no valid lifecycle proof") from exc
                 metadata = dict(obj.metadata or {})
                 if (
                     metadata.get("canonical_kind") == "pending_proposal"

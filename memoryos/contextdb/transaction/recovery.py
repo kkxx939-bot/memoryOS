@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from pathlib import Path
 
 from memoryos.contextdb.store.source_store import LockLostError
 from memoryos.memory.canonical.event import canonical_json
 from memoryos.operations.commit.operation_committer import OperationCommitter
 from memoryos.operations.commit.outbox_envelope import OutboxIntegrityError, validate_outbox
+from memoryos.operations.commit.planning_proof import PlanningProofIntegrityError
 from memoryos.operations.commit.quarantine import quarantine_control_file
+from memoryos.operations.commit.receipt import load_transaction_receipt
 from memoryos.operations.commit.redo_log import (
     RedoControlFileError,
     RedoIntegrityError,
@@ -65,7 +66,7 @@ class RecoveryService:
                 recovered.extend(self.committer.resume_canonical_batch(user_id, transaction_entries))
             except RedoIntegrityError as exc:
                 failed_count += len(transaction_entries)
-                last_error = type(exc).__name__
+                last_error = self._describe_failure(exc)
                 quarantine_count += self._quarantine_canonical(user_id, transaction_entries, exc)
                 for entry in transaction_entries:
                     self._record_failure(user_id, entry, exc, terminal="quarantine")
@@ -76,7 +77,7 @@ class RecoveryService:
                 LockLostError,
             ) as exc:
                 failed_count += len(transaction_entries)
-                last_error = type(exc).__name__
+                last_error = self._describe_failure(exc)
                 for entry in transaction_entries:
                     self._record_failure(user_id, entry, exc, terminal="retryable")
         for entry in regular_entries:
@@ -92,7 +93,7 @@ class RecoveryService:
                     recovered.append(operation.operation_id)
             except RedoIntegrityError as exc:
                 failed_count += 1
-                last_error = type(exc).__name__
+                last_error = self._describe_failure(exc)
                 quarantine_count += self._quarantine_regular(user_id, entry, exc)
                 self._record_failure(user_id, entry, exc, terminal="quarantine")
             except (
@@ -102,7 +103,7 @@ class RecoveryService:
                 LockLostError,
             ) as exc:
                 failed_count += 1
-                last_error = type(exc).__name__
+                last_error = self._describe_failure(exc)
                 self._record_failure(user_id, entry, exc, terminal="retryable")
         return RecoveryResult(
             recovered_count=len(recovered),
@@ -134,10 +135,28 @@ class RecoveryService:
                 )
                 failed += 1
                 quarantined += 1
-                last_error = type(exc).__name__
+                last_error = self._describe_failure(exc)
                 continue
             status = str(envelope["status"])
             operations = [ContextOperation.from_dict(item) for item in envelope["operations"]]
+            try:
+                self.committer.planning_proofs.load_canonical_intent(
+                    str(envelope["transaction_id"]),
+                    operations=operations,
+                    prepared_intent_digest=str(envelope["prepared_intent_digest"]),
+                )
+            except PlanningProofIntegrityError as exc:
+                quarantine_control_file(
+                    self.committer.artifact_root,
+                    path,
+                    kind="outbox",
+                    error=exc,
+                    identifiers={"transaction_id": envelope["transaction_id"]},
+                )
+                failed += max(1, len(operations))
+                quarantined += 1
+                last_error = self._describe_failure(exc)
+                continue
             if status == "aborted":
                 continue
             if status == "committed":
@@ -146,11 +165,19 @@ class RecoveryService:
                     if not marker.exists():
                         raise RedoIntegrityError("committed outbox has no marker")
                     self.committer._validate_transaction_marker(marker, operations)
+                    self.committer._validate_head_published_receipt(
+                        marker,
+                        load_transaction_receipt(marker),
+                    )
                 except (OSError, RuntimeError, ValueError) as exc:
-                    self._quarantine_outbox_and_marker(path, envelope, exc)
+                    # The outbox has already passed its own digest, tenant,
+                    # operation-set and immutable-intent checks.  A missing or
+                    # corrupt earlier receipt/head binding must fail closed,
+                    # but does not prove the later outbox itself is corrupt.
+                    # Preserve every artifact for deterministic repair and
+                    # let startup remain NOT_READY.
                     failed += 1
-                    quarantined += 1
-                    last_error = type(exc).__name__
+                    last_error = self._describe_failure(exc)
                 continue
             if status not in {"prepared", "source_committed"}:
                 continue
@@ -184,7 +211,7 @@ class RecoveryService:
                     )
                 failed += max(1, len(operations))
                 quarantined += 1 + len(entries)
-                last_error = type(exc).__name__
+                last_error = self._describe_failure(exc)
         return RecoveryResult(
             recovered_count=len(recovered),
             operation_ids=recovered,
@@ -192,6 +219,13 @@ class RecoveryService:
             quarantine_count=quarantined,
             last_error=last_error,
         )
+
+    @staticmethod
+    def _describe_failure(exc: BaseException) -> str:
+        """Keep the failing artifact identity visible without unbounded output."""
+
+        message = " ".join(str(exc).split())[:500]
+        return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
 
     def _seed_redo_from_outbox(
         self,
@@ -275,30 +309,6 @@ class RecoveryService:
             key=canonical_json,
         )
         return canonical_json(actual_relations) == canonical_json(expected_relations)
-
-    def _quarantine_outbox_and_marker(
-        self,
-        outbox: Path,
-        envelope: dict,
-        exc: BaseException,
-    ) -> None:
-        if outbox.exists():
-            quarantine_control_file(
-                self.committer.artifact_root,
-                outbox,
-                kind="outbox",
-                error=exc,
-                identifiers={"transaction_id": envelope.get("transaction_id")},
-            )
-        marker = self.committer._transaction_marker(str(envelope["idempotency_key"]))
-        if marker.exists():
-            quarantine_control_file(
-                self.committer.artifact_root,
-                marker,
-                kind="marker",
-                error=exc,
-                identifiers={"idempotency_key": envelope.get("idempotency_key")},
-            )
 
     def _safe_pending_entries(self) -> list:
         try:

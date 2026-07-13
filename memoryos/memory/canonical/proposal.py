@@ -356,17 +356,14 @@ class MemorySemanticProposal:
             "related_claim_ids": list(self.related_claim_ids),
             "evidence_refs": [ref.to_dict() for ref in self.evidence_refs],
             "field_evidence_refs": {
-                field_name: [ref.to_dict() for ref in refs]
-                for field_name, refs in self.field_evidence_refs.items()
+                field_name: [ref.to_dict() for ref in refs] for field_name, refs in self.field_evidence_refs.items()
             },
             "confidence": self.confidence,
             "extractor_version": self.extractor_version,
             "model_id": self.model_id,
             "prompt_version": self.prompt_version,
             "semantic_contract_version": self.semantic_contract_version,
-            "atomic_evidence_ref": self.atomic_evidence_ref.to_dict()
-            if self.atomic_evidence_ref is not None
-            else None,
+            "atomic_evidence_ref": self.atomic_evidence_ref.to_dict() if self.atomic_evidence_ref is not None else None,
             "metadata": canonicalize(self.metadata),
         }
 
@@ -401,10 +398,7 @@ class MemorySemanticProposal:
                 str(semantic_payload.get("atomicity", "unknown")),
             )
         evidence_refs = tuple(EvidenceRef(**dict(item)) for item in payload.get("evidence_refs", []) or [])
-        by_payload = {
-            stable_hash(dict(ref.to_dict()), length=40): ref
-            for ref in evidence_refs
-        }
+        by_payload = {stable_hash(dict(ref.to_dict()), length=40): ref for ref in evidence_refs}
 
         def evidence(item: Mapping[str, Any]) -> EvidenceRef:
             key = stable_hash(dict(item), length=40)
@@ -469,13 +463,133 @@ PENDING_PROPOSAL_TRANSITIONS: dict[LifecycleState, frozenset[LifecycleState]] = 
             LifecycleState.EXPIRED,
         }
     ),
-    LifecycleState.CONFIRMED: frozenset(
-        {LifecycleState.RESOLVED, LifecycleState.REJECTED, LifecycleState.EXPIRED}
-    ),
+    LifecycleState.CONFIRMED: frozenset({LifecycleState.RESOLVED, LifecycleState.REJECTED, LifecycleState.EXPIRED}),
     LifecycleState.REJECTED: frozenset(),
     LifecycleState.EXPIRED: frozenset(),
     LifecycleState.RESOLVED: frozenset(),
 }
+
+
+class PendingReason(str, Enum):
+    REVIEWABLE_DESTRUCTIVE = "REVIEWABLE_DESTRUCTIVE"
+    REVIEWABLE_LOW_CONFIDENCE = "REVIEWABLE_LOW_CONFIDENCE"
+    NEEDS_EVIDENCE = "NEEDS_EVIDENCE"
+    NEEDS_SCHEMA_REPAIR = "NEEDS_SCHEMA_REPAIR"
+    NEEDS_SCOPE_RESOLUTION = "NEEDS_SCOPE_RESOLUTION"
+    RETRYABLE_BACKEND = "RETRYABLE_BACKEND"
+    FALLBACK_REQUIRES_REEXTRACTION = "FALLBACK_REQUIRES_REEXTRACTION"
+    POLICY_RESTRICTED = "POLICY_RESTRICTED"
+
+
+@dataclass(frozen=True)
+class PendingReasonPolicy:
+    confirm: bool
+    confirm_and_apply: bool
+    retry: bool
+    requires_new_proposal: bool = False
+    requires_reextraction: bool = False
+
+
+PENDING_REASON_POLICIES: dict[PendingReason, PendingReasonPolicy] = {
+    PendingReason.REVIEWABLE_DESTRUCTIVE: PendingReasonPolicy(True, True, False),
+    PendingReason.REVIEWABLE_LOW_CONFIDENCE: PendingReasonPolicy(True, True, False),
+    PendingReason.NEEDS_EVIDENCE: PendingReasonPolicy(False, False, False, requires_new_proposal=True),
+    PendingReason.NEEDS_SCHEMA_REPAIR: PendingReasonPolicy(False, False, False, requires_new_proposal=True),
+    PendingReason.NEEDS_SCOPE_RESOLUTION: PendingReasonPolicy(False, False, False, requires_new_proposal=True),
+    PendingReason.RETRYABLE_BACKEND: PendingReasonPolicy(False, False, True),
+    PendingReason.FALLBACK_REQUIRES_REEXTRACTION: PendingReasonPolicy(
+        False,
+        False,
+        False,
+        requires_new_proposal=True,
+        requires_reextraction=True,
+    ),
+    PendingReason.POLICY_RESTRICTED: PendingReasonPolicy(False, False, False, requires_new_proposal=True),
+}
+
+
+def classify_pending_reason(value: str | PendingReason) -> PendingReason:
+    if isinstance(value, PendingReason):
+        return value
+    raw = str(value or "").strip()
+    try:
+        return PendingReason(raw)
+    except ValueError:
+        normalized = raw.casefold()
+    # Finite legacy spellings retained only for migration/test fixtures.  Do
+    # not infer review authority from an arbitrary internal reason merely
+    # because it contains words such as "review" or "confidence".
+    if normalized in {
+        "low_confidence_review",
+        "review_required",
+        "needs review",
+        "manual_review",
+        "secondary_manual_review",
+    }:
+        return PendingReason.REVIEWABLE_LOW_CONFIDENCE
+    if "fallback" in normalized or "reextract" in normalized:
+        return PendingReason.FALLBACK_REQUIRES_REEXTRACTION
+    if any(token in normalized for token in ("backend", "transport", "timeout", "rate_limit", "retryable")):
+        return PendingReason.RETRYABLE_BACKEND
+    if any(token in normalized for token in ("privacy", "policy", "restricted", "security")):
+        return PendingReason.POLICY_RESTRICTED
+    if "scope" in normalized or "subject" in normalized:
+        return PendingReason.NEEDS_SCOPE_RESOLUTION
+    # These states describe a proposition that cannot become canonical merely
+    # because a reviewer toggles its lifecycle flag.  In particular, a
+    # compound/ambiguous v3 candidate must be replaced by new atomic semantic
+    # proposals; classifying the word "ambiguous" as low confidence would let
+    # it enter CONFIRMED even though resolution must (correctly) reject it.
+    if any(
+        token in normalized
+        for token in (
+            "schema",
+            "identity",
+            "unsupported_memory",
+            "not_normalized",
+            "contract_not_validated",
+            "ambiguous",
+            "ambiguous_or_compound",
+            "not_active_eligible",
+            "modal_force_inconsistent",
+            "semantic_inconsistent",
+            "commitment_pending",
+            "temporality_pending",
+            "nonfinal_relation_requires_review",
+        )
+    ):
+        return PendingReason.NEEDS_SCHEMA_REPAIR
+    if any(
+        token in normalized
+        for token in (
+            "evidence",
+            "atomic",
+            "source_ground",
+            "source_role",
+            "source_not_authoritative",
+            "hypothesis_requires_confirmation",
+            "admission_score_below_threshold",
+            "uncertain",
+            "confidence",
+        )
+    ):
+        return PendingReason.NEEDS_EVIDENCE
+    if any(
+        token in normalized
+        for token in (
+            "destructive",
+            "replacement",
+            "retraction",
+            "supersed",
+            "correct",
+            "relation_requires_confirmation",
+            "nonfinal_relation_requires_review",
+        )
+    ):
+        return PendingReason.REVIEWABLE_DESTRUCTIVE
+    # Unknown internal reasons are never silently upgraded into user
+    # authorization.  They require a corrected proposal under a typed policy.
+    return PendingReason.POLICY_RESTRICTED
 
 
 @dataclass(frozen=True)
@@ -486,7 +600,8 @@ class PendingMemoryProposal:
     proposal: MemorySemanticProposal
     scope: MemoryScope
     source_role: str
-    pending_reason_code: str
+    pending_reason_code: PendingReason | str
+    pending_reason_detail: str = ""
     request_identity: str = ""
     related_existing_memory_ids: tuple[str, ...] = ()
     retrieval_views: tuple[str, ...] = ()
@@ -507,8 +622,19 @@ class PendingMemoryProposal:
         if self.lifecycle_revision < 1:
             raise ValueError("pending proposal lifecycle revision must be positive")
         object.__setattr__(self, "related_existing_memory_ids", tuple(self.related_existing_memory_ids))
+        original_reason = (
+            self.pending_reason_code.value
+            if isinstance(self.pending_reason_code, PendingReason)
+            else str(self.pending_reason_code)
+        )
+        reason = classify_pending_reason(self.pending_reason_code)
+        object.__setattr__(self, "pending_reason_code", reason)
+        if not self.pending_reason_detail and original_reason != reason.value:
+            object.__setattr__(self, "pending_reason_detail", original_reason)
         object.__setattr__(self, "retrieval_views", tuple(self.retrieval_views))
-        object.__setattr__(self, "lifecycle_history", tuple(immutable_snapshot(dict(item)) for item in self.lifecycle_history))
+        object.__setattr__(
+            self, "lifecycle_history", tuple(immutable_snapshot(dict(item)) for item in self.lifecycle_history)
+        )
 
     @classmethod
     def create(
@@ -541,7 +667,12 @@ class PendingMemoryProposal:
             proposal=proposal,
             scope=scope,
             source_role=source_role,
-            pending_reason_code=pending_reason_code,
+            pending_reason_code=classify_pending_reason(pending_reason_code),
+            pending_reason_detail=(
+                pending_reason_code
+                if str(pending_reason_code) != classify_pending_reason(pending_reason_code).value
+                else ""
+            ),
             request_identity=request_identity,
             related_existing_memory_ids=tuple(dict.fromkeys(related_existing_memory_ids)),
             retrieval_views=tuple(dict.fromkeys(retrieval_views)),
@@ -581,7 +712,8 @@ class PendingMemoryProposal:
                 field_name: [ref.to_dict() for ref in refs]
                 for field_name, refs in self.proposal.field_evidence_refs.items()
             },
-            "pending_reason_code": self.pending_reason_code,
+            "pending_reason_code": PendingReason(self.pending_reason_code).value,
+            "pending_reason_detail": self.pending_reason_detail,
             "request_identity": self.request_identity,
             "extractor_name": self.proposal.extractor_version,
             "model_id": self.proposal.model_id,
@@ -590,9 +722,7 @@ class PendingMemoryProposal:
             "model_confidence": self.proposal.confidence,
             "admission_score": self.proposal.metadata.get("admission_score"),
             "admission_threshold": self.proposal.metadata.get("admission_threshold"),
-            "admission_score_components": canonicalize(
-                self.proposal.metadata.get("admission_score_components", {})
-            ),
+            "admission_score_components": canonicalize(self.proposal.metadata.get("admission_score_components", {})),
             "retrieval_views": list(self.retrieval_views),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -640,7 +770,8 @@ class PendingMemoryProposal:
             proposal=MemorySemanticProposal.from_dict(dict(metadata.get("proposal", {}) or {})),
             scope=MemoryScope.from_dict(dict(metadata.get("scope", {}) or {})),
             source_role=str(metadata.get("source_role", "")),
-            pending_reason_code=str(metadata.get("pending_reason_code", "")),
+            pending_reason_code=classify_pending_reason(str(metadata.get("pending_reason_code", ""))),
+            pending_reason_detail=str(metadata.get("pending_reason_detail", "")),
             request_identity=str(metadata.get("request_identity", "")),
             related_existing_memory_ids=tuple(
                 str(item) for item in metadata.get("related_existing_memory_ids", []) or []
@@ -656,6 +787,25 @@ class PendingMemoryProposal:
             updated_at=str(metadata.get("updated_at") or obj.updated_at),
         )
 
+    @property
+    def reason_policy(self) -> PendingReasonPolicy:
+        return PENDING_REASON_POLICIES[PendingReason(self.pending_reason_code)]
+
+    def assert_review_decision(self, decision: str) -> None:
+        normalized = str(decision or "").strip().upper()
+        allowed = {
+            "CONFIRM": self.reason_policy.confirm,
+            "CONFIRM_AND_APPLY": self.reason_policy.confirm_and_apply,
+            "CORRECT": self.reason_policy.requires_new_proposal,
+            "RETRY": self.reason_policy.retry,
+            "REJECT": True,
+            "EXPIRE": True,
+        }
+        if normalized not in allowed or not allowed[normalized]:
+            raise ValueError(
+                f"pending reason {PendingReason(self.pending_reason_code).value} does not allow {normalized or 'empty'}"
+            )
+
     def with_lifecycle(
         self,
         lifecycle_state: LifecycleState,
@@ -663,7 +813,29 @@ class PendingMemoryProposal:
         updated_at: str = "",
         retry_increment: bool = False,
         reason: str = "",
+        review_command_id: str = "",
+        review_decision: str = "",
+        review_request_digest: str = "",
     ) -> PendingMemoryProposal:
+        review_binding: dict[str, str] = {}
+        if review_command_id or review_decision or review_request_digest:
+            if not review_command_id or not review_decision or not review_request_digest:
+                raise ValueError("pending review lifecycle binding must be complete")
+            normalized_decision = review_decision.strip().upper()
+            if normalized_decision not in {
+                "CONFIRM",
+                "CONFIRM_AND_APPLY",
+                "CORRECT",
+                "REJECT",
+                "EXPIRE",
+                "RETRY",
+            }:
+                raise ValueError("pending review lifecycle binding has an invalid decision")
+            review_binding = {
+                "review_command_id": review_command_id,
+                "review_decision": normalized_decision,
+                "review_request_digest": review_request_digest,
+            }
         if lifecycle_state == self.lifecycle_state:
             if retry_increment and lifecycle_state == LifecycleState.RETRYABLE:
                 timestamp = updated_at or utc_now()
@@ -681,6 +853,7 @@ class PendingMemoryProposal:
                                 "to_revision": self.lifecycle_revision + 1,
                                 "reason": reason,
                                 "updated_at": timestamp,
+                                **review_binding,
                             }
                         ),
                     ),
@@ -708,6 +881,7 @@ class PendingMemoryProposal:
                         "to_revision": self.lifecycle_revision + 1,
                         "reason": reason,
                         "updated_at": timestamp,
+                        **review_binding,
                     }
                 ),
             ),

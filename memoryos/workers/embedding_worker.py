@@ -6,9 +6,15 @@ import os
 import uuid
 from collections.abc import Callable
 
-from memoryos.contextdb.store.source_store import QueueStore, SourceStore
+from memoryos.contextdb.store.source_store import (
+    QueueStore,
+    SourceStore,
+    is_canonical_memory_object,
+    is_canonical_memory_uri,
+)
 from memoryos.contextdb.store.vector_store import VectorStore
 from memoryos.providers.embedding import EmbeddingProvider, HashingEmbeddingProvider
+from memoryos.workers.readiness import require_source_store_ready
 
 
 class EmbeddingWorker:
@@ -35,9 +41,11 @@ class EmbeddingWorker:
         lease_seconds: int = 60,
         max_retries: int = 3,
     ) -> dict:
+        require_source_store_ready(self.source_store)
         processed = []
         failed: list[str] = []
         dead_letter: list[str] = []
+        quarantine: list[str] = []
         jobs = self.queue_store.lease(
             "embedding",
             lease_owner=self.worker_id,
@@ -46,6 +54,17 @@ class EmbeddingWorker:
         )
         for job in jobs:
             try:
+                if is_canonical_memory_uri(job.target_uri):
+                    self.queue_store.quarantine(job, "canonical_requires_projector")
+                    failed.append(job.job_id)
+                    quarantine.append(job.job_id)
+                    continue
+                obj = self.source_store.read_object(job.target_uri)
+                if is_canonical_memory_object(obj):
+                    self.queue_store.quarantine(job, "canonical_requires_projector")
+                    failed.append(job.job_id)
+                    quarantine.append(job.job_id)
+                    continue
                 content = self.source_store.read_content(job.target_uri)
                 embedding = self.embedding_provider.embed(content)
                 metadata = {
@@ -76,4 +95,5 @@ class EmbeddingWorker:
             "processed": processed,
             "failed": failed,
             "dead_letter": dead_letter,
+            "quarantine": quarantine,
         }

@@ -7,7 +7,9 @@ from memoryos.api.mcp import stdio
 from memoryos.api.mcp.config import MCPServerConfig
 from memoryos.api.mcp.server import MemoryOSMCPServer
 from memoryos.api.sdk.client import MemoryOSClient
+from memoryos.api.trusted_context import AUTHORITATIVE_REMEMBER, DEFAULT_AGENT_CAPABILITIES
 from memoryos.connect import ConnectMetadata
+from memoryos.runtime.readiness import RuntimeNotReadyError, RuntimeReadinessState
 
 
 class FakeMCPClient:
@@ -18,6 +20,14 @@ class FakeMCPClient:
         self.predict_calls = 0
         self.process_calls = 0
         self.fail_search = False
+        self.tenant_id = "default"
+        self.remember_calls: list[dict[str, Any]] = []
+        self.pending_calls: list[dict[str, Any]] = []
+        self.review_calls: list[dict[str, Any]] = []
+        self.health_payload: dict[str, Any] = {
+            "status": "ready",
+            "runtime": {"state": "READY", "ready": True, "reasons": []}
+        }
 
     def search_context(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
         self.search_calls.append({"query": query, **kwargs})
@@ -65,18 +75,86 @@ class FakeMCPClient:
 
         return Result()
 
+    def remember(self, **kwargs: Any) -> dict[str, Any]:
+        self.remember_calls.append(kwargs)
+        return {"status": "COMMITTED", "uri": "memoryos://memory/c1"}
 
-def _server(*, enable_action_tools: bool = False) -> tuple[MemoryOSMCPServer, FakeMCPClient]:
+    def list_pending(self, **kwargs: Any) -> list[dict[str, Any]]:
+        self.pending_calls.append(kwargs)
+        return [{"uri": "memoryos://user/u1/memories/pending/p1", "lifecycle_revision": 1}]
+
+    def review_pending(self, **kwargs: Any) -> dict[str, Any]:
+        self.review_calls.append(kwargs)
+        return {"status": "resolved", "uri": kwargs["pending_uri"]}
+
+    def health(self) -> dict[str, Any]:
+        return self.health_payload
+
+
+def _server(
+    *,
+    enable_action_tools: bool = False,
+    authoritative: bool = False,
+) -> tuple[MemoryOSMCPServer, FakeMCPClient]:
     client = FakeMCPClient()
     config = MCPServerConfig(
         root="/tmp/memory",
         user_id="u1",
         adapter_id="codex",
         agent_name="codex",
+        actor_kind="user" if authoritative else "agent",
+        actor_id="u1" if authoritative else "codex",
+        capabilities=(
+            frozenset({*DEFAULT_AGENT_CAPABILITIES, AUTHORITATIVE_REMEMBER})
+            if authoritative
+            else DEFAULT_AGENT_CAPABILITIES
+        ),
         token_budget=64,
         enable_action_tools=enable_action_tools,
     )
     return MemoryOSMCPServer(cast(MemoryOSClient, client), config=config), client
+
+
+def test_mcp_memory_identity_pending_list_and_review_are_strictly_bound() -> None:
+    server, client = _server(authoritative=True)
+    invalid = server.call_tool(
+        "memoryos_remember",
+        {
+            "content": "PostgreSQL",
+            "identity_fields": ["primary storage backend"],
+        },
+    )
+    assert invalid["error"]["code"] == "VALIDATION_ERROR"
+    assert client.remember_calls == []
+
+    remembered = server.call_tool(
+        "memoryos_remember",
+        {
+            "content": "PostgreSQL",
+            "memory_type": "project_decision",
+            "identity_fields": {"decision_topic": "primary storage backend"},
+        },
+    )
+    assert remembered["error"] is None
+    assert client.remember_calls[0]["identity_fields"] == {
+        "decision_topic": "primary storage backend"
+    }
+    listed = server.call_tool("memoryos_list_pending", {"lifecycle_states": ["PENDING"]})
+    assert listed["error"] is None
+    assert listed["results"][0]["lifecycle_revision"] == 1
+    reviewed = server.call_tool(
+        "memoryos_review_pending",
+        {
+            "pending_uri": "memoryos://user/u1/memories/pending/p1",
+            "decision": "CONFIRM_AND_APPLY",
+            "expected_lifecycle_revision": 1,
+            "expected_proposal_fingerprint": "fingerprint",
+            "command_id": "review-command",
+        },
+    )
+    assert reviewed["error"] is None
+    assert reviewed["status"] == "resolved"
+    assert client.review_calls[0]["tenant_id"] == "default"
 
 
 def _request(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -257,6 +335,55 @@ def test_mcp_connection_schema_and_health() -> None:
     assert "codex" in schema["allowed_adapter_ids"]
     assert health["client_ready"] is True
     assert server.call_tool("memoryos_health", None)["status"] == "ok"
+
+
+def test_mcp_health_and_memory_calls_do_not_report_ready_before_runtime_recovery() -> None:
+    server, client = _server()
+    client.health_payload = {
+        "runtime": {"state": "NOT_READY", "ready": False, "reasons": ["receipt mismatch"]}
+    }
+
+    health = server.call_tool("memoryos_health", {})
+
+    assert health["status"] == "not_ready"
+    assert health["storage_ready"] is False
+    assert health["contextdb_ready"] is False
+    assert health["client_ready"] is False
+
+    client.search_context = lambda *args, **kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        RuntimeNotReadyError(RuntimeReadinessState.NOT_READY, ("receipt mismatch",))
+    )
+    blocked = server.call_tool("memoryos_search_context", {"query": "memory"})
+    assert blocked["error"]["code"] == "NOT_READY"
+    assert blocked["error"]["retryable"] is True
+
+
+def test_mcp_health_requires_an_explicit_runtime_readiness_proof() -> None:
+    server, client = _server()
+    client.health = lambda: {}  # type: ignore[method-assign]
+
+    health = server.call_tool("memoryos_health", {})
+
+    assert health["status"] == "not_ready"
+    assert health["storage_ready"] is False
+    assert health["contextdb_ready"] is False
+    assert health["client_ready"] is False
+
+
+def test_mcp_health_propagates_degraded_derived_state_even_when_runtime_is_ready() -> None:
+    server, client = _server()
+    client.health_payload = {
+        "status": "degraded",
+        "runtime": {"state": "READY", "ready": True, "reasons": []},
+        "queue": {"dead_letter": 1},
+    }
+
+    health = server.call_tool("memoryos_health", {})
+
+    assert health["status"] == "degraded"
+    assert health["storage_ready"] is False
+    assert health["contextdb_ready"] is False
+    assert health["client_ready"] is False
 
 
 def test_action_tools_default_closed_and_coding_agent_rejected() -> None:

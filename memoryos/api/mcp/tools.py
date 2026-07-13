@@ -66,6 +66,8 @@ class MCPToolRouter:
                 if self.caller.actor_kind != "user":
                     raise PermissionError("authoritative remember requires a trusted user actor")
                 self._assert_identity(args)
+                if "identity_fields" in args and not isinstance(args["identity_fields"], dict):
+                    raise ValueError("identity_fields must be an object")
                 metadata = normalize_agent_metadata(args.get("connect_metadata"), self.config)
                 return _client_payload(
                     self.client.remember(
@@ -77,8 +79,52 @@ class MCPToolRouter:
                         constraint_polarity=str(args.get("constraint_polarity") or ""),
                         condition=str(args.get("condition") or ""),
                         exception=str(args.get("exception") or ""),
+                        identity_fields=(dict(args["identity_fields"]) if "identity_fields" in args else None),
                         connect_metadata=metadata,
                         tenant_id=self.caller.tenant_id,
+                        **self._local_caller_kwargs(),
+                    )
+                )
+            if name == "memoryos_list_pending":
+                self.caller.require(READ_CONTEXT)
+                self._assert_identity(args)
+                return ok_payload(
+                    {
+                        "results": self.client.list_pending(
+                            user_id=self.caller.user_id,
+                            tenant_id=self.caller.tenant_id,
+                            lifecycle_states=([str(item) for item in optional_list(args, "lifecycle_states") or []]),
+                            project_id=str(args.get("project_id") or ""),
+                            **self._local_caller_kwargs(),
+                        )
+                    }
+                )
+            if name == "memoryos_review_pending":
+                self.caller.require(AUTHORITATIVE_REMEMBER)
+                if self.caller.actor_kind != "user":
+                    raise PermissionError("pending review requires a trusted user actor")
+                self._assert_identity(args)
+                if "corrected_proposal" in args and not isinstance(args["corrected_proposal"], dict):
+                    raise ValueError("corrected_proposal must be an object")
+                return _client_payload(
+                    self.client.review_pending(
+                        user_id=self.caller.user_id,
+                        pending_uri=required_str(args, "pending_uri"),
+                        decision=required_str(args, "decision"),
+                        expected_lifecycle_revision=optional_int(
+                            args,
+                            "expected_lifecycle_revision",
+                            0,
+                            minimum=1,
+                        ),
+                        expected_proposal_fingerprint=required_str(
+                            args,
+                            "expected_proposal_fingerprint",
+                        ),
+                        command_id=required_str(args, "command_id"),
+                        tenant_id=self.caller.tenant_id,
+                        reason=str(args.get("reason") or ""),
+                        corrected_proposal=(dict(args["corrected_proposal"]) if "corrected_proposal" in args else None),
                         **self._local_caller_kwargs(),
                     )
                 )
@@ -316,13 +362,23 @@ class MCPToolRouter:
         health_fn = getattr(self.client, "health", None)
         raw_health = health_fn() if callable(health_fn) else {}
         health: dict[str, Any] = raw_health if isinstance(raw_health, dict) else {}
+        runtime_payload = health.get("runtime")
+        runtime = dict(runtime_payload) if isinstance(runtime_payload, dict) else {}
+        runtime_state = str(runtime.get("state") or "NOT_READY")
+        reported_status = str(health.get("status") or "not_ready").casefold()
+        ready = runtime.get("ready") is True and runtime_state == "READY" and reported_status == "ready"
+        status = (
+            "ok"
+            if ready
+            else (reported_status if reported_status in {"degraded", "not_ready"} else runtime_state.casefold())
+        )
         return ok_payload(
             {
-                "status": "ok",
                 **health,
-                "storage_ready": hasattr(self.client, "source_store"),
-                "contextdb_ready": hasattr(self.client, "context_db"),
-                "client_ready": self.client is not None,
+                "status": status,
+                "storage_ready": ready and hasattr(self.client, "source_store"),
+                "contextdb_ready": ready and hasattr(self.client, "context_db"),
+                "client_ready": ready and self.client is not None,
                 "version": memoryos.__version__,
                 "metadata": metadata,
             }

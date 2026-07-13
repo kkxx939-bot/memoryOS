@@ -81,9 +81,10 @@ class AliasRegistry:
         payload = dict(aliases or {})
         self._aliases: dict[str, dict[str, str]] = {}
         for namespace, values in payload.items():
-            self._aliases[str(namespace)] = {
-                canonical_text(alias): str(identifier) for alias, identifier in values.items()
-            }
+            resolved = {canonical_text(alias): str(identifier) for alias, identifier in values.items()}
+            for identifier in values.values():
+                resolved.setdefault(canonical_text(identifier), str(identifier))
+            self._aliases[str(namespace)] = resolved
 
     def resolve(self, namespace: str, value: Any) -> str:
         normalized = canonical_text(value)

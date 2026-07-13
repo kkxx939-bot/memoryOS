@@ -6,7 +6,15 @@ from memoryos.behavior.model.observation import Observation
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.model.lifecycle import LifecycleState
 from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
-from memoryos.contextdb.store.source_store import IndexHit, IndexStore, RelationStore, SourceStore
+from memoryos.contextdb.store.source_store import (
+    IndexHit,
+    IndexStore,
+    RelationStore,
+    SourceStore,
+    is_canonical_memory_object,
+    is_canonical_memory_uri,
+)
+from memoryos.memory.canonical.visibility import read_committed_canonical
 
 
 class SimilarBehaviorRetriever:
@@ -131,9 +139,8 @@ class SimilarBehaviorRetriever:
     def _source_allows_hit(self, uri: str, context_type: ContextType, user_id: str) -> bool:
         if self.source_store is None or not uri:
             return False
-        try:
-            obj = self.source_store.read_object(uri)
-        except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+        obj = self._read_visible_object(uri)
+        if obj is None:
             return False
         if obj.context_type != context_type:
             return False
@@ -189,9 +196,8 @@ class SimilarBehaviorRetriever:
     def _object_item(self, uri: str, relation_type: str, user_id: str) -> dict | None:
         if self.source_store is None:
             return None
-        try:
-            obj = self.source_store.read_object(uri)
-        except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+        obj = self._read_visible_object(uri)
+        if obj is None:
             return None
         if obj.owner_user_id != user_id:
             return None
@@ -208,6 +214,27 @@ class SimilarBehaviorRetriever:
             "relation_type": relation_type,
             "metadata": dict(obj.metadata),
         }
+
+    def _read_visible_object(self, uri: str):  # noqa: ANN202
+        if self.source_store is None:
+            return None
+        try:
+            if is_canonical_memory_uri(uri):
+                return read_committed_canonical(
+                    self.source_store,
+                    uri,
+                    self.relation_store,
+                ).object
+            obj = self.source_store.read_object(uri)
+            if is_canonical_memory_object(obj):
+                return read_committed_canonical(
+                    self.source_store,
+                    uri,
+                    self.relation_store,
+                ).object
+            return obj
+        except (FileNotFoundError, IsADirectoryError, NotADirectoryError, TypeError, ValueError):
+            return None
 
     def _is_active_authoritative_memory(self, obj) -> bool:  # noqa: ANN001
         if obj.lifecycle_state != LifecycleState.ACTIVE:

@@ -14,6 +14,7 @@ from memoryos.contextdb.store.source_store import (
     LeaseLostError,
     QueueIdempotencyConflictError,
     QueueJob,
+    QueueLeaseIdentityError,
 )
 from memoryos.core.time import utc_now
 
@@ -181,6 +182,22 @@ class SQLiteQueueStore:
             (int(bool(retryable)), max(1, int(max_retries)), str(error)[:500]),
         )
 
+    def release(self, job: QueueJob, reason: str = "") -> QueueJob:
+        """Return an unattempted owned lease without consuming retry budget."""
+
+        return self._settle(
+            job,
+            """
+            UPDATE queue_jobs
+            SET status = 'pending', last_error = ?, updated_at = ?,
+                leased_until = NULL, lease_token = '', lease_owner = ''
+            WHERE job_id = ? AND status = 'leased' AND lease_token = ?
+              AND lease_generation = ? AND lease_owner = ? AND leased_until > ?
+            RETURNING *
+            """,
+            (str(reason)[:500] if reason else job.last_error,),
+        )
+
     def quarantine(self, job: QueueJob, error: str) -> QueueJob:
         return self._settle(
             job,
@@ -194,6 +211,24 @@ class SQLiteQueueStore:
             RETURNING *
             """,
             (str(error)[:500],),
+        )
+
+    def quarantine_identity_conflict(self, job: QueueJob, error: str) -> QueueJob:
+        """Quarantine an owned lease whose immutable payload was corrupted."""
+
+        return self._settle(
+            job,
+            """
+            UPDATE queue_jobs
+            SET status = 'quarantine', retry_count = retry_count + 1,
+                last_error = ?, updated_at = ?, leased_until = NULL,
+                lease_token = '', lease_owner = ''
+            WHERE job_id = ? AND status = 'leased' AND lease_token = ?
+              AND lease_generation = ? AND lease_owner = ? AND leased_until > ?
+            RETURNING *
+            """,
+            (str(error)[:500],),
+            verify_identity=False,
         )
 
     def extend(self, job: QueueJob, *, lease_seconds: int = 60) -> QueueJob:
@@ -215,11 +250,61 @@ class SQLiteQueueStore:
             row = conn.execute("SELECT * FROM queue_jobs WHERE job_id = ?", (job_id,)).fetchone()
         return self._row_to_job(row) if row is not None else None
 
-    def _settle(self, job: QueueJob, sql: str, prefix: tuple[object, ...]) -> QueueJob:
+    def recover_expired_leases(self, *, queue_name: str | None = None) -> int:
+        """Return expired work to pending without consuming retry budget."""
+
+        now = self._now_dt().isoformat()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            queue_filter = "" if queue_name is None else " AND queue_name = ?"
+            parameters: tuple[object, ...] = (now,) if queue_name is None else (now, queue_name)
+            cursor = conn.execute(
+                f"""
+                UPDATE queue_jobs
+                SET status = 'pending', updated_at = ?, leased_until = NULL,
+                    lease_token = '', lease_owner = ''
+                WHERE status = 'leased'
+                  AND (leased_until IS NULL OR leased_until <= ?)
+                  {queue_filter}
+                """,
+                (now, *parameters),
+            )
+            recovered = int(cursor.rowcount)
+            conn.commit()
+        return recovered
+
+    def _settle(
+        self,
+        job: QueueJob,
+        sql: str,
+        prefix: tuple[object, ...],
+        *,
+        verify_identity: bool = True,
+    ) -> QueueJob:
         self._validate_lease(job)
         now = self._now_dt().isoformat()
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                "SELECT * FROM queue_jobs WHERE job_id = ?",
+                (job.job_id,),
+            ).fetchone()
+            if verify_identity:
+                try:
+                    identity_changed = current is not None and self._identity(current) != (
+                        job.queue_name,
+                        job.action,
+                        job.target_uri,
+                        self._canonical_payload(job.payload),
+                    )
+                except QueueIdempotencyConflictError as exc:
+                    conn.rollback()
+                    raise QueueLeaseIdentityError(
+                        f"queue immutable identity is corrupt while leased: {job.job_id}"
+                    ) from exc
+                if identity_changed:
+                    conn.rollback()
+                    raise QueueLeaseIdentityError(f"queue immutable identity changed while leased: {job.job_id}")
             row = conn.execute(
                 sql,
                 (
@@ -230,19 +315,23 @@ class SQLiteQueueStore:
                     job.lease_generation,
                     job.lease_owner,
                     now,
-                )
+                ),
             ).fetchone()
             if row is None:
                 conn.rollback()
-                raise LeaseLostError(
-                    f"queue lease lost for {job.job_id} generation {job.lease_generation}"
-                )
+                raise LeaseLostError(f"queue lease lost for {job.job_id} generation {job.lease_generation}")
             conn.commit()
         return self._row_to_job(row)
 
-    def stats(self) -> dict[str, int]:
+    def stats(self, *, queue_name: str | None = None) -> dict[str, int]:
         with self._connect() as conn:
-            rows = conn.execute("SELECT status, COUNT(*) AS count FROM queue_jobs GROUP BY status").fetchall()
+            if queue_name is None:
+                rows = conn.execute("SELECT status, COUNT(*) AS count FROM queue_jobs GROUP BY status").fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT status, COUNT(*) AS count FROM queue_jobs WHERE queue_name = ? GROUP BY status",
+                    (queue_name,),
+                ).fetchall()
         return {str(row["status"]): int(row["count"]) for row in rows}
 
     def _row_to_job(self, row: sqlite3.Row) -> QueueJob:
@@ -321,9 +410,7 @@ class SQLiteQueueStore:
         try:
             payload = json.loads(row["payload_json"] or "{}")
         except json.JSONDecodeError as exc:
-            raise QueueIdempotencyConflictError(
-                f"existing queue payload is corrupt: {row['job_id']}"
-            ) from exc
+            raise QueueIdempotencyConflictError(f"existing queue payload is corrupt: {row['job_id']}") from exc
         return (
             str(row["queue_name"]),
             str(row["action"]),

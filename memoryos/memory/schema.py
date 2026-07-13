@@ -104,6 +104,28 @@ class MemoryTypeSchema:
     display_fields: tuple[str, ...] = ()
     applicability_fields: tuple[str, ...] = ()
 
+    def allowed_value_fields(self) -> frozenset[str]:
+        """Return every schema-declared field that may enter canonical state.
+
+        ``field_merge_rules`` may contain system-authored or legacy-projection
+        fields that are intentionally not model-authored, but they are still
+        explicit schema declarations.  Provenance and slot identity remain on
+        their dedicated surfaces and are never accepted as value fields merely
+        because they exist in the schema.
+        """
+
+        fields = {
+            *self.required_fields,
+            *self.optional_fields,
+            *self.claim_identity_fields,
+            *self.display_fields,
+            *self.applicability_fields,
+            *self.field_merge_rules,
+            "canonical_value",
+        }
+        fields.discard("*")
+        return frozenset(fields)
+
     def claim_identity_keys(self, value_fields: dict[str, Any]) -> tuple[str, ...]:
         """Return all schema-declared semantic claim keys deterministically.
 
@@ -237,7 +259,7 @@ class MemoryTypeRegistry:
                 memory_type=MemoryType.PROJECT_RULE,
                 description="Long-lived project constraints and rules that must be followed in future work.",
                 required_fields=("rule", "project_id"),
-                optional_fields=("scope", "rationale"),
+                optional_fields=("scope", "rationale", "constraint_polarity"),
                 default_retrieval_views=("project:{project_id}:rules",),
                 field_merge_rules={
                     "rule_key": FieldMergeMode.IMMUTABLE,
@@ -245,6 +267,7 @@ class MemoryTypeRegistry:
                     "content": FieldMergeMode.PATCH_TEXT,
                     "constraints": FieldMergeMode.APPEND_UNIQUE,
                     "project_id": FieldMergeMode.IMMUTABLE,
+                    "constraint_polarity": FieldMergeMode.IMMUTABLE,
                 },
                 slot_identity_fields=("rule_topic",),
                 claim_identity_fields=("canonical_value", "subject", *COMMON_CLAIM_QUALIFIER_FIELDS),

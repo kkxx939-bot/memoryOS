@@ -80,7 +80,12 @@ def _context_db(tmp_path, queue: InMemoryQueueStore) -> tuple[ContextDB, Recordi
         SessionArchiveStore(tmp_path),
         queue,
         committer=cast(Any, committer),
-        memory_planner=MemoryCommitPlanner(extractor=RuleFallbackExtractor()),
+        memory_planner=MemoryCommitPlanner(
+            extractor=RuleFallbackExtractor(),
+            source_store=source,
+            index_store=index,
+            relation_store=relations,
+        ),
     )
     database = ContextDB(
         source,
@@ -147,12 +152,17 @@ def test_commit_session_async_false_keeps_sync_archive_pending_job(tmp_path) -> 
 
 def test_session_commit_worker_processes_real_pending_archive_once(tmp_path) -> None:
     queue = InMemoryQueueStore()
-    _source, _index, _relations, committer = _stores_with_recording_committer(tmp_path, queue)
+    source, index, relations, committer = _stores_with_recording_committer(tmp_path, queue)
     service = SessionCommitService(
         SessionArchiveStore(tmp_path),
         queue,
         committer=cast(Any, committer),
-        memory_planner=MemoryCommitPlanner(extractor=RuleFallbackExtractor()),
+        memory_planner=MemoryCommitPlanner(
+            extractor=RuleFallbackExtractor(),
+            source_store=source,
+            index_store=index,
+            relation_store=relations,
+        ),
     )
     archive = _archive()
     queued = service.sync_archive(archive)

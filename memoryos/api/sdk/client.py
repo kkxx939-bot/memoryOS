@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import inspect
 import json
+import math
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -34,7 +36,7 @@ from memoryos.contextdb.store import IndexStore, RelationStore, SourceStore
 from memoryos.contextdb.store.source_store import LockStore, QueueStore
 from memoryos.contextdb.store.vector_store import VectorStore
 from memoryos.contextdb.transaction.path_lock import PathLock
-from memoryos.core.ids import stable_hash
+from memoryos.core.ids import require_safe_path_segment, stable_hash
 from memoryos.memory.canonical import (
     IDENTITY_ALGORITHM_V2,
     Atomicity,
@@ -57,9 +59,15 @@ from memoryos.memory.canonical import (
     bind_field_evidence,
     scope_key_from_payload,
 )
-from memoryos.memory.canonical.visibility import read_committed_canonical
-from memoryos.memory.extraction import MemoryExtractorBackend
-from memoryos.memory.schema import MemoryType
+from memoryos.memory.canonical.current_head import artifact_root_for, load_current_head
+from memoryos.memory.canonical.review_command import (
+    PendingReviewCommandStore,
+    PendingReviewIdempotencyConflict,
+    validate_pending_review_record,
+)
+from memoryos.memory.canonical.visibility import committed_content, read_committed_canonical
+from memoryos.memory.extraction import MemoryEgressPolicy, MemoryExtractorBackend
+from memoryos.memory.schema import MemoryType, MemoryTypeRegistry
 from memoryos.operations.model.context_diff import ContextDiff
 from memoryos.operations.model.context_operation import ContextOperation
 from memoryos.operations.model.operation_action import OperationAction
@@ -88,6 +96,7 @@ class MemoryOSClient:
         hybrid_search: HybridSearch | None = None,
         reranker: Reranker | None = None,
         memory_extractor: MemoryExtractorBackend | None = None,
+        memory_egress_policy: MemoryEgressPolicy | None = None,
         memory_aliases: dict[str, dict[str, str]] | None = None,
         mode: str = "local",
         tenant_id: str = "default",
@@ -101,6 +110,7 @@ class MemoryOSClient:
                 mode=mode,
                 tenant_id=tenant_id,
                 memory_extractor=memory_extractor,
+                memory_egress_policy=memory_egress_policy,
                 memory_aliases=memory_aliases,
                 reranker=reranker,
             ),
@@ -132,10 +142,20 @@ class MemoryOSClient:
         self.memory_projection_worker = container.memory_projection_worker
         self.recovery_service = container.recovery_service
         self.recovery_worker = container.recovery_worker
+        self.readiness = container.readiness
+        self._tenant_clients: dict[str, MemoryOSClient] = {}
+        self._tenant_clients_lock = threading.RLock()
+        self._tenant_mode = mode
+        self._tenant_memory_extractor = memory_extractor
+        self._tenant_memory_egress_policy = memory_egress_policy
+        self._tenant_memory_aliases = memory_aliases
+        self._tenant_reranker = reranker
+        self._tenant_embedding_provider = embedding_provider
 
     def predict(self, request: PredictionRequest, policies: list[ActionPolicy] | None = None) -> PredictionResult:
         """处理 predict 这一步。"""
 
+        self._require_ready()
         self._require_predict_metadata(request.connect_metadata)
         return self.engine.process(request, policies=policies)
 
@@ -149,6 +169,7 @@ class MemoryOSClient:
     ) -> ProcessObservationResult:
         """处理一次观察并返回预测结果，记忆仍由会话提交形成。"""
 
+        self._require_ready()
         metadata = self._require_process_observation_metadata(request.connect_metadata)
         connect_metadata = metadata.to_dict()
         result = self.engine.process(request, policies=policies)
@@ -217,7 +238,10 @@ class MemoryOSClient:
             feedback=feedback,
             used_contexts=used_contexts,
             used_skills=used_skills,
-            metadata={"connect": connect_metadata},
+            metadata={
+                "connect": connect_metadata,
+                "tenant_id": self._effective_tenant(None, None),
+            },
         )
         archive_error = None
         try:
@@ -244,7 +268,7 @@ class MemoryOSClient:
         search_scope: str | None = None,
         retrieval_views: list[str] | None = None,
         project_id: str = "",
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
         applicability_scopes: list[dict[str, Any]] | None = None,
         memory_states: list[str] | None = None,
         memory_types: list[str] | None = None,
@@ -255,12 +279,33 @@ class MemoryOSClient:
     ) -> list[dict[str, Any]]:
         """按用户、工作区、状态和查询意图检索上下文。"""
 
+        tenant_id = self._effective_tenant(caller, tenant_id)
+        scoped = self._client_for_tenant(tenant_id)
+        if scoped is not self:
+            return scoped.search_context(
+                query,
+                user_id=user_id,
+                context_type=context_type,
+                limit=limit,
+                connect_metadata=connect_metadata,
+                search_scope=search_scope,
+                retrieval_views=retrieval_views,
+                project_id=project_id,
+                tenant_id=tenant_id,
+                applicability_scopes=applicability_scopes,
+                memory_states=memory_states,
+                memory_types=memory_types,
+                claim_uris=claim_uris,
+                slot_uris=slot_uris,
+                query_intent=query_intent,
+                caller=caller,
+            )
+        self._require_ready()
         if caller is not None:
             caller.require(READ_CONTEXT)
             caller.assert_identity(user_id=user_id, tenant_id=tenant_id)
             caller.assert_applicability_scopes(applicability_scopes)
             user_id = caller.user_id
-            tenant_id = caller.tenant_id
             project_id = caller.bind_read_workspace(project_id)
 
         connect_filters = self._connect_filters_from_metadata(connect_metadata)
@@ -284,7 +329,9 @@ class MemoryOSClient:
             "query_intent": query_intent,
         }
         service = RetrievalService(assembler, _trace_root(self))
-        results, self.last_recall_trace_id = service.search(query, **_supported_kwargs(assembler.search, kwargs))
+        results, trace_id = service.search(query, **_supported_kwargs(assembler.search, kwargs))
+        self._require_ready()
+        self.last_recall_trace_id = trace_id
         return results
 
     def assemble_context(
@@ -299,7 +346,7 @@ class MemoryOSClient:
         search_scope: str | None = None,
         retrieval_views: list[str] | None = None,
         project_id: str = "",
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
         applicability_scopes: list[dict[str, Any]] | None = None,
         memory_states: list[str] | None = None,
         memory_types: list[str] | None = None,
@@ -310,12 +357,34 @@ class MemoryOSClient:
     ) -> dict[str, Any]:
         """检索并打包本次请求能看到的上下文。"""
 
+        tenant_id = self._effective_tenant(caller, tenant_id)
+        scoped = self._client_for_tenant(tenant_id)
+        if scoped is not self:
+            return scoped.assemble_context(
+                query,
+                user_id=user_id,
+                token_budget=token_budget,
+                context_types=context_types,
+                limit=limit,
+                connect_metadata=connect_metadata,
+                search_scope=search_scope,
+                retrieval_views=retrieval_views,
+                project_id=project_id,
+                tenant_id=tenant_id,
+                applicability_scopes=applicability_scopes,
+                memory_states=memory_states,
+                memory_types=memory_types,
+                claim_uris=claim_uris,
+                slot_uris=slot_uris,
+                query_intent=query_intent,
+                caller=caller,
+            )
+        self._require_ready()
         if caller is not None:
             caller.require(READ_CONTEXT)
             caller.assert_identity(user_id=user_id, tenant_id=tenant_id)
             caller.assert_applicability_scopes(applicability_scopes)
             user_id = caller.user_id
-            tenant_id = caller.tenant_id
             project_id = caller.bind_read_workspace(project_id)
 
         metadata = self._parse_connect_metadata(connect_metadata)
@@ -345,6 +414,7 @@ class MemoryOSClient:
         }
         service = RetrievalService(assembler, _trace_root(self))
         result = service.assemble(query, **_supported_kwargs(assembler.assemble, kwargs))
+        self._require_ready()
         self.last_recall_trace_id = str(result.get("trace_id", ""))
         return result
 
@@ -354,6 +424,7 @@ class MemoryOSClient:
         *,
         caller: TrustedRequestContext | None = None,
     ) -> dict[str, Any]:
+        self._require_ready()
         if caller is not None:
             caller.require(READ_CONTEXT)
         trace = RetrievalService(self._context_assembler(), _trace_root(self)).read_trace(trace_id)
@@ -369,35 +440,63 @@ class MemoryOSClient:
         uri: str,
         *,
         layer: str = "L2",
+        tenant_id: str | None = None,
         caller: TrustedRequestContext | None = None,
     ) -> dict[str, Any]:
+        tenant_id = self._effective_tenant(caller, tenant_id)
+        scoped = self._client_for_tenant(tenant_id)
+        if scoped is not self:
+            return scoped.read(uri, layer=layer, tenant_id=tenant_id, caller=caller)
+        self._require_ready()
+        parsed = ContextURI.parse(uri)
         if caller is not None:
             caller.require(READ_CONTEXT)
-            parsed = ContextURI.parse(uri)
-        obj = self.context_db.read_object(uri)
         committed = None
-        if caller is not None and dict(obj.metadata or {}).get("canonical_kind"):
+        if "/memories/canonical/" in uri or "/memories/pending/" in uri:
             committed = read_committed_canonical(self.source_store, uri, self.relation_store)
             obj = committed.object
+        else:
+            obj = self.context_db.read_object(uri)
+            if dict(obj.metadata or {}).get("canonical_kind") in {"slot", "claim", "pending_proposal"}:
+                committed = read_committed_canonical(self.source_store, uri, self.relation_store)
+                obj = committed.object
         if caller is not None:
             self._require_exact_read_visibility(uri, obj, caller)
-        layer_uri = {"L0": obj.layers.l0_uri, "L1": obj.layers.l1_uri, "L2": obj.layers.l2_uri or obj.uri}.get(
-            layer.upper()
-        )
+        requested_layer = layer.upper()
+        if committed is not None and requested_layer != "L2":
+            metadata = dict(obj.metadata or {})
+            if metadata.get("canonical_kind") != "claim":
+                raise FileNotFoundError(f"committed layer unavailable: {layer}")
+            revision = int(metadata.get("revision", 0) or 0)
+            self.memory_projection_worker._verify_claim_projection(obj.uri, revision)
+            record = self.memory_projection_worker.projector.record_store.load_current(
+                obj.uri,
+                source_revision=revision,
+            )
+            if record is None:
+                raise FileNotFoundError(f"committed layer unavailable: {layer}")
+            layer_uri = {
+                "L0": record.l0_uri,
+                "L1": record.l1_uri,
+            }.get(requested_layer)
+        else:
+            layer_uri = {
+                "L0": obj.layers.l0_uri,
+                "L1": obj.layers.l1_uri,
+                "L2": obj.layers.l2_uri or obj.uri,
+            }.get(requested_layer)
         if not layer_uri:
             raise FileNotFoundError(f"layer unavailable: {layer}")
-        if committed is not None and committed.from_before_image and layer.upper() != "L2":
-            raise FileNotFoundError(f"committed layer unavailable: {layer}")
         if caller is not None:
             layer_parsed = ContextURI.parse(layer_uri)
             if layer_parsed.authority != parsed.authority or layer_parsed.user_id != parsed.user_id:
                 raise FileNotFoundError(uri)
         content = (
-            committed.content_override
-            if committed is not None and committed.content_override is not None and layer.upper() == "L2"
+            committed_content(committed)
+            if committed is not None and requested_layer == "L2"
             else self.source_store.read_content(layer_uri)
         )
-        return {"object": obj.to_dict(), "layer": layer.upper(), "content": content}
+        return {"object": obj.to_dict(), "layer": requested_layer, "content": content}
 
     def remember(
         self,
@@ -410,12 +509,31 @@ class MemoryOSClient:
         constraint_polarity: str = "",
         condition: str = "",
         exception: str = "",
+        identity_fields: dict[str, Any] | None = None,
         connect_metadata: dict[str, Any] | None = None,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
         caller: TrustedRequestContext | None = None,
     ) -> dict[str, Any]:
         """Commit a structured explicit-memory command through the canonical chain."""
 
+        tenant_id = self._effective_tenant(caller, tenant_id)
+        scoped = self._client_for_tenant(tenant_id)
+        if scoped is not self:
+            return scoped.remember(
+                user_id=user_id,
+                content=content,
+                title=title,
+                memory_type=memory_type,
+                project_id=project_id,
+                constraint_polarity=constraint_polarity,
+                condition=condition,
+                exception=exception,
+                identity_fields=identity_fields,
+                connect_metadata=connect_metadata,
+                tenant_id=tenant_id,
+                caller=caller,
+            )
+        self._require_ready()
         if caller is not None:
             caller.require(AUTHORITATIVE_REMEMBER)
             caller.assert_identity(user_id=user_id, tenant_id=tenant_id)
@@ -436,8 +554,10 @@ class MemoryOSClient:
                 user_id,
                 project_id,
                 normalized_type,
+                tenant_id,
                 title,
                 content,
+                identity_fields or {},
                 constraint_polarity,
                 condition,
                 exception,
@@ -450,6 +570,7 @@ class MemoryOSClient:
             user_id=user_id,
             project_id=project_id,
             event_id=event_id,
+            explicit_fields=identity_fields,
         )
         value_fields: dict[str, Any] = {"canonical_value": content}
         modal_force = ModalForce.PREFER
@@ -587,15 +708,39 @@ class MemoryOSClient:
         if formed.decision.value != "ACCEPT_FOR_RECONCILE":
             raise ValueError(f"explicit memory was not admitted: {formed.reason}")
         if not operations:
-            existing = self.search_context(
-                content[:120],
-                user_id=user_id,
-                project_id=project_id,
-                context_type=ContextType.MEMORY,
-                query_intent="CURRENT",
+            identity = formed.resolved_identity
+            if identity is None:
+                raise RuntimeError("canonical no-op has no resolved Identity V2 proof")
+            _slot, existing_claims = CanonicalMemoryRepository(
+                self.source_store,
+                self.relation_store,
+            ).load(identity)
+            existing_claim = next(
+                (
+                    claim
+                    for claim in existing_claims
+                    if claim.claim_id == identity.claim_id and claim.current.state == "ACTIVE"
+                ),
+                None,
             )
-            uri = str(existing[0]["uri"]) if existing else ""
-            return {"uri": uri, "status": "COMMITTED", "diff_id": ""}
+            if existing_claim is None:
+                raise RuntimeError("canonical no-op does not resolve to an exact committed ACTIVE Claim")
+            artifact_root = artifact_root_for(self.source_store)
+            if artifact_root is None:
+                raise RuntimeError("canonical no-op has no tenant artifact root")
+            head, receipt, _snapshot = load_current_head(
+                artifact_root,
+                existing_claim.uri,
+                canonical_kind="claim",
+            )
+            return {
+                "uri": existing_claim.uri,
+                "status": "COMMITTED",
+                "diff_id": str(dict(receipt.get("diff", {}) or {}).get("diff_id") or ""),
+                "transaction_id": str(head["current_transaction_id"]),
+                "receipt_digest": str(head["receipt_digest"]),
+                "idempotent_replay": True,
+            }
         diff = self.committer.commit(user_id, operations)
         self.memory_projection_worker.process_pending()
         uri = next(
@@ -604,7 +749,22 @@ class MemoryOSClient:
             if dict(operation.payload.get("context_object", {}).get("metadata", {}) or {}).get("canonical_kind")
             == "claim"
         )
-        return {"uri": uri, "status": "COMMITTED", "diff_id": diff.diff_id}
+        artifact_root = artifact_root_for(self.source_store)
+        if artifact_root is None:
+            raise RuntimeError("canonical commit has no tenant artifact root")
+        head, _receipt, _snapshot = load_current_head(
+            artifact_root,
+            uri,
+            canonical_kind="claim",
+        )
+        return {
+            "uri": uri,
+            "status": "COMMITTED",
+            "diff_id": diff.diff_id,
+            "transaction_id": str(head["current_transaction_id"]),
+            "receipt_digest": str(head["receipt_digest"]),
+            "idempotent_replay": False,
+        }
 
     def forget(
         self,
@@ -616,18 +776,33 @@ class MemoryOSClient:
     ) -> dict[str, Any]:
         """撤回或软删除自己拥有的记忆，同时保留审计信息。"""
 
+        tenant_id = self._effective_tenant(caller, tenant_id)
+        scoped = self._client_for_tenant(tenant_id)
+        if scoped is not self:
+            return scoped.forget(
+                user_id=user_id,
+                uri=uri,
+                tenant_id=tenant_id,
+                caller=caller,
+            )
+        self._require_ready()
         if caller is not None:
             caller.require(AUTHORITATIVE_FORGET)
             caller.assert_identity(user_id=user_id, tenant_id=tenant_id)
         parsed = ContextURI.parse(uri)
-        obj = self.context_db.read_object(uri)
+        if "/memories/canonical/" in uri or "/memories/pending/" in uri:
+            obj = read_committed_canonical(self.source_store, uri, self.relation_store).object
+        else:
+            obj = self.context_db.read_object(uri)
+            if dict(obj.metadata or {}).get("canonical_kind") in {"slot", "claim", "pending_proposal"}:
+                obj = read_committed_canonical(self.source_store, uri, self.relation_store).object
         metadata = dict(obj.metadata or {})
         if caller is not None:
             self._require_exact_workspace(metadata, caller, uri)
         scope = dict(metadata.get("scope", {}) or {})
         authority = dict(scope.get("authority", {}) or {})
         authority_principals = {str(item) for item in authority.get("principal_ids", []) or []}
-        if tenant_id is not None and str(obj.tenant_id or "default") != tenant_id:
+        if str(obj.tenant_id or "default") != tenant_id:
             raise PermissionError("forget tenant does not match trusted identity")
         if (
             obj.owner_user_id != user_id
@@ -663,11 +838,22 @@ class MemoryOSClient:
         self,
         *,
         user_id: str,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
         lifecycle_states: list[str] | None = None,
         project_id: str = "",
         caller: TrustedRequestContext | None = None,
     ) -> list[dict[str, Any]]:
+        tenant_id = self._effective_tenant(caller, tenant_id)
+        scoped = self._client_for_tenant(tenant_id)
+        if scoped is not self:
+            return scoped.list_pending(
+                user_id=user_id,
+                tenant_id=tenant_id,
+                lifecycle_states=lifecycle_states,
+                project_id=project_id,
+                caller=caller,
+            )
+        self._require_ready()
         if caller is not None:
             caller.require(READ_CONTEXT)
             caller.assert_identity(user_id=user_id, tenant_id=tenant_id)
@@ -693,16 +879,170 @@ class MemoryOSClient:
         expected_lifecycle_revision: int,
         expected_proposal_fingerprint: str,
         command_id: str,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
         reason: str = "",
+        corrected_proposal: MemorySemanticProposal | dict[str, Any] | None = None,
         caller: TrustedRequestContext | None = None,
     ) -> dict[str, Any]:
         """Apply a user-owned structured review without accepting arbitrary operations or targets."""
 
+        tenant_id = self._effective_tenant(caller, tenant_id)
+        scoped = self._client_for_tenant(tenant_id)
+        if scoped is not self:
+            return scoped.review_pending(
+                user_id=user_id,
+                pending_uri=pending_uri,
+                decision=decision,
+                expected_lifecycle_revision=expected_lifecycle_revision,
+                expected_proposal_fingerprint=expected_proposal_fingerprint,
+                command_id=command_id,
+                tenant_id=tenant_id,
+                reason=reason,
+                corrected_proposal=corrected_proposal,
+                caller=caller,
+            )
+        self._require_ready()
         if expected_lifecycle_revision < 1:
             raise ValueError("expected_lifecycle_revision must be positive")
         if not expected_proposal_fingerprint or not command_id:
             raise ValueError("pending review requires proposal fingerprint and command_id")
+        normalized_decision = str(decision or "").strip().upper()
+        allowed_decisions = {
+            "CONFIRM",
+            "CONFIRM_AND_APPLY",
+            "CORRECT",
+            "REJECT",
+            "EXPIRE",
+            "RETRY",
+        }
+        if normalized_decision not in allowed_decisions:
+            raise ValueError(
+                "pending review decision must be CONFIRM, CONFIRM_AND_APPLY, CORRECT, REJECT, EXPIRE, or RETRY"
+            )
+        if corrected_proposal is not None and not isinstance(corrected_proposal, MemorySemanticProposal | dict):
+            raise ValueError("corrected_proposal must be a semantic proposal object")
+        correction = (
+            corrected_proposal
+            if isinstance(corrected_proposal, MemorySemanticProposal)
+            else MemorySemanticProposal.from_dict(corrected_proposal)
+            if isinstance(corrected_proposal, dict)
+            else None
+        )
+        if (normalized_decision == "CORRECT") != (correction is not None):
+            raise ValueError("CORRECT requires corrected_proposal and other decisions forbid it")
+        correction_digest = stable_hash([correction.to_dict()], length=64) if correction is not None else ""
+        review_store = PendingReviewCommandStore(self.root, tenant_id=tenant_id)
+        lock_key = f"pending-review:{tenant_id}:{pending_uri}"
+        with PathLock(self.lock_store).acquire(lock_key, ttl_seconds=120) as guard:
+            guard.checkpoint()
+            committed_pending = CanonicalMemoryRepository(
+                self.source_store,
+                self.relation_store,
+            ).load_pending(
+                pending_uri,
+                tenant_id=tenant_id,
+                owner_user_id=user_id,
+            )
+            if caller is not None:
+                caller.require(AUTHORITATIVE_REMEMBER)
+                caller.assert_identity(user_id=user_id, tenant_id=tenant_id)
+                self._require_exact_workspace(
+                    {"scope": committed_pending.scope.to_dict()},
+                    caller,
+                    pending_uri,
+                )
+            if committed_pending.lifecycle_state == LifecycleState.CONFIRMED:
+                for raw_transition in reversed(committed_pending.lifecycle_history):
+                    transition = dict(raw_transition)
+                    owning_command = str(transition.get("review_command_id") or "")
+                    if (
+                        str(transition.get("to") or "").casefold() != "confirmed"
+                        or str(transition.get("review_decision") or "").upper() != "CONFIRM_AND_APPLY"
+                        or not owning_command
+                        or owning_command == command_id
+                    ):
+                        continue
+                    owning_record = review_store.load(owning_command)
+                    if owning_record.get("status") == "running":
+                        raise PendingReviewIdempotencyConflict(
+                            "another CONFIRM_AND_APPLY command owns the in-flight resolution"
+                        )
+                    break
+            command_proof_preexisting = review_store.path(command_id).exists()
+            command = review_store.begin(
+                command_id,
+                owner_user_id=user_id,
+                pending_uri=pending_uri,
+                decision=normalized_decision,
+                expected_lifecycle_revision=expected_lifecycle_revision,
+                expected_proposal_fingerprint=expected_proposal_fingerprint,
+                reason=reason,
+                correction_proposal_digest=correction_digest,
+            )
+            if command["status"] == "completed":
+                validate_pending_review_record(command, committed_pending)
+                return dict(command["result"])
+            if command["status"] == "failed":
+                error = dict(command.get("error", {}) or {})
+                raise ValueError(
+                    "pending review command previously failed: "
+                    f"{error.get('type', 'UnknownError')}: {error.get('message', '')}"
+                )
+            self.committer.recover_pending_regular_memory(
+                user_id,
+                commit_group_id=f"pending-review:{command_id}",
+            )
+            self.committer.recover_pending_canonical(
+                user_id,
+                commit_group_id=f"pending-resolution:{command_id}",
+            )
+            self.committer.recover_pending_canonical(
+                user_id,
+                commit_group_id=f"pending-correction:{command_id}",
+            )
+            try:
+                result = self._review_pending_locked(
+                    user_id=user_id,
+                    pending_uri=pending_uri,
+                    normalized_decision=normalized_decision,
+                    expected_lifecycle_revision=expected_lifecycle_revision,
+                    expected_proposal_fingerprint=expected_proposal_fingerprint,
+                    command_id=command_id,
+                    tenant_id=tenant_id,
+                    reason=reason,
+                    corrected_proposal=correction,
+                    caller=caller,
+                    review_request_digest=str(command["request_digest"]),
+                    command_proof_preexisting=command_proof_preexisting,
+                )
+            except (FileNotFoundError, PermissionError, KeyError, TypeError, ValueError) as exc:
+                review_store.fail(command_id, exc)
+                raise
+            except (OSError, TimeoutError, RuntimeError):
+                # The durable command stays ``running``.  A retry first
+                # recovers receipt/head/redo state and then returns or
+                # completes the exact same command effect.
+                raise
+            guard.checkpoint()
+            review_store.complete(command_id, result)
+            return result
+
+    def _review_pending_locked(
+        self,
+        *,
+        user_id: str,
+        pending_uri: str,
+        normalized_decision: str,
+        expected_lifecycle_revision: int,
+        expected_proposal_fingerprint: str,
+        command_id: str,
+        tenant_id: str,
+        reason: str,
+        corrected_proposal: MemorySemanticProposal | None,
+        caller: TrustedRequestContext | None,
+        review_request_digest: str,
+        command_proof_preexisting: bool,
+    ) -> dict[str, Any]:
         repository = CanonicalMemoryRepository(self.source_store, self.relation_store)
         pending = repository.load_pending(
             pending_uri,
@@ -713,14 +1053,90 @@ class MemoryOSClient:
             caller.require(AUTHORITATIVE_REMEMBER)
             caller.assert_identity(user_id=user_id, tenant_id=tenant_id)
             self._require_exact_workspace({"scope": pending.scope.to_dict()}, caller, pending_uri)
-        if (
-            pending.lifecycle_revision != expected_lifecycle_revision
-            or pending.proposal.fingerprint != expected_proposal_fingerprint
-        ):
+        if pending.proposal.fingerprint != expected_proposal_fingerprint:
             raise ValueError("pending review expected revision or proposal fingerprint mismatch")
-        normalized_decision = str(decision or "").strip().upper()
+        command_reason_prefix = f"structured_review:{command_id}"
+        structured_history = [
+            dict(item)
+            for item in pending.lifecycle_history
+            if str(dict(item).get("review_command_id") or "") == command_id
+        ]
+        if any(
+            str(item.get("review_decision") or "").strip().upper() != normalized_decision
+            or str(item.get("review_request_digest") or "") != review_request_digest
+            for item in structured_history
+        ):
+            raise PendingReviewIdempotencyConflict(
+                "pending review command_id is already bound by a receipt to a different decision or effect"
+            )
+        legacy_command_history = any(
+            str(dict(item).get("reason") or "").startswith(
+                (command_reason_prefix, f"structured_correction:{command_id}")
+            )
+            and not dict(item).get("review_command_id")
+            for item in pending.lifecycle_history
+        )
+        if legacy_command_history and not command_proof_preexisting:
+            raise PendingReviewIdempotencyConflict(
+                "legacy pending review history has no durable request binding; command_id cannot be recreated"
+            )
+        command_history = bool(structured_history or legacy_command_history)
+        if pending.lifecycle_revision != expected_lifecycle_revision and not command_history:
+            raise ValueError("pending review expected revision or proposal fingerprint mismatch")
+        pending.assert_review_decision(normalized_decision)
         formation = self.session_commit_service.memory_planner.formation
         review_reason = f"structured_review:{command_id}:{reason}".rstrip(":")
+        if normalized_decision == "CORRECT":
+            assert corrected_proposal is not None
+            correction_prefix = f"structured_correction:{command_id}"
+            correction_history = any(
+                str(dict(item).get("reason") or "").startswith(correction_prefix) for item in pending.lifecycle_history
+            )
+            if pending.lifecycle_state == LifecycleState.REJECTED and correction_history:
+                return self._pending_review_recovered_result(pending_uri, pending, ())
+            evidence = corrected_proposal.atomic_evidence_ref or (
+                corrected_proposal.evidence_refs[0] if corrected_proposal.evidence_refs else None
+            )
+            if evidence is None or not evidence.source_uri:
+                raise ValueError("corrected proposal has no durable source archive")
+            archive = self.session_archive_store.read_archive(evidence.source_uri, tenant_id=tenant_id)
+            episode = self.session_commit_service.memory_planner.episode_adapter.adapt(archive)
+            corrected = formation.plan_pending_correction(
+                pending_uri,
+                corrected_proposal,
+                archive=archive,
+                episode=episode,
+                tenant_id=tenant_id,
+                owner_user_id=user_id,
+                commit_group_id=f"pending-correction:{command_id}",
+                retrieval_views=list(pending.retrieval_views),
+                reason=correction_prefix,
+                review_command_id=command_id,
+                review_decision=normalized_decision,
+                review_request_digest=review_request_digest,
+            )
+            diff = self.committer.commit(user_id, list(corrected.operations))
+            self.memory_projection_worker.process_pending()
+            final = repository.load_pending(
+                pending_uri,
+                tenant_id=tenant_id,
+                owner_user_id=user_id,
+            )
+            corrected_claim_uris = tuple(
+                str(operation.target_uri)
+                for operation in corrected.operations
+                if isinstance((payload := operation.payload.get("context_object")), dict)
+                and dict(payload.get("metadata", {}) or {}).get("canonical_kind") == "claim"
+                and dict(payload.get("metadata", {}) or {}).get("state") == "ACTIVE"
+            )
+            return {
+                "uri": pending_uri,
+                "status": final.lifecycle_state.value,
+                "lifecycle_revision": final.lifecycle_revision,
+                "corrected_claim_uris": list(corrected_claim_uris),
+                "corrected_proposal_fingerprint": corrected.proposal.fingerprint,
+                "diff_id": diff.diff_id,
+            }
         terminal = {
             "REJECT": LifecycleState.REJECTED,
             "EXPIRE": LifecycleState.EXPIRED,
@@ -728,6 +1144,8 @@ class MemoryOSClient:
             "CONFIRM": LifecycleState.CONFIRMED,
         }
         if normalized_decision in terminal:
+            if pending.lifecycle_state == terminal[normalized_decision] and command_history:
+                return self._pending_review_recovered_result(pending_uri, pending, ())
             operation = formation.plan_pending_lifecycle_transition(
                 pending_uri,
                 terminal[normalized_decision],
@@ -736,6 +1154,9 @@ class MemoryOSClient:
                 commit_group_id=f"pending-review:{command_id}",
                 reason=review_reason,
                 retry_increment=normalized_decision == "RETRY",
+                review_command_id=command_id,
+                review_decision=normalized_decision,
+                review_request_digest=review_request_digest,
             )
             diff = self.committer.commit(user_id, [operation])
             updated = repository.load_pending(
@@ -749,8 +1170,8 @@ class MemoryOSClient:
                 "lifecycle_revision": updated.lifecycle_revision,
                 "diff_id": diff.diff_id,
             }
-        if normalized_decision != "CONFIRM_AND_APPLY":
-            raise ValueError("pending review decision must be CONFIRM, CONFIRM_AND_APPLY, REJECT, EXPIRE, or RETRY")
+        if pending.lifecycle_state == LifecycleState.RESOLVED and command_history:
+            return self._pending_review_recovered_result(pending_uri, pending, ())
         if pending.lifecycle_state in {LifecycleState.PENDING, LifecycleState.RETRYABLE}:
             confirmation = formation.plan_pending_lifecycle_transition(
                 pending_uri,
@@ -759,6 +1180,9 @@ class MemoryOSClient:
                 owner_user_id=user_id,
                 commit_group_id=f"pending-review:{command_id}",
                 reason=review_reason,
+                review_command_id=command_id,
+                review_decision=normalized_decision,
+                review_request_digest=review_request_digest,
             )
             self.committer.commit(user_id, [confirmation])
             pending = repository.load_pending(
@@ -785,6 +1209,9 @@ class MemoryOSClient:
             commit_group_id=f"pending-resolution:{command_id}",
             retrieval_views=list(pending.retrieval_views),
             reason=review_reason,
+            review_command_id=command_id,
+            review_decision=normalized_decision,
+            review_request_digest=review_request_digest,
         )
         diff = self.committer.commit(user_id, list(resolved.operations))
         self.memory_projection_worker.process_pending()
@@ -808,10 +1235,60 @@ class MemoryOSClient:
             "diff_id": diff.diff_id,
         }
 
+    def _pending_review_recovered_result(
+        self,
+        pending_uri: str,
+        pending: Any,
+        claim_uris: tuple[str, ...],
+    ) -> dict[str, Any]:
+        diff_id = ""
+        resolved_claim_uris = list(claim_uris)
+        artifact_root = artifact_root_for(self.source_store)
+        if artifact_root is not None:
+            _head, receipt, _snapshot = load_current_head(
+                artifact_root,
+                pending_uri,
+                canonical_kind="pending_proposal",
+            )
+            diff_id = str(dict(receipt.get("diff", {}) or {}).get("diff_id") or "")
+            for operation in receipt.get("operations", []):
+                if not isinstance(operation, dict) or operation.get("target_uri") != pending_uri:
+                    continue
+                resolved_claim_uris.extend(
+                    str(item) for item in dict(operation.get("payload", {}) or {}).get("resolved_claim_uris", []) or []
+                )
+                corrected_claim_uris = [
+                    str(item) for item in dict(operation.get("payload", {}) or {}).get("corrected_claim_uris", []) or []
+                ]
+                if corrected_claim_uris:
+                    result_correction = {
+                        "corrected_claim_uris": corrected_claim_uris,
+                        "corrected_proposal_fingerprint": str(
+                            dict(operation.get("payload", {}) or {}).get("corrected_proposal_fingerprint") or ""
+                        ),
+                    }
+                    break
+            else:
+                result_correction = {}
+        result: dict[str, Any] = {
+            "uri": pending_uri,
+            "status": pending.lifecycle_state.value,
+            "lifecycle_revision": pending.lifecycle_revision,
+            "diff_id": diff_id,
+        }
+        if pending.lifecycle_state == LifecycleState.RESOLVED:
+            result["resolved_claim_uris"] = list(dict.fromkeys(resolved_claim_uris))
+        result.update(result_correction if artifact_root is not None else {})
+        return result
+
     def _forget_canonical_claim(self, user_id: str, obj) -> dict[str, Any]:  # noqa: ANN001
         metadata = dict(obj.metadata or {})
         slot_uri = obj.uri.rsplit("/claims/", 1)[0]
-        slot_obj = self.source_store.read_object(slot_uri)
+        slot_obj = read_committed_canonical(
+            self.source_store,
+            slot_uri,
+            self.relation_store,
+        ).object
         slot_metadata = dict(slot_obj.metadata or {})
         memory_scope = MemoryScope.from_dict(dict(metadata.get("scope", {}) or {}))
         canonical_subject = memory_scope.canonical_subject
@@ -975,13 +1452,20 @@ class MemoryOSClient:
         self,
         archive_uri: str,
         *,
+        tenant_id: str | None = None,
         caller: TrustedRequestContext | None = None,
     ) -> dict[str, Any]:
+        tenant_id = self._effective_tenant(caller, tenant_id)
+        scoped = self._client_for_tenant(tenant_id)
+        if scoped is not self:
+            return scoped.archive_read(archive_uri, tenant_id=tenant_id, caller=caller)
+        self._require_ready()
         if caller is not None:
             caller.require(READ_CONTEXT)
             if ContextURI.parse(archive_uri).user_id != caller.user_id:
                 raise FileNotFoundError(archive_uri)
-        tenant_id = caller.tenant_id if caller is not None else None
+        if not self.session_archive_store.archive_exists(archive_uri, tenant_id=tenant_id):
+            raise FileNotFoundError(archive_uri)
         archive = self.session_archive_store.read_archive(archive_uri, tenant_id=tenant_id)
         if caller is not None:
             if archive.user_id != caller.user_id:
@@ -999,22 +1483,33 @@ class MemoryOSClient:
         caller: TrustedRequestContext | None = None,
         project_id: str = "",
     ) -> list[dict[str, Any]]:
+        tenant_id = self._effective_tenant(caller, tenant_id)
+        scoped = self._client_for_tenant(tenant_id)
+        if scoped is not self:
+            return scoped.archive_search(
+                query,
+                user_id=user_id,
+                limit=limit,
+                tenant_id=tenant_id,
+                caller=caller,
+                project_id=project_id,
+            )
+        self._require_ready()
         if caller is not None:
             caller.require(READ_CONTEXT)
             caller.assert_identity(user_id=user_id, tenant_id=tenant_id)
-            tenant_id = caller.tenant_id
             project_id = caller.bind_read_workspace(project_id)
         results = []
         needle = query.lower()
-        for head_path in Path(self.root).glob("tenants/*/users/*/sessions/history/**/commit_head.json"):
-            try:
-                head = json.loads(head_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                continue
-            head_tenant = str(head.get("tenant_id") or "default")
-            if head.get("user_id") != user_id or (tenant_id is not None and head_tenant != tenant_id):
-                continue
-            archive = self.session_archive_store.read_archive(str(head["archive_uri"]), tenant_id=head_tenant)
+        tenant_root = Path(self.root) / "tenants" / tenant_id
+        safe_user_id = require_safe_path_segment(user_id, "archive search user_id")
+        history_root = tenant_root / "users" / safe_user_id / "sessions" / "history"
+        for head_path in history_root.glob("**/commit_head.json"):
+            archive = self.session_archive_store.read_archive_from_commit_head(
+                head_path,
+                tenant_id=tenant_id,
+                user_id=safe_user_id,
+            )
             if not self._workspace_matches(dict(archive.metadata or {}), project_id, caller):
                 continue
             text = "\n".join(str(item.get("content", item.get("text", ""))) for item in archive.messages)
@@ -1027,11 +1522,7 @@ class MemoryOSClient:
         return results
 
     def health(self) -> dict[str, Any]:
-        artifact_root = (
-            Path(self.root)
-            if self.tenant_id == "default"
-            else Path(self.root) / "tenants" / self.tenant_id
-        )
+        artifact_root = Path(self.root) if self.tenant_id == "default" else Path(self.root) / "tenants" / self.tenant_id
         heartbeat = artifact_root / "system" / "worker-health.json"
         worker_health: dict[str, Any] = {}
         if heartbeat.exists():
@@ -1055,19 +1546,47 @@ class MemoryOSClient:
             except (OSError, UnicodeError, json.JSONDecodeError):
                 worker_health = {"status": "failed", "last_error": "InvalidWorkerHealth"}
         queue_stats: dict[str, int] = getattr(self.queue_store, "stats", lambda: {})()
+        runtime = self.readiness.snapshot()
+        runtime_ready = bool(runtime.get("ready"))
+        worker_status = str(worker_health.get("status") or "stopped")
+
+        def failure_count(payload: dict[str, Any], key: str) -> int:
+            """Treat malformed health counters as evidence of degradation."""
+
+            try:
+                value = int(payload.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                return 1
+            return value if value >= 0 else 1
+
+        derived_unhealthy = bool(
+            worker_status in {"degraded", "failed"}
+            or failure_count(worker_health, "dead_letter") > 0
+            or failure_count(worker_health, "quarantine") > 0
+            or failure_count(queue_stats, "dead_letter") > 0
+            or failure_count(queue_stats, "quarantine") > 0
+        )
+        overall_status = "not_ready" if not runtime_ready else "degraded" if derived_unhealthy else "ready"
+        operational_state = "ready" if runtime_ready else "not_ready"
+
+        def optional_state(configured: object) -> str:
+            if configured is None:
+                return "disabled"
+            return operational_state
+
         return {
-            "source_store": "ready",
-            "index_store": "ready",
-            "queue_store": "ready",
-            "worker": str(worker_health.get("status") or "stopped"),
+            "status": overall_status,
+            "runtime": runtime,
+            "source_store": operational_state,
+            "index_store": operational_state,
+            "queue_store": operational_state,
+            "worker": worker_status,
             "worker_health": worker_health,
-            "memory_extractor": "ready"
-            if self.session_commit_service.memory_planner.extractor is not None
-            else "disabled",
-            "embedding": "ready" if self.embedding_provider else "disabled",
-            "vector_store": "ready" if self.vector_store else "disabled",
-            "reranker": "ready" if self.reranker else "disabled",
-            "http_server": "ready" if self.mode == "server" else "disabled",
+            "memory_extractor": optional_state(self.session_commit_service.memory_planner.extractor),
+            "embedding": optional_state(self.embedding_provider),
+            "vector_store": optional_state(self.vector_store),
+            "reranker": optional_state(self.reranker),
+            "http_server": operational_state if self.mode == "server" else "disabled",
             "queue": queue_stats,
             "degraded_features": [
                 name
@@ -1095,13 +1614,34 @@ class MemoryOSClient:
         session_key: str = "",
         scope: dict[str, Any] | None = None,
         provenance: dict[str, Any] | None = None,
+        tenant_id: str | None = None,
         caller: TrustedRequestContext | None = None,
     ) -> Any:
         """归档并提交一次 Agent 会话。"""
 
+        tenant_id = self._effective_tenant(caller, tenant_id)
+        scoped = self._client_for_tenant(tenant_id)
+        if scoped is not self:
+            return scoped.commit_agent_session(
+                user_id=user_id,
+                session_id=session_id,
+                messages=messages,
+                used_contexts=used_contexts,
+                used_skills=used_skills,
+                tool_results=tool_results,
+                connect_metadata=connect_metadata,
+                async_commit=async_commit,
+                project_id=project_id,
+                session_key=session_key,
+                scope=scope,
+                provenance=provenance,
+                tenant_id=tenant_id,
+                caller=caller,
+            )
+        self._require_ready()
         if caller is not None:
             caller.require(COMMIT_SESSION)
-            caller.assert_identity(user_id=user_id, tenant_id=dict(scope or {}).get("tenant_id"))
+            caller.assert_identity(user_id=user_id, tenant_id=tenant_id)
         metadata = self._parse_connect_metadata(connect_metadata)
         stable_session_id = session_key or session_id
         archive_uri = f"memoryos://user/{user_id}/sessions/history/{stable_session_id}"
@@ -1111,10 +1651,11 @@ class MemoryOSClient:
             normalized_project_id = caller.bind_write_workspace(normalized_project_id)
         if caller is None:
             normalized_scope = {
+                **dict(scope or {}),
                 "user_id": user_id,
                 "project_id": normalized_project_id,
                 "session_key": stable_session_id,
-                **dict(scope or {}),
+                "tenant_id": tenant_id,
             }
             normalized_provenance = {"native_session_id": session_id, **dict(provenance or {})}
             normalized_messages = messages or []
@@ -1126,6 +1667,7 @@ class MemoryOSClient:
                 project_id=normalized_project_id,
                 session_key=stable_session_id,
             )
+            normalized_scope["tenant_id"] = tenant_id
             normalized_provenance = sanitize_session_provenance(
                 provenance,
                 caller,
@@ -1211,6 +1753,47 @@ class MemoryOSClient:
                 service_allowed = caller.actor_kind == "service" and caller.actor_id in services
                 if not principal_allowed and not service_allowed:
                     raise FileNotFoundError(uri)
+
+    def _effective_tenant(
+        self,
+        caller: TrustedRequestContext | None,
+        explicit_tenant_id: str | None,
+    ) -> str:
+        if caller is not None:
+            if explicit_tenant_id is not None and explicit_tenant_id != caller.tenant_id:
+                raise PermissionError("tenant_id does not match trusted caller")
+            return caller.tenant_id
+        effective = explicit_tenant_id or getattr(self, "tenant_id", "default")
+        if not isinstance(effective, str) or not effective.strip():
+            raise ValueError("tenant_id is required")
+        return effective
+
+    def _client_for_tenant(self, tenant_id: str) -> MemoryOSClient:
+        """Return a runtime whose stores and recovery artifacts are bound to tenant_id."""
+
+        if tenant_id == getattr(self, "tenant_id", "default"):
+            return self
+        with self._tenant_clients_lock:
+            existing = self._tenant_clients.get(tenant_id)
+            if existing is not None:
+                return existing
+            client = MemoryOSClient(
+                self.root,
+                mode=self._tenant_mode,
+                tenant_id=tenant_id,
+                memory_extractor=self._tenant_memory_extractor,
+                memory_egress_policy=self._tenant_memory_egress_policy,
+                memory_aliases=self._tenant_memory_aliases,
+                reranker=self._tenant_reranker,
+                embedding_provider=self._tenant_embedding_provider,
+            )
+            self._tenant_clients[tenant_id] = client
+            return client
+
+    def _require_ready(self) -> None:
+        readiness = getattr(self, "readiness", None)
+        if readiness is not None:
+            readiness.require_ready()
 
     def _require_exact_workspace(
         self,
@@ -1381,11 +1964,7 @@ def _supported_kwargs(function: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
 def _trace_root(client: Any) -> Path:
     root = Path(str(getattr(client, "root", "/tmp/memoryos-test")))
     tenant_id = str(getattr(client, "tenant_id", "default"))
-    return (
-        root / "recall-traces"
-        if tenant_id == "default"
-        else root / "tenants" / tenant_id / "recall-traces"
-    )
+    return root / "recall-traces" if tenant_id == "default" else root / "tenants" / tenant_id / "recall-traces"
 
 
 def _scope_keys(scopes: list[dict[str, Any]] | None) -> list[str]:
@@ -1464,24 +2043,82 @@ def _explicit_identity_fields(
     user_id: str,
     project_id: str,
     event_id: str,
-) -> dict[str, str]:
-    topic = title.strip() or memory_type.replace("_", " ")
-    if memory_type == MemoryType.PROFILE.value:
-        return {"attribute_key": topic}
-    if memory_type == MemoryType.PREFERENCE.value:
-        return {"subject": user_id, "dimension": topic}
-    if memory_type == MemoryType.ENTITY.value:
-        return {"entity_type": "entity", "canonical_entity_id": topic}
-    if memory_type == MemoryType.PROJECT_RULE.value:
-        return {"rule_topic": topic}
-    if memory_type == MemoryType.PROJECT_DECISION.value:
-        return {"decision_topic": topic}
-    if memory_type == MemoryType.EVENT.value:
-        return {"event_key": event_id}
-    return {
-        "task_pattern": topic,
-        "environment_signature": project_id or "global",
+    explicit_fields: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate the exact Identity V2 slot schema for an explicit command."""
+
+    schema = MemoryTypeRegistry().get(MemoryType(memory_type))
+    expected = tuple(schema.slot_identity_fields)
+    supplied = dict(explicit_fields or {})
+    topic = title.strip()
+    if not supplied:
+        if not topic:
+            raise ValueError(
+                f"explicit remember requires identity_fields {expected}; title is only a compatibility identity input"
+            )
+        generic_topics = {
+            "memory",
+            "profile",
+            "user profile",
+            "preference",
+            "user preference",
+            "project rule",
+            "rule",
+            "project decision",
+            "decision",
+            "agent experience",
+            "entity",
+            "event",
+            "记忆",
+            "个人资料",
+            "偏好",
+            "项目规则",
+            "规则",
+            "项目决策",
+            "决策",
+        }
+        normalized_topic = " ".join(topic.casefold().replace("_", " ").replace("-", " ").split())
+        if normalized_topic in generic_topics:
+            raise ValueError(
+                "explicit remember title is too generic for stable identity; provide type-specific identity_fields"
+            )
+        compatibility: dict[str, dict[str, Any]] = {
+            MemoryType.PROFILE.value: {"attribute_key": topic},
+            MemoryType.PREFERENCE.value: {"subject": user_id, "dimension": topic},
+            MemoryType.PROJECT_RULE.value: {"rule_topic": topic},
+            MemoryType.PROJECT_DECISION.value: {"decision_topic": topic},
+            MemoryType.EVENT.value: {"event_key": topic},
+        }
+        supplied = compatibility.get(memory_type, {})
+        if not supplied:
+            raise ValueError(
+                f"{memory_type} requires explicit identity_fields {expected}; title cannot safely infer them"
+            )
+    unknown = set(supplied) - set(expected)
+    missing = {
+        field_name
+        for field_name in expected
+        if supplied.get(field_name) is None
+        or isinstance(supplied.get(field_name), str)
+        and not str(supplied[field_name]).strip()
     }
+    if unknown or missing:
+        details = [
+            *(f"missing:{item}" for item in sorted(missing)),
+            *(f"unknown:{item}" for item in sorted(unknown)),
+        ]
+        raise ValueError(f"explicit remember identity_fields mismatch: {','.join(details)}")
+    result: dict[str, Any] = {}
+    for field_name in expected:
+        value = supplied[field_name]
+        if isinstance(value, str):
+            value = value.strip()
+        if isinstance(value, dict | list | tuple | set) or isinstance(value, bool):
+            raise ValueError(f"identity field {field_name} must be a stable scalar")
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError(f"identity field {field_name} must be finite")
+        result[field_name] = value
+    return result
 
 
 class LocalMemoryOSClient(MemoryOSClient):

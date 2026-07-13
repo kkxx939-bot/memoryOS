@@ -12,6 +12,7 @@ class RuntimeConfig:
     root: str
     mode: str = "local"
     memory_extractor: Any | None = None
+    memory_egress_policy: Any | None = None
     memory_aliases: dict[str, dict[str, str]] | None = None
     embedding: Any | None = None
     vector_store: Any | None = None

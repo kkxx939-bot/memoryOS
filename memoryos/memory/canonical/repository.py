@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from memoryos.contextdb.model.context_object import ContextObject
+from memoryos.contextdb.model.lifecycle import LifecycleState
 from memoryos.contextdb.store.source_store import RelationStore, SourceStore
 from memoryos.memory.canonical.identity import IDENTITY_ALGORITHM_V2, ResolvedMemoryIdentity
 from memoryos.memory.canonical.proposal import PendingMemoryProposal
@@ -16,8 +18,26 @@ from memoryos.memory.canonical.state import (
     MemorySlot,
     MissingClaimInvariantError,
     TransitionProfile,
+    materialized_current_revision_payload,
 )
-from memoryos.memory.canonical.visibility import read_committed_canonical
+from memoryos.memory.canonical.visibility import (
+    list_committed_canonical,
+    read_committed_canonical,
+    read_committed_pending,
+)
+
+_PLANNING_STAGING_CAPABILITY = object()
+
+
+def _evidence_payload(value: object) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    serializer = getattr(value, "to_dict", None)
+    if callable(serializer):
+        payload = serializer()
+        if isinstance(payload, Mapping):
+            return dict(payload)
+    raise CanonicalMemoryInvariantError("canonical display evidence reference is invalid")
 
 
 class CanonicalMemoryRepository:
@@ -25,11 +45,42 @@ class CanonicalMemoryRepository:
 
     def __init__(
         self,
-        source_store: SourceStore,
+        source_store: SourceStore | None,
         relation_store: RelationStore | None = None,
+        *,
+        _request_staged_objects: Mapping[str, ContextObject] | None = None,
+        _staging_capability: object | None = None,
     ) -> None:
+        if _request_staged_objects and _staging_capability is not _PLANNING_STAGING_CAPABILITY:
+            raise PermissionError("request-local staged canonical state is internal to one PlanningContext")
         self.source_store = source_store
         self.relation_store = relation_store
+        # This overlay is deliberately private and request-owned. Public
+        # repositories never receive it, so business reads remain head/receipt
+        # committed while one planner can see its own earlier proposals.
+        self._request_staged_objects = dict(_request_staged_objects or {})
+
+    @classmethod
+    def _for_planning(
+        cls,
+        source_store: SourceStore | None,
+        relation_store: RelationStore | None,
+        staged_objects: Mapping[str, ContextObject],
+    ) -> CanonicalMemoryRepository:
+        return cls(
+            source_store,
+            relation_store,
+            _request_staged_objects=staged_objects,
+            _staging_capability=_PLANNING_STAGING_CAPABILITY,
+        )
+
+    def _read_object(self, uri: str) -> ContextObject:
+        staged = self._request_staged_objects.get(uri)
+        if staged is not None:
+            return ContextObject.from_dict(staged.to_dict())
+        if self.source_store is None:
+            raise FileNotFoundError(uri)
+        return read_committed_canonical(self.source_store, uri, self.relation_store).object
 
     def load(self, identity: ResolvedMemoryIdentity) -> tuple[MemorySlot | None, tuple[MemoryClaim, ...]]:
         if identity.identity_algorithm_version != IDENTITY_ALGORITHM_V2:
@@ -45,7 +96,7 @@ class CanonicalMemoryRepository:
         return slot, claims
 
     def load_uri(self, slot_uri: str) -> tuple[MemorySlot, tuple[MemoryClaim, ...]]:
-        obj = read_committed_canonical(self.source_store, slot_uri, self.relation_store).object
+        obj = self._read_object(slot_uri)
         metadata = dict(obj.metadata or {})
         if metadata.get("canonical_kind") != "slot":
             raise CanonicalMemoryInvariantError(f"canonical Slot URI contains {metadata.get('canonical_kind')!r}")
@@ -78,10 +129,23 @@ class CanonicalMemoryRepository:
             canonical_subject_key=subject_key,
             canonical_subject=subject,
         )
+        if (
+            obj.schema_version != "canonical_memory_v2"
+            or obj.lifecycle_state != LifecycleState.ACTIVE
+            or metadata.get("projection_pending") is not False
+        ):
+            raise CanonicalMemoryInvariantError("canonical Slot materialized mirror is inconsistent")
         claims_list = []
         for claim_id in slot.claim_ids:
             try:
-                claims_list.append(self._load_claim(slot, claim_id))
+                claims_list.append(
+                    self._load_claim(
+                        slot,
+                        claim_id,
+                        tenant_id=str(obj.tenant_id or "default"),
+                        owner_user_id=str(obj.owner_user_id or ""),
+                    )
+                )
             except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
                 raise MissingClaimInvariantError(slot.slot_id, (claim_id,)) from None
         claims = tuple(claims_list)
@@ -95,7 +159,9 @@ class CanonicalMemoryRepository:
         tenant_id: str | None = None,
         owner_user_id: str | None = None,
     ) -> PendingMemoryProposal:
-        obj = self.source_store.read_object(uri)
+        if self.source_store is None:
+            raise FileNotFoundError(uri)
+        obj = read_committed_pending(self.source_store, uri, self.relation_store).object
         record = PendingMemoryProposal.from_context_object(obj)
         if tenant_id is not None and str(obj.tenant_id or "default") != str(tenant_id):
             raise PermissionError("pending proposal tenant does not match the requested tenant")
@@ -110,9 +176,16 @@ class CanonicalMemoryRepository:
         owner_user_id: str,
         lifecycle_states: tuple[str, ...] = (),
     ) -> tuple[PendingMemoryProposal, ...]:
+        if self.source_store is None:
+            return ()
         requested = {str(item).casefold() for item in lifecycle_states}
         records: list[PendingMemoryProposal] = []
-        for obj in self.source_store.list_objects():
+        for committed in list_committed_canonical(
+            self.source_store,
+            self.relation_store,
+            kinds=("pending_proposal",),
+        ):
+            obj = committed.object
             metadata = dict(obj.metadata or {})
             if metadata.get("canonical_kind") != "pending_proposal":
                 continue
@@ -126,9 +199,16 @@ class CanonicalMemoryRepository:
             records.append(record)
         return tuple(sorted(records, key=lambda item: (item.created_at, item.uri)))
 
-    def _load_claim(self, slot: MemorySlot, claim_id: str) -> MemoryClaim:
+    def _load_claim(
+        self,
+        slot: MemorySlot,
+        claim_id: str,
+        *,
+        tenant_id: str,
+        owner_user_id: str,
+    ) -> MemoryClaim:
         uri = f"{slot.uri}/claims/{claim_id}"
-        obj = read_committed_canonical(self.source_store, uri, self.relation_store).object
+        obj = self._read_object(uri)
         metadata = dict(obj.metadata or {})
         if metadata.get("canonical_kind") != "claim":
             raise CanonicalMemoryInvariantError(f"slot claim URI is not a canonical claim: {uri}")
@@ -162,14 +242,38 @@ class CanonicalMemoryRepository:
             raise CanonicalMemoryInvariantError(f"canonical Claim identity does not match Slot path: {uri}")
         if claim.canonical_subject_key != slot.canonical_subject_key:
             raise CanonicalMemoryInvariantError(f"canonical Claim subject does not match its Slot: {uri}")
+        if str(obj.tenant_id or "default") != tenant_id or str(obj.owner_user_id or "") != owner_user_id:
+            raise CanonicalMemoryInvariantError(f"canonical Claim crosses its Slot owner or tenant: {uri}")
         if persisted_revision != claim.latest_revision.revision:
             raise CanonicalMemoryInvariantError(
                 f"claim {claim.claim_id} metadata revision {persisted_revision} "
                 f"does not match history {claim.latest_revision.revision}"
             )
-        persisted_current = metadata.get("current_revision")
-        if persisted_current is not None and int(persisted_current) != claim.current.revision:
+        current_payload = materialized_current_revision_payload(metadata)
+        if int(current_payload["revision"]) != claim.current.revision:
             raise CanonicalMemoryInvariantError(f"claim {claim.claim_id} current revision pointer is inconsistent")
+        current = claim.current
+        expected_display = dict(current.qualifiers.get("display_fields", {}) or {})
+        expected_display_evidence = {
+            str(field_name): [_evidence_payload(ref) for ref in refs]
+            for field_name, refs in dict(
+                current.qualifiers.get("display_field_evidence_refs", {}) or {}
+            ).items()
+        }
+        if (
+            metadata.get("state") != current.state
+            or metadata.get("epistemic_status") != current.epistemic_status
+            or metadata.get("semantic_relation") != current.relation
+            or dict(metadata.get("display_fields", {}) or {}) != expected_display
+            or dict(metadata.get("display_field_evidence_refs", {}) or {})
+            != expected_display_evidence
+            or metadata.get("projection_pending") is not True
+            or obj.schema_version != "canonical_memory_v2"
+            or obj.lifecycle_state != LifecycleState.ACTIVE
+        ):
+            raise CanonicalMemoryInvariantError(
+                f"canonical Claim materialized current-state mirror is inconsistent: {uri}"
+            )
         return claim
 
     def _validate_scope_authority(

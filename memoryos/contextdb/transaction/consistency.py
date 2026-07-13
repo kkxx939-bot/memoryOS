@@ -5,7 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from memoryos.contextdb.model.lifecycle import LifecycleState
-from memoryos.contextdb.store.source_store import IndexStore, RelationStore, SourceStore
+from memoryos.contextdb.store.source_store import (
+    IndexStore,
+    RelationStore,
+    SourceStore,
+    is_canonical_memory_object,
+    is_canonical_memory_uri,
+)
 
 
 @dataclass(frozen=True)
@@ -27,7 +33,11 @@ class ConsistencyVerifier:
         self.relation_store = relation_store
 
     def verify(self) -> ConsistencyReport:
-        objects = list(self.source_store.list_objects())
+        objects = [
+            obj
+            for obj in self.source_store.list_objects()
+            if not is_canonical_memory_object(obj)
+        ]
         source_uris = {obj.uri for obj in objects}
         missing_index = []
         deleted_in_default_search = []
@@ -39,7 +49,11 @@ class ConsistencyVerifier:
                 missing_index.append(obj.uri)
             if obj.lifecycle_state in inactive_states and obj.uri in hit_uris:
                 deleted_in_default_search.append(obj.uri)
-        indexed_uris = set(getattr(self.index_store, "indexed_uris", lambda: [])())
+        indexed_uris = {
+            uri
+            for uri in getattr(self.index_store, "indexed_uris", lambda: [])()
+            if not self._canonical_uri(uri)
+        }
         orphan_index = sorted(uri for uri in indexed_uris if uri not in source_uris)
         broken_relations = self._broken_relations(source_uris)
         return ConsistencyReport(
@@ -57,9 +71,15 @@ class ConsistencyVerifier:
             for relation in self.relation_store.relations_of(uri):
                 if self._global_uri(relation.source_uri) or self._global_uri(relation.target_uri):
                     continue
+                if self._canonical_uri(relation.source_uri) or self._canonical_uri(relation.target_uri):
+                    continue
                 if relation.source_uri not in source_uris or relation.target_uri not in source_uris:
                     broken.append(relation.to_dict())
         return broken
 
     def _global_uri(self, uri: str) -> bool:
         return uri.startswith(("memoryos://resources/", "memoryos://skills/"))
+
+    @staticmethod
+    def _canonical_uri(uri: str) -> bool:
+        return is_canonical_memory_uri(uri)

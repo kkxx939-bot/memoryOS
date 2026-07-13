@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
+from memoryos.api.sdk.client import MemoryOSClient
 from memoryos.contextdb.context_db import ContextDB
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_relation import ContextRelation
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.retrieval.context_assembler import ContextAssembler
 from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
+from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.contextdb.store.local_stores import (
     FileSystemSourceStore,
     InMemoryIndexStore,
@@ -27,22 +30,20 @@ from memoryos.memory.canonical import (
     MemoryRevision,
     MemorySlot,
     ScopeRef,
+    SessionArchiveEpisodeAdapter,
     TransitionProfile,
 )
+from memoryos.memory.canonical.current_head import publish_current_head_sets
 from memoryos.memory.canonical.prefetch import ExistingMemoryPrefetcher
 from memoryos.memory.canonical.projection_state import ProjectionRecordStore
 from memoryos.memory.canonical.retrieval import CanonicalInvariantViolation
-from memoryos.operations.commit.effect_marker import (
-    atomic_write_json,
-    build_marker,
-    relation_effects_from_manifest,
-)
 from memoryos.operations.commit.operation_committer import OperationCommitter
 from memoryos.operations.model.context_diff import ContextDiff
 from memoryos.operations.model.context_operation import ContextOperation
 from memoryos.operations.model.operation_action import OperationAction
 from memoryos.operations.model.operation_status import OperationStatus
 from memoryos.providers.embedding import HashingEmbeddingProvider
+from memoryos.runtime.readiness import RuntimeNotReadyError, RuntimeReadinessState
 
 
 def _scope(*refs, tenant_id: str = "t1", principals=()):  # noqa: ANN001, ANN202
@@ -88,6 +89,7 @@ def _write_committed_canonical_fixture(
 
     transaction_id = f"tx-{key}"
     idempotency_key = f"idem-{key}"
+    commit_group_id = f"fixture-group-{key}"
     operations: list[ContextOperation] = []
     for index, (obj, content) in enumerate(entries):
         owner_user_id = obj.owner_user_id
@@ -97,7 +99,6 @@ def _write_committed_canonical_fixture(
             "canonical_transaction_id": transaction_id,
             "canonical_idempotency_key": idempotency_key,
         }
-        source.write_object(obj, content=content)
         operations.append(
             ContextOperation(
                 operation_id=f"op-{key}-{index}",
@@ -110,12 +111,11 @@ def _write_committed_canonical_fixture(
                     "canonical_memory": True,
                     "transaction_id": transaction_id,
                     "idempotency_key": idempotency_key,
+                    "commit_group_id": commit_group_id,
                     "tenant_id": obj.tenant_id,
-                    "expected_revision": (
-                        0
-                        if action == OperationAction.ADD
-                        else max(0, int(obj.metadata.get("revision", 1)) - 1)
-                    ),
+                    "expected_revision": 0
+                    if action == OperationAction.ADD
+                    else max(0, int(obj.metadata.get("revision", 1)) - 1),
                     "context_object": obj.to_dict(),
                     "content": content,
                 },
@@ -123,20 +123,62 @@ def _write_committed_canonical_fixture(
         )
     assert operations
     assert len({operation.user_id for operation in operations}) == 1
+    fixture_relations = InMemoryRelationStore()
     committer = OperationCommitter(
         source,
         InMemoryIndexStore(),
         str(source.root),
+        relation_store=fixture_relations,
         tenant_id=source.tenant_id,
     )
+    before_images = committer._capture_canonical_state(operations)
+    before_by_uri = {str(item["uri"]): item.get("object") for item in before_images}
+    relation_manifests = {
+        operation.operation_id: committer._build_canonical_relation_manifest(
+            operation,
+            before_by_uri.get(str(operation.target_uri or "")),
+        )
+        for operation in operations
+    }
     diff = ContextDiff(
         user_id=operations[0].user_id,
         operations=operations,
         diff_id=f"diff-{transaction_id}",
     )
+    planning_digest = committer._ensure_canonical_planning_digest(operations)
+    for operation in operations:
+        operation.payload["planning_digest"] = planning_digest
+    committer._write_outbox_event(
+        transaction_id,
+        idempotency_key,
+        operations,
+        status="prepared",
+        before_images=before_images,
+        relation_manifests=relation_manifests,
+    )
+    for obj, content in entries:
+        source.write_object(obj, content=content)
+    committer._write_outbox_event(
+        transaction_id,
+        idempotency_key,
+        operations,
+        status="source_committed",
+        before_images=before_images,
+        relation_manifests=relation_manifests,
+    )
     marker = committer._transaction_marker(idempotency_key)
-    committer._write_transaction_marker(marker, diff, operations)
+    committer._write_transaction_marker(
+        marker,
+        diff,
+        operations,
+        relation_manifests=relation_manifests,
+    )
     committer._validate_transaction_marker(marker, operations)
+    publish_current_head_sets(
+        committer.artifact_root,
+        marker,
+        json.loads(marker.read_text(encoding="utf-8")),
+    )
 
 
 def _write_claim(
@@ -150,6 +192,8 @@ def _write_claim(
     scope: dict,
     profile: TransitionProfile = TransitionProfile.AUTHORITATIVE_STATE,
     owner_user_id: str = "u1",
+    object_relations: tuple[ContextRelation, ...] = (),
+    metadata_extra: dict | None = None,
 ):  # noqa: ANN001, ANN202
     uri = f"memoryos://user/{owner_user_id}/memories/canonical/slots/{claim_id}-slot/claims/{claim_id}"
     revision = MemoryRevision(
@@ -172,6 +216,8 @@ def _write_claim(
         canonical_subject_key=subject.key,
     )
     obj = claim.to_context_object(tenant_id="t1", owner_user_id=owner_user_id, memory_type=memory_type, scope=scope)
+    obj.relations.extend(object_relations)
+    obj.metadata = {**obj.metadata, **dict(metadata_extra or {})}
     applicability = dict(scope.get("applicability", {}) or {})
     scope_keys = tuple(
         f"{item.get('namespace', 'memoryos')}:{item.get('kind')}:{item.get('id')}"
@@ -484,6 +530,19 @@ def test_canonical_retrieval_supports_exact_vector_and_relation_expansion(tmp_pa
         memory_type="project_decision",
         scope=scope,
     )
+    postgres_uri = "memoryos://user/u1/memories/canonical/slots/postgres-related-slot/claims/postgres-related"
+    cockroach_uri = "memoryos://user/u1/memories/canonical/slots/cockroach-related-slot/claims/cockroach-related"
+    related = ContextRelation(
+        source_uri=postgres_uri,
+        relation_type="alternative",
+        target_uri=cockroach_uri,
+        metadata={
+            "tenant_id": "t1",
+            "owner_user_id": "u1",
+            "canonical_idempotency_key": "idem-claim-postgres-related-r1",
+            "canonical_transaction_id": "tx-claim-postgres-related-r1",
+        },
+    )
     postgres = _write_claim(
         source,
         projector,
@@ -492,6 +551,7 @@ def test_canonical_retrieval_supports_exact_vector_and_relation_expansion(tmp_pa
         state="PROPOSED",
         memory_type="project_decision",
         scope=scope,
+        object_relations=(related,),
     )
     cockroach = _write_claim(
         source,
@@ -502,41 +562,8 @@ def test_canonical_retrieval_supports_exact_vector_and_relation_expansion(tmp_pa
         memory_type="project_decision",
         scope=scope,
     )
-    related = ContextRelation(
-                source_uri=postgres,
-                relation_type="alternative",
-                target_uri=cockroach,
-                metadata={
-                    "tenant_id": "t1",
-                    "owner_user_id": "u1",
-                    "canonical_idempotency_key": "idem-claim-postgres-related-r1",
-                    "canonical_transaction_id": "tx-claim-postgres-related-r1",
-                },
-            )
+    assert postgres == postgres_uri and cockroach == cockroach_uri
     relations.add_relation(related)
-    relation_marker = (
-        tmp_path
-        / "tenants"
-        / "t1"
-        / "system"
-        / "transactions"
-        / "idem-claim-postgres-related-r1.json"
-    )
-    marker_payload = json.loads(relation_marker.read_text(encoding="utf-8"))
-    atomic_write_json(
-        relation_marker,
-        build_marker(
-            transaction_id=str(marker_payload["transaction_id"]),
-            idempotency_key=str(marker_payload["idempotency_key"]),
-            tenant_id="t1",
-            user_id="u1",
-            operation_ids=[str(item) for item in marker_payload["operation_ids"]],
-            object_effects=list(marker_payload["object_effects"]),
-            relation_effects=relation_effects_from_manifest({"expected": [related.to_dict()]}),
-            diff=dict(marker_payload["diff"]),
-            operations=list(marker_payload["operations"]),
-        ),
-    )
     hybrid = HybridSearch(index, vector_store=vectors, embedding_provider=embedding, source_store=source)
     retriever = CanonicalMemoryRetriever(source, index, relations, hybrid_search=hybrid)
 
@@ -634,6 +661,114 @@ def test_stale_index_vector_and_projection_hits_are_filtered_by_canonical_revisi
     assert current[0]["projection_revision"] == 2
 
 
+def test_vector_head_corruption_fails_closed_before_empty_search_trace(tmp_path) -> None:  # noqa: ANN001
+    vectors = InMemoryVectorStore()
+    client = MemoryOSClient(
+        str(tmp_path),
+        vector_store=vectors,
+        embedding_provider=HashingEmbeddingProvider(),
+    )
+    committed = client.remember(
+        user_id="u1",
+        content="Always run tests before release",
+        title="Release validation",
+        memory_type="project_rule",
+        project_id="p1",
+        constraint_polarity="REQUIRE",
+        identity_fields={"rule_topic": "release_validation"},
+    )
+    claim_uri = str(committed["uri"])
+    assert claim_uri in vectors.vector_uris()
+
+    tampered = False
+    for path in (Path(tmp_path) / "system" / "current-heads").glob("*.json"):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        heads = dict(payload.get("heads", {}) or {})
+        if claim_uri not in heads:
+            continue
+        heads[claim_uri] = {**dict(heads[claim_uri]), "head_digest": "0" * 64}
+        payload["heads"] = heads
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        tampered = True
+        break
+    assert tampered
+
+    trace_root = Path(tmp_path) / "recall-traces"
+    traces_before = tuple(trace_root.glob("*.json")) if trace_root.exists() else ()
+    with pytest.raises(RuntimeNotReadyError, match="runtime is NOT_READY"):
+        client.search_context(
+            "Always run tests before release",
+            user_id="u1",
+            context_type=ContextType.RESOURCE,
+        )
+
+    assert client.readiness.state == RuntimeReadinessState.NOT_READY
+    traces_after = tuple(trace_root.glob("*.json")) if trace_root.exists() else ()
+    assert traces_after == traces_before
+
+
+def test_canonical_hybrid_recall_reuses_the_query_committed_snapshot(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # noqa: ANN001
+    vectors = InMemoryVectorStore()
+    client = MemoryOSClient(
+        str(tmp_path),
+        vector_store=vectors,
+        embedding_provider=HashingEmbeddingProvider(),
+    )
+    committed = client.remember(
+        user_id="u1",
+        content="Always run tests before release",
+        title="Release validation",
+        memory_type="project_rule",
+        project_id="p1",
+        constraint_polarity="REQUIRE",
+        identity_fields={"rule_topic": "snapshot_release_validation"},
+    )
+    claim_uri = str(committed["uri"])
+    assert client.hybrid_search is not None
+    original_search = client.hybrid_search.search
+    original_read = client.source_store.read_object
+    in_canonical_hybrid = False
+    canonical_calls = 0
+
+    def guarded_search(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        nonlocal in_canonical_hybrid, canonical_calls
+        allowed = set(dict(kwargs.get("filters") or {}).get("allowed_uris", ()) or ())
+        canonical_call = claim_uri in allowed
+        if canonical_call:
+            assert kwargs.get("source_snapshot", {}).get(claim_uri) is not None
+            canonical_calls += 1
+            in_canonical_hybrid = True
+        try:
+            return original_search(*args, **kwargs)
+        finally:
+            if canonical_call:
+                in_canonical_hybrid = False
+
+    def reject_live_canonical_reread(uri: str):  # noqa: ANN202
+        if in_canonical_hybrid and uri == claim_uri:
+            raise AssertionError("canonical hybrid recall re-read live Source after snapshot capture")
+        return original_read(uri)
+
+    monkeypatch.setattr(client.hybrid_search, "search", guarded_search)
+    monkeypatch.setattr(client.source_store, "read_object", reject_live_canonical_reread)
+
+    results = client.search_context(
+        "Always run tests before release",
+        user_id="u1",
+        project_id="p1",
+        context_type=ContextType.MEMORY,
+    )
+
+    assert canonical_calls == 1
+    assert [item["uri"] for item in results] == [claim_uri]
+
+
 def test_history_expands_old_revision_while_current_returns_only_slot_current(tmp_path) -> None:  # noqa: ANN001
     source = FileSystemSourceStore(tmp_path, tenant_id="t1")
     index = InMemoryIndexStore()
@@ -662,6 +797,18 @@ def test_history_expands_old_revision_while_current_returns_only_slot_current(tm
     assert "historical sqlite choice" in history[0]["text"]
     assert history[0]["layer_revisions"] == {"L0": 1, "L1": 1, "L2": 1}
 
+    historical_record = projector.record_store.load(claim_uri, 1)
+    assert historical_record is not None
+    source.write_content(historical_record.l2_uri, "tampered historical projection bait")
+
+    after_tamper = retriever.search(replace(base, intent=CanonicalQueryIntent.HISTORY))
+
+    assert len(after_tamper) == 1
+    assert "historical sqlite choice" in after_tamper[0]["text"]
+    assert "tampered historical projection bait" not in after_tamper[0]["text"]
+    assert after_tamper[0]["layer"] == "canonical_source"
+    assert after_tamper[0]["layer_revisions"] == {}
+
 
 def test_late_historical_transaction_does_not_replace_effective_current_projection(tmp_path) -> None:  # noqa: ANN001
     source = FileSystemSourceStore(tmp_path, tenant_id="t1")
@@ -679,6 +826,7 @@ def test_late_historical_transaction_does_not_replace_effective_current_projecti
         proposal_id="current",
         relation="UNRELATED",
         epistemic_status="EXPLICIT",
+        qualifiers={"display_fields": {"summary": "current effective display"}},
         valid_from="2026-01-02T00:00:00+00:00",
     )
     late_history = MemoryRevision(
@@ -689,7 +837,10 @@ def test_late_historical_transaction_does_not_replace_effective_current_projecti
         proposal_id="late",
         relation="SUPPLEMENTS",
         epistemic_status="EXPLICIT",
-        qualifiers={"non_current_historical": True},
+        qualifiers={
+            "non_current_historical": True,
+            "display_fields": {"summary": "older historical display"},
+        },
         previous_revision=1,
         valid_from="2025-12-01T00:00:00+00:00",
         transaction_time="2026-07-11T00:00:00+00:00",
@@ -715,6 +866,43 @@ def test_late_historical_transaction_does_not_replace_effective_current_projecti
         canonical_subject_key=subject.key,
         canonical_subject=subject,
     )
+    revision_one_claim = MemoryClaim(
+        "late-history",
+        claim_uri,
+        "late-history",
+        "current effective rule",
+        TransitionProfile.AUTHORITATIVE_STATE,
+        (current_revision,),
+        canonical_subject_key=subject.key,
+    )
+    revision_one_slot = MemorySlot(
+        slot_id="late-history",
+        uri=slot_uri,
+        memory_type="project_rule",
+        identity_fields={"rule_topic": "late history"},
+        scope_keys=("memoryos:workspace:memoryos",),
+        claim_ids=("late-history",),
+        active_claim_id="late-history",
+        revision=1,
+        canonical_subject_key=subject.key,
+        canonical_subject=subject,
+    )
+    _write_committed_canonical_fixture(
+        source,
+        [
+            (revision_one_slot.to_context_object(tenant_id="t1", owner_user_id="u1", scope=scope), ""),
+            (
+                revision_one_claim.to_context_object(
+                    tenant_id="t1",
+                    owner_user_id="u1",
+                    memory_type="project_rule",
+                    scope=scope,
+                ),
+                "",
+            ),
+        ],
+        key="late-history-r1",
+    )
     _write_committed_canonical_fixture(
         source,
         [
@@ -730,6 +918,7 @@ def test_late_historical_transaction_does_not_replace_effective_current_projecti
             ),
         ],
         key="late-history-r2",
+        action=OperationAction.UPDATE,
     )
     projector.project(claim_uri, 2)
     retriever = CanonicalMemoryRetriever(source, index)
@@ -748,7 +937,30 @@ def test_late_historical_transaction_does_not_replace_effective_current_projecti
     assert current[0]["source_revision"] == 2
     assert current[0]["projection_record"]["current_claim_revision"] == 1
     assert "current effective rule" in current[0]["text"]
+    assert "current effective display" in current[0]["text"]
+    assert "older historical display" not in current[0]["text"]
     assert [(item["revision"], item["text"]) for item in history] == [(2, "older historical rule")]
+
+    episode = SessionArchiveEpisodeAdapter().adapt(
+        SessionArchive(
+            user_id="u1",
+            session_id="late-history-prefetch",
+            archive_uri="memoryos://user/u1/sessions/history/late-history-prefetch",
+            messages=[
+                {
+                    "id": "m1",
+                    "role": "user",
+                    "content": "current effective rule",
+                    "metadata": {"memory_types": ["project_rule"]},
+                }
+            ],
+            metadata={"tenant_id": "t1", "project_id": "memoryos"},
+        )
+    )
+    prefetched = ExistingMemoryPrefetcher(source, index).prefetch(episode, owner_user_id="u1")
+    assert len(prefetched) == 1
+    assert "current effective rule" in prefetched[0].l1
+    assert "older historical rule" not in prefetched[0].l1
 
 
 def test_multiple_active_claims_raise_invariant_violation_instead_of_returning_first(tmp_path) -> None:  # noqa: ANN001
@@ -874,26 +1086,18 @@ def test_canonical_results_still_obey_connect_and_authority_filters(tmp_path) ->
         state="ACTIVE",
         memory_type="project_rule",
         scope=_scope(("workspace", "memoryos")),
-    )
-    claim = source.read_object(claim_uri)
-    claim.metadata = {
-        **claim.metadata,
-        "connect": {
-            "connect_type": "agent",
-            "adapter_id": "codex",
-            "run_mode": "context_reduction",
-            "world_domain": "software",
-            "source_kind": "transcript",
+        metadata_extra={
+            "connect": {
+                "connect_type": "agent",
+                "adapter_id": "codex",
+                "run_mode": "context_reduction",
+                "world_domain": "software",
+                "source_kind": "transcript",
+            },
+            "retrieval_views": ["project:memoryos:rules"],
+            "authority": {"tenant_id": "t1", "allowed_principal_ids": ["u1"]},
+            "asserted_by": "u1",
         },
-        "retrieval_views": ["project:memoryos:rules"],
-        "authority": {"tenant_id": "t1", "allowed_principal_ids": ["u1"]},
-        "asserted_by": "u1",
-    }
-    _write_committed_canonical_fixture(
-        source,
-        [(claim, "workspace canonical rule")],
-        key="connect-filtered-r2",
-        action=OperationAction.UPDATE,
     )
     assembler = ContextAssembler(ContextDB(source, index, relations))
 
@@ -913,15 +1117,26 @@ def test_canonical_results_still_obey_connect_and_authority_filters(tmp_path) ->
         context_type=ContextType.MEMORY,
         connect_filters={"run_mode": "action_capable"},
     )
-    invalid_authority = source.read_object(claim_uri)
-    invalid_authority.metadata = {**invalid_authority.metadata, "asserted_by": "u2"}
-    _write_committed_canonical_fixture(
-        source,
-        [(invalid_authority, "workspace canonical rule")],
-        key="connect-filtered-r3-invalid-authority",
-        action=OperationAction.UPDATE,
+    invalid_root = tmp_path / "invalid-authority"
+    invalid_source = FileSystemSourceStore(invalid_root, tenant_id="t1")
+    invalid_index = InMemoryIndexStore()
+    invalid_relations = InMemoryRelationStore()
+    invalid_projector = CanonicalMemoryProjector(invalid_source, invalid_index, invalid_root)
+    _write_claim(
+        invalid_source,
+        invalid_projector,
+        claim_id="invalid-authority",
+        value="workspace canonical rule",
+        state="ACTIVE",
+        memory_type="project_rule",
+        scope=_scope(("workspace", "memoryos")),
+        metadata_extra={"asserted_by": "u2"},
     )
-    blocked_authority = CanonicalMemoryRetriever(source, index).search(
+    blocked_authority = CanonicalMemoryRetriever(
+        invalid_source,
+        invalid_index,
+        invalid_relations,
+    ).search(
         CanonicalMemoryQuery(
             text="canonical rule",
             tenant_id="t1",

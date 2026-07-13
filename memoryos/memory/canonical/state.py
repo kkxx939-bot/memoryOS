@@ -13,6 +13,7 @@ from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.model.lifecycle import LifecycleState
 from memoryos.core.time import utc_now
+from memoryos.memory.canonical.event import canonicalize
 from memoryos.memory.canonical.evidence import EvidenceRef
 from memoryos.memory.canonical.identity import IDENTITY_ALGORITHM_V2
 from memoryos.memory.canonical.scope import ScopeRef
@@ -47,7 +48,8 @@ class ActiveClaimInvariantError(CanonicalMemoryInvariantError):
         self.active_claim_ids = active_claim_ids
         self.declared_active_claim_id = declared_active_claim_id
         super().__init__(
-            f"slot {slot_id} ACTIVE invariant violated: active={active_claim_ids}, declared={declared_active_claim_id}"
+            f"slot {slot_id} ACTIVE invariant violated: active_claim_ids={active_claim_ids}, "
+            f"active_claim_id={declared_active_claim_id}"
         )
 
 
@@ -66,6 +68,39 @@ class ClaimState(str, Enum):
 
 
 CLAIM_STATES = frozenset(state.value for state in ClaimState)
+
+
+def materialized_current_revision_payload(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the one revision selected by the canonical current pointer.
+
+    ``revision`` is the immutable history tail while ``current_revision`` is
+    the effective state pointer. They intentionally differ for a late
+    historical assertion, so callers must never infer current state from list
+    order.
+    """
+
+    try:
+        current_revision = int(metadata.get("current_revision", metadata.get("revision", 0)) or 0)
+    except (TypeError, ValueError) as exc:
+        raise CanonicalMemoryInvariantError("canonical current revision pointer is invalid") from exc
+    if current_revision < 1:
+        raise CanonicalMemoryInvariantError("canonical current revision pointer is missing")
+    matches: list[dict[str, Any]] = []
+    for item in metadata.get("revisions", []) or []:
+        if not isinstance(item, Mapping):
+            continue
+        try:
+            revision = int(item.get("revision", 0) or 0)
+        except (TypeError, ValueError) as exc:
+            raise CanonicalMemoryInvariantError("canonical revision number is invalid") from exc
+        if revision == current_revision:
+            matches.append(dict(item))
+    if len(matches) != 1:
+        raise CanonicalMemoryInvariantError("canonical current revision pointer must select exactly one revision")
+    qualifiers = dict(matches[0].get("qualifiers", {}) or {})
+    if qualifiers.get("non_current_historical", False):
+        raise CanonicalMemoryInvariantError("canonical current revision pointer selects a historical-only revision")
+    return matches[0]
 
 
 def _parse_timestamp(value: str, label: str) -> datetime:
@@ -143,7 +178,7 @@ class MemoryRevision:
         return {
             "revision": self.revision,
             "state": self.state,
-            "value_fields": dict(self.value_fields),
+            "value_fields": canonicalize(self.value_fields),
             "evidence_refs": [ref.to_dict() for ref in self.evidence_refs],
             "field_evidence_refs": {
                 field_name: [ref.to_dict() for ref in refs] for field_name, refs in self.field_evidence_refs.items()
@@ -157,7 +192,7 @@ class MemoryRevision:
             "prompt_version": self.prompt_version,
             "policy_version": self.policy_version,
             "schema_version": self.schema_version,
-            "qualifiers": dict(self.qualifiers),
+            "qualifiers": canonicalize(self.qualifiers),
             "created_at": self.created_at,
             "transaction_time": self.transaction_time,
             "previous_revision": self.previous_revision,
@@ -245,14 +280,15 @@ class MemoryClaim:
             raise ValueError(f"invalid {self.profile.value} state: {revision.state}")
         revisions = list(self.revisions)
         if not revision.historical_only:
-            current_index = revisions.index(self.current)
             current_start = _parse_timestamp(self.current.valid_from, "valid_from")
             incoming_start = _parse_timestamp(revision.valid_from, "valid_from")
             if incoming_start <= current_start:
                 transaction_time = _parse_timestamp(revision.transaction_time, "transaction_time")
                 next_start = max(transaction_time, current_start + timedelta(microseconds=1))
                 revision = replace(revision, valid_from=next_start.isoformat())
-            revisions[current_index] = replace(self.current, valid_to=revision.valid_from)
+            # Historical revisions are immutable.  Their effective end is
+            # derived from the next non-historical revision rather than
+            # retroactively rewriting ``valid_to`` in the stored prefix.
         revisions.append(revision)
         return MemoryClaim(
             self.claim_id,
@@ -268,6 +304,7 @@ class MemoryClaim:
     def to_context_object(
         self, *, tenant_id: str, owner_user_id: str, memory_type: str, scope: dict[str, Any]
     ) -> ContextObject:
+        current_qualifiers = dict(self.current.to_dict().get("qualifiers", {}) or {})
         return ContextObject(
             uri=self.uri,
             context_type=ContextType.MEMORY,
@@ -291,6 +328,13 @@ class MemoryClaim:
                 "state": self.current.state,
                 "epistemic_status": self.current.epistemic_status,
                 "semantic_relation": self.current.relation,
+                # Compatibility mirrors derive only from the materialized
+                # current revision; transition callers cannot maintain a
+                # second, independently mutable display state.
+                "display_fields": canonicalize(current_qualifiers.get("display_fields", {}) or {}),
+                "display_field_evidence_refs": canonicalize(
+                    current_qualifiers.get("display_field_evidence_refs", {}) or {}
+                ),
                 "revision": self.latest_revision.revision,
                 "current_revision": self.current.revision,
                 "revisions": [revision.to_dict() for revision in self.revisions],

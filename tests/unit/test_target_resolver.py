@@ -85,6 +85,10 @@ class TargetResolverTest(unittest.TestCase):
             def clear(self) -> None:
                 return None
 
+            def get_index_metadata(self, uri: str) -> dict | None:
+                del uri
+                return None
+
         obj = ContextObject(
             uri="memoryos://user/u1/memories/profile/name",
             context_type=ContextType.MEMORY,

@@ -21,6 +21,10 @@ class VectorStore(Protocol):
 
     def search_vector(self, embedding: list[float], namespace: str, limit: int = 10) -> list[VectorHit]: ...
 
+    def get_vector_metadata(self, uri: str) -> dict | None: ...
+
+    def vector_uris(self) -> list[str]: ...
+
 
 class InMemoryVectorStore:
     def __init__(self) -> None:
@@ -31,6 +35,13 @@ class InMemoryVectorStore:
 
     def delete_vector(self, uri: str) -> None:
         self.rows.pop(uri, None)
+
+    def get_vector_metadata(self, uri: str) -> dict | None:
+        row = self.rows.get(uri)
+        return dict(row[1]) if row is not None else None
+
+    def vector_uris(self) -> list[str]:
+        return list(self.rows)
 
     def search_vector(self, embedding: list[float], namespace: str, limit: int = 10) -> list[VectorHit]:
         embedding = _finite_vector(embedding)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import uuid
 from collections.abc import Iterator
@@ -12,6 +13,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from memoryos.core.file_lock import open_private_lock
+from memoryos.core.ids import require_safe_path_segment
 from memoryos.core.time import utc_now
 from memoryos.memory.canonical.event import canonical_digest
 from memoryos.operations.commit.effect_marker import atomic_write_json
@@ -38,6 +41,7 @@ class ConsumerStatus:
     retryable: bool = True
     completed_revision: int | None = None
     attempt_id: str = ""
+    owner_pid: int = 0
     lease_expires_at: str = ""
     next_retry_at: str = ""
     terminal_status: str = ""
@@ -51,6 +55,7 @@ class ConsumerStatus:
             "retryable": self.retryable,
             "completed_revision": self.completed_revision,
             "attempt_id": self.attempt_id,
+            "owner_pid": self.owner_pid,
             "lease_expires_at": self.lease_expires_at,
             "next_retry_at": self.next_retry_at,
             "terminal_status": self.terminal_status,
@@ -68,6 +73,7 @@ class ConsumerStatus:
                 int(payload["completed_revision"]) if payload.get("completed_revision") is not None else None
             ),
             attempt_id=str(payload.get("attempt_id", "")),
+            owner_pid=int(payload.get("owner_pid", 0) or 0),
             lease_expires_at=str(payload.get("lease_expires_at", "")),
             next_retry_at=str(payload.get("next_retry_at", "")),
             terminal_status=str(payload.get("terminal_status", "")),
@@ -92,9 +98,13 @@ class CommitGroupStatus:
     canonical_result: dict[str, Any] = field(default_factory=dict)
     canonical_effects: dict[str, dict[str, Any]] = field(default_factory=dict)
     canonical_attempt_id: str = ""
+    canonical_owner_pid: int = 0
     canonical_lease_expires_at: str = ""
     canonical_next_retry_at: str = ""
     canonical_terminal_status: str = ""
+    canonical_phase: str = "unstarted"
+    salience_reservation_digest: str = ""
+    planning_digest: str = ""
     consumers: dict[str, ConsumerStatus] = field(default_factory=lambda: {name: ConsumerStatus() for name in CONSUMERS})
     created_at: str = ""
     updated_at: str = ""
@@ -133,9 +143,13 @@ class CommitGroupStatus:
                 key: dict(value) for key, value in self.canonical_effects.items()
             },
             "canonical_attempt_id": self.canonical_attempt_id,
+            "canonical_owner_pid": self.canonical_owner_pid,
             "canonical_lease_expires_at": self.canonical_lease_expires_at,
             "canonical_next_retry_at": self.canonical_next_retry_at,
             "canonical_terminal_status": self.canonical_terminal_status,
+            "canonical_phase": self.canonical_phase,
+            "salience_reservation_digest": self.salience_reservation_digest,
+            "planning_digest": self.planning_digest,
             "consumers": {key: value.to_dict() for key, value in self.consumers.items()},
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -170,9 +184,13 @@ class CommitGroupStatus:
                 if isinstance(value, dict)
             },
             canonical_attempt_id=str(payload.get("canonical_attempt_id", "")),
+            canonical_owner_pid=int(payload.get("canonical_owner_pid", 0) or 0),
             canonical_lease_expires_at=str(payload.get("canonical_lease_expires_at", "")),
             canonical_next_retry_at=str(payload.get("canonical_next_retry_at", "")),
             canonical_terminal_status=str(payload.get("canonical_terminal_status", "")),
+            canonical_phase=str(payload.get("canonical_phase", "unstarted")),
+            salience_reservation_digest=str(payload.get("salience_reservation_digest", "")),
+            planning_digest=str(payload.get("planning_digest", "")),
             consumers=statuses,
             created_at=str(payload.get("created_at", "")),
             updated_at=str(payload.get("updated_at", "")),
@@ -184,14 +202,16 @@ class CommitGroupStore:
 
     MAX_ATTEMPTS = 3
 
-    def __init__(self, root: str | Path) -> None:
+    def __init__(self, root: str | Path, test_hook=None) -> None:  # noqa: ANN001
         self.artifact_root = Path(root)
         self.root = self.artifact_root / "system" / "commit_groups"
         self._fallback_locks: dict[str, threading.RLock] = {}
         self._fallback_guard = threading.Lock()
+        self.test_hook = test_hook
 
     def path(self, group_id: str) -> Path:
-        return self.root / f"{group_id}.json"
+        safe_group = require_safe_path_segment(group_id, "commit group_id")
+        return self.root / f"{safe_group}.json"
 
     def load(self, group_id: str) -> CommitGroupStatus | None:
         return self._load_unlocked(group_id)
@@ -207,6 +227,10 @@ class CommitGroupStore:
         archive_digest: str = "",
         manifest_digest: str = "",
     ) -> CommitGroupStatus:
+        require_safe_path_segment(group_id, "commit group_id")
+        require_safe_path_segment(task_id, "commit task_id")
+        require_safe_path_segment(user_id, "commit user_id")
+        require_safe_path_segment(tenant_id, "commit tenant_id")
         with self.group_lock(group_id):
             existing = self._load_unlocked(group_id)
             if existing is not None:
@@ -268,14 +292,63 @@ class CommitGroupStore:
             status.canonical_attempt_count += 1
             status.canonical_last_error = ""
             status.canonical_attempt_id = attempt_id
+            status.canonical_owner_pid = os.getpid()
             status.canonical_next_retry_at = ""
             status.canonical_terminal_status = ""
+            status.canonical_phase = "claimed"
             status.canonical_lease_expires_at = (
                 datetime.now(timezone.utc) + timedelta(seconds=max(1, lease_seconds))
             ).isoformat()
             status.updated_at = _now()
             self._write(status)
             return True
+
+    def mark_canonical_phase(
+        self,
+        group_id: str,
+        *,
+        phase: str,
+        attempt_id: str,
+        salience_reservation_digest: str = "",
+        planning_digest: str = "",
+    ) -> CommitGroupStatus:
+        """Persist the semantic-planning publication boundary under lease fencing."""
+
+        allowed = {"salience_reserved", "planning_sealed"}
+        if phase not in allowed:
+            raise ValueError(f"unsupported canonical planning phase: {phase}")
+        with self.group_lock(group_id):
+            status = self._required_unlocked(group_id)
+            if status.canonical_status != "running" or status.canonical_attempt_id != attempt_id:
+                raise RuntimeError("canonical planning attempt no longer owns the lease")
+            if phase == "salience_reserved":
+                if len(salience_reservation_digest) != 64:
+                    raise ValueError("salience reservation phase requires a durable digest")
+                if (
+                    status.salience_reservation_digest
+                    and status.salience_reservation_digest != salience_reservation_digest
+                ):
+                    raise ValueError("commit group is bound to another salience reservation")
+                status.salience_reservation_digest = salience_reservation_digest
+            else:
+                if len(salience_reservation_digest) != 64 or len(planning_digest) != 64:
+                    raise ValueError("sealed planning phase requires salience and planning digests")
+                if (
+                    status.salience_reservation_digest
+                    and status.salience_reservation_digest != salience_reservation_digest
+                ):
+                    raise ValueError("sealed planning differs from the reserved salience decision")
+                if status.planning_digest and status.planning_digest != planning_digest:
+                    raise ValueError("commit group is bound to another planning envelope")
+                status.salience_reservation_digest = salience_reservation_digest
+                status.planning_digest = planning_digest
+            order = {"unstarted": 0, "claimed": 1, "salience_reserved": 2, "planning_sealed": 3}
+            if order.get(phase, -1) < order.get(status.canonical_phase, -1):
+                raise ValueError("canonical planning phase cannot move backwards")
+            status.canonical_phase = phase
+            status.updated_at = _now()
+            self._write(status)
+            return status
 
     def mark_canonical(
         self,
@@ -295,9 +368,11 @@ class CommitGroupStore:
             status.canonical_retryable = False
             status.canonical_result = dict(result or {})
             status.canonical_attempt_id = ""
+            status.canonical_owner_pid = 0
             status.canonical_lease_expires_at = ""
             status.canonical_next_retry_at = ""
             status.canonical_terminal_status = "done"
+            status.canonical_phase = "committed"
             status.updated_at = _now()
             self._write(status)
             return status
@@ -321,6 +396,7 @@ class CommitGroupStore:
             status.canonical_last_error = str(error)[:200]
             status.canonical_retryable = retryable and not exhausted
             status.canonical_attempt_id = ""
+            status.canonical_owner_pid = 0
             status.canonical_lease_expires_at = ""
             status.canonical_next_retry_at = _now() if status.canonical_retryable else ""
             status.canonical_terminal_status = "" if status.canonical_retryable else "dead_letter"
@@ -364,6 +440,7 @@ class CommitGroupStore:
             item.attempt_count += 1
             item.last_error = ""
             item.attempt_id = attempt_id
+            item.owner_pid = os.getpid()
             item.next_retry_at = ""
             item.terminal_status = ""
             item.lease_expires_at = (datetime.now(timezone.utc) + timedelta(seconds=max(1, lease_seconds))).isoformat()
@@ -421,6 +498,8 @@ class CommitGroupStore:
             status.canonical_effects[diff_id] = dict(diff)
             status.updated_at = _now()
             self._write(status)
+            if self.test_hook is not None:
+                self.test_hook("after_commit_group_effect_record", group_id)
             return status
 
     def complete_consumer(
@@ -441,10 +520,32 @@ class CommitGroupStore:
             item.last_error = ""
             item.completed_revision = revision
             item.attempt_id = ""
+            item.owner_pid = 0
             item.lease_expires_at = ""
             item.next_retry_at = ""
             item.terminal_status = "done"
             item.result = dict(result or {})
+            status.updated_at = _now()
+            self._write(status)
+            return status
+
+    def refresh_completed_consumer_result(
+        self,
+        group_id: str,
+        consumer: str,
+        *,
+        result: dict[str, Any],
+    ) -> CommitGroupStatus:
+        """Refresh a disposable proof only after independently re-verifying it."""
+
+        with self.group_lock(group_id):
+            status = self._required_unlocked(group_id)
+            item = self._consumer(status, consumer)
+            if item.status != "completed" or item.attempt_id or item.owner_pid or item.lease_expires_at:
+                raise CommitGroupIntegrityError(
+                    "only an unleased completed consumer may receive a refreshed proof"
+                )
+            item.result = dict(result)
             status.updated_at = _now()
             self._write(status)
             return status
@@ -467,6 +568,7 @@ class CommitGroupStore:
             item.retryable = retryable and not exhausted
             item.last_error = str(error)[:200]
             item.attempt_id = ""
+            item.owner_pid = 0
             item.lease_expires_at = ""
             item.next_retry_at = _now() if item.retryable else ""
             item.terminal_status = "" if item.retryable else "dead_letter"
@@ -486,6 +588,21 @@ class CommitGroupStore:
                 result.append(status)
         return result
 
+    def all(self) -> list[CommitGroupStatus]:
+        """Load every durable group, including terminal history, with path checks."""
+
+        if not self.root.exists():
+            return []
+        result: list[CommitGroupStatus] = []
+        for path in sorted(self.root.glob("*.json")):
+            status = self._load_unlocked(path.stem)
+            if status is None:
+                raise CommitGroupIntegrityError(f"commit group disappeared during scan: {path.name}")
+            if path.is_symlink() or self.path(status.group_id).resolve() != path.resolve():
+                raise CommitGroupIntegrityError(f"commit group has an invalid artifact path: {path.name}")
+            result.append(status)
+        return result
+
     def recover_expired_consumers(self) -> list[tuple[str, str]]:
         recovered: list[tuple[str, str]] = []
         for status in self.pending():
@@ -497,6 +614,7 @@ class CommitGroupStore:
                     current.canonical_retryable = True
                     current.canonical_last_error = "canonical commit lease expired before completion"
                     current.canonical_attempt_id = ""
+                    current.canonical_owner_pid = 0
                     current.canonical_lease_expires_at = ""
                     current.canonical_next_retry_at = _now()
                     changed = True
@@ -506,10 +624,55 @@ class CommitGroupStore:
                         item.retryable = True
                         item.last_error = "consumer lease expired before completion"
                         item.attempt_id = ""
+                        item.owner_pid = 0
                         item.lease_expires_at = ""
                         item.next_retry_at = _now()
                         recovered.append((status.group_id, consumer))
                         changed = True
+                if changed:
+                    current.updated_at = _now()
+                    self._write(current)
+        return recovered
+
+    def recover_abandoned_leases(self) -> list[tuple[str, str]]:
+        """Release leases whose recorded local process no longer exists.
+
+        An unexpired lease owned by a live process is never stolen.  This lets
+        startup recover immediately after a real process crash without
+        weakening concurrent worker fencing.
+        """
+
+        recovered: list[tuple[str, str]] = []
+        for status in self.pending():
+            with self.group_lock(status.group_id):
+                current = self._required_unlocked(status.group_id)
+                changed = False
+                if (
+                    current.canonical_status == "running"
+                    and current.canonical_owner_pid > 0
+                    and not self._pid_alive(current.canonical_owner_pid)
+                ):
+                    current.canonical_status = "failed"
+                    current.canonical_retryable = True
+                    current.canonical_last_error = "canonical commit owner process exited"
+                    current.canonical_attempt_id = ""
+                    current.canonical_owner_pid = 0
+                    current.canonical_lease_expires_at = ""
+                    current.canonical_next_retry_at = _now()
+                    recovered.append((status.group_id, "canonical"))
+                    changed = True
+                for consumer, item in current.consumers.items():
+                    if item.status != "running" or item.owner_pid <= 0 or self._pid_alive(item.owner_pid):
+                        continue
+                    item.status = "failed"
+                    item.retryable = True
+                    item.last_error = "consumer owner process exited"
+                    item.attempt_id = ""
+                    item.owner_pid = 0
+                    item.lease_expires_at = ""
+                    item.next_retry_at = _now()
+                    recovered.append((status.group_id, consumer))
+                    changed = True
                 if changed:
                     current.updated_at = _now()
                     self._write(current)
@@ -535,13 +698,15 @@ class CommitGroupStore:
         payload = status.to_dict()
         payload["control_schema_version"] = "commit_group_control_v1"
         payload["control_digest"] = canonical_digest(payload)
-        atomic_write_json(path, payload)
+        atomic_write_json(path, payload, artifact_root=self.artifact_root)
 
     def _load_unlocked(self, group_id: str) -> CommitGroupStatus | None:
         path = self.path(group_id)
-        if not path.exists():
+        if not path.exists() and not path.is_symlink():
             return None
         try:
+            if path.is_symlink():
+                raise ValueError("commit group state cannot be a symbolic link")
             payload = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("commit group state must be a JSON object")
@@ -582,6 +747,15 @@ class CommitGroupStore:
     def _retry_waiting(self, value: str) -> bool:
         return self._lease_active(value)
 
+    def _pid_alive(self, pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
     def _canonical_json(self, payload: dict[str, Any]) -> str:
         return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -589,19 +763,16 @@ class CommitGroupStore:
     def group_lock(self, group_id: str) -> Iterator[None]:
         """Serialize one commit group across processes without blocking unrelated groups."""
 
-        lock_path = self.root / ".locks" / f"{group_id}.lock"
-        lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        lock_path.parent.chmod(0o700)
-        if not lock_path.exists():
-            lock_path.touch(mode=0o600)
-        lock_path.chmod(0o600)
+        safe_group = require_safe_path_segment(group_id, "commit group_id")
+        lock_path = self.root / ".locks" / f"{safe_group}.lock"
         if fcntl is not None:
-            with lock_path.open("a+", encoding="utf-8") as handle:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-                try:
-                    yield
-                finally:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            descriptor = open_private_lock(lock_path, root=self.root)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                yield
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
             return
         with self._fallback_guard:  # pragma: no cover
             lock = self._fallback_locks.setdefault(str(lock_path), threading.RLock())

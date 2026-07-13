@@ -11,6 +11,7 @@ from memoryos.contextdb.store.source_store import IndexStore, SourceStore
 from memoryos.operations.commit.operation_committer import OperationCommitter
 from memoryos.operations.model.context_operation import ContextOperation
 from memoryos.operations.model.operation_action import OperationAction
+from memoryos.workers.readiness import require_source_store_ready
 
 
 class CoolingWorker:
@@ -31,11 +32,18 @@ class CoolingWorker:
         recent_observations: list[Observation],
         limit: int = 100,
     ) -> dict:
+        require_source_store_ready(self.source_store)
         query = " ".join(
             dict.fromkeys(
                 tag
                 for observation in recent_observations
-                for tag in [observation.raw_text, observation.location, observation.activity, *observation.signals, *observation.context_tags()]
+                for tag in [
+                    observation.raw_text,
+                    observation.location,
+                    observation.activity,
+                    *observation.signals,
+                    *observation.context_tags(),
+                ]
                 if tag
             )
         )
@@ -156,7 +164,9 @@ class CoolingWorker:
         obj = self.source_store.read_object(uri)
         metadata = obj.metadata
         opportunity_payload = metadata.get("opportunity", {})
-        opportunity = OpportunityStats(**opportunity_payload) if isinstance(opportunity_payload, dict) else OpportunityStats()
+        opportunity = (
+            OpportunityStats(**opportunity_payload) if isinstance(opportunity_payload, dict) else OpportunityStats()
+        )
         return BehaviorPattern(
             user_id=str(obj.owner_user_id or metadata.get("user_id", "")),
             scene_key=str(metadata.get("scene_key", "")),

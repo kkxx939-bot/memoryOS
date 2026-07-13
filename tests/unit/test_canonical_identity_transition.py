@@ -7,18 +7,23 @@ from typing import Any
 import pytest
 
 import memoryos.memory.canonical as canonical_api
+from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.model.lifecycle import LifecycleState
 from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.memory.canonical import (
     AliasRegistry,
+    CanonicalMemoryFormationService,
     Commitment,
     EpistemicStatus,
     EvidenceRef,
+    MemoryClaim,
+    MemoryRevision,
     MemoryScope,
     MemorySemanticNormalizer,
     MemorySemanticProposal,
     MemoryTransitionPolicy,
     PendingMemoryProposal,
+    PendingReason,
     PendingSemanticReconciliation,
     ProposalEvidenceValidator,
     ScopeRef,
@@ -28,10 +33,13 @@ from memoryos.memory.canonical import (
     SessionArchiveEpisodeAdapter,
     SpeechAct,
     StableMemoryIdentityResolver,
+    TransitionProfile,
     VisibilityPolicy,
     bind_field_evidence,
 )
 from memoryos.memory.canonical.reconcile import MemorySemanticReconciler, RelationAuthority
+from memoryos.operations.model.context_operation import ContextOperation
+from memoryos.operations.model.operation_action import OperationAction
 
 
 def _explicit_bindings(
@@ -184,7 +192,7 @@ def _confirmed_pending(proposal, scope):  # noqa: ANN001, ANN202
         tenant_id="t1",
         owner_user_id="u1",
         source_role="user",
-        pending_reason_code="test_review",
+        pending_reason_code=PendingReason.REVIEWABLE_DESTRUCTIVE,
         request_identity=proposal.proposal_id,
     )
     return replace(
@@ -1169,10 +1177,73 @@ def test_claim_revision_history_links_previous_and_validity_interval() -> None:
         first,
         proposal_id="p-corrected",
         value_fields={"canonical_value": "SQLite", "reason": "verified"},
+        field_evidence_refs={
+            **dict(first.field_evidence_refs),
+            "value.reason": first.evidence_refs,
+        },
         semantic=replace(first.semantic, speech_act=SpeechAct.CORRECTION),
     )
     _, updated = _apply(corrected, scope, initial.slot, initial.claims)
     revisions = updated.claims[0].revisions
     assert len(revisions) == 2
     assert revisions[1].previous_revision == 1
-    assert revisions[0].valid_to == revisions[1].valid_from
+    assert revisions[0] == initial.claims[0].revisions[0]
+    assert revisions[0].valid_to is None
+    assert revisions[1].valid_from
+
+
+def test_formation_display_mirror_uses_effective_current_revision_not_history_tail() -> None:
+    episode, _scope_ref = _context()
+    proposal = _proposal(episode, "SQLite", "confirmation", "confirmed", "p-display")
+    current = MemoryRevision(
+        revision=1,
+        state="ACTIVE",
+        value_fields={"canonical_value": "SQLite"},
+        evidence_refs=proposal.evidence_refs,
+        proposal_id="p-current",
+        relation="UNRELATED",
+        epistemic_status="EXPLICIT",
+        qualifiers={"display_fields": {"summary": "effective current display"}},
+    )
+    historical = MemoryRevision(
+        revision=2,
+        state="PROPOSED",
+        value_fields={"canonical_value": "SQLite in the past"},
+        evidence_refs=proposal.evidence_refs,
+        proposal_id="p-history",
+        relation="SUPPLEMENTS",
+        epistemic_status="EXPLICIT",
+        qualifiers={
+            "non_current_historical": True,
+            "display_fields": {"summary": "historical-only display"},
+        },
+        previous_revision=1,
+    )
+    claim = MemoryClaim(
+        "claim-display",
+        "memoryos://user/u1/memories/canonical/slots/slot-display/claims/claim-display",
+        "slot-display",
+        "sqlite",
+        TransitionProfile.AUTHORITATIVE_STATE,
+        (current, historical),
+    )
+    obj = claim.to_context_object(
+        tenant_id="t1",
+        owner_user_id="u1",
+        memory_type="project_decision",
+        scope={},
+    )
+    operation = ContextOperation(
+        context_type=ContextType.MEMORY,
+        action=OperationAction.UPDATE,
+        target_uri=obj.uri,
+        user_id="u1",
+        payload={"context_object": obj.to_dict(), "expected_revision": 1},
+    )
+
+    CanonicalMemoryFormationService(None)._decorate_operations([operation], proposal, [])
+
+    metadata = operation.payload["context_object"]["metadata"]
+    assert metadata["current_revision"] == 1
+    assert metadata["revision"] == 2
+    assert metadata["display_fields"] == {"summary": "effective current display"}

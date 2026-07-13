@@ -14,6 +14,7 @@ from typing import Any
 
 from memoryos.contextdb.model.context_uri import ContextURI
 from memoryos.contextdb.session.session_model import SessionArchive
+from memoryos.core.file_lock import open_private_lock
 from memoryos.core.ids import require_safe_path_segment
 from memoryos.core.time import utc_now
 from memoryos.memory.canonical.event import canonical_digest, canonical_json, canonicalize
@@ -88,7 +89,13 @@ class SessionArchiveStore:
 
     def write_sync_archive(self, archive: SessionArchive) -> Path:
         tenant_id = self._archive_tenant(archive)
+        self._materialize_archive_tenant(archive, tenant_id)
         directory = self._dir(archive.archive_uri, tenant_id=tenant_id)
+        head_path = directory / "commit_head.json"
+        if head_path.is_symlink():
+            raise EvidenceArchiveIntegrityError(
+                "session archive head cannot be a symbolic link"
+            )
         self._secure_directory(directory)
 
         collections: dict[str, str] = {}
@@ -157,7 +164,7 @@ class SessionArchiveStore:
         archive.manifest_digest = manifest_digest
         archive.manifest_uri = manifest_uri
         self._write_head(
-            directory / "commit_head.json",
+            head_path,
             {
                 "schema_version": ARCHIVE_HEAD_SCHEMA_VERSION,
                 "archive_uri": archive.archive_uri,
@@ -316,19 +323,76 @@ class SessionArchiveStore:
         tenant_id: str | None = None,
         manifest_digest: str | None = None,
     ) -> SessionArchive:
+        effective_tenant = tenant_id or self.tenant_id
+        parsed_uri = ContextURI.parse(archive_uri)
         directory = self._dir(archive_uri, tenant_id=tenant_id)
         head_path = directory / "commit_head.json"
+        if not manifest_digest and head_path.is_symlink():
+            raise EvidenceArchiveIntegrityError(
+                "session archive head cannot be a symbolic link"
+            )
         head = {} if manifest_digest else dict(self._read_json(head_path) or {})
         if head and str(head.get("schema_version") or "") != ARCHIVE_HEAD_SCHEMA_VERSION:
             raise EvidenceArchiveIntegrityError("unsupported session archive head schema")
         if head and str(head.get("archive_uri") or "") != archive_uri:
             raise EvidenceArchiveIntegrityError("session archive head URI mismatch")
+        if head and str(head.get("tenant_id") or "") != effective_tenant:
+            raise EvidenceArchiveIntegrityError("session archive head tenant mismatch")
+        if head and str(head.get("user_id") or "") != str(parsed_uri.user_id or ""):
+            raise EvidenceArchiveIntegrityError("session archive head user mismatch")
         selected = manifest_digest or str(head.get("manifest_digest") or "")
         if not selected:
             raise EvidenceArchiveIntegrityError("session archive head has no manifest digest")
-        archive = self._read_v2_archive(directory, archive_uri, selected)
+        archive = self._read_v2_archive(
+            directory,
+            archive_uri,
+            selected,
+            tenant_id=effective_tenant,
+        )
         if head and str(head.get("archive_digest") or "") != archive.archive_digest:
             raise EvidenceArchiveIntegrityError("session archive head aggregate digest mismatch")
+        return archive
+
+    def read_archive_from_commit_head(
+        self,
+        head_path: Path,
+        *,
+        tenant_id: str,
+        user_id: str,
+    ) -> SessionArchive:
+        """Read one enumerated archive only after proving its head path identity."""
+
+        if head_path.is_symlink():
+            raise EvidenceArchiveIntegrityError(
+                "archive commit head cannot be a symbolic link"
+            )
+        try:
+            head = self._read_json(head_path)
+        except EvidenceArchiveIntegrityError as exc:
+            raise EvidenceArchiveIntegrityError(
+                f"archive commit head is unreadable: {head_path}"
+            ) from exc
+        if not isinstance(head, dict):
+            raise EvidenceArchiveIntegrityError("archive commit head must be a JSON object")
+        if str(head.get("schema_version") or "") != ARCHIVE_HEAD_SCHEMA_VERSION:
+            raise EvidenceArchiveIntegrityError("archive commit head schema is invalid")
+        if str(head.get("tenant_id") or "") != tenant_id:
+            raise EvidenceArchiveIntegrityError("archive commit head tenant mismatch")
+        if str(head.get("user_id") or "") != user_id:
+            raise EvidenceArchiveIntegrityError("archive commit head user mismatch")
+        archive_uri = str(head.get("archive_uri") or "")
+        try:
+            parsed_uri = ContextURI.parse(archive_uri)
+        except ValueError as exc:
+            raise EvidenceArchiveIntegrityError("archive commit head URI is invalid") from exc
+        if parsed_uri.user_id != user_id:
+            raise EvidenceArchiveIntegrityError("archive commit head URI user mismatch")
+        expected_path = self._dir(archive_uri, tenant_id=tenant_id) / "commit_head.json"
+        if head_path.is_symlink() or head_path.resolve() != expected_path.resolve():
+            raise EvidenceArchiveIntegrityError("archive commit head path identity mismatch")
+        archive = self.read_archive(archive_uri, tenant_id=tenant_id)
+        if archive.user_id != user_id:
+            raise EvidenceArchiveIntegrityError("archive manifest user mismatch")
         return archive
 
     def read_archive_at_manifest(
@@ -342,7 +406,12 @@ class SessionArchiveStore:
 
     def archive_exists(self, archive_uri: str, *, tenant_id: str | None = None) -> bool:
         directory = self._dir(archive_uri, tenant_id=tenant_id)
-        return (directory / "commit_head.json").exists()
+        path = directory / "commit_head.json"
+        if path.is_symlink():
+            raise EvidenceArchiveIntegrityError(
+                "session archive head cannot be a symbolic link"
+            )
+        return path.exists()
 
     def archive_tenant(self, archive: SessionArchive) -> str:
         """Resolve the tenant path used by both archive writes and idempotent reads."""
@@ -373,12 +442,23 @@ class SessionArchiveStore:
             raise EvidenceArchiveIntegrityError("session archive head has no manifest digest")
         return self._read_manifest(directory, digest)
 
-    def _read_v2_archive(self, directory: Path, archive_uri: str, manifest_digest: str) -> SessionArchive:
+    def _read_v2_archive(
+        self,
+        directory: Path,
+        archive_uri: str,
+        manifest_digest: str,
+        *,
+        tenant_id: str,
+    ) -> SessionArchive:
         manifest = self._read_manifest(directory, manifest_digest)
         if str(manifest.get("schema_version") or "") != ARCHIVE_MANIFEST_SCHEMA_VERSION:
             raise EvidenceArchiveIntegrityError("unsupported session archive manifest schema")
         if str(manifest.get("archive_uri")) != archive_uri:
             raise EvidenceArchiveIntegrityError("session archive manifest URI mismatch")
+        if str(manifest.get("tenant_id") or "") != tenant_id:
+            raise EvidenceArchiveIntegrityError("session archive manifest tenant mismatch")
+        if str(manifest.get("user_id") or "") != str(ContextURI.parse(archive_uri).user_id or ""):
+            raise EvidenceArchiveIntegrityError("session archive manifest user mismatch")
         for event_ref in manifest.get("events", []) or []:
             self.read_event(
                 archive_uri,
@@ -428,6 +508,7 @@ class SessionArchiveStore:
         )
         if archive.archive_digest != expected_archive_digest:
             raise EvidenceArchiveIntegrityError("session archive aggregate digest mismatch")
+        self._materialize_archive_tenant(archive, tenant_id)
         return archive
 
     def _read_manifest(self, directory: Path, digest: str) -> dict[str, Any]:
@@ -463,6 +544,10 @@ class SessionArchiveStore:
                 os.chmod(path, 0o600)
                 self._fsync_directory(path.parent)
             except FileExistsError:
+                if path.is_symlink():
+                    raise EvidenceArchiveConflictError(
+                        f"immutable evidence path cannot be a symbolic link: {path}"
+                    ) from None
                 if compare_existing and path.read_bytes() != payload:
                     raise EvidenceArchiveConflictError(
                         f"immutable evidence path contains different content: {path}"
@@ -471,18 +556,33 @@ class SessionArchiveStore:
             temporary.unlink(missing_ok=True)
 
     def _write_head(self, path: Path, payload: dict[str, Any]) -> None:
+        if path.is_symlink():
+            raise EvidenceArchiveIntegrityError(
+                "session archive head cannot be a symbolic link"
+            )
         self._secure_directory(path.parent)
         temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
-        with temporary.open("x", encoding="utf-8") as handle:
-            os.chmod(temporary, 0o600)
-            handle.write(canonical_json(payload))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        os.chmod(path, 0o600)
-        self._fsync_directory(path.parent)
+        try:
+            with temporary.open("x", encoding="utf-8") as handle:
+                os.chmod(temporary, 0o600)
+                handle.write(canonical_json(payload))
+                handle.flush()
+                os.fsync(handle.fileno())
+            if path.is_symlink():
+                raise EvidenceArchiveIntegrityError(
+                    "session archive head cannot be a symbolic link"
+                )
+            os.replace(temporary, path)
+            os.chmod(path, 0o600)
+            self._fsync_directory(path.parent)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _write_bytes_atomic(self, path: Path, payload: bytes) -> None:
+        if path.is_symlink():
+            raise EvidenceArchiveIntegrityError(
+                "session archive output cannot be a symbolic link"
+            )
         self._secure_directory(path.parent)
         temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
         try:
@@ -491,6 +591,10 @@ class SessionArchiveStore:
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
+            if path.is_symlink():
+                raise EvidenceArchiveIntegrityError(
+                    "session archive output cannot be a symbolic link"
+                )
             os.replace(temporary, path)
             try:
                 path.chmod(0o600)
@@ -504,6 +608,10 @@ class SessionArchiveStore:
     def _async_output_lock(self, async_root: Path) -> Iterator[None]:
         self._secure_directory(async_root)
         lock_path = async_root / ".publish.lock"
+        if lock_path.is_symlink():
+            raise AsyncOutputIntegrityError(
+                "async output lock cannot be a symbolic link"
+            )
         if fcntl is None:  # pragma: no cover
             key = str(lock_path)
             with self._fallback_guard:
@@ -511,16 +619,13 @@ class SessionArchiveStore:
             with lock:
                 yield
             return
-        with lock_path.open("a+b") as handle:
-            try:
-                os.chmod(lock_path, 0o600)
-            except OSError:
-                pass
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        descriptor = open_private_lock(lock_path, root=self.root)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
 
     def _read_async_generation_for_archive(
         self,
@@ -541,6 +646,10 @@ class SessionArchiveStore:
         return self._read_async_generation(directory, head, archive.task_id)
 
     def _read_async_head_optional(self, path: Path) -> dict[str, Any] | None:
+        if path.is_symlink():
+            raise AsyncOutputIntegrityError(
+                "async output head cannot be a symbolic link"
+            )
         if not path.exists():
             return None
         try:
@@ -569,6 +678,10 @@ class SessionArchiveStore:
         safe_task = require_safe_path_segment(task_id, "async output task_id")
         generation = directory / "async_outputs" / safe_task
         manifest_path = generation / "manifest.json"
+        if generation.is_symlink() or manifest_path.is_symlink():
+            raise AsyncOutputIntegrityError(
+                "async output generation cannot be a symbolic link"
+            )
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -595,6 +708,10 @@ class SessionArchiveStore:
             if not isinstance(details, dict):
                 raise AsyncOutputIntegrityError("async output file proof is invalid")
             path = generation / filename
+            if path.is_symlink():
+                raise AsyncOutputIntegrityError(
+                    "async output file cannot be a symbolic link"
+                )
             try:
                 raw = path.read_bytes()
             except OSError as exc:
@@ -637,7 +754,7 @@ class SessionArchiveStore:
             directory / "async_outputs" / archive.task_id / "manifest.json",
         ]
         for path in controls:
-            if path.exists():
+            if path.exists() or path.is_symlink():
                 quarantine_control_file(
                     artifact_root,
                     path,
@@ -666,7 +783,32 @@ class SessionArchiveStore:
     def _archive_tenant(self, archive: SessionArchive) -> str:
         metadata = dict(archive.metadata or {})
         scope = dict(metadata.get("scope", {}) or {})
-        return str(metadata.get("tenant_id") or scope.get("tenant_id") or self.tenant_id)
+        direct = str(metadata.get("tenant_id") or "")
+        scoped = str(scope.get("tenant_id") or "")
+        if direct and scoped and direct != scoped:
+            raise EvidenceArchiveIntegrityError("session archive metadata has conflicting tenants")
+        claimed = direct or scoped
+        if claimed and claimed != self.tenant_id:
+            raise EvidenceArchiveIntegrityError(
+                "session archive tenant does not match the bound archive store"
+            )
+        return self.tenant_id
+
+    def _materialize_archive_tenant(self, archive: SessionArchive, tenant_id: str) -> None:
+        metadata = dict(archive.metadata or {})
+        scope = dict(metadata.get("scope", {}) or {})
+        claimed = tuple(
+            str(value)
+            for value in (metadata.get("tenant_id"), scope.get("tenant_id"))
+            if value not in (None, "")
+        )
+        if any(value != tenant_id for value in claimed):
+            raise EvidenceArchiveIntegrityError("session archive metadata tenant mismatch")
+        metadata["tenant_id"] = tenant_id
+        if "scope" in metadata:
+            scope["tenant_id"] = tenant_id
+            metadata["scope"] = scope
+        archive.metadata = metadata
 
     def _write_json(self, path: Path, payload: Any) -> None:
         self._write_bytes_atomic(
@@ -688,9 +830,13 @@ class SessionArchiveStore:
             current = current.parent
 
     def _read_json(self, path: Path) -> Any:
+        if path.is_symlink():
+            raise EvidenceArchiveIntegrityError(
+                f"evidence archive path cannot be a symbolic link: {path}"
+            )
         try:
             return json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError as exc:
             raise EvidenceArchiveIntegrityError(f"missing evidence archive object: {path}") from exc
-        except json.JSONDecodeError as exc:
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise EvidenceArchiveIntegrityError(f"invalid evidence archive JSON: {path}") from exc

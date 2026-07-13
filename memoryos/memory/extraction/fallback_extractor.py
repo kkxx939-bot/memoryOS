@@ -45,6 +45,7 @@ class RuleFallbackExtractor(MemoryExtractorBackend):
     semantic_proposal_backend = True
     llm_semantic_backend = False
     pending_only = True
+    is_remote = False
 
     def __init__(self, signal_matcher: EvidenceSignalMatcher | None = None) -> None:
         self.signal_matcher = signal_matcher or EvidenceSignalMatcher()

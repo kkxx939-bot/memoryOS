@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
+from pathlib import PurePosixPath
 from typing import Any
 
+from memoryos.core.ids import require_safe_path_segment
 from memoryos.memory.canonical.event import canonical_digest, canonical_json
 from memoryos.operations.model.context_operation import ContextOperation
 
@@ -19,6 +21,24 @@ OUTBOX_TRANSITIONS = {
     "committed": {"committed"},
     "aborted": {"aborted"},
 }
+
+PREPARED_INTENT_FIELDS = (
+    "schema_version",
+    "event_type",
+    "transaction_id",
+    "idempotency_key",
+    "tenant_id",
+    "user_id",
+    "operation_ids",
+    "operations",
+    "operations_digest",
+    "before_images",
+    "before_images_digest",
+    "effect_manifests",
+    "effect_manifests_digest",
+    "claim_revisions",
+    "commit_group_id",
+)
 
 
 class OutboxIntegrityError(RuntimeError):
@@ -78,14 +98,18 @@ def build_outbox(
     effect_manifests: list[dict[str, Any]],
     claim_revisions: list[dict[str, Any]],
     commit_group_id: str,
+    receipt_path: str = "",
+    receipt_digest: str = "",
 ) -> dict[str, Any]:
     if status not in OUTBOX_STATES:
         raise OutboxIntegrityError("canonical outbox status is unsupported")
+    operation_commit_groups = {str(operation.payload.get("commit_group_id") or "") for operation in operations}
+    if not isinstance(commit_group_id, str) or not commit_group_id or operation_commit_groups != {commit_group_id}:
+        raise OutboxIntegrityError("canonical outbox crosses or omits its commit group boundary")
     normalized_operations = [normalized_operation(operation) for operation in operations]
-    core: dict[str, Any] = {
+    immutable_intent: dict[str, Any] = {
         "schema_version": OUTBOX_SCHEMA_VERSION,
         "event_type": OUTBOX_EVENT_TYPE,
-        "status": status,
         "transaction_id": transaction_id,
         "idempotency_key": idempotency_key,
         "tenant_id": tenant_id,
@@ -99,6 +123,13 @@ def build_outbox(
         "effect_manifests_digest": canonical_digest(effect_manifests),
         "claim_revisions": claim_revisions,
         "commit_group_id": commit_group_id,
+    }
+    core: dict[str, Any] = {
+        **immutable_intent,
+        "status": status,
+        "prepared_intent_digest": canonical_digest(immutable_intent),
+        "receipt_path": receipt_path,
+        "receipt_digest": receipt_digest,
     }
     return {**core, "outbox_digest": canonical_digest(core)}
 
@@ -138,6 +169,7 @@ def validate_outbox(
     stored_operations = payload.get("operations")
     before_images = payload.get("before_images")
     effect_manifests = payload.get("effect_manifests")
+    claim_revisions = payload.get("claim_revisions")
     if (
         not isinstance(operation_ids, list)
         or not operation_ids
@@ -147,18 +179,82 @@ def validate_outbox(
         or not isinstance(before_images, list)
         or not isinstance(effect_manifests, list)
         or len(effect_manifests) != len(operation_ids)
+        or not isinstance(claim_revisions, list)
     ):
         raise OutboxIntegrityError("canonical outbox transaction members are incomplete")
     stored_ids = [str(item.get("operation_id") or "") for item in stored_operations if isinstance(item, dict)]
     effect_ids = [str(item.get("operation_id") or "") for item in effect_manifests if isinstance(item, dict)]
     if stored_ids != [str(item) for item in operation_ids] or set(effect_ids) != set(stored_ids):
         raise OutboxIntegrityError("canonical outbox operation ids are inconsistent")
+    stored_commit_groups = {
+        str(dict(item.get("payload", {}) or {}).get("commit_group_id") or "")
+        for item in stored_operations
+        if isinstance(item, dict)
+    }
+    if (
+        not isinstance(payload.get("commit_group_id"), str)
+        or not payload.get("commit_group_id")
+        or stored_commit_groups != {str(payload["commit_group_id"])}
+    ):
+        raise OutboxIntegrityError("canonical outbox crosses or omits its commit group boundary")
     if payload.get("operations_digest") != operation_set_digest(stored_operations):
         raise OutboxIntegrityError("canonical outbox operations digest is corrupt")
     if payload.get("before_images_digest") != canonical_digest(before_images):
         raise OutboxIntegrityError("canonical outbox before images are corrupt")
     if payload.get("effect_manifests_digest") != canonical_digest(effect_manifests):
         raise OutboxIntegrityError("canonical outbox effect manifests are corrupt")
+    expected_claim_revisions: list[dict[str, Any]] = []
+    for operation in stored_operations:
+        assert isinstance(operation, dict)
+        operation_payload = operation.get("payload")
+        context_object = operation_payload.get("context_object") if isinstance(operation_payload, dict) else None
+        if not isinstance(context_object, dict):
+            continue
+        metadata = dict(context_object.get("metadata", {}) or {})
+        if metadata.get("canonical_kind") != "claim":
+            continue
+        uri = context_object.get("uri")
+        claim_id = metadata.get("claim_id")
+        revision = metadata.get("revision")
+        if (
+            not isinstance(uri, str)
+            or not uri
+            or not isinstance(claim_id, str)
+            or not claim_id
+            or isinstance(revision, bool)
+            or not isinstance(revision, int)
+            or revision < 1
+        ):
+            raise OutboxIntegrityError("canonical outbox Claim operation has an invalid revision identity")
+        expected_claim_revisions.append({"uri": uri, "claim_id": claim_id, "revision": revision})
+    if claim_revisions != expected_claim_revisions:
+        raise OutboxIntegrityError("canonical outbox claim revision set is detached from its immutable operations")
+    immutable_intent = {key: payload.get(key) for key in PREPARED_INTENT_FIELDS}
+    if payload.get("prepared_intent_digest") != canonical_digest(immutable_intent):
+        raise OutboxIntegrityError("canonical outbox prepared intent digest is corrupt")
+    receipt_path = payload.get("receipt_path", "")
+    receipt_digest = payload.get("receipt_digest", "")
+    if status == "committed":
+        if (
+            not isinstance(receipt_path, str)
+            or not receipt_path
+            or not isinstance(receipt_digest, str)
+            or not receipt_digest
+        ):
+            raise OutboxIntegrityError("committed canonical outbox requires an immutable receipt reference")
+        try:
+            receipt_identity = require_safe_path_segment(
+                payload.get("idempotency_key"),
+                "canonical outbox idempotency_key",
+            )
+        except (TypeError, ValueError) as exc:
+            raise OutboxIntegrityError("canonical outbox receipt identity is invalid") from exc
+        normalized_receipt = PurePosixPath(receipt_path)
+        expected_receipt = PurePosixPath("system") / "transactions" / f"{receipt_identity}.json"
+        if normalized_receipt.is_absolute() or normalized_receipt != expected_receipt:
+            raise OutboxIntegrityError("committed canonical outbox must reference its unique immutable receipt")
+    elif receipt_path or receipt_digest:
+        raise OutboxIntegrityError("pre-commit canonical outbox cannot reference a later receipt")
     for effect in effect_manifests:
         _validate_effect_manifest(effect, payload)
     stored_by_id = {
@@ -185,10 +281,7 @@ def validate_outbox(
         before_uris.add(uri)
         object_payload = snapshot.get("object")
         relations = snapshot.get("relations")
-        if (
-            not isinstance(relations, list)
-            or snapshot.get("relations_digest") != canonical_digest(relations)
-        ):
+        if not isinstance(relations, list) or snapshot.get("relations_digest") != canonical_digest(relations):
             raise OutboxIntegrityError("canonical outbox before-image relations are corrupt")
         if snapshot["exists"]:
             if (
@@ -214,9 +307,7 @@ def validate_outbox(
 
 def assert_transition(previous: str, requested: str) -> None:
     if requested not in OUTBOX_TRANSITIONS.get(previous, set()):
-        raise OutboxIntegrityError(
-            f"canonical outbox terminal state cannot transition from {previous} to {requested}"
-        )
+        raise OutboxIntegrityError(f"canonical outbox terminal state cannot transition from {previous} to {requested}")
 
 
 def load_outbox_text(raw: str) -> dict[str, Any]:
@@ -241,14 +332,27 @@ def _validate_effect_manifest(effect: object, envelope: dict[str, Any]) -> None:
         or effect.get("operation_id") not in envelope.get("operation_ids", [])
         or not effect.get("uri")
         or effect.get("expected_exists") is not True
-        or effect.get("relation_manifest_digest")
-        != canonical_digest(effect.get("relation_manifest", {}))
+        or effect.get("relation_manifest_digest") != canonical_digest(effect.get("relation_manifest", {}))
     ):
         raise OutboxIntegrityError("canonical outbox effect manifest crosses its transaction boundary")
 
 
 def same_immutable_envelope(left: dict[str, Any], right: dict[str, Any]) -> bool:
-    mutable = {"status", "outbox_digest"}
+    mutable = {"status", "outbox_digest", "receipt_path", "receipt_digest"}
     return canonical_json({k: v for k, v in left.items() if k not in mutable}) == canonical_json(
         {k: v for k, v in right.items() if k not in mutable}
     )
+
+
+def prepared_intent_digest(payload: dict[str, Any]) -> str:
+    """Return the immutable prepared-intent identity used by receipts."""
+
+    validated = validate_outbox(payload)
+    return str(validated["prepared_intent_digest"])
+
+
+def prepared_intent_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return the complete immutable intent carried by an outbox envelope."""
+
+    validated = validate_outbox(payload)
+    return {key: validated[key] for key in PREPARED_INTENT_FIELDS}

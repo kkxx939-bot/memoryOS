@@ -69,18 +69,10 @@ class HTTPMemoryOSClient:
                     decoded = json.loads(response.read().decode())
                     return decoded if isinstance(decoded, dict) else {"data": decoded}
             except urllib.error.HTTPError as exc:
-                retryable = exc.code >= 500
+                error = _remote_http_error(exc, request_id=request_id, operation=path)
+                retryable = bool(error["retryable"])
                 if not retryable or attempt >= self.retries:
-                    return {
-                        "error": {
-                            "code": "HTTP_ERROR",
-                            "message": f"HTTP {exc.code}",
-                            "retryable": retryable,
-                            "request_id": request_id,
-                            "operation": path,
-                            "status_code": exc.code,
-                        }
-                    }
+                    return {"error": error}
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 if attempt >= self.retries:
                     return {
@@ -115,53 +107,60 @@ class HTTPMemoryOSClient:
 
     def commit_agent_session(self, **kwargs: Any) -> dict[str, Any]:
         archived = self.append_session_event(kwargs)
-        if archived.get("error"):
-            return archived
         session_key = str(archived.get("session_key") or kwargs.get("session_key") or "")
         if not session_key:
-            return {
-                "error": {
-                    "code": "INVALID_SESSION_RESPONSE",
-                    "message": "session event response omitted session_key",
-                    "retryable": False,
-                    "request_id": _request_id(),
-                    "operation": "commit_agent_session",
-                }
-            }
+            raise RemoteMemoryOSError(
+                code="INVALID_SESSION_RESPONSE",
+                message="session event response omitted session_key",
+                retryable=False,
+                request_id=_request_id(),
+                operation="commit_agent_session",
+            )
         return self.finalize_session(session_key, async_commit=bool(kwargs.get("async_commit", True)))
 
     def append_session_event(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self.request("POST", "/v1/sessions/events", payload)
+        response = self.request("POST", "/v1/sessions/events", payload)
+        _raise_remote_error(response)
+        return response
 
     def checkpoint_session(self, session_key: str) -> dict[str, Any]:
-        return self.request("POST", f"/v1/sessions/{session_key}/checkpoint", {})
+        response = self.request("POST", f"/v1/sessions/{session_key}/checkpoint", {})
+        _raise_remote_error(response)
+        return response
 
     def finalize_session(self, session_key: str, *, async_commit: bool = True) -> dict[str, Any]:
-        return self.request(
+        response = self.request(
             "POST",
             f"/v1/sessions/{session_key}/finalize",
             {"async_commit": async_commit},
         )
+        _raise_remote_error(response)
+        return response
 
     def remember(self, **kwargs: Any) -> dict[str, Any]:
-        return self.request("POST", "/v1/memories/remember", kwargs)
+        response = self.request("POST", "/v1/memories/remember", kwargs)
+        _raise_remote_error(response)
+        return response
 
     def forget(self, **kwargs: Any) -> dict[str, Any]:
-        return self.request("POST", "/v1/memories/forget", kwargs)
+        response = self.request("POST", "/v1/memories/forget", kwargs)
+        _raise_remote_error(response)
+        return response
 
     def list_pending(
         self,
         *,
         user_id: str,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
         lifecycle_states: list[str] | None = None,
         project_id: str = "",
     ) -> list[dict[str, Any]]:
+        effective_tenant = tenant_id or self.tenant_id
         query = urllib.parse.urlencode(
             {
                 "user_id": user_id,
-                "tenant_id": tenant_id,
                 "lifecycle_state": ",".join(lifecycle_states or []),
+                **({"tenant_id": effective_tenant} if effective_tenant else {}),
                 **({"project_id": project_id} if project_id else {}),
             }
         )
@@ -170,14 +169,20 @@ class HTTPMemoryOSClient:
         return list(response.get("results", []))
 
     def review_pending(self, **kwargs: Any) -> dict[str, Any]:
-        return self.request("POST", "/v1/memories/pending/review", kwargs)
+        response = self.request("POST", "/v1/memories/pending/review", kwargs)
+        _raise_remote_error(response)
+        return response
 
     def read(self, uri: str, *, layer: str = "L2") -> dict[str, Any]:
         query = urllib.parse.urlencode({"uri": uri, "layer": layer})
-        return self.request("GET", f"/v1/context/read?{query}")
+        response = self.request("GET", f"/v1/context/read?{query}")
+        _raise_remote_error(response)
+        return response
 
     def recall_trace(self, trace_id: str) -> dict[str, Any]:
-        return self.request("GET", f"/v1/recall-traces/{urllib.parse.quote(trace_id, safe='')}")
+        response = self.request("GET", f"/v1/recall-traces/{urllib.parse.quote(trace_id, safe='')}")
+        _raise_remote_error(response)
+        return response
 
     def archive_search(
         self,
@@ -204,7 +209,9 @@ class HTTPMemoryOSClient:
 
     def archive_read(self, archive_uri: str) -> dict[str, Any]:
         query = urllib.parse.urlencode({"archive_uri": archive_uri})
-        return self.request("GET", f"/v1/archives/read?{query}")
+        response = self.request("GET", f"/v1/archives/read?{query}")
+        _raise_remote_error(response)
+        return response
 
     def health(self) -> dict[str, Any]:
         return self.request("GET", "/health")
@@ -214,6 +221,39 @@ def _request_id() -> str:
     import uuid
 
     return str(uuid.uuid4())
+
+
+def _remote_http_error(
+    exc: urllib.error.HTTPError,
+    *,
+    request_id: str,
+    operation: str,
+) -> dict[str, Any]:
+    """Preserve a bounded structured server error without trusting its body."""
+
+    remote: dict[str, Any] = {}
+    try:
+        raw = exc.read(65_537)
+        if len(raw) <= 65_536:
+            payload = json.loads(raw.decode("utf-8"))
+            if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
+                remote = dict(payload["error"])
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        remote = {}
+    code = str(remote.get("code") or "HTTP_ERROR")[:64]
+    message = str(remote.get("message") or f"HTTP {exc.code}")[:500]
+    remote_request_id = str(remote.get("request_id") or request_id)[:128]
+    remote_operation = str(remote.get("operation") or operation)[:200]
+    raw_retryable = remote.get("retryable")
+    retryable = raw_retryable if isinstance(raw_retryable, bool) else exc.code >= 500
+    return {
+        "code": code,
+        "message": message,
+        "retryable": retryable,
+        "request_id": remote_request_id,
+        "operation": remote_operation,
+        "status_code": int(exc.code),
+    }
 
 
 class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):

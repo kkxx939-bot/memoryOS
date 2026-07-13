@@ -8,6 +8,7 @@ from typing import Any
 
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.memory.canonical.scope import scope_keys_from_payloads
+from memoryos.memory.canonical.state import materialized_current_revision_payload
 from memoryos.operations.model.context_operation import ContextOperation
 from memoryos.operations.model.operation_action import OperationAction
 from memoryos.operations.model.operation_status import OperationStatus
@@ -53,7 +54,10 @@ def operation_memory_metadata(operation: ContextOperation) -> MemoryOperationMet
     context_object = operation.payload.get("context_object")
     metadata = dict(context_object.get("metadata", {}) or {}) if isinstance(context_object, dict) else {}
     revisions = metadata.get("revisions", []) or []
-    current = dict(revisions[-1]) if revisions and isinstance(revisions[-1], dict) else {}
+    if metadata.get("canonical_kind") == "claim":
+        current = materialized_current_revision_payload(metadata)
+    else:
+        current = dict(revisions[-1]) if revisions and isinstance(revisions[-1], dict) else {}
     values = dict(current.get("value_fields", {}) or {})
     semantic_memory_type = str(operation.payload.get("memory_type") or metadata.get("memory_type") or "")
     storage_memory_kind = str(metadata.get("memory_kind") or operation.payload.get("memory_kind") or "")

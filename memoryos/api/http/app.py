@@ -29,6 +29,7 @@ from memoryos.api.trusted_context import (
     workspace_ids_from_csv,
 )
 from memoryos.prediction.model.prediction_request import PredictionRequest
+from memoryos.runtime.readiness import RuntimeNotReadyError
 
 
 def handle(
@@ -75,7 +76,7 @@ def handle(
             search_scope=payload.get("search_scope"),
             retrieval_views=payload.get("retrieval_views"),
             project_id=str(payload.get("project_id") or ""),
-            tenant_id=str(payload.get("tenant_id") or "default"),
+            tenant_id=(str(payload["tenant_id"]) if payload.get("tenant_id") is not None else None),
             applicability_scopes=payload.get("applicability_scopes"),
             memory_states=payload.get("memory_states"),
             memory_types=payload.get("memory_types"),
@@ -98,6 +99,7 @@ def handle(
             session_key=str(payload.get("session_key") or ""),
             scope=payload.get("scope"),
             provenance=payload.get("provenance"),
+            tenant_id=(str(payload["tenant_id"]) if payload.get("tenant_id") is not None else None),
             caller=caller,
         )
         if result is None:
@@ -153,6 +155,8 @@ class MemoryOSASGI:
             status, body = 401, self._error("UNAUTHORIZED", exc, False, request_id)
         except PermissionError as exc:
             status, body = 403, self._error("FORBIDDEN", exc, False, request_id)
+        except RuntimeNotReadyError as exc:
+            status, body = 503, self._error("NOT_READY", exc, True, request_id)
         except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
             status, body = 400, self._error("BAD_REQUEST", exc, False, request_id)
         except FileNotFoundError as exc:
@@ -175,6 +179,12 @@ class MemoryOSASGI:
     ) -> dict[str, Any]:
         if method == "GET" and path == "/health":
             return self.client.health()
+        # Health is the only public endpoint that remains available while
+        # startup/recovery has not established the canonical-memory closure.
+        # Session event/checkpoint routes write durable staging files directly
+        # through AgentSessionService, so relying only on SDK method-level
+        # gates would let those routes mutate state while NOT_READY.
+        self.client.readiness.require_ready()
         if method == "POST" and path == "/v1/context/search":
             return handle(
                 "POST /context/search",
@@ -233,6 +243,8 @@ class MemoryOSASGI:
         if method == "POST" and path == "/v1/memories/remember":
             caller.require(AUTHORITATIVE_REMEMBER)
             caller.assert_identity(user_id=payload.get("user_id"), tenant_id=payload.get("tenant_id"))
+            if "identity_fields" in payload and not isinstance(payload["identity_fields"], dict):
+                raise ValueError("identity_fields must be an object")
             return self.client.remember(
                 user_id=caller.user_id,
                 content=_required_str(payload, "content", path),
@@ -242,6 +254,7 @@ class MemoryOSASGI:
                 constraint_polarity=str(payload.get("constraint_polarity") or ""),
                 condition=str(payload.get("condition") or ""),
                 exception=str(payload.get("exception") or ""),
+                identity_fields=(dict(payload["identity_fields"]) if "identity_fields" in payload else None),
                 connect_metadata=caller.bind_agent_connect_metadata(payload.get("connect_metadata")),
                 tenant_id=caller.tenant_id,
                 caller=caller,
@@ -277,6 +290,8 @@ class MemoryOSASGI:
         if method == "POST" and path == "/v1/memories/pending/review":
             caller.require(AUTHORITATIVE_REMEMBER)
             caller.assert_identity(user_id=payload.get("user_id"), tenant_id=payload.get("tenant_id"))
+            if "corrected_proposal" in payload and not isinstance(payload["corrected_proposal"], dict):
+                raise ValueError("corrected_proposal must be an object")
             return self.client.review_pending(
                 user_id=caller.user_id,
                 pending_uri=_required_str(payload, "pending_uri", path),
@@ -290,6 +305,7 @@ class MemoryOSASGI:
                 command_id=_required_str(payload, "command_id", path),
                 tenant_id=caller.tenant_id,
                 reason=str(payload.get("reason") or ""),
+                corrected_proposal=(dict(payload["corrected_proposal"]) if "corrected_proposal" in payload else None),
                 caller=caller,
             )
         if method == "GET" and path == "/v1/context/read":
@@ -363,10 +379,9 @@ class MemoryOSASGI:
         event: NormalizedAgentEvent,
         caller: TrustedRequestContext,
     ) -> None:
-        tenant_id = str(event.metadata.get("tenant_id") or "default")
         if (
             event.user_id != caller.user_id
-            or tenant_id != caller.tenant_id
+            or event.tenant_id != caller.tenant_id
             or event.adapter_id != caller.actor_id
             or event.project_id not in caller.allowed_workspace_ids
         ):
@@ -449,7 +464,7 @@ def _search_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
         "search_scope": payload.get("search_scope"),
         "retrieval_views": payload.get("retrieval_views"),
         "project_id": str(payload.get("project_id") or ""),
-        "tenant_id": str(payload.get("tenant_id") or "default"),
+        "tenant_id": (str(payload["tenant_id"]) if payload.get("tenant_id") is not None else None),
         "applicability_scopes": payload.get("applicability_scopes"),
         "memory_states": payload.get("memory_states"),
         "memory_types": payload.get("memory_types"),

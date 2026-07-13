@@ -13,6 +13,7 @@ import memoryos
 from memoryos.api.sdk.client import MemoryOSClient
 from memoryos.connect import ConnectMetadata, ConnectType, PipelineMode
 from memoryos.prediction.model.prediction_request import PredictionRequest
+from memoryos.runtime.readiness import RuntimeNotReadyError
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -93,14 +94,34 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "worker":
         from memoryos.workers.runner import WorkerRunner
 
-        client = MemoryOSClient(args.root)
-        result = WorkerRunner(
-            client,
-            poll_interval=args.poll_interval,
-            batch_size=args.batch_size,
-            lease_seconds=args.lease_seconds,
-            max_retries=args.max_retries,
-        ).run(args.kind, once=args.once)
+        try:
+            client = MemoryOSClient(args.root)
+            result = WorkerRunner(
+                client,
+                poll_interval=args.poll_interval,
+                batch_size=args.batch_size,
+                lease_seconds=args.lease_seconds,
+                max_retries=args.max_retries,
+            ).run(args.kind, once=args.once)
+        except RuntimeNotReadyError as exc:
+            error = {
+                "kind": args.kind,
+                "status": "not_ready",
+                "runtime_state": exc.state.value,
+                "reasons": [_safe_cli_error_message(reason) for reason in exc.reasons],
+            }
+            print(json.dumps(error, ensure_ascii=False), file=sys.stderr)
+            return 2
+        if result.get("status") == "not_ready":
+            runtime = dict(result.get("runtime", {}) or {})
+            error = {
+                "kind": args.kind,
+                "status": "not_ready",
+                "runtime_state": str(runtime.get("state") or "NOT_READY"),
+                "reasons": [_safe_cli_error_message(str(reason)) for reason in runtime.get("reasons", [])],
+            }
+            print(json.dumps(error, ensure_ascii=False), file=sys.stderr)
+            return 2
         print(json.dumps({"kind": args.kind, "status": "completed", "result": result}, ensure_ascii=False))
         return 0
     if args.command == "predict":
@@ -118,7 +139,9 @@ def main(argv: list[str] | None = None) -> int:
             connect_metadata=connect_metadata,
         )
         try:
-            print(json.dumps(MemoryOSClient(args.root).predict(request, policies).to_dict(), ensure_ascii=False, indent=2))
+            print(
+                json.dumps(MemoryOSClient(args.root).predict(request, policies).to_dict(), ensure_ascii=False, indent=2)
+            )
         except PermissionError as exc:
             _print_cli_error(exc)
             return 2

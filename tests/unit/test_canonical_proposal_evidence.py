@@ -440,6 +440,10 @@ def test_missing_candidate_source_never_falls_back_to_first_episode_event() -> N
     assert pending.payload["canonical_pending_proposal"] is True
     assert (
         pending.payload["context_object"]["metadata"]["pending_reason_code"]
+        == "FALLBACK_REQUIRES_REEXTRACTION"
+    )
+    assert (
+        pending.payload["context_object"]["metadata"]["pending_reason_detail"]
         == CandidateProposalAdapter.FALLBACK_PENDING_REASON
     )
 

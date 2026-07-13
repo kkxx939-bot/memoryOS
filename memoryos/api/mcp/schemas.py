@@ -99,6 +99,7 @@ TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "content": {"type": "string"},
             "title": {"type": "string"},
             "memory_type": {"type": "string"},
+            "identity_fields": {"type": "object"},
             "project_id": {"type": "string"},
             "constraint_polarity": {"type": "string"},
             "condition": {"type": "string"},
@@ -106,6 +107,37 @@ TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "connect_metadata": {"type": "object"},
         },
         "required": ["content"],
+    },
+    "memoryos_list_pending": {
+        "type": "object",
+        "properties": {
+            "user_id": {"type": "string"},
+            "tenant_id": {"type": "string"},
+            "lifecycle_states": {"type": "array", "items": {"type": "string"}},
+            "project_id": {"type": "string"},
+        },
+        "required": [],
+    },
+    "memoryos_review_pending": {
+        "type": "object",
+        "properties": {
+            "user_id": {"type": "string"},
+            "tenant_id": {"type": "string"},
+            "pending_uri": {"type": "string"},
+            "decision": {"type": "string"},
+            "expected_lifecycle_revision": {"type": "integer"},
+            "expected_proposal_fingerprint": {"type": "string"},
+            "command_id": {"type": "string"},
+            "reason": {"type": "string"},
+            "corrected_proposal": {"type": "object"},
+        },
+        "required": [
+            "pending_uri",
+            "decision",
+            "expected_lifecycle_revision",
+            "expected_proposal_fingerprint",
+            "command_id",
+        ],
     },
     "memoryos_forget": {
         "type": "object",
@@ -163,6 +195,8 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "memoryos_health": "Check MemoryOS availability.",
     "memoryos_read": "Read one exact MemoryOS URI at L0, L1, or L2.",
     "memoryos_remember": "Store an explicit confirmed memory.",
+    "memoryos_list_pending": "List only committed pending-memory proposals.",
+    "memoryos_review_pending": "Review one committed pending-memory proposal with lifecycle CAS.",
     "memoryos_forget": "Forget one exact MemoryOS URI.",
     "memoryos_archive_search": "Search archived coding-agent sessions.",
     "memoryos_archive_read": "Read one exact archived session.",
@@ -177,6 +211,7 @@ def tool_definitions(config: MCPServerConfig | None = None) -> list[dict[str, An
     action_tools = {"memoryos_predict", "memoryos_process_observation"}
     authoritative_tools = {
         "memoryos_remember": AUTHORITATIVE_REMEMBER,
+        "memoryos_review_pending": AUTHORITATIVE_REMEMBER,
         "memoryos_forget": AUTHORITATIVE_FORGET,
     }
     action_enabled = config.enable_action_tools if config is not None else False

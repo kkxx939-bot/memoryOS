@@ -248,7 +248,8 @@ def test_coding_agent_event_to_projection_retrieval_and_safe_transition(tmp_path
         if obj.metadata.get("canonical_kind") == "pending_proposal"
         and obj.metadata.get("proposal", {}).get("proposal_id") == "p-postgres-confirm"
     )
-    assert replacement_pending.metadata["pending_reason_code"].endswith(
+    assert replacement_pending.metadata["pending_reason_code"] == "REVIEWABLE_DESTRUCTIVE"
+    assert replacement_pending.metadata["pending_reason_detail"].endswith(
         "destructive_effect_requires_structured_review"
     )
     history = client.search_context(
@@ -949,7 +950,9 @@ def test_runtime_aliases_converge_llm_wording_to_one_slot(tmp_path) -> None:  # 
     assert len({item["metadata"]["slot_id"] for item in decisions}) == 1
 
 
-def test_llm_outage_archives_evidence_and_deferred_proposal_replays(tmp_path) -> None:  # noqa: ANN001
+def test_llm_outage_is_terminal_for_the_group_and_reextraction_requires_a_new_group(
+    tmp_path,
+) -> None:  # noqa: ANN001
     workspace = {"namespace": "memoryos", "kind": "workspace", "id": "memoryos"}
     source_text = "I confirm the storage backend is SQLite."
 
@@ -958,10 +961,11 @@ def test_llm_outage_archives_evidence_and_deferred_proposal_replays(tmp_path) ->
 
         def __init__(self) -> None:
             self.calls = 0
+            self.source_text = source_text
 
         def complete(self, prompt: str) -> str:  # noqa: ARG002
             self.calls += 1
-            if self.calls == 1:
+            if self.calls <= 3:
                 raise RuntimeError("model unavailable")
             return _response(
                 [
@@ -973,7 +977,7 @@ def test_llm_outage_archives_evidence_and_deferred_proposal_replays(tmp_path) ->
                         speech_act="confirmation",
                         commitment="confirmed",
                         scopes=[workspace],
-                        source_text=source_text,
+                        source_text=self.source_text,
                     )
                 ]
             )
@@ -988,12 +992,37 @@ def test_llm_outage_archives_evidence_and_deferred_proposal_replays(tmp_path) ->
         connect_metadata=ConnectMetadata.default_agent("codex").to_dict(),
     )
     assert not result.done
+    assert provider.calls == 3
     assert result.status == "canonical_pending"
+    assert result.state.value == "DEAD_LETTER"
     assert not result.canonical_committed
-    assert cast(Any, client.queue_store).stats().get("pending", 0) >= 1
+    assert cast(Any, client.queue_store).stats() == {}
 
     replay = MemoryProposalWorker(client.session_commit_service).process_pending()
-    assert replay["committed"] == 1
+    assert replay == {"claimed": 0, "committed": 0, "failed": 0, "dead_letter": 0}
+    same_group = client.commit_agent_session(
+        user_id="u1",
+        session_id="s1",
+        project_id="memoryos",
+        messages=[{"role": "user", "content": source_text}],
+        connect_metadata=ConnectMetadata.default_agent("codex").to_dict(),
+    )
+    assert same_group.commit_group_id == result.commit_group_id
+    assert same_group.state.value == "DEAD_LETTER"
+    assert provider.calls == 3
+
+    retry_source_text = "Please remember: I confirm the storage backend is SQLite."
+    provider.source_text = retry_source_text
+    retried = client.commit_agent_session(
+        user_id="u1",
+        session_id="s2",
+        project_id="memoryos",
+        messages=[{"role": "user", "content": retry_source_text}],
+        connect_metadata=ConnectMetadata.default_agent("codex").to_dict(),
+    )
+    assert retried.commit_group_id != result.commit_group_id
+    assert retried.canonical_committed
+    assert provider.calls == 4
     current = client.search_context(
         "storage",
         user_id="u1",
@@ -1245,7 +1274,7 @@ def test_llm_semantic_hallucination_or_question_cannot_create_active_claim(
 @pytest.mark.parametrize(
     ("decision", "expected_status", "expected_pending_count"),
     [
-        ("RETRY", "RETRYABLE", 1),
+        ("RETRY", "PENDING", 1),
         ("CONFIRM", "CONFIRMED", 1),
         ("REJECT", "REJECTED", 0),
         ("EXPIRE", "EXPIRED", 0),
@@ -1273,14 +1302,20 @@ def test_exact_remember_after_pending_review_returns_existing_lifecycle_without_
         project_id="memoryos",
     )
     record = client.list_pending(user_id="u1")[0]
-    reviewed = client.review_pending(
-        user_id="u1",
-        pending_uri=pending["uri"],
-        decision=decision,
-        expected_lifecycle_revision=record["lifecycle_revision"],
-        expected_proposal_fingerprint=record["proposal_fingerprint"],
-        command_id=f"review-{decision.casefold()}",
-    )
+    review_kwargs = {
+        "user_id": "u1",
+        "pending_uri": pending["uri"],
+        "decision": decision,
+        "expected_lifecycle_revision": record["lifecycle_revision"],
+        "expected_proposal_fingerprint": record["proposal_fingerprint"],
+        "command_id": f"review-{decision.casefold()}",
+    }
+    if decision == "RETRY":
+        with pytest.raises(ValueError, match="does not allow RETRY"):
+            client.review_pending(**review_kwargs)
+        reviewed = {"lifecycle_revision": record["lifecycle_revision"]}
+    else:
+        reviewed = client.review_pending(**review_kwargs)
 
     repeated = client.remember(
         user_id="u1",
@@ -1300,7 +1335,7 @@ def test_exact_remember_after_pending_review_returns_existing_lifecycle_without_
 
 
 def test_structured_command_retry_reuses_nondefault_tenant_evidence_archive(tmp_path) -> None:  # noqa: ANN001
-    client = MemoryOSClient(str(tmp_path))
+    client = MemoryOSClient(str(tmp_path), tenant_id="t1")
     uri = "memoryos://user/u1/sessions/history/tenant-command"
     message = {
         "id": "tenant-command",

@@ -165,6 +165,22 @@ def test_content_addressed_archive_is_idempotent_and_old_manifests_remain_readab
     assert store.read_event(archive.archive_uri, first_event, tenant_id="t1")["event_digest"] == first_event
 
 
+def test_archive_write_rejects_broken_commit_head_symlink(tmp_path) -> None:
+    store = SessionArchiveStore(tmp_path, tenant_id="t1")
+    archive = _archive()
+    directory = store._dir(archive.archive_uri, tenant_id="t1")
+    directory.mkdir(parents=True, exist_ok=True)
+    head = directory / "commit_head.json"
+    missing_target = tmp_path / "missing-archive-head.json"
+    head.symlink_to(missing_target)
+
+    with pytest.raises(EvidenceArchiveIntegrityError, match="symbolic link"):
+        store.write_sync_archive(archive)
+
+    assert head.is_symlink()
+    assert not missing_target.exists()
+
+
 def test_async_commit_reloads_archived_manifest_instead_of_overwriting_from_caller(tmp_path) -> None:
     store = SessionArchiveStore(tmp_path, tenant_id="t1")
     service = SessionCommitService(store, InMemoryQueueStore(), allow_plan_only=True)

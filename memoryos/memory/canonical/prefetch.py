@@ -11,7 +11,12 @@ from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
 from memoryos.contextdb.store.source_store import IndexStore, RelationStore, SourceStore
 from memoryos.memory.canonical.episode import EvidenceEpisode
 from memoryos.memory.canonical.scope import MemoryScope
-from memoryos.memory.canonical.visibility import read_committed_canonical, relation_is_committed
+from memoryos.memory.canonical.state import materialized_current_revision_payload
+from memoryos.memory.canonical.visibility import (
+    committed_content,
+    committed_relations,
+    read_committed_canonical,
+)
 
 
 @dataclass(frozen=True)
@@ -67,10 +72,7 @@ class ExistingMemoryPrefetcher:
             "owner_user_id": owner_user_id,
             "context_type": ContextType.MEMORY.value,
         }
-        try:
-            hits = self._recall(query, filters, episode)
-        except Exception:
-            return ()
+        hits = self._recall(query, filters, episode)
         remaining = self.token_budget
         results = []
         legal_scope_keys = {scope.key for scope in episode.legal_scope_candidates()}
@@ -106,18 +108,21 @@ class ExistingMemoryPrefetcher:
                 "CONFLICTED",
             }:
                 continue
-            l0 = self._read(obj.layers.l0_uri) or obj.title
-            l1 = self._read(obj.layers.l1_uri) or l0
+            current_revision = materialized_current_revision_payload(metadata)
+            l0 = obj.title
+            l1 = str(
+                {
+                    "identity_fields": metadata.get("identity_fields", {}),
+                    "value_fields": current_revision.get("value_fields", {}),
+                    "qualifiers": current_revision.get("qualifiers", {}),
+                }
+            )
             required = self._tokens(l0) + self._tokens(l1)
             if required > remaining:
                 continue
             remaining -= required
             l2 = ""
-            full = (
-                committed.content_override
-                if committed.content_override is not None and not obj.layers.l2_uri
-                else self._read(obj.layers.l2_uri or obj.uri)
-            )
+            full = committed_content(committed)
             full_tokens = self._tokens(full)
             if full and full_tokens <= remaining:
                 l2 = full
@@ -138,16 +143,7 @@ class ExistingMemoryPrefetcher:
                     l2=l2,
                     relations=tuple(
                         relation.to_dict()
-                        for relation in (
-                            self.relation_store.relations_of(
-                                obj.uri,
-                                tenant_id=episode.tenant_id,
-                                owner_user_id=owner_user_id,
-                            )
-                            if self.relation_store is not None
-                            else []
-                        )
-                        if relation_is_committed(self.source_store, relation, self.relation_store)
+                        for relation in committed_relations(committed)
                     ),
                 )
             )
@@ -224,14 +220,6 @@ class ExistingMemoryPrefetcher:
         except (KeyError, TypeError, ValueError):
             return None
         return scope if scope.canonical_subject is not None else None
-
-    def _read(self, uri: str | None) -> str:
-        if not uri or self.source_store is None:
-            return ""
-        try:
-            return self.source_store.read_content(uri)
-        except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
-            return ""
 
     def _tokens(self, text: str) -> int:
         return max(1, len(text) // 4) if text else 0

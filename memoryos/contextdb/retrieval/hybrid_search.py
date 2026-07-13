@@ -10,7 +10,13 @@ from typing import Any
 
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.model.lifecycle import LifecycleState
-from memoryos.contextdb.store.source_store import IndexHit, IndexStore, SourceStore
+from memoryos.contextdb.store.source_store import (
+    IndexHit,
+    IndexStore,
+    SourceStore,
+    is_canonical_memory_object,
+    is_canonical_memory_uri,
+)
 from memoryos.contextdb.store.vector_store import VectorStore
 from memoryos.providers.embedding import EmbeddingProvider
 
@@ -59,6 +65,7 @@ class HybridSearch:
         namespace: str = "",
         context_type: ContextType | None = None,
         limit: int = 10,
+        source_snapshot: Mapping[str, Any] | None = None,
     ) -> list[HybridHit]:
         """按给定条件查找匹配结果。"""
 
@@ -76,7 +83,13 @@ class HybridSearch:
                 continue
             hit_metadata = self._mapping(hit.metadata)
             retrieval_scores = self._mapping(hit_metadata.get("retrieval_scores", {}))
-            item = self._vector_item(hit.uri, hit.metadata, filters, context_type)
+            item = self._vector_item(
+                hit.uri,
+                hit.metadata,
+                filters,
+                context_type,
+                source_snapshot=source_snapshot,
+            )
             if item is None:
                 continue
             combined[hit.uri] = {
@@ -95,13 +108,27 @@ class HybridSearch:
                 if not embedding or any(not math.isfinite(float(value)) for value in embedding):
                     raise ValueError("embedding provider returned non-finite values")
                 vector_limit = limit
-                if self.source_store is not None and "allowed_uris" in filters:
-                    vector_limit = max(limit, len(self.source_store.list_objects()))
+                if "allowed_uris" in filters:
+                    # The vector backend applies ``limit`` before this layer
+                    # can enforce the authoritative URI allowlist.  Asking
+                    # only for ``len(allowed_uris)`` is therefore insufficient:
+                    # a higher-scoring disallowed row can consume the entire
+                    # result window and hide a legal candidate.  Enumerating
+                    # the derived vector keys avoids a second live Source read
+                    # while guaranteeing that filtering happens before the
+                    # caller-visible limit.
+                    vector_limit = max(limit, len(self.vector_store.vector_uris()))
                 for vector_hit in self.vector_store.search_vector(embedding, namespace=namespace, limit=vector_limit):
                     normalized_vector_score = self._bounded_score(vector_hit.score)
                     if normalized_vector_score < self.min_vector_similarity:
                         continue
-                    item = self._vector_item(vector_hit.uri, vector_hit.metadata, filters, context_type)
+                    item = self._vector_item(
+                        vector_hit.uri,
+                        vector_hit.metadata,
+                        filters,
+                        context_type,
+                        source_snapshot=source_snapshot,
+                    )
                     if item is None:
                         continue
                     existing = combined.setdefault(
@@ -123,6 +150,20 @@ class HybridSearch:
                     existing["vector_score"] = normalized_vector_score
                     existing["source"] = "hybrid" if existing.get("index_score") is not None else "vector"
             except Exception as exc:
+                # Import lazily: HybridSearch participates in session planner
+                # initialization, while the canonical visibility package also
+                # imports retrieval components.  The runtime type check keeps
+                # the module graph acyclic without weakening fail-closed
+                # handling.
+                from memoryos.memory.canonical.visibility import (
+                    CommittedStateIntegrityError,
+                )
+
+                if isinstance(exc, CommittedStateIntegrityError):
+                    # A vector outage may fall back to lexical search; a
+                    # broken committed-state proof may never become an empty
+                    # successful result.
+                    raise
                 logger.warning(
                     "HybridSearch vector branch failed; falling back to lexical search: %s",
                     exc,
@@ -173,6 +214,8 @@ class HybridSearch:
         metadata: Any,
         filters: dict,
         context_type: ContextType | None,
+        *,
+        source_snapshot: Mapping[str, Any] | None = None,
     ) -> dict | None:
         metadata = self._mapping(metadata)
         projected_revision = metadata.get("projection_source_revision")
@@ -185,7 +228,20 @@ class HybridSearch:
         lifecycle_state = metadata.get("lifecycle_state")
         if self.source_store is not None:
             try:
-                obj = self.source_store.read_object(uri)
+                if source_snapshot is not None:
+                    obj = source_snapshot.get(uri)
+                    if obj is None:
+                        return None
+                elif is_canonical_memory_uri(uri):
+                    from memoryos.memory.canonical.visibility import read_committed_canonical
+
+                    obj = read_committed_canonical(self.source_store, uri).object
+                else:
+                    obj = self.source_store.read_object(uri)
+                    if is_canonical_memory_object(obj):
+                        from memoryos.memory.canonical.visibility import read_committed_canonical
+
+                        obj = read_committed_canonical(self.source_store, uri).object
             except (FileNotFoundError, IsADirectoryError, NotADirectoryError, TypeError, ValueError):
                 return None
             if obj.lifecycle_state != LifecycleState.ACTIVE:
@@ -255,10 +311,7 @@ class HybridSearch:
                 or ""
             )
             asserted_by_service = str(metadata.get("asserted_by_service") or "")
-            if (
-                canonical_scope.authority.principal_ids
-                or canonical_scope.authority.service_ids
-            ) and not (
+            if (canonical_scope.authority.principal_ids or canonical_scope.authority.service_ids) and not (
                 asserted_by in set(canonical_scope.authority.principal_ids)
                 or asserted_by_service in set(canonical_scope.authority.service_ids)
             ):

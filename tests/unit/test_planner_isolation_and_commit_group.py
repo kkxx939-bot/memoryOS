@@ -11,8 +11,11 @@ from memoryos.connect import ConnectMetadata
 from memoryos.contextdb.session.planners.memory_commit_planner import MemoryCommitPlanner
 from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.memory.canonical import CandidateProposalAdapter, MemorySemanticProposal, SessionArchiveEpisodeAdapter
+from memoryos.memory.canonical.event import canonical_digest
 from memoryos.memory.extraction import FakeMemoryModelProvider, LLMMemoryExtractorBackend
 from memoryos.memory.schema import MemoryCandidateDraft, MemoryType, MemoryTypeSchema
+from memoryos.operations.commit.effect_marker import atomic_write_json
+from memoryos.runtime.readiness import RuntimeReadinessState
 from memoryos.workers.session_commit_worker import SessionCommitWorker
 
 
@@ -92,10 +95,13 @@ def _assert_isolated(result_a, result_b) -> None:  # noqa: ANN001
     assert result_b.context.operation_group_identity == "commit_group_task-b"
     assert {ref.event_id for ref in result_a.context.evidence_references} == {"a:m1"}
     assert {ref.event_id for ref in result_b.context.evidence_references} == {"b:m1"}
-    assert all("workspace-a" in snapshot.payload_json for snapshot in result_a.context.staged_objects)
-    assert all("workspace-b" in snapshot.payload_json for snapshot in result_b.context.staged_objects)
-    assert not any("workspace-b" in snapshot.payload_json for snapshot in result_a.context.staged_objects)
-    assert not any("workspace-a" in snapshot.payload_json for snapshot in result_b.context.staged_objects)
+    assert result_a.context.user_id == "user-a"
+    assert result_b.context.user_id == "user-b"
+    assert {item.object_digest for item in result_a.context.staged_objects}.isdisjoint(
+        {item.object_digest for item in result_b.context.staged_objects}
+    )
+    assert all(not hasattr(item, "payload_json") for item in result_a.context.staged_objects)
+    assert all(not hasattr(item, "payload_json") for item in result_b.context.staged_objects)
 
 
 def test_one_planner_is_request_isolated_across_threads_and_replan() -> None:
@@ -216,12 +222,43 @@ def test_commit_group_restart_retries_only_failed_projection_consumer(tmp_path, 
     assert not client.session_archive_store.async_outputs_done_for_task(archived)
 
     restarted = MemoryOSClient(str(tmp_path))
+    assert restarted.readiness.state == RuntimeReadinessState.READY
+    startup_recovered = restarted.session_commit_service.commit_group_store.load(
+        result.commit_group_id
+    )
+    assert startup_recovered is not None and startup_recovered.complete
     recovery = SessionCommitWorker(restarted.session_commit_service).process_pending()
-    assert recovery["recovered"] == 1
+    assert recovery["recovered"] == 0
     after = restarted.session_commit_service.commit_group_store.load(result.commit_group_id)
     assert after is not None and after.complete
     assert after.canonical_attempt_count == before["canonical_attempt_count"]
     assert after.consumers["projection"].attempt_count == 2
+    projection_result = after.consumers["projection"].result
+    assert projection_result["status"] == "completed"
+    assert projection_result["transaction_ids"]
+    assert projection_result["completion_proofs"]
+    proof = projection_result["completion_proofs"][0]
+    assert proof["schema_version"] == "projection_completion_proof_v2"
+    assert proof["queue_status"] == "done"
+    assert len(proof["receipt_digest"]) == 64
+    assert len(proof["proof_digest"]) == 64
+    assert proof["claims"][0]["projection_attempt_id"]
+    assert proof["claims"][0]["publish_token"]
     for consumer in ("behavior", "action_policy", "context"):
         assert after.consumers[consumer].attempt_count == before["consumers"][consumer]["attempt_count"]
     assert restarted.session_archive_store.async_outputs_done_for_task(archived)
+
+    group_path = restarted.session_commit_service.commit_group_store.path(result.commit_group_id)
+    payload = json.loads(group_path.read_text(encoding="utf-8"))
+    payload["canonical_effects"] = {}
+    core = {key: value for key, value in payload.items() if key != "control_digest"}
+    payload["control_digest"] = canonical_digest(core)
+    atomic_write_json(
+        group_path,
+        payload,
+        artifact_root=restarted.session_commit_service.commit_group_store.artifact_root,
+    )
+
+    detached = MemoryOSClient(str(tmp_path))
+    assert detached.readiness.state == RuntimeReadinessState.NOT_READY
+    assert "detached from immutable receipts" in " ".join(detached.readiness.reasons)

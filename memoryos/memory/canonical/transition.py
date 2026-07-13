@@ -11,6 +11,7 @@ from typing import Any, NoReturn
 
 from memoryos.contextdb.model.lifecycle import LifecycleState
 from memoryos.core.time import utc_now
+from memoryos.memory.canonical.field_merge import FieldMergeError, FieldMerger
 from memoryos.memory.canonical.identity import ResolvedMemoryIdentity, canonical_identity_value
 from memoryos.memory.canonical.proposal import (
     Commitment,
@@ -114,6 +115,7 @@ class MemoryTransitionPolicy:
     ) -> None:
         self.registry = registry or MemoryTypeRegistry()
         self.eligibility_policy = eligibility_policy or MemoryTypeEligibilityPolicy()
+        self.field_merger = FieldMerger()
         self.__effect_authorizations: dict[_DestructiveEffectAuthorization, _DestructiveEffectBinding] = {}
 
     def __issue_effect_authorization(
@@ -195,6 +197,32 @@ class MemoryTransitionPolicy:
             raise PendingSemanticReconciliation(
                 reconciliation.relation,
                 "destructive_effect_requires_confirmed_pending_record",
+            )
+        try:
+            pending.assert_review_decision("CONFIRM_AND_APPLY")
+        except ValueError as exc:
+            raise PendingSemanticReconciliation(
+                reconciliation.relation,
+                "pending_reason_does_not_authorize_canonical_effect",
+            ) from exc
+        semantic = proposal.semantic
+        if (
+            reconciliation.relation == SemanticRelation.AMBIGUOUS
+            and isinstance(semantic, NormalizedSemanticAssessment)
+            and semantic.relation_to_existing == SemanticRelation.SUPPLEMENTS
+            and reconciliation.claim is not None
+            and reconciliation.active_claim is not None
+            and reconciliation.claim.claim_id == reconciliation.active_claim.claim_id
+        ):
+            # A structured review may authorize a deterministic same-Claim
+            # schema merge (for example APPEND_UNIQUE or PATCH_TEXT).  It may
+            # not turn an alternative/contradiction into a replacement, nor
+            # select a different Claim; exact target and evidence checks still
+            # run below at the final transition boundary.
+            reconciliation = replace(
+                reconciliation,
+                relation=SemanticRelation.SUPPLEMENTS,
+                pending_reason="",
             )
         active = reconciliation.active_claim
         reconciliation = replace(
@@ -297,12 +325,66 @@ class MemoryTransitionPolicy:
         changed: list[str] = []
 
         if target is None:
+            schema = self.registry.get(proposal.memory_type)
+            try:
+                merged = self.field_merger.merge(
+                    schema,
+                    {},
+                    {},
+                    proposal.value_fields,
+                    proposal.field_evidence_refs,
+                    relation=reconciliation.relation.value,
+                    review_authority=bool(
+                        effect_authorization is not None
+                        or reconciliation.relation_authority == RelationAuthority.STRUCTURED_REVIEW
+                        or proposal.metadata.get("effect_authority") == "structured_explicit_command"
+                    ),
+                )
+                display_merge = self.field_merger.merge(
+                    schema,
+                    {},
+                    {},
+                    self._display_fields(proposal),
+                    dict(proposal.metadata.get("display_field_evidence_refs", {}) or {}),
+                    relation=reconciliation.relation.value,
+                    review_authority=True,
+                )
+            except FieldMergeError as exc:
+                raise PendingSemanticReconciliation(
+                    reconciliation.relation,
+                    "schema_field_merge_requires_review",
+                ) from exc
+            qualifiers = self._proposal_qualifiers(
+                proposal,
+                semantic,
+                target_state,
+                reconciliation.historical_only,
+            )
+            qualifiers.update(
+                {
+                    "field_merge_digest": merged.merge_digest,
+                    "field_merge_decisions": [decision.to_dict() for decision in merged.decisions],
+                }
+            )
+            if display_merge.value_fields:
+                qualifiers.update(
+                    {
+                        "display_fields": display_merge.value_fields,
+                        "display_field_evidence_refs": display_merge.field_evidence_refs,
+                        "display_merge_digest": display_merge.merge_digest,
+                        "display_merge_decisions": [
+                            decision.to_dict() for decision in display_merge.decisions
+                        ],
+                    }
+                )
             revision = self._revision(
                 1,
                 target_state,
                 proposal,
                 reconciliation.relation,
-                self._proposal_qualifiers(proposal, semantic, target_state, reconciliation.historical_only),
+                qualifiers,
+                value_fields=merged.value_fields,
+                field_evidence_refs=merged.field_evidence_refs,
             )
             target = MemoryClaim(
                 identity.claim_id,
@@ -318,19 +400,77 @@ class MemoryTransitionPolicy:
             expected[target.uri] = 0
             changed.append(target.claim_id)
         else:
+            review_authority = bool(
+                effect_authorization is not None
+                or reconciliation.relation_authority == RelationAuthority.STRUCTURED_REVIEW
+                or proposal.metadata.get("effect_authority") == "structured_explicit_command"
+            )
+            try:
+                merged = self.field_merger.merge(
+                    self.registry.get(proposal.memory_type),
+                    target.current.value_fields,
+                    target.current.field_evidence_refs,
+                    proposal.value_fields,
+                    proposal.field_evidence_refs,
+                    relation=reconciliation.relation.value,
+                    review_authority=review_authority,
+                )
+            except FieldMergeError as exc:
+                raise PendingSemanticReconciliation(
+                    reconciliation.relation,
+                    "schema_field_merge_requires_review",
+                ) from exc
             next_state, qualifiers = self._next_existing_state(
                 target,
                 target_state,
                 semantic,
                 reconciliation.relation,
                 reconciliation.historical_only,
-                proposal,
             )
+            value_changed = dict(target.current.value_fields) != dict(merged.value_fields)
+            if value_changed:
+                qualifiers = {
+                    **qualifiers,
+                    "field_merge_digest": merged.merge_digest,
+                    "field_merge_decisions": [decision.to_dict() for decision in merged.decisions],
+                }
+            current_display = dict(target.current.qualifiers.get("display_fields", {}) or {})
+            incoming_display = self._display_fields(proposal)
+            display_changed = False
+            if current_display or incoming_display:
+                try:
+                    display_merge = self.field_merger.merge(
+                        self.registry.get(proposal.memory_type),
+                        current_display,
+                        dict(
+                            target.current.qualifiers.get("display_field_evidence_refs", {})
+                            or {}
+                        ),
+                        incoming_display,
+                        dict(proposal.metadata.get("display_field_evidence_refs", {}) or {}),
+                        relation=reconciliation.relation.value,
+                        review_authority=review_authority,
+                    )
+                except FieldMergeError as exc:
+                    raise PendingSemanticReconciliation(
+                        reconciliation.relation,
+                        "schema_display_merge_requires_review",
+                    ) from exc
+                display_changed = current_display != dict(display_merge.value_fields)
+                if display_changed:
+                    qualifiers.update({
+                        "display_fields": display_merge.value_fields,
+                        "display_field_evidence_refs": display_merge.field_evidence_refs,
+                        "display_merge_digest": display_merge.merge_digest,
+                        "display_merge_decisions": [
+                            decision.to_dict() for decision in display_merge.decisions
+                        ],
+                    })
             if (
-                reconciliation.relation != SemanticRelation.DUPLICATE
-                or next_state != target.current.state
+                next_state != target.current.state
                 or qualifiers != dict(target.current.qualifiers)
-                or dict(target.current.value_fields) != dict(proposal.value_fields)
+                or value_changed
+                or display_changed
             ):
                 target = target.with_revision(
                     self._revision(
@@ -339,6 +479,8 @@ class MemoryTransitionPolicy:
                         proposal,
                         reconciliation.relation,
                         qualifiers,
+                        value_fields=merged.value_fields,
+                        field_evidence_refs=merged.field_evidence_refs,
                     )
                 )
                 claims = [target if item.claim_id == target.claim_id else item for item in claims]
@@ -580,7 +722,6 @@ class MemoryTransitionPolicy:
         semantic: NormalizedSemanticAssessment,
         relation: SemanticRelation,
         historical_only: bool,
-        proposal: MemorySemanticProposal,
     ) -> tuple[str, dict]:
         qualifiers = dict(claim.current.qualifiers)
         if historical_only:
@@ -595,13 +736,6 @@ class MemoryTransitionPolicy:
             qualifiers.pop("phase", None)
         if semantic.speech_act == SpeechAct.EVALUATION_REQUEST and target_state == "PROPOSED":
             qualifiers["phase"] = "evaluation_candidate"
-        if relation == SemanticRelation.SUPPLEMENTS:
-            display_fields = self._display_fields(proposal)
-            if display_fields:
-                qualifiers["display_fields"] = {
-                    **dict(qualifiers.get("display_fields", {}) or {}),
-                    **display_fields,
-                }
         return target_state, qualifiers
 
     def _proposal_qualifiers(
@@ -617,6 +751,9 @@ class MemoryTransitionPolicy:
         display_fields = self._display_fields(proposal)
         if display_fields:
             qualifiers["display_fields"] = display_fields
+            qualifiers["display_field_evidence_refs"] = dict(
+                proposal.metadata.get("display_field_evidence_refs", {}) or {}
+            )
         return qualifiers
 
     def _validate_replacement(
@@ -849,6 +986,15 @@ class MemoryTransitionPolicy:
         target: MemoryClaim,
         proposal: MemorySemanticProposal,
     ) -> MemoryClaim:
+        transaction_time = self._transaction_at(proposal)
+        preserved_field_evidence = dict(claim.current.field_evidence_refs)
+        preserved_field_evidence.update(
+            {
+                str(field_name): tuple(refs)
+                for field_name, refs in proposal.field_evidence_refs.items()
+                if not str(field_name).startswith("value.")
+            }
+        )
         return claim.with_revision(
             MemoryRevision(
                 revision=claim.latest_revision.revision + 1,
@@ -858,7 +1004,7 @@ class MemoryTransitionPolicy:
                 proposal_id=proposal.proposal_id,
                 relation=SemanticRelation.SUPERSEDES.value,
                 epistemic_status=proposal.epistemic_status.value,
-                field_evidence_refs=proposal.field_evidence_refs,
+                field_evidence_refs=preserved_field_evidence,
                 proposal_fingerprint=proposal.fingerprint,
                 extractor_version=proposal.extractor_version,
                 model_id=proposal.model_id,
@@ -866,11 +1012,14 @@ class MemoryTransitionPolicy:
                 policy_version=self.VERSION,
                 schema_version="canonical_memory_v2",
                 qualifiers={
+                    **dict(claim.current.qualifiers),
                     "superseded_by": target.claim_id,
                     **self._provenance_qualifiers(proposal),
                 },
+                created_at=transaction_time,
+                transaction_time=transaction_time,
                 previous_revision=claim.latest_revision.revision,
-                valid_from=self._effective_at(proposal),
+                valid_from=self._effective_at(proposal, fallback=transaction_time),
             )
         )
 
@@ -881,17 +1030,22 @@ class MemoryTransitionPolicy:
         proposal: MemorySemanticProposal,
         relation: SemanticRelation,
         qualifiers: dict | None = None,
+        *,
+        value_fields: Mapping[str, Any] | None = None,
+        field_evidence_refs: Mapping[str, tuple[Any, ...]] | None = None,
     ) -> MemoryRevision:
-        now = utc_now()
+        now = self._transaction_at(proposal)
         return MemoryRevision(
             revision=revision,
             state=state,
-            value_fields=proposal.value_fields,
+            value_fields=proposal.value_fields if value_fields is None else value_fields,
             evidence_refs=proposal.evidence_refs,
             proposal_id=proposal.proposal_id,
             relation=relation.value,
             epistemic_status=proposal.epistemic_status.value,
-            field_evidence_refs=proposal.field_evidence_refs,
+            field_evidence_refs=(
+                proposal.field_evidence_refs if field_evidence_refs is None else field_evidence_refs
+            ),
             proposal_fingerprint=proposal.fingerprint,
             extractor_version=proposal.extractor_version,
             model_id=proposal.model_id,
@@ -917,10 +1071,36 @@ class MemoryTransitionPolicy:
         occurred = sorted(str(ref.occurred_at) for ref in transition_refs if ref.occurred_at)
         return occurred[-1] if occurred else str(fallback or utc_now())
 
+    def _transaction_at(self, proposal: MemorySemanticProposal) -> str:
+        explicit = proposal.metadata.get("planning_timestamp")
+        if explicit:
+            return str(explicit)
+        ingested = sorted(
+            str(ref.ingested_at)
+            for ref in proposal.evidence_refs
+            if ref.ingested_at
+        )
+        if ingested:
+            return ingested[-1]
+        occurred = sorted(
+            str(ref.occurred_at)
+            for ref in proposal.evidence_refs
+            if ref.occurred_at
+        )
+        return occurred[-1] if occurred else utc_now()
+
     def _provenance_qualifiers(self, proposal: MemorySemanticProposal) -> dict[str, Any]:
         qualifiers: dict[str, Any] = {
             key: str(proposal.metadata[key])
-            for key in ("asserted_by", "source_role", "source_adapter_id", "source_session_id")
+            for key in (
+                "asserted_by",
+                "source_role",
+                "source_adapter_id",
+                "source_session_id",
+                "corrects_pending_uri",
+                "corrects_pending_fingerprint",
+                "correction_commit_group_id",
+            )
             if proposal.metadata.get(key)
         }
         actor_ids = tuple(

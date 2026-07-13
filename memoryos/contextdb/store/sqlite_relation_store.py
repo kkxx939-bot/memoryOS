@@ -80,6 +80,21 @@ class SQLiteRelationStore:
                 (source_uri, relation_type, target_uri),
             )
 
+    def all_relations(self) -> list[ContextRelation]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM relations").fetchall()
+        return [
+            ContextRelation(
+                source_uri=row["source_uri"],
+                relation_type=row["relation_type"],
+                target_uri=row["target_uri"],
+                weight=float(row["weight"]),
+                metadata=json.loads(row["metadata_json"] or "{}"),
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)
         conn.row_factory = sqlite3.Row

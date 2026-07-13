@@ -28,13 +28,13 @@ from memoryos.memory.canonical import (
     ProjectionRecord,
     TransitionProfile,
 )
+from memoryos.memory.canonical.current_head import publish_current_head_sets
+from memoryos.memory.canonical.event import canonical_digest
 from memoryos.memory.canonical.projection_state import ProjectionRecordStore
-from memoryos.operations.commit.effect_marker import (
-    atomic_write_json,
-    build_marker,
-    object_effect_from_store,
-)
+from memoryos.memory.canonical.visibility import CommittedStateIntegrityError
+from memoryos.operations.commit.effect_marker import atomic_write_json
 from memoryos.operations.commit.outbox_envelope import build_outbox, planned_effect_manifest
+from memoryos.operations.commit.receipt import build_transaction_receipt
 from memoryos.operations.model.context_operation import ContextOperation
 from memoryos.operations.model.operation_action import OperationAction
 
@@ -78,6 +78,15 @@ class SQLiteTestVectorStore:
 
     def search_vector(self, embedding: list[float], namespace: str, limit: int = 10) -> list[Any]:  # noqa: ARG002
         return []
+
+    def get_vector_metadata(self, uri: str) -> dict | None:
+        with sqlite3.connect(self.path) as conn:
+            row = conn.execute("SELECT metadata_json FROM vectors WHERE uri = ?", (uri,)).fetchone()
+        return json.loads(row[0]) if row is not None else None
+
+    def vector_uris(self) -> list[str]:
+        with sqlite3.connect(self.path) as conn:
+            return [str(row[0]) for row in conn.execute("SELECT uri FROM vectors ORDER BY uri")]
 
 
 def _claim(revision: int, state: str = "ACTIVE") -> MemoryClaim:
@@ -139,52 +148,88 @@ def _artifact_root(root):  # noqa: ANN001, ANN202
 def _persist_committed_claim(source, artifact_root, obj, content: str) -> None:  # noqa: ANN001
     revision = int(obj.metadata.get("revision", 0))
     idempotency_key = f"projection-fixture-revision-{revision}"
-    transaction_id = f"projection-fixture-transaction-{revision}"
+    transaction_id = f"projection-{revision}"
     obj.metadata = {
         **obj.metadata,
         "canonical_idempotency_key": idempotency_key,
         "canonical_transaction_id": transaction_id,
     }
     source.write_object(obj, content=content)
-    marker = artifact_root / "system" / "transactions" / f"{idempotency_key}.json"
     operation_id = f"projection-fixture-operation-{revision}"
-    atomic_write_json(
-        marker,
-        build_marker(
-            transaction_id=transaction_id,
-            idempotency_key=idempotency_key,
-            tenant_id="t1",
-            user_id="u1",
-            operation_ids=[operation_id],
-            object_effects=[object_effect_from_store(source, obj.uri, operation_type="fixture")],
-            relation_effects=[],
-            diff={"user_id": "u1", "operations": [], "diff_id": f"fixture-{revision}"},
-            operations=[],
-        ),
-    )
-
-
-def _enqueue(queue, tmp_path, revision: int, job_id: str) -> None:  # noqa: ANN001
-    outbox = tmp_path / "system" / "outbox" / f"{job_id}.json"
-    uri = "memoryos://user/u1/memories/canonical/slots/slot1/claims/claim1"
     operation = ContextOperation(
         user_id="u1",
         context_type=ContextType.MEMORY,
-        action=OperationAction.UPDATE,
-        target_uri=uri,
-        operation_id=f"op-{job_id}",
+        action=OperationAction.ADD if revision == 1 else OperationAction.UPDATE,
+        target_uri=obj.uri,
+        operation_id=operation_id,
         payload={
-            "transaction_id": job_id,
-            "idempotency_key": f"projection-fixture-revision-{revision}",
+            "canonical_memory": True,
+            "transaction_id": transaction_id,
+            "idempotency_key": idempotency_key,
             "tenant_id": "t1",
-            "context_object": {
-                "uri": uri,
-                "metadata": {"revision": revision},
-            },
-            "content": "",
+            "commit_group_id": f"projection-fixture-{revision}",
+            "planning_digest": canonical_digest(["projection-fixture", revision]),
+            "expected_revision": max(0, revision - 1),
+            "context_object": obj.to_dict(),
+            "content": content,
         },
     )
+    diff = {
+        "user_id": "u1",
+        "operations": [operation.to_dict()],
+        "pending_operations": [],
+        "rejected_operations": [],
+        "diff_id": f"fixture-{revision}",
+    }
     effect = planned_effect_manifest(operation, {})
+    prepared = build_outbox(
+        transaction_id=transaction_id,
+        idempotency_key=idempotency_key,
+        tenant_id="t1",
+        user_id="u1",
+        operations=[operation],
+        status="prepared",
+        before_images=[],
+        effect_manifests=[effect],
+        claim_revisions=[
+            {
+                "uri": obj.uri,
+                "claim_id": str(obj.metadata["claim_id"]),
+                "revision": revision,
+            }
+        ],
+        commit_group_id=f"projection-fixture-{revision}",
+    )
+    receipt = build_transaction_receipt(
+        transaction_id=transaction_id,
+        idempotency_key=idempotency_key,
+        tenant_id="t1",
+        user_id="u1",
+        commit_group_id=f"projection-fixture-{revision}",
+        operations=[operation],
+        diff=diff,
+        planning_digest=str(operation.payload["planning_digest"]),
+        prepared_intent_digest=str(prepared["prepared_intent_digest"]),
+    )
+    marker = artifact_root / "system" / "transactions" / f"{idempotency_key}.json"
+    atomic_write_json(marker, receipt, artifact_root=artifact_root)
+    publish_current_head_sets(artifact_root, marker, receipt)
+
+
+def _enqueue(queue, tmp_path, revision: int, job_id: str) -> None:  # noqa: ANN001
+    receipt = json.loads(
+        (
+            tmp_path
+            / "system"
+            / "transactions"
+            / f"projection-fixture-revision-{revision}.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert receipt["transaction_id"] == job_id
+    operation = ContextOperation.from_dict(dict(receipt["operations"][0]))
+    uri = operation.target_uri
+    effect = planned_effect_manifest(operation, {})
+    outbox = tmp_path / "system" / "outbox" / f"{job_id}.json"
     atomic_write_json(
         outbox,
         build_outbox(
@@ -197,8 +242,11 @@ def _enqueue(queue, tmp_path, revision: int, job_id: str) -> None:  # noqa: ANN0
             before_images=[],
             effect_manifests=[effect],
             claim_revisions=[{"uri": uri, "claim_id": "claim1", "revision": revision}],
-            commit_group_id="",
+            commit_group_id=f"projection-fixture-{revision}",
+            receipt_path=f"system/transactions/projection-fixture-revision-{revision}.json",
+            receipt_digest=str(receipt["receipt_digest"]),
         ),
+        artifact_root=tmp_path,
     )
     queue.enqueue(
         QueueJob(
@@ -209,7 +257,7 @@ def _enqueue(queue, tmp_path, revision: int, job_id: str) -> None:  # noqa: ANN0
             payload={
                 "transaction_id": job_id,
                 "outbox_path": str(outbox),
-                "operation_ids": [f"op-{job_id}"],
+                "operation_ids": [operation.operation_id],
             },
         )
     )
@@ -344,9 +392,8 @@ def test_projection_sidecar_retry_idempotency_stale_guard_and_rebuild(tmp_path) 
         updated_obj,
         json.dumps({"claim": "SQLite", "revision": 2}),
     )
-    _enqueue(queue, artifact_root, 1, "stale-projection")
-    stale = worker.process_pending()
-    assert stale["stale"] == ["outbox_stale-projection"]
+    stale = projector.project(claim.uri, 1)
+    assert stale.status == "skipped_stale"
     old = projector.record_store.load(claim.uri, 1)
     assert old is not None and old.current is False and old.status == "stale"
     assert index.rows[claim.uri][0].metadata["projection_source_revision"] == 1
@@ -362,7 +409,7 @@ def test_projection_sidecar_retry_idempotency_stale_guard_and_rebuild(tmp_path) 
 
     new_scope_current.unlink()
     rebuilt = projector.rebuild()
-    assert rebuilt == {"projected": 1, "skipped": 0}
+    assert rebuilt == {"projected": 1, "skipped": 0, "retired": 0}
     assert next((artifact_root / "views" / "scope").glob("**/current.json")).exists()
 
 
@@ -634,8 +681,13 @@ def test_projection_crash_boundaries_and_same_revision_integrity_conflict(tmp_pa
     tampered = source.read_object(claim.uri)
     tampered.title = "same revision, different effect"
     source.write_object(tampered, content="tampered")
-    with pytest.raises(ProjectionIntegrityError, match="different input effect"):
-        CanonicalMemoryProjector(source, index, artifact_root, vector_store=vectors).project(claim.uri, 1)
+    with pytest.raises(CommittedStateIntegrityError, match="without an in-flight redo proof"):
+        CanonicalMemoryProjector(
+            source,
+            index,
+            artifact_root,
+            vector_store=vectors,
+        ).project(claim.uri, 1)
     still_current = ProjectionRecordStore(artifact_root).load_current(claim.uri, source_revision=1)
     assert still_current is not None and still_current.projection_attempt_id == current.projection_attempt_id
 

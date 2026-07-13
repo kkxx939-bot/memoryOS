@@ -140,6 +140,37 @@ def test_existing_canonical_duplicate_and_episode_dedupe_fail_closed() -> None:
     assert repeated.reasons == ("duplicate_episode",)
 
 
+def test_episode_fingerprint_is_stable_across_session_and_task_identity() -> None:
+    def episode(session_id: str):  # noqa: ANN202
+        return SessionArchiveEpisodeAdapter().adapt(
+            SessionArchive(
+                user_id="u1",
+                session_id=session_id,
+                archive_uri=f"memoryos://user/u1/sessions/history/{session_id}",
+                messages=[
+                    {
+                        "id": f"{session_id}-message",
+                        "role": "user",
+                        "content": "Project rule: never bypass OperationCommitter.",
+                    }
+                ],
+                metadata={"tenant_id": "t1", "project_id": "memoryos"},
+                task_id=f"task-{session_id}",
+                created_at="2026-01-01T00:00:00Z",
+            )
+        )
+
+    first = EpisodeSalienceGate().evaluate(episode("session-one"))
+    second = EpisodeSalienceGate().evaluate(
+        episode("session-two"),
+        seen_episode_fingerprints={first.episode_fingerprint},
+    )
+
+    assert not second.salient
+    assert second.duplicate
+    assert second.reasons == ("duplicate_episode",)
+
+
 def test_privacy_and_budget_are_hard_boundaries() -> None:
     private = _decision("Remember this: OPENAI_API_KEY=sk-secret")
     assert not private.salient

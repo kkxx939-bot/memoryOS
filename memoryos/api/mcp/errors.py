@@ -7,6 +7,7 @@ from typing import Any
 
 from memoryos.adapters.agent_hooks.sanitizer import sanitize_error_text
 from memoryos.api.sdk.http_client import RemoteMemoryOSError
+from memoryos.runtime.readiness import RuntimeNotReadyError
 
 
 class MCPErrorCode:
@@ -15,6 +16,7 @@ class MCPErrorCode:
     CLIENT_ERROR = "CLIENT_ERROR"
     STORAGE_ERROR = "STORAGE_ERROR"
     INTERNAL_ERROR = "INTERNAL_ERROR"
+    NOT_READY = "NOT_READY"
 
 
 @dataclass(frozen=True)
@@ -65,8 +67,20 @@ def exception_payload(exc: Exception) -> dict[str, Any]:
             "operation": exc.operation,
             "status_code": exc.status_code,
         }
-        code = MCPErrorCode.PERMISSION_DENIED if exc.status_code in {401, 403} else MCPErrorCode.CLIENT_ERROR
+        if exc.code == "NOT_READY" or exc.status_code == 503:
+            code = MCPErrorCode.NOT_READY
+        elif exc.status_code in {401, 403}:
+            code = MCPErrorCode.PERMISSION_DENIED
+        else:
+            code = MCPErrorCode.CLIENT_ERROR
         return error_payload(code, str(exc), retryable=exc.retryable, details=details)
+    if isinstance(exc, RuntimeNotReadyError):
+        return error_payload(
+            MCPErrorCode.NOT_READY,
+            str(exc),
+            retryable=True,
+            details={"runtime_state": exc.state.value},
+        )
     if isinstance(exc, ToolValidationError | ValueError):
         return error_payload(MCPErrorCode.VALIDATION_ERROR, str(exc), retryable=False)
     if isinstance(exc, ToolPermissionError | PermissionError):

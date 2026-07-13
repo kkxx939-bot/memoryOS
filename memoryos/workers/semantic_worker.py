@@ -6,7 +6,13 @@ import os
 import uuid
 
 from memoryos.contextdb.layers.layer_refresher import LayerRefresher
-from memoryos.contextdb.store.source_store import QueueStore, SourceStore
+from memoryos.contextdb.store.source_store import (
+    QueueStore,
+    SourceStore,
+    is_canonical_memory_object,
+    is_canonical_memory_uri,
+)
+from memoryos.workers.readiness import require_source_store_ready
 
 
 class SemanticWorker:
@@ -28,9 +34,11 @@ class SemanticWorker:
         lease_seconds: int = 60,
         max_retries: int = 3,
     ) -> dict:
+        require_source_store_ready(self.source_store)
         processed = []
         failed: list[str] = []
         dead_letter: list[str] = []
+        quarantine: list[str] = []
         jobs = self.queue_store.lease(
             "semantic",
             lease_owner=self.worker_id,
@@ -39,7 +47,17 @@ class SemanticWorker:
         )
         for job in jobs:
             try:
+                if is_canonical_memory_uri(job.target_uri):
+                    self.queue_store.quarantine(job, "canonical_requires_projector")
+                    failed.append(job.job_id)
+                    quarantine.append(job.job_id)
+                    continue
                 obj = self.source_store.read_object(job.target_uri)
+                if is_canonical_memory_object(obj):
+                    self.queue_store.quarantine(job, "canonical_requires_projector")
+                    failed.append(job.job_id)
+                    quarantine.append(job.job_id)
+                    continue
                 content = self.source_store.read_content(job.target_uri)
                 LayerRefresher(self.source_store).refresh(obj, content)
             except Exception as exc:
@@ -60,4 +78,5 @@ class SemanticWorker:
             "processed": processed,
             "failed": failed,
             "dead_letter": dead_letter,
+            "quarantine": quarantine,
         }

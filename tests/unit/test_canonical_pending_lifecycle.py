@@ -26,16 +26,43 @@ from memoryos.memory.canonical import (
     CanonicalMemoryFormationService,
     CanonicalMemoryRepository,
     MemorySemanticProposal,
+    PendingReason,
     ProposalAdmissionDecision,
     RevisionConflictError,
     SessionArchiveEpisodeAdapter,
 )
+from memoryos.memory.canonical.current_head import head_set_path, load_current_head
+from memoryos.memory.canonical.proposal import classify_pending_reason
 from memoryos.memory.extraction import MemoryExtractionBatchResult, RejectedMemoryCandidate
 from memoryos.memory.schema import MemoryCandidateDraft, MemoryType, MemoryTypeSchema
 from memoryos.operations.commit.operation_committer import OperationCommitter
 from memoryos.operations.commit.redo_log import RedoIntegrityError
 from memoryos.operations.model.context_operation import ContextOperation
 from memoryos.operations.model.operation_action import OperationAction
+from memoryos.runtime import RuntimeConfig, build_runtime_container
+from memoryos.runtime.readiness import RuntimeReadinessState
+from tests.unit.test_canonical_transaction_commit import _review_command_binding
+
+
+@pytest.mark.parametrize(
+    ("raw_reason", "expected"),
+    [
+        ("semantic_v3_ambiguous_or_compound", PendingReason.NEEDS_SCHEMA_REPAIR),
+        ("semantic_v3_nonfinal_relation_requires_review", PendingReason.NEEDS_SCHEMA_REPAIR),
+        ("hypothesis_requires_confirmation", PendingReason.NEEDS_EVIDENCE),
+        ("system_admission_score_below_threshold", PendingReason.NEEDS_EVIDENCE),
+        ("semantic_reconciliation_pending:relation_requires_confirmation", PendingReason.REVIEWABLE_DESTRUCTIVE),
+        ("low_confidence_review", PendingReason.REVIEWABLE_LOW_CONFIDENCE),
+        ("novel_internal_review_error", PendingReason.POLICY_RESTRICTED),
+        ("ambiguous_candidate", PendingReason.NEEDS_SCHEMA_REPAIR),
+        ("uncertain_confidence", PendingReason.NEEDS_EVIDENCE),
+    ],
+)
+def test_pending_reason_classification_never_upgrades_repair_to_review_authority(
+    raw_reason: str,
+    expected: PendingReason,
+) -> None:
+    assert classify_pending_reason(raw_reason) == expected
 
 
 def _archive(*, task_id: str = "pending-task") -> SessionArchive:
@@ -135,7 +162,8 @@ def test_admission_pending_is_stable_durable_and_review_query_only(tmp_path) -> 
     record = CanonicalMemoryRepository(source).load_pending(uri, tenant_id="t1", owner_user_id="u1")
     payload = record.to_payload()
     assert record.lifecycle_state == LifecycleState.PENDING
-    assert record.pending_reason_code == "PENDING_FALLBACK_REQUIRES_SEMANTIC_REVIEW"
+    assert record.pending_reason_code == PendingReason.FALLBACK_REQUIRES_REEXTRACTION
+    assert record.pending_reason_detail == "PENDING_FALLBACK_REQUIRES_SEMANTIC_REVIEW"
     assert payload["proposal_id"] == proposal.proposal_id
     assert payload["memory_type"] == "project_rule"
     assert payload["identity_fields"]
@@ -186,7 +214,8 @@ def test_pending_lifecycle_transitions_use_operation_committer_and_terminal_stat
         retrieval_views=["project:memoryos:rules"],
         commit_group_id="pending-create",
     )
-    committer.commit("u1", list(formed.operations))
+    create_diff = committer.commit("u1", list(formed.operations))
+    create_replay = ContextOperation.from_dict(deepcopy(create_diff.operations[0].to_dict()))
     uri = str(formed.operations[0].target_uri)
     repository = CanonicalMemoryRepository(source)
     pending_record = repository.load_pending(uri, tenant_id="t1", owner_user_id="u1")
@@ -210,6 +239,12 @@ def test_pending_lifecycle_transitions_use_operation_committer_and_terminal_stat
         with pytest.raises(ValueError, match="illegal pending proposal lifecycle transition"):
             terminal_record.with_lifecycle(LifecycleState.PENDING)
 
+    confirm_binding = _review_command_binding(
+        committer,
+        pending_record,
+        decision="CONFIRM",
+        suffix="pending-review",
+    )
     confirmed = formation.plan_pending_lifecycle_transition(
         uri,
         LifecycleState.CONFIRMED,
@@ -218,11 +253,26 @@ def test_pending_lifecycle_transitions_use_operation_committer_and_terminal_stat
         commit_group_id="pending-review",
         reason="human_confirmed",
         updated_at="2026-07-11T02:00:00Z",
+        **confirm_binding,
     )
     committer.commit("u1", [confirmed])
     confirmed_record = repository.load_pending(uri, tenant_id="t1", owner_user_id="u1")
     assert confirmed_record.lifecycle_state == LifecycleState.CONFIRMED
     assert confirmed_record.lifecycle_history[-1]["from"] == "pending"
+
+    artifact_root = tmp_path / "tenants" / "t1"
+    confirmed_head = load_current_head(artifact_root, uri)[0]
+    replayed_create = committer.commit("u1", [create_replay])
+    assert replayed_create.diff_id == create_diff.diff_id
+    assert load_current_head(artifact_root, uri)[0] == confirmed_head
+    assert (
+        repository.load_pending(
+            uri,
+            tenant_id="t1",
+            owner_user_id="u1",
+        )
+        == confirmed_record
+    )
 
     repeated = formation.plan_pending_lifecycle_transition(
         uri,
@@ -231,6 +281,7 @@ def test_pending_lifecycle_transitions_use_operation_committer_and_terminal_stat
         owner_user_id="u1",
         commit_group_id="pending-review",
         reason="human_confirmed",
+        **confirm_binding,
     )
     assert repeated.operation_id == confirmed.operation_id
     committer.commit("u1", [repeated])
@@ -296,12 +347,30 @@ def test_pending_lifecycle_commit_uses_revision_cas(tmp_path) -> None:  # noqa: 
     )
     committer.commit("u1", list(formed.operations))
     uri = str(formed.operations[0].target_uri)
+    pending = CanonicalMemoryRepository(source).load_pending(
+        uri,
+        tenant_id="t1",
+        owner_user_id="u1",
+    )
+    confirm_binding = _review_command_binding(
+        committer,
+        pending,
+        decision="CONFIRM",
+        suffix="reviewer-a",
+    )
+    reject_binding = _review_command_binding(
+        committer,
+        pending,
+        decision="REJECT",
+        suffix="reviewer-b",
+    )
     confirm = formation.plan_pending_lifecycle_transition(
         uri,
         LifecycleState.CONFIRMED,
         tenant_id="t1",
         owner_user_id="u1",
         commit_group_id="reviewer-a",
+        **confirm_binding,
     )
     reject = formation.plan_pending_lifecycle_transition(
         uri,
@@ -309,6 +378,7 @@ def test_pending_lifecycle_commit_uses_revision_cas(tmp_path) -> None:  # noqa: 
         tenant_id="t1",
         owner_user_id="u1",
         commit_group_id="reviewer-b",
+        **reject_binding,
     )
 
     committer.commit("u1", [confirm])
@@ -317,6 +387,33 @@ def test_pending_lifecycle_commit_uses_revision_cas(tmp_path) -> None:  # noqa: 
     current = CanonicalMemoryRepository(source).load_pending(uri, tenant_id="t1", owner_user_id="u1")
     assert current.lifecycle_state == LifecycleState.CONFIRMED
     assert current.lifecycle_revision == 2
+
+
+def test_pending_review_requires_a_durable_command_proof(tmp_path) -> None:  # noqa: ANN001
+    _source, _index, _relations, _queue, committer, formation, formed = _persist_pending(tmp_path)
+    uri = str(formed.operations[0].target_uri)
+    unbound = formation.plan_pending_lifecycle_transition(
+        uri,
+        LifecycleState.CONFIRMED,
+        tenant_id="t1",
+        owner_user_id="u1",
+        commit_group_id="unbound-review",
+    )
+    with pytest.raises(ValueError, match="durable review command"):
+        committer.commit("u1", [unbound])
+
+    forged = formation.plan_pending_lifecycle_transition(
+        uri,
+        LifecycleState.CONFIRMED,
+        tenant_id="t1",
+        owner_user_id="u1",
+        commit_group_id="forged-review",
+        review_command_id="forged-command",
+        review_decision="CONFIRM",
+        review_request_digest="a" * 64,
+    )
+    with pytest.raises(ValueError, match="durable review command"):
+        committer.commit("u1", [forged])
 
 
 def test_pending_lifecycle_commit_rejects_forged_state_history_content_and_immutable_proposal(tmp_path) -> None:  # noqa: ANN001
@@ -505,7 +602,10 @@ def test_pending_add_source_written_redo_resumes_without_being_treated_as_overwr
     )
     operation = formed.operations[0]
     fresh_retry = ContextOperation.from_dict(deepcopy(operation.to_dict()))
+    committer._bind_pending_receipt_identity(operation)
+    committer._ensure_pending_planning_digest(operation)
     relation_manifest = committer._build_regular_relation_manifest(operation)
+    committer.planning_proofs.ensure_pending_intent(operation, relation_manifest=relation_manifest)
     committer.redo.begin(
         operation,
         phase="started",
@@ -526,6 +626,216 @@ def test_pending_add_source_written_redo_resumes_without_being_treated_as_overwr
     assert str(operation.target_uri) in index.indexed_uris()
     assert len(CanonicalMemoryRepository(source).list_pending(tenant_id="t1", owner_user_id="u1")) == 1
     assert not committer.redo.pending_entries()
+
+
+def test_pending_receipt_without_head_is_published_by_startup_recovery(tmp_path) -> None:  # noqa: ANN001
+    source, _index, _relations, _queue, committer = _stores(tmp_path)
+    archive = _archive(task_id="pending-receipt-head-crash")
+    episode = SessionArchiveEpisodeAdapter().adapt(archive)
+    proposal = CandidateProposalAdapter().adapt(_pending_draft(missing_source=True), episode, archive)
+    formed = CanonicalMemoryFormationService(source).plan_pending(
+        proposal,
+        archive=archive,
+        episode=episode,
+        reason="review_required",
+        commit_group_id="pending-receipt-head-crash",
+    )
+    operation = formed.operations[0]
+    crashed = False
+
+    def crash_after_receipt(stage: str, transaction_id: str) -> None:
+        nonlocal crashed
+        if stage == "after_receipt" and transaction_id == operation.operation_id and not crashed:
+            crashed = True
+            raise SystemExit("pending receipt published before head")
+
+    committer.test_hook = crash_after_receipt
+    with pytest.raises(SystemExit, match="pending receipt published before head"):
+        committer.commit("u1", [operation])
+
+    artifact_root = tmp_path / "tenants" / "t1"
+    receipt_path = artifact_root / "system" / "operations" / f"{operation.operation_id}.json"
+    assert receipt_path.exists()
+    assert not head_set_path(artifact_root, str(operation.target_uri)).exists()
+    assert [entry.phase for entry in committer.redo.pending_entries()] == ["diff_written"]
+
+    restarted = build_runtime_container(RuntimeConfig(root=str(tmp_path), tenant_id="t1"))
+
+    assert restarted.readiness.state == RuntimeReadinessState.READY
+    pending = CanonicalMemoryRepository(
+        restarted.source_store,
+        restarted.relation_store,
+    ).list_pending(tenant_id="t1", owner_user_id="u1")
+    assert [record.uri for record in pending] == [operation.target_uri]
+    assert not restarted.committer.redo.pending_entries()
+
+
+def test_pending_head_published_redo_never_recreates_a_deleted_head(tmp_path) -> None:  # noqa: ANN001
+    source, _index, _relations, _queue, committer = _stores(tmp_path)
+    archive = _archive(task_id="pending-head-published-crash")
+    episode = SessionArchiveEpisodeAdapter().adapt(archive)
+    proposal = CandidateProposalAdapter().adapt(
+        _pending_draft(missing_source=True),
+        episode,
+        archive,
+    )
+    formed = CanonicalMemoryFormationService(source).plan_pending(
+        proposal,
+        archive=archive,
+        episode=episode,
+        reason="review_required",
+        commit_group_id="pending-head-published-crash",
+    )
+    operation = formed.operations[0]
+
+    def crash_after_head(stage: str, transaction_id: str) -> None:
+        if stage == "after_current_head" and transaction_id == operation.operation_id:
+            raise SystemExit("pending current head published")
+
+    committer.test_hook = crash_after_head
+    with pytest.raises(SystemExit, match="pending current head published"):
+        committer.commit("u1", [operation])
+
+    artifact_root = tmp_path / "tenants" / "t1"
+    head_path = head_set_path(artifact_root, str(operation.target_uri))
+    assert head_path.exists()
+    assert [entry.phase for entry in committer.redo.pending_entries()] == ["head_published"]
+    head_path.unlink()
+
+    restarted = build_runtime_container(RuntimeConfig(root=str(tmp_path), tenant_id="t1"))
+
+    assert restarted.readiness.state == RuntimeReadinessState.NOT_READY
+    assert "head-published" in " ".join(restarted.readiness.reasons)
+    assert not head_path.exists()
+
+
+def test_idempotent_pending_replay_cannot_recreate_a_deleted_committed_head(tmp_path) -> None:  # noqa: ANN001
+    source, _index, _relations, _queue, committer = _stores(tmp_path)
+    archive = _archive(task_id="pending-deleted-head-replay")
+    episode = SessionArchiveEpisodeAdapter().adapt(archive)
+    proposal = CandidateProposalAdapter().adapt(
+        _pending_draft(missing_source=True),
+        episode,
+        archive,
+    )
+    operation = (
+        CanonicalMemoryFormationService(source)
+        .plan_pending(
+            proposal,
+            archive=archive,
+            episode=episode,
+            reason="review_required",
+            commit_group_id="pending-deleted-head-replay",
+        )
+        .operations[0]
+    )
+    committer.commit("u1", [operation])
+    artifact_root = tmp_path / "tenants" / "t1"
+    head_path = head_set_path(artifact_root, str(operation.target_uri))
+    head_path.unlink()
+
+    with pytest.raises(RedoIntegrityError, match="missing or has an invalid current head"):
+        committer.commit("u1", [ContextOperation.from_dict(deepcopy(operation.to_dict()))])
+
+    assert not head_path.exists()
+
+
+def test_legacy_committed_pending_redo_cannot_recreate_a_deleted_head(tmp_path) -> None:  # noqa: ANN001
+    source, _index, _relations, _queue, committer = _stores(tmp_path)
+    archive = _archive(task_id="pending-legacy-committed-redo")
+    episode = SessionArchiveEpisodeAdapter().adapt(archive)
+    proposal = CandidateProposalAdapter().adapt(
+        _pending_draft(missing_source=True),
+        episode,
+        archive,
+    )
+    operation = (
+        CanonicalMemoryFormationService(source)
+        .plan_pending(
+            proposal,
+            archive=archive,
+            episode=episode,
+            reason="review_required",
+            commit_group_id="pending-legacy-committed-redo",
+        )
+        .operations[0]
+    )
+    committer.commit("u1", [operation])
+
+    artifact_root = tmp_path / "tenants" / "t1"
+    head_path = head_set_path(artifact_root, str(operation.target_uri))
+    head_path.unlink()
+    committer.redo.begin(operation, phase="committed")
+
+    with pytest.raises(RedoIntegrityError, match="missing or has an invalid current head"):
+        committer.resume("u1", operation, "committed")
+
+    assert not head_path.exists()
+    assert [entry.phase for entry in committer.redo.pending_entries()] == ["committed"]
+
+
+def test_pending_idempotent_replay_rejects_current_source_tamper(tmp_path) -> None:  # noqa: ANN001
+    source, _index, _relations, _queue, committer = _stores(tmp_path)
+    archive = _archive(task_id="pending-current-source-tamper")
+    episode = SessionArchiveEpisodeAdapter().adapt(archive)
+    proposal = CandidateProposalAdapter().adapt(
+        _pending_draft(missing_source=True),
+        episode,
+        archive,
+    )
+    operation = (
+        CanonicalMemoryFormationService(source)
+        .plan_pending(
+            proposal,
+            archive=archive,
+            episode=episode,
+            reason="review_required",
+            commit_group_id="pending-current-source-tamper",
+        )
+        .operations[0]
+    )
+    committer.commit("u1", [operation])
+
+    tampered = source.read_object(str(operation.target_uri))
+    tampered.title = "tampered pending bundle"
+    source.write_object(tampered, content="tampered pending content")
+
+    with pytest.raises(RedoIntegrityError, match="current Source bundle"):
+        committer.commit("u1", [ContextOperation.from_dict(deepcopy(operation.to_dict()))])
+
+
+def test_first_start_migration_cannot_recreate_deleted_committed_pending_head(tmp_path) -> None:  # noqa: ANN001
+    source, _index, _relations, _queue, committer = _stores(tmp_path)
+    archive = _archive(task_id="pending-first-start-deleted-head")
+    episode = SessionArchiveEpisodeAdapter().adapt(archive)
+    proposal = CandidateProposalAdapter().adapt(
+        _pending_draft(missing_source=True),
+        episode,
+        archive,
+    )
+    operation = (
+        CanonicalMemoryFormationService(source)
+        .plan_pending(
+            proposal,
+            archive=archive,
+            episode=episode,
+            reason="review_required",
+            commit_group_id="pending-first-start-deleted-head",
+        )
+        .operations[0]
+    )
+    committer.commit("u1", [operation])
+    artifact_root = tmp_path / "tenants" / "t1"
+    assert not (artifact_root / "system" / "migrations" / "memory-closure-v1.json").exists()
+    assert not committer.redo.pending_entries()
+    head_path = head_set_path(artifact_root, str(operation.target_uri))
+    head_path.unlink()
+
+    restarted = build_runtime_container(RuntimeConfig(root=str(tmp_path), tenant_id="t1"))
+
+    assert restarted.readiness.state == RuntimeReadinessState.NOT_READY
+    assert "missing its current head" in " ".join(restarted.readiness.reasons)
+    assert not head_path.exists()
 
 
 def test_pending_add_source_written_redo_rejects_tampered_source_effect(tmp_path) -> None:  # noqa: ANN001
@@ -721,11 +1031,28 @@ def test_session_pending_count_tracks_only_outstanding_lifecycle_states(
         proposal,
         archive=archive,
         episode=episode,
-        reason="review_required",
+        reason=("retryable_backend" if lifecycle_state == LifecycleState.RETRYABLE else "review_required"),
         commit_group_id=f"create-{lifecycle_state.value}",
     )
     committer.commit("u1", list(created.operations))
     pending_uri = str(created.operations[0].target_uri)
+    pending = CanonicalMemoryRepository(source).load_pending(
+        pending_uri,
+        tenant_id="t1",
+        owner_user_id="u1",
+    )
+    decision = {
+        LifecycleState.RETRYABLE: "RETRY",
+        LifecycleState.CONFIRMED: "CONFIRM",
+        LifecycleState.REJECTED: "REJECT",
+        LifecycleState.EXPIRED: "EXPIRE",
+    }[lifecycle_state]
+    review_binding = _review_command_binding(
+        committer,
+        pending,
+        decision=decision,
+        suffix=f"pending-state-{lifecycle_state.value}",
+    )
     transition = formation.plan_pending_lifecycle_transition(
         pending_uri,
         lifecycle_state,
@@ -733,6 +1060,7 @@ def test_session_pending_count_tracks_only_outstanding_lifecycle_states(
         owner_user_id="u1",
         commit_group_id=f"review-{lifecycle_state.value}",
         retry_increment=lifecycle_state == LifecycleState.RETRYABLE,
+        **review_binding,
     )
     service = SessionCommitService(
         SessionArchiveStore(tmp_path, tenant_id="t1"),
