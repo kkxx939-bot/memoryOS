@@ -16,15 +16,33 @@ class SQLiteIndexStoreTest(unittest.TestCase):
     def test_upsert_search_delete_and_filters(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteIndexStore(Path(tmp) / "index.sqlite3")
-            u1 = ContextObject(uri="memoryos://user/u1/memories/preferences/temp", context_type=ContextType.MEMORY, title="temperature preference", owner_user_id="u1")
-            u2 = ContextObject(uri="memoryos://user/u2/memories/preferences/temp", context_type=ContextType.MEMORY, title="temperature preference", owner_user_id="u2")
-            policy = ContextObject(uri="memoryos://user/u1/action_policies/hot/turn_on_ac", context_type=ContextType.ACTION_POLICY, title="turn on ac policy", owner_user_id="u1")
+            u1 = ContextObject(
+                uri="memoryos://user/u1/memories/preferences/temp",
+                context_type=ContextType.MEMORY,
+                title="temperature preference",
+                owner_user_id="u1",
+            )
+            u2 = ContextObject(
+                uri="memoryos://user/u2/memories/preferences/temp",
+                context_type=ContextType.MEMORY,
+                title="temperature preference",
+                owner_user_id="u2",
+            )
+            policy = ContextObject(
+                uri="memoryos://user/u1/action_policies/hot/turn_on_ac",
+                context_type=ContextType.ACTION_POLICY,
+                title="turn on ac policy",
+                owner_user_id="u1",
+            )
             store.upsert_index(u1, content="prefers 26 degree")
             store.upsert_index(u2, content="prefers 18 degree")
             store.upsert_index(policy, content="hot room turn_on_ac")
             self.assertEqual(store.search("26", filters={"owner_user_id": "u1"})[0].uri, u1.uri)
             self.assertFalse(store.search("18", filters={"owner_user_id": "u1"}))
-            self.assertEqual(store.search("turn_on_ac", filters={"owner_user_id": "u1", "context_type": "action_policy"})[0].uri, policy.uri)
+            self.assertEqual(
+                store.search("turn_on_ac", filters={"owner_user_id": "u1", "context_type": "action_policy"})[0].uri,
+                policy.uri,
+            )
             store.delete_index(u1.uri)
             self.assertFalse(store.search("26", filters={"owner_user_id": "u1"}))
 
@@ -149,7 +167,7 @@ class SQLiteIndexStoreTest(unittest.TestCase):
             )
             assert [hit.uri for hit in reviewed] == [pending.uri]
 
-    def test_lexical_matching_uses_complete_latin_tokens_and_cjk_ngrams_in_fallback(self) -> None:
+    def test_fts_disabled_does_not_restore_python_row_scan_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteIndexStore(Path(tmp) / "index.sqlite3")
             related = ContextObject(
@@ -178,12 +196,17 @@ class SQLiteIndexStoreTest(unittest.TestCase):
             store.upsert_index(chinese, content="生产数据库继续使用PostgreSQL")
             store.fts_enabled = False
 
-            assert [hit.uri for hit in store.search("Redis", filters={"owner_user_id": "u1"})] == [
-                related.uri
-            ]
-            assert chinese.uri in {
-                hit.uri for hit in store.search("数据库继续使用", filters={"owner_user_id": "u1"})
-            }
+            assert store.search("Redis", filters={"owner_user_id": "u1"}) == []
+            assert store.search("数据库继续使用", filters={"owner_user_id": "u1"}) == []
+
+    def test_runtime_fts_storage_failure_is_not_reported_as_empty_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteIndexStore(Path(tmp) / "index.sqlite3")
+            with store._connect() as conn:  # noqa: SLF001 - failure-injection boundary.
+                conn.execute("DROP TABLE contexts_fts")
+
+            with self.assertRaises(sqlite3.OperationalError):
+                store.search_catalog("must remain observable", filters={"tenant_id": "default"})
 
     def test_inmemory_lexical_matching_matches_sqlite_token_semantics(self) -> None:
         store = InMemoryIndexStore()
@@ -210,12 +233,8 @@ class SQLiteIndexStoreTest(unittest.TestCase):
         store.upsert_index(unrelated, content="redistribution strategy")
         store.upsert_index(chinese, content="生产数据库继续使用PostgreSQL")
 
-        assert [hit.uri for hit in store.search("Redis", filters={"owner_user_id": "u1"})] == [
-            related.uri
-        ]
-        assert chinese.uri in {
-            hit.uri for hit in store.search("数据库继续使用", filters={"owner_user_id": "u1"})
-        }
+        assert [hit.uri for hit in store.search("Redis", filters={"owner_user_id": "u1"})] == [related.uri]
+        assert chinese.uri in {hit.uri for hit in store.search("数据库继续使用", filters={"owner_user_id": "u1"})}
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ from typing import Any
 
 from memoryos.memory.canonical.proposal import MemorySemanticProposal
 from memoryos.memory.schema import MemoryCandidateDraft, MemoryType, MemoryTypeSchema
+from memoryos.security.workspace_identity import normalize_workspace_id, repository_workspace_id
 
 
 def project_id_from_archive(archive: Any) -> str:
@@ -14,24 +15,30 @@ def project_id_from_archive(archive: Any) -> str:
     for key in ("project_id", "project"):
         value = metadata.get(key)
         if value:
-            return str(value)
+            return normalize_workspace_id(value)
     connect = metadata.get("connect")
     if isinstance(connect, dict):
         for key in ("project_id", "project"):
             value = connect.get(key)
             if value:
-                return str(value)
+                return normalize_workspace_id(value)
         extra = connect.get("extra")
         if isinstance(extra, dict):
-            for key in ("project_id", "project", "repo"):
+            for key in ("project_id", "project"):
                 value = extra.get(key)
                 if value:
-                    return str(value)
+                    return normalize_workspace_id(value)
+            if extra.get("repo"):
+                return repository_workspace_id(
+                    repo_root=extra["repo"],
+                    cwd=extra.get("cwd") or "",
+                    git_remote=extra.get("git_remote") or "",
+                )
     for message in getattr(archive, "messages", []) or []:
         if isinstance(message, dict):
             value = message.get("project_id") or message.get("project")
             if value:
-                return str(value)
+                return normalize_workspace_id(value)
     return ""
 
 

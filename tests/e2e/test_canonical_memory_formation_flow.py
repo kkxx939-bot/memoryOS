@@ -186,7 +186,7 @@ def test_coding_agent_event_to_projection_retrieval_and_safe_transition(tmp_path
         context_type="memory",
         query_intent="OPTIONS",
     )
-    assert {item["metadata"]["canonical_value"] for item in current} == {"sqlite", "forbidden"}
+    assert {item["metadata"]["canonical_value"] for item in current} == {"SQLite", "forbidden"}
     assert options == []
     assert initial_result.pending_count == 1
     assert initial_result.pending_persisted is True
@@ -240,7 +240,7 @@ def test_coding_agent_event_to_projection_retrieval_and_safe_transition(tmp_path
         for item in active_backend
         if item["metadata"]["memory_type"] == "project_decision"
     }
-    assert backend_values == {"sqlite"}
+    assert backend_values == {"SQLite"}
     assert replacement_result.pending_count == 1
     replacement_pending = next(
         obj
@@ -288,7 +288,7 @@ def test_coding_agent_event_to_projection_retrieval_and_safe_transition(tmp_path
         item["metadata"]["canonical_value"]
         for item in active_after_review
         if item["metadata"]["memory_type"] == "project_decision"
-    } == {"postgresql"}
+    } == {"PostgreSQL"}
     history = client.search_context(
         "",
         user_id="u1",
@@ -296,7 +296,7 @@ def test_coding_agent_event_to_projection_retrieval_and_safe_transition(tmp_path
         context_type="memory",
         memory_states=["SUPERSEDED"],
     )
-    assert {item["metadata"]["canonical_value"] for item in history} == {"sqlite"}
+    assert {item["metadata"]["canonical_value"] for item in history} == {"SQLite"}
     assert client.list_pending(
         user_id="u1",
         lifecycle_states=[LifecycleState.RESOLVED.value],
@@ -342,7 +342,7 @@ def test_coding_agent_event_to_projection_retrieval_and_safe_transition(tmp_path
         item["metadata"]["canonical_value"]
         for item in still_active
         if item["metadata"]["memory_type"] == "project_decision"
-    } == {"postgresql"}
+    } == {"PostgreSQL"}
 
 
 def test_llm_mixed_database_statement_is_split_into_atomic_safe_outcomes(tmp_path) -> None:  # noqa: ANN001
@@ -415,7 +415,7 @@ def test_llm_mixed_database_statement_is_split_into_atomic_safe_outcomes(tmp_pat
         context_type="memory",
         query_intent="OPTIONS",
     )
-    assert {item["metadata"]["canonical_value"] for item in current} == {"sqlite", "forbidden"}
+    assert {item["metadata"]["canonical_value"] for item in current} == {"SQLite", "forbidden"}
     assert options == []
     assert first.pending_count == 0
     assert first.pending_persisted is False
@@ -435,7 +435,7 @@ def test_llm_mixed_database_statement_is_split_into_atomic_safe_outcomes(tmp_pat
         context_type="memory",
         query_intent="CURRENT",
     )
-    assert {item["metadata"]["canonical_value"] for item in still_current} == {"sqlite", "forbidden"}
+    assert {item["metadata"]["canonical_value"] for item in still_current} == {"SQLite", "forbidden"}
     assert not any(
         obj.metadata.get("canonical_value") == "postgresql"
         for obj in client.source_store.list_objects()
@@ -520,7 +520,7 @@ def test_discussed_or_negated_switch_cannot_self_supersede_active_claim(tmp_path
         item["metadata"]["canonical_value"]
         for item in active
         if item["metadata"].get("memory_type") == "project_decision"
-    } == {"postgresql"}
+    } == {"PostgreSQL"}
     assert not superseded
 
 
@@ -799,10 +799,10 @@ def test_canonical_memory_shares_workspace_subject_but_isolates_tenant_and_works
             if item["metadata"]["memory_type"] == "project_decision"
         }
 
-    assert active("u1", "workspace-a") == {"postgresql"}
-    assert active("u2", "workspace-a") == {"postgresql"}
-    assert active("u1", "workspace-b") == {"sqlite"}
-    assert active("u1", "workspace-a", "other") == {"sqlite"}
+    assert active("u1", "workspace-a") == {"PostgreSQL"}
+    assert active("u2", "workspace-a") == {"PostgreSQL"}
+    assert active("u1", "workspace-b") == {"SQLite"}
+    assert active("u1", "workspace-a", "other") == {"SQLite"}
 
 
 def test_reachy_compatible_origin_forms_person_environment_preference(tmp_path) -> None:  # noqa: ANN001
@@ -946,7 +946,7 @@ def test_runtime_aliases_converge_llm_wording_to_one_slot(tmp_path) -> None:  # 
         query_intent="CURRENT",
     )
     decisions = [item for item in current if item["metadata"]["memory_type"] == "project_decision"]
-    assert {item["metadata"]["canonical_value"] for item in decisions} == {"sqlite"}
+    assert {item["metadata"]["canonical_value"] for item in decisions} == {"SQLite"}
     assert len({item["metadata"]["slot_id"] for item in decisions}) == 1
 
 
@@ -1030,7 +1030,7 @@ def test_llm_outage_is_terminal_for_the_group_and_reextraction_requires_a_new_gr
         context_type="memory",
         query_intent="CURRENT",
     )
-    assert {item["metadata"]["canonical_value"] for item in current} == {"sqlite"}
+    assert {item["metadata"]["canonical_value"] for item in current} == {"SQLite"}
 
 
 def test_explicit_forget_creates_retracted_revision_without_physical_delete(tmp_path) -> None:  # noqa: ANN001
@@ -1218,7 +1218,7 @@ def test_structured_remember_persists_ambiguous_second_value_as_pending(tmp_path
         context_type="memory",
         query_intent="CURRENT",
     )
-    assert {item["metadata"]["canonical_value"] for item in current} == {"postgresql"}
+    assert {item["metadata"]["canonical_value"] for item in current} == {"PostgreSQL"}
 
 
 @pytest.mark.parametrize(

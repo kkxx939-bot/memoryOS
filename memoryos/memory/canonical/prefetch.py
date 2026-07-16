@@ -84,10 +84,15 @@ class ExistingMemoryPrefetcher:
         for hit in hits:
             if (monotonic() - started) * 1000 > self.timeout_ms:
                 break
+            source_uri = self._canonical_source_uri(hit)
+            if not source_uri:
+                continue
             try:
-                committed = read_committed_canonical(self.source_store, hit.uri, self.relation_store)
+                committed = read_committed_canonical(self.source_store, source_uri, self.relation_store)
                 obj = committed.object
             except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+                continue
+            if source_uri != str(hit.uri) and not self._current_slot_binding_is_valid(hit, obj):
                 continue
             if str(obj.tenant_id or "default") != episode.tenant_id:
                 continue
@@ -148,6 +153,104 @@ class ExistingMemoryPrefetcher:
                 )
             )
         return tuple(results)
+
+    @staticmethod
+    def _canonical_source_uri(hit: Any) -> str:
+        """Resolve a rebuildable Current Slot row to its authoritative Claim.
+
+        ``current_slot`` is the CURRENT serving identity, so its public URI is
+        deliberately not a SourceStore object URI.  Extraction prefetch still
+        needs the exact Claim in order to bind an LLM's opaque candidate ref
+        to a canonical Claim/Slot identity.  The Catalog may only supply that
+        bounded pointer; the Claim and Slot are verified from canonical Source
+        below before the candidate is exposed to the model.
+        """
+
+        metadata = dict(getattr(hit, "metadata", {}) or {})
+        record_kind = str(metadata.get("record_kind") or "")
+        canonical_kind = str(metadata.get("canonical_kind") or "")
+        if record_kind != "current_slot" and canonical_kind != "current_slot_projection":
+            return str(getattr(hit, "uri", "") or "")
+        if str(metadata.get("canonical_state") or "ACTIVE").upper() != "ACTIVE":
+            return ""
+        return str(metadata.get("active_claim_uri") or metadata.get("canonical_claim_uri") or "")
+
+    def _current_slot_binding_is_valid(self, hit: Any, claim_obj: Any) -> bool:
+        """Fail closed when a Current Slot pointer lags or crosses identity."""
+
+        if self.source_store is None:
+            return False
+        metadata = dict(getattr(hit, "metadata", {}) or {})
+        claim_metadata = dict(getattr(claim_obj, "metadata", {}) or {})
+        claim_id = str(claim_metadata.get("claim_id") or "")
+        slot_id = str(claim_metadata.get("slot_id") or "")
+        claim_uri = str(getattr(claim_obj, "uri", "") or "")
+        advertised_claim_ids = {
+            str(value)
+            for value in (metadata.get("active_claim_id"), metadata.get("canonical_claim_id"))
+            if value
+        }
+        advertised_claim_uris = {
+            str(value)
+            for value in (metadata.get("active_claim_uri"), metadata.get("canonical_claim_uri"))
+            if value
+        }
+        if (
+            not claim_id
+            or not slot_id
+            or not claim_uri
+            or claim_metadata.get("canonical_kind") != "claim"
+            or claim_metadata.get("state") != "ACTIVE"
+            or advertised_claim_ids != {claim_id}
+            or advertised_claim_uris != {claim_uri}
+        ):
+            return False
+        advertised_claim_revisions = tuple(
+            value
+            for value in (metadata.get("active_claim_revision"), metadata.get("canonical_revision"))
+            if value is not None
+        )
+        try:
+            claim_revision = int(claim_metadata.get("revision", 0))
+            if not advertised_claim_revisions or any(
+                int(revision) != claim_revision for revision in advertised_claim_revisions
+            ):
+                return False
+        except (TypeError, ValueError, OverflowError):
+            return False
+        slot_uri = str(
+            metadata.get("canonical_slot_uri")
+            or metadata.get("slot_uri")
+            or claim_metadata.get("slot_uri")
+            or str(getattr(claim_obj, "uri", "")).rsplit("/claims/", 1)[0]
+        )
+        if not slot_uri:
+            return False
+        try:
+            slot = read_committed_canonical(self.source_store, slot_uri, self.relation_store).object
+        except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+            return False
+        slot_metadata = dict(slot.metadata or {})
+        advertised_slot_revisions = tuple(
+            value
+            for value in (metadata.get("projection_source_revision"), metadata.get("slot_revision"))
+            if value is not None
+        )
+        try:
+            slot_revision = int(slot_metadata.get("revision", 0))
+            if not advertised_slot_revisions or any(
+                int(revision) != slot_revision for revision in advertised_slot_revisions
+            ):
+                return False
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return bool(
+            slot_metadata.get("canonical_kind") == "slot"
+            and str(slot.tenant_id or "default") == str(claim_obj.tenant_id or "default")
+            and str(slot_metadata.get("slot_id") or "") == slot_id
+            and str(slot_metadata.get("active_claim_id") or "") == claim_id
+            and str(metadata.get("canonical_slot_id") or metadata.get("slot_id") or slot_id) == slot_id
+        )
 
     def _recall(self, query: str, filters: dict[str, Any], episode: EvidenceEpisode) -> list[Any]:
         exact_uris: list[str] = []

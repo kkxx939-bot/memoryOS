@@ -462,7 +462,11 @@ def validate_marker(
         )
     if relation_store is not None:
         for effect in relation_effects:
-            _validate_relation_effect(relation_store, effect)
+            _validate_relation_effect(
+                relation_store,
+                effect,
+                tenant_id=str(payload["tenant_id"]),
+            )
     return payload
 
 
@@ -513,7 +517,12 @@ def _validate_object_effect(
         raise EffectProofError(f"transaction marker content digest does not match: {uri}")
 
 
-def _validate_relation_effect(relation_store: RelationStore, effect: object) -> None:
+def _validate_relation_effect(
+    relation_store: RelationStore,
+    effect: object,
+    *,
+    tenant_id: str,
+) -> None:
     if not isinstance(effect, dict) or not isinstance(effect.get("identity"), dict):
         raise EffectProofError("transaction marker relation effect is invalid")
     identity = relation_identity(effect["identity"])
@@ -521,7 +530,10 @@ def _validate_relation_effect(relation_store: RelationStore, effect: object) -> 
         raise EffectProofError("transaction marker relation identity is invalid")
     matches = [
         relation
-        for relation in relation_store.relations_of(identity["source_uri"])
+        for relation in relation_store.relations_of(
+            identity["source_uri"],
+            tenant_id=tenant_id,
+        )
         if relation.source_uri == identity["source_uri"]
         and relation.relation_type == identity["relation_type"]
         and relation.target_uri == identity["target_uri"]

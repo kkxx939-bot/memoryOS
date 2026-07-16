@@ -7,13 +7,24 @@ import os
 import re
 import shutil
 import uuid
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from memoryos.contextdb.catalog import (
+    CatalogProjectionStatus,
+    CatalogRecord,
+    CatalogRecordKind,
+    ServingTier,
+    catalog_vector_metadata,
+    validate_tree_paths,
+)
 from memoryos.contextdb.model.context_layer import ContextLayers
 from memoryos.contextdb.model.context_object import ContextObject
+from memoryos.contextdb.projection_equivalence import build_projection_equivalence_proof
 from memoryos.contextdb.store.source_store import (
     IndexStore,
     QueueIdempotencyConflictError,
@@ -25,11 +36,12 @@ from memoryos.contextdb.store.source_store import (
     is_canonical_memory_object,
     is_canonical_memory_uri,
 )
-from memoryos.contextdb.store.vector_store import VectorStore
+from memoryos.contextdb.store.vector_store import VectorStore, vector_row_id
 from memoryos.core.ids import require_safe_path_segment
 from memoryos.memory.canonical.current_head import (
     CurrentHeadIntegrityError,
     artifact_root_for,
+    head_from_receipt_snapshot,
     iter_current_head_uris,
     load_current_head,
 )
@@ -49,9 +61,11 @@ from memoryos.memory.canonical.projection_state import (
     ProjectionStepStatus,
 )
 from memoryos.memory.canonical.scope import MemoryScope
+from memoryos.memory.canonical.slot_projection import CurrentSlotProjection, CurrentSlotProjectionResult
 from memoryos.memory.canonical.state import (
     CanonicalMemoryInvariantError,
     materialized_current_revision_payload,
+    revision_payload_with_effective_validity,
 )
 from memoryos.memory.canonical.visibility import (
     CommittedCanonicalRead,
@@ -65,6 +79,7 @@ from memoryos.operations.commit.outbox_envelope import (
     OUTBOX_EVENT_TYPE,
     OutboxIntegrityError,
     prepared_intent_digest,
+    projection_workspace_id,
     validate_outbox,
 )
 from memoryos.operations.commit.quarantine import quarantine_control_file
@@ -74,6 +89,7 @@ from memoryos.operations.commit.receipt import (
     receipt_snapshot,
 )
 from memoryos.providers.embedding import EmbeddingProvider, HashingEmbeddingProvider
+from memoryos.security.context_projection import ContextProjectionSanitizer
 from memoryos.workers.readiness import (
     readiness_for_source_store,
     require_source_store_ready,
@@ -91,8 +107,42 @@ class ProjectionResult:
     input_effect_hash: str = ""
 
 
+@dataclass(frozen=True)
+class _CurrentSlotProjectionTarget:
+    slot_uri: str
+    slot_id: str
+    tenant_id: str
+    source_revision: int
+    active_claim_id: str | None
+    previous_source_revision: int | None = None
+    previous_active_claim_id: str | None = None
+
+
 class ProjectionOutboxIntegrityError(RuntimeError):
     """A projection outbox control file is corrupt or missing."""
+
+
+_MAX_CLAIM_REVISION_REFRESH = 10_000
+_PROJECTION_DOMAIN_IDENTITY_FIELDS = (
+    "claim_uri",
+    "tenant_id",
+    "owner_user_id",
+    "canonical_kind",
+    "claim_state",
+    "canonical_head_digest",
+    "current_transaction_id",
+    "current_receipt_digest",
+    "current_claim_revision",
+)
+_PROJECTION_ATTEMPT_IDENTITY_FIELDS = (
+    "projection_revision",
+    "projection_attempt_id",
+    "projection_input_effect_hash",
+    "projection_publish_token",
+    "projection_content_digest",
+    "projection_relation_digest",
+    "projection_manifest_uri",
+)
 
 
 class CanonicalMemoryProjector:
@@ -113,6 +163,7 @@ class CanonicalMemoryProjector:
         record_store: ProjectionRecordStore | None = None,
         test_hook: Callable[[str, str, int], None] | None = None,
         status_callback: Callable[[ProjectionRecord], None] | None = None,
+        sanitizer: ContextProjectionSanitizer | None = None,
     ) -> None:
         self.source_store = source_store
         self.index_store = index_store
@@ -123,6 +174,7 @@ class CanonicalMemoryProjector:
         self.record_store = record_store or ProjectionRecordStore(self.root)
         self.test_hook = test_hook
         self.status_callback = status_callback
+        self.sanitizer = sanitizer or ContextProjectionSanitizer()
 
     def project(
         self,
@@ -223,8 +275,38 @@ class CanonicalMemoryProjector:
         published_view_currents = False
         self._notify("after_read", claim_uri, requested)
         try:
-            revision = self._revision_payload(metadata, current_claim_revision)
-            l0, l1, l2 = self._layers(obj, metadata, revision, requested)
+            revisions = self._bounded_claim_revisions(metadata)
+            # Legacy/offline artifacts deliberately describe the materialized
+            # current assertion.  A late historical transaction advances the
+            # Source tail without replacing that effective current value.
+            # Unified Claim Revision serving rows are built separately below
+            # from the requested immutable revision.
+            revision = revision_payload_with_effective_validity(
+                revisions,
+                current_claim_revision,
+            )
+            l0, l1, l2 = self._sanitized_revision_layers(
+                obj,
+                metadata,
+                revision,
+                requested,
+            )
+            catalog_upsert = getattr(self.index_store, "upsert_catalog", None)
+            unified_catalog = callable(catalog_upsert)
+            requested_revision = revision_payload_with_effective_validity(
+                revisions,
+                requested,
+            )
+            serving_l0, serving_l1, serving_l2 = (
+                self._sanitized_revision_layers(
+                    obj,
+                    metadata,
+                    requested_revision,
+                    requested,
+                )
+                if unified_catalog
+                else (l0, l1, l2)
+            )
             relation_payload = [relation.to_dict() for relation in committed_relations(committed)]
             record = self.record_store.update(
                 record,
@@ -263,7 +345,7 @@ class CanonicalMemoryProjector:
                 record = self.record_store.update(record, vector_status=ProjectionStepStatus.SKIPPED.value)
             else:
                 record = self.record_store.update(record, vector_status=ProjectionStepStatus.RUNNING.value)
-                vector_embedding = self.embedding_provider.embed("\n".join((l0, l1)))
+                vector_embedding = self.embedding_provider.embed("\n".join((serving_l0, serving_l1)))
             self._notify("after_artifacts", claim_uri, requested)
 
             with self.record_store.claim_lock(claim_uri):
@@ -299,10 +381,27 @@ class CanonicalMemoryProjector:
                     domain_identity=domain_identity,
                     layers=ContextLayers(l0_uri=l0_uri, l1_uri=l1_uri, l2_uri=l2_uri),
                 )
+                catalog_record = (
+                    self._claim_revision_catalog_record(
+                        obj,
+                        metadata,
+                        record,
+                        requested_revision,
+                        proof_metadata=dict(projection_obj.metadata or {}),
+                        l0_text=serving_l0,
+                        l1_text=serving_l1,
+                        l2_text=serving_l2,
+                    )
+                    if unified_catalog
+                    else None
+                )
                 if self.vector_store is not None:
                     assert vector_embedding is not None
                     try:
-                        self._publish_vector(projection_obj, vector_embedding, record)
+                        if catalog_record is not None:
+                            self._publish_catalog_vector(catalog_record, vector_embedding, record)
+                        else:
+                            self._publish_vector(projection_obj, vector_embedding, record)
                     except Exception:
                         record = self.record_store.update(record, vector_status=ProjectionStepStatus.FAILED.value)
                         raise
@@ -310,7 +409,17 @@ class CanonicalMemoryProjector:
 
                 record = self.record_store.update(record, index_status=ProjectionStepStatus.RUNNING.value)
                 try:
-                    self.index_store.upsert_index(projection_obj, content="\n".join((l0, l1, l2)))
+                    index_content = "\n".join((l0, l1, l2))
+                    if catalog_record is not None:
+                        assert callable(catalog_upsert)
+                        catalog_upsert(catalog_record)
+                        self._reconcile_claim_catalog_projections(
+                            obj,
+                            metadata,
+                            published_revision=requested,
+                        )
+                    else:
+                        self.index_store.upsert_index(projection_obj, content=index_content)
                 except Exception:
                     record = self.record_store.update(record, index_status=ProjectionStepStatus.FAILED.value)
                     raise
@@ -403,23 +512,55 @@ class CanonicalMemoryProjector:
         # deleting a view, retiring a pointer, or replacing an index/vector
         # row.  Outbox/queue boundary validation remains the worker/caller's
         # responsibility because the projector deliberately has no queue.
-        ProjectionProofStore(self.root).validate_all()
+        proof_store = ProjectionProofStore(self.root)
+        proof_store.validate_all()
+        historical_proofs = self._verified_rebuild_claim_proofs(proof_store)
         artifact_root = artifact_root_for(self.source_store)
         claim_uris = tuple(iter_current_head_uris(artifact_root, kinds=("claim",)) if artifact_root is not None else ())
         committed_claims = set(claim_uris)
 
-        def uncommitted_canonical_row(uri: str, metadata: dict[str, Any] | None) -> bool:
-            if uri in committed_claims:
-                return False
+        source_tenant = str(getattr(self.source_store, "tenant_id", "") or "")
+
+        def uncommitted_canonical_row(
+            row_id: str,
+            metadata: dict[str, Any] | None,
+            *,
+            allow_source_read: bool,
+        ) -> bool:
             row_metadata = dict(metadata or {})
+            metadata_tenant = str(row_metadata.get("tenant_id") or "")
+            if source_tenant and metadata_tenant and metadata_tenant != source_tenant:
+                return False
+            logical_uris = tuple(
+                dict.fromkeys(
+                    value
+                    for value in (
+                        str(row_metadata.get("public_uri") or ""),
+                        str(row_metadata.get("uri") or ""),
+                        str(row_metadata.get("source_uri") or ""),
+                        str(row_metadata.get("claim_uri") or ""),
+                        str(row_id),
+                    )
+                    if value.startswith("memoryos://")
+                )
+            )
+            if any(uri in committed_claims for uri in logical_uris):
+                return False
             if (
-                is_canonical_memory_uri(uri)
+                any(is_canonical_memory_uri(uri) for uri in logical_uris)
                 or str(row_metadata.get("canonical_kind") or "") in {"slot", "claim", "pending_proposal"}
+                or str(row_metadata.get("record_kind") or "")
+                in {CatalogRecordKind.CLAIM_REVISION.value, CatalogRecordKind.CURRENT_SLOT.value}
                 or str(row_metadata.get("schema_version") or "").startswith("canonical_")
             ):
                 return True
+            # Backend row IDs (for example ``memoryos-vector://`` hashes) are
+            # never Source URIs.  Only the SQLite URI path may perform this
+            # offline repair read, and only after proving a logical URI.
+            if not allow_source_read or len(logical_uris) != 1:
+                return False
             try:
-                return is_canonical_memory_object(self.source_store.read_object(uri))
+                return is_canonical_memory_object(self.source_store.read_object(logical_uris[0]))
             except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
                 return False
 
@@ -438,6 +579,7 @@ class CanonicalMemoryProjector:
             if uncommitted_canonical_row(
                 indexed_uri,
                 self.index_store.get_index_metadata(indexed_uri),
+                allow_source_read=True,
             )
         )
         vector_to_remove = (
@@ -447,6 +589,7 @@ class CanonicalMemoryProjector:
                 if uncommitted_canonical_row(
                     vector_uri,
                     self.vector_store.get_vector_metadata(vector_uri),
+                    allow_source_read=vector_uri.startswith("memoryos://"),
                 )
             )
             if self.vector_store is not None
@@ -479,13 +622,328 @@ class CanonicalMemoryProjector:
         if self.vector_store is not None:
             for vector_uri in vector_to_remove:
                 self.vector_store.delete_vector(vector_uri)
+        historical_restored = 0
         for claim_uri in claim_uris:
             result = self.project(claim_uri, force=True)
             if result.status == "projected":
                 projected += 1
             else:
                 skipped += 1
-        return {"projected": projected, "skipped": skipped, "retired": retired}
+            historical_restored += self._rebuild_claim_revision_catalog(
+                claim_uri,
+                historical_proofs,
+            )
+        return {
+            "projected": projected,
+            "skipped": skipped,
+            "retired": retired,
+            "historical_restored": historical_restored,
+        }
+
+    def _verified_rebuild_claim_proofs(
+        self,
+        proof_store: ProjectionProofStore,
+    ) -> dict[tuple[str, int], tuple[dict[str, Any], ProjectionRecord]]:
+        """Preflight immutable publication/receipt/record closure for rebuild."""
+
+        verified: dict[tuple[str, int], tuple[dict[str, Any], ProjectionRecord]] = {}
+        for publication in proof_store.iter_publications():
+            receipt = self._verified_publication_receipt(publication)
+            claims = publication.get("claims")
+            if not isinstance(claims, list):
+                raise ProjectionIntegrityError("projection rebuild publication Claim set is invalid")
+            for raw_proof in claims:
+                if not isinstance(raw_proof, dict):
+                    raise ProjectionIntegrityError("projection rebuild Claim proof is invalid")
+                claim_uri = str(raw_proof.get("claim_uri") or "")
+                source_revision = int(raw_proof.get("source_revision", 0) or 0)
+                identity = (claim_uri, source_revision)
+                if identity in verified:
+                    raise ProjectionIntegrityError("projection rebuild Claim revision proof is duplicated")
+                record = self._verified_projection_record_from_publication(
+                    raw_proof,
+                    receipt=receipt,
+                )
+                verified[identity] = (dict(raw_proof), record)
+        return verified
+
+    def _verified_publication_receipt(self, publication: dict[str, Any]) -> dict[str, Any]:
+        """Verify one publication against its immutable outbox, receipt, and completion.
+
+        The helper is deliberately transaction-bounded.  Online projection
+        reconciliation uses it to recover the exact published attempt for one
+        historical Claim revision without scanning every publication.
+        """
+
+        transaction_id = str(publication["transaction_id"])
+        resolved_root = self.root.resolve()
+        outbox_path = self.root / "system" / "outbox" / f"{transaction_id}.json"
+        expected_outbox = resolved_root / "system" / "outbox" / f"{transaction_id}.json"
+        try:
+            resolved_outbox = outbox_path.resolve(strict=True)
+        except OSError as exc:
+            raise ProjectionIntegrityError("projection rebuild outbox is missing") from exc
+        if outbox_path.is_symlink() or resolved_outbox != expected_outbox:
+            raise ProjectionIntegrityError("projection rebuild outbox path is unsafe")
+        try:
+            outbox = validate_outbox(
+                json.loads(outbox_path.read_text(encoding="utf-8")),
+                transaction_id=transaction_id,
+                tenant_id=str(publication["tenant_id"]),
+                allowed_statuses={"committed"},
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError, OutboxIntegrityError) as exc:
+            raise ProjectionIntegrityError("projection rebuild has no valid immutable outbox") from exc
+        receipt_relative = Path(str(outbox.get("receipt_path") or ""))
+        receipt_path = self.root / receipt_relative
+        try:
+            resolved_receipt = receipt_path.resolve(strict=True)
+        except OSError as exc:
+            raise ProjectionIntegrityError("projection rebuild receipt is missing") from exc
+        if (
+            receipt_relative.is_absolute()
+            or receipt_path.is_symlink()
+            or resolved_receipt == resolved_root
+            or resolved_root not in resolved_receipt.parents
+        ):
+            raise ProjectionIntegrityError("projection rebuild receipt path is unsafe")
+        try:
+            receipt = load_transaction_receipt(resolved_receipt)
+        except ReceiptIntegrityError as exc:
+            raise ProjectionIntegrityError("projection rebuild receipt is invalid") from exc
+        if (
+            str(receipt.get("transaction_id") or "") != transaction_id
+            or str(receipt.get("receipt_digest") or "") != str(publication["receipt_digest"])
+            or str(outbox.get("receipt_digest") or "") != str(publication["receipt_digest"])
+            or str(outbox.get("outbox_digest") or "") != str(publication["outbox_digest"])
+            or str(receipt.get("prepared_intent_digest") or "")
+            != str(publication["prepared_intent_digest"])
+        ):
+            raise ProjectionIntegrityError("projection rebuild publication differs from its receipt/outbox")
+        completion = ProjectionProofStore(self.root).load_completion(transaction_id)
+        if completion is not None:
+            for field in (
+                "commit_group_id",
+                "transaction_id",
+                "job_id",
+                "tenant_id",
+                "user_id",
+                "queue_identity_digest",
+                "outbox_digest",
+                "receipt_digest",
+                "prepared_intent_digest",
+                "operation_ids",
+                "claim_revisions",
+                "claims",
+                "publication_digest",
+            ):
+                if completion.get(field) != publication.get(field):
+                    raise ProjectionIntegrityError(
+                        "projection completion proof differs from its publication receipt"
+                    )
+        return receipt
+
+    def _verified_projection_record_from_publication(
+        self,
+        claim_proof: dict[str, Any],
+        *,
+        receipt: dict[str, Any],
+    ) -> ProjectionRecord:
+        claim_uri = str(claim_proof.get("claim_uri") or "")
+        source_revision = int(claim_proof.get("source_revision", 0) or 0)
+        try:
+            snapshot = receipt_snapshot(receipt, claim_uri)
+            snapshot_obj = ContextObject.from_dict(dict(snapshot["object"]))
+        except (KeyError, TypeError, ValueError, ReceiptIntegrityError) as exc:
+            raise ProjectionIntegrityError("projection rebuild Claim proof has no Source snapshot") from exc
+        snapshot_metadata = dict(snapshot_obj.metadata or {})
+        if (
+            str(snapshot.get("canonical_kind") or snapshot_metadata.get("canonical_kind") or "") != "claim"
+            or int(snapshot.get("after_revision", 0) or 0) != source_revision
+            or int(snapshot_metadata.get("revision", 0) or 0) != source_revision
+        ):
+            raise ProjectionIntegrityError("projection rebuild Claim snapshot revision is inconsistent")
+        historical = CommittedCanonicalRead(snapshot_obj, receipt=receipt)
+        if self._input_effect_hash(historical, source_revision) != str(claim_proof.get("input_effect_hash") or ""):
+            raise ProjectionIntegrityError("projection rebuild Claim effect differs from its receipt")
+        domain = claim_proof.get("domain_identity")
+        expected_head = head_from_receipt_snapshot(snapshot, receipt)
+        try:
+            snapshot_current = materialized_current_revision_payload(snapshot_metadata)
+        except CanonicalMemoryInvariantError as exc:
+            raise ProjectionIntegrityError("projection rebuild Claim snapshot state is invalid") from exc
+        expected_domain = {
+            "claim_uri": claim_uri,
+            "tenant_id": str(snapshot_obj.tenant_id or "default"),
+            "owner_user_id": str(snapshot_obj.owner_user_id or ""),
+            "canonical_kind": "claim",
+            "claim_state": str(snapshot_current.get("state") or ""),
+            "canonical_head_digest": str(expected_head.get("head_digest") or ""),
+            "current_transaction_id": str(receipt.get("transaction_id") or ""),
+            "current_receipt_digest": str(receipt.get("receipt_digest") or ""),
+            "current_claim_revision": int(snapshot_current.get("revision", 0) or 0),
+        }
+        if domain != expected_domain:
+            raise ProjectionIntegrityError("projection rebuild Claim domain proof is inconsistent")
+        try:
+            current = read_committed_canonical(
+                self.source_store,
+                claim_uri,
+                self.relation_store,
+            )
+        except (FileNotFoundError, CommittedStateIntegrityError) as exc:
+            raise ProjectionIntegrityError("projection rebuild current Claim is unavailable") from exc
+        current_revision_payload = next(
+            (
+                item
+                for item in dict(current.object.metadata or {}).get("revisions", ()) or ()
+                if isinstance(item, dict) and int(item.get("revision", 0) or 0) == source_revision
+            ),
+            None,
+        )
+        snapshot_revision_payload = next(
+            (
+                item
+                for item in snapshot_metadata.get("revisions", ()) or ()
+                if isinstance(item, dict) and int(item.get("revision", 0) or 0) == source_revision
+            ),
+            None,
+        )
+        immutable_revision_fields = (
+            "revision",
+            "value_fields",
+            "evidence_refs",
+            "proposal_id",
+            "relation",
+            "epistemic_status",
+        )
+        if current_revision_payload is None or snapshot_revision_payload is None or any(
+            canonical_digest(current_revision_payload.get(field))
+            != canonical_digest(snapshot_revision_payload.get(field))
+            for field in immutable_revision_fields
+        ):
+            raise ProjectionIntegrityError("projection rebuild current Claim revision differs from receipt")
+        layer_uris = claim_proof.get("layer_uris")
+        layer_digests = claim_proof.get("layer_digests")
+        if not isinstance(layer_uris, dict) or not isinstance(layer_digests, dict):
+            raise ProjectionIntegrityError("projection rebuild Claim artifacts are incomplete")
+        try:
+            layer_values = {
+                level: self.source_store.read_content(str(layer_uris[level]))
+                for level in ("L0", "L1", "L2")
+            }
+            manifest = json.loads(self.source_store.read_content(str(layer_uris["manifest"])))
+            relations = json.loads(self.source_store.read_content(str(layer_uris["relations"])))
+        except (KeyError, OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ProjectionIntegrityError("projection rebuild Claim artifacts are unreadable") from exc
+        if (
+            not isinstance(manifest, dict)
+            or not isinstance(relations, dict)
+            or {level: canonical_digest(value) for level, value in layer_values.items()} != layer_digests
+            or canonical_digest(manifest) != str(claim_proof.get("manifest_digest") or "")
+            or canonical_digest(relations) != str(claim_proof.get("relation_artifact_digest") or "")
+        ):
+            raise ProjectionIntegrityError("projection rebuild Claim artifact digest is corrupt")
+        record_payload = {key: manifest.get(key) for key in ProjectionRecord.__dataclass_fields__}
+        record_payload["record_digest"] = manifest.get("record_digest")
+        try:
+            record = ProjectionRecord.from_dict(record_payload)
+        except (KeyError, TypeError, ValueError, ProjectionIntegrityError) as exc:
+            raise ProjectionIntegrityError("projection rebuild manifest has no valid projection record") from exc
+        if (
+            record.claim_uri != claim_uri
+            or record.source_revision != source_revision
+            or projection_publication_record_digest(record)
+            != str(claim_proof.get("publication_record_digest") or "")
+            or record.projected_content_digest != canonical_digest(layer_values)
+            or record.projected_relation_digest != canonical_digest(relations.get("relations", []))
+        ):
+            raise ProjectionIntegrityError("projection rebuild record differs from publication proof")
+        persisted = self.record_store.load(
+            claim_uri,
+            source_revision,
+            projection_attempt_id=record.projection_attempt_id,
+        )
+        if persisted is None:
+            self.record_store.save(record)
+        elif projection_publication_record_digest(persisted) != projection_publication_record_digest(record):
+            raise ProjectionIntegrityError("projection rebuild durable record differs from publication proof")
+        return persisted or record
+
+    def _rebuild_claim_revision_catalog(
+        self,
+        claim_uri: str,
+        proofs: dict[tuple[str, int], tuple[dict[str, Any], ProjectionRecord]],
+    ) -> int:
+        upsert_catalog = getattr(self.index_store, "upsert_catalog", None)
+        if not callable(upsert_catalog):
+            return 0
+        committed = read_committed_canonical(self.source_store, claim_uri, self.relation_store)
+        obj = committed.object
+        metadata = dict(obj.metadata or {})
+        revisions = self._bounded_claim_revisions(metadata)
+        tail_revision = int(metadata.get("revision", 0) or 0)
+        available_for_claim = {revision for uri, revision in proofs if uri == claim_uri}
+        restored = 0
+        for raw_revision in revisions:
+            revision_number = int(raw_revision.get("revision", 0) or 0)
+            if revision_number == tail_revision:
+                continue
+            proof_entry = proofs.get((claim_uri, revision_number))
+            if proof_entry is None:
+                if available_for_claim:
+                    raise ProjectionIntegrityError("projection rebuild is missing an immutable historical proof")
+                continue
+            claim_proof, record = proof_entry
+            snapshot_revision = next(
+                (
+                    item
+                    for item in revisions
+                    if int(item.get("revision", 0) or 0) == revision_number
+                ),
+                None,
+            )
+            if snapshot_revision is None:
+                raise ProjectionIntegrityError("projection rebuild Source revision disappeared")
+            effective = revision_payload_with_effective_validity(revisions, revision_number)
+            l0_text, l1_text, l2_text = self._sanitized_revision_layers(
+                obj,
+                metadata,
+                effective,
+                revision_number,
+            )
+            domain = dict(claim_proof.get("domain_identity", {}) or {})
+            proof_metadata = {
+                **domain,
+                # ACL ownership is current Source state; transaction/head
+                # fields below still name the original immutable publication.
+                "claim_uri": obj.uri,
+                "tenant_id": str(obj.tenant_id or "default"),
+                "owner_user_id": str(obj.owner_user_id or ""),
+                "canonical_kind": "claim",
+                "projection_revision": record.projection_revision,
+                "projection_attempt_id": record.projection_attempt_id,
+                "projection_input_effect_hash": record.input_effect_hash,
+                "projection_publish_token": record.publish_token,
+                "projection_content_digest": record.projected_content_digest,
+                "projection_relation_digest": record.projected_relation_digest,
+                "projection_manifest_uri": record.manifest_uri,
+                "projection_record_path": str(self.record_store.attempt_path_for(record)),
+            }
+            catalog = self._claim_revision_catalog_record(
+                obj,
+                metadata,
+                record,
+                effective,
+                proof_metadata=proof_metadata,
+                l0_text=l0_text,
+                l1_text=l1_text,
+                l2_text=l2_text,
+            )
+            upsert_catalog(catalog)
+            self._refresh_claim_vector(catalog)
+            restored += 1
+        return restored
 
     def _layers(
         self,
@@ -546,6 +1004,41 @@ class CanonicalMemoryProjector:
         )
         return l0, l1, l2
 
+    def _sanitized_revision_layers(
+        self,
+        obj: ContextObject,
+        metadata: dict[str, Any],
+        revision: dict[str, Any],
+        source_revision: int,
+    ) -> tuple[str, str, str]:
+        l0, l1, l2 = self._layers(obj, metadata, revision, source_revision)
+        safe = self.sanitizer.sanitize(
+            title=obj.title,
+            l0_text=l0,
+            l1_text=l1,
+            metadata={"l2": json.loads(l2)},
+            source_kind="canonical_claim",
+        )
+        l2_payload = safe.metadata.get("l2")
+        if not isinstance(l2_payload, dict):
+            raise ProjectionIntegrityError("canonical revision L2 sanitization returned an invalid payload")
+        return (
+            safe.l0_text,
+            safe.l1_text,
+            json.dumps(l2_payload, ensure_ascii=False, indent=2, sort_keys=True),
+        )
+
+    @staticmethod
+    def _bounded_claim_revisions(metadata: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+        raw_revisions = metadata.get("revisions", ()) or ()
+        if not isinstance(raw_revisions, (list, tuple)):
+            raise ProjectionIntegrityError("canonical Claim revisions are not an array")
+        if not raw_revisions or len(raw_revisions) > _MAX_CLAIM_REVISION_REFRESH:
+            raise ProjectionIntegrityError("canonical Claim revision refresh exceeds its bounded limit")
+        if any(not isinstance(item, dict) for item in raw_revisions):
+            raise ProjectionIntegrityError("canonical Claim revision payload is invalid")
+        return tuple(dict(item) for item in raw_revisions)
+
     def _revision_payload(self, metadata: dict[str, Any], revision: int) -> dict[str, Any]:
         revisions = [
             dict(item) for item in metadata.get("revisions", []) or [] if int(item.get("revision", 0)) == revision
@@ -581,6 +1074,7 @@ class CanonicalMemoryProjector:
             "owner_user_id": str(obj.owner_user_id or ""),
             "canonical_kind": "claim",
             "claim_state": state,
+            "canonical_head_digest": str(head["head_digest"]),
             "current_transaction_id": str(head["current_transaction_id"]),
             "current_receipt_digest": str(head["receipt_digest"]),
             "current_claim_revision": int(current_revision["revision"]),
@@ -597,21 +1091,483 @@ class CanonicalMemoryProjector:
     ) -> ContextObject:
         projected = ContextObject.from_dict(obj.to_dict())
         projected.layers = layers
-        projected.metadata = {
-            **metadata,
-            **domain_identity,
-            "projection_source_revision": record.source_revision,
+        materialized_current = materialized_current_revision_payload(metadata)
+        current_revision = revision_payload_with_effective_validity(
+            tuple(metadata.get("revisions", ()) or ()),
+            int(materialized_current["revision"]),
+        )
+        tree_paths = self._canonical_tree_paths(metadata)
+        source_timestamp = str(
+            current_revision.get("transaction_time")
+            or current_revision.get("created_at")
+            or projected.updated_at
+            or projected.created_at
+        )
+        valid_from = str(current_revision.get("valid_from") or "")
+        valid_to = str(current_revision.get("valid_to") or "")
+        safe = self.sanitizer.sanitize(
+            title=projected.title,
+            metadata={
+                **metadata,
+                **domain_identity,
+                "record_kind": CatalogRecordKind.CLAIM_REVISION.value,
+                "source_kind": "canonical_claim",
+                "catalog_record_key": self._claim_catalog_record_key(metadata, record.source_revision),
+                "tree_paths": list(tree_paths),
+                "primary_tree_path": tree_paths[0],
+                "source_uri": projected.uri,
+                "source_digest": record.projected_content_digest,
+                "source_revision": record.source_revision,
+                "event_time": str(current_revision.get("event_time") or valid_from or projected.created_at),
+                "ingested_at": str(current_revision.get("created_at") or projected.created_at),
+                "transaction_time": source_timestamp,
+                "valid_from": valid_from,
+                "valid_to": valid_to,
+                "serving_tier": ServingTier.HOT.value,
+                "projection_status": CatalogProjectionStatus.PROJECTED.value,
+                "projection_effect_hash": record.input_effect_hash,
+                "projection_source_revision": record.source_revision,
+                "projection_revision": record.projection_revision,
+                "projection_attempt_id": record.projection_attempt_id,
+                "projection_input_effect_hash": record.input_effect_hash,
+                "projection_publish_token": record.publish_token,
+                "projection_content_digest": record.projected_content_digest,
+                "projection_relation_digest": record.projected_relation_digest,
+                "current_claim_revision": record.current_claim_revision,
+                "projection_manifest_uri": record.manifest_uri,
+                "projection_record_path": str(self.record_store.attempt_path_for(record)),
+            },
+            source_kind="canonical_claim",
+        )
+        projected.title = safe.title
+        projected.metadata = safe.metadata
+        return projected
+
+    def _claim_revision_catalog_record(
+        self,
+        obj: ContextObject,
+        metadata: dict[str, Any],
+        record: ProjectionRecord,
+        revision: dict[str, Any],
+        *,
+        proof_metadata: dict[str, Any],
+        l0_text: str,
+        l1_text: str,
+        l2_text: str,
+    ) -> CatalogRecord:
+        """Build one requested-revision serving row without changing legacy artifacts."""
+
+        source_revision = int(revision.get("revision", 0) or 0)
+        if source_revision != record.source_revision:
+            raise ProjectionIntegrityError("Claim Catalog revision does not match projection proof")
+        # These fields are not searchable business state.  They are the exact
+        # immutable domain/attempt identity consumed by the publication
+        # verifier.  Keep them in metadata_json as well as typed Catalog
+        # columns: reconstructing them from mutable columns would weaken the
+        # receipt -> publication -> serving-row binding.
+        required_proof_fields = (
+            *_PROJECTION_DOMAIN_IDENTITY_FIELDS,
+            *_PROJECTION_ATTEMPT_IDENTITY_FIELDS,
+        )
+        missing_proof_fields = [key for key in required_proof_fields if key not in proof_metadata]
+        if missing_proof_fields:
+            raise ProjectionIntegrityError(
+                "Claim Catalog proof metadata is incomplete: " + ", ".join(sorted(missing_proof_fields))
+            )
+        proof_fields = {key: proof_metadata[key] for key in required_proof_fields}
+        expected_domain_identity: dict[str, object] = {
+            "claim_uri": obj.uri,
+            "tenant_id": str(obj.tenant_id or "default"),
+            "owner_user_id": str(obj.owner_user_id or ""),
+            "canonical_kind": "claim",
+        }
+        for field, expected in expected_domain_identity.items():
+            if proof_fields.get(field) != expected:
+                raise ProjectionIntegrityError(f"Claim Catalog proof {field} differs from Source identity")
+        expected_attempt_identity: dict[str, object] = {
             "projection_revision": record.projection_revision,
             "projection_attempt_id": record.projection_attempt_id,
             "projection_input_effect_hash": record.input_effect_hash,
             "projection_publish_token": record.publish_token,
             "projection_content_digest": record.projected_content_digest,
             "projection_relation_digest": record.projected_relation_digest,
-            "current_claim_revision": record.current_claim_revision,
             "projection_manifest_uri": record.manifest_uri,
-            "projection_record_path": str(self.record_store.attempt_path_for(record)),
         }
-        return projected
+        for field, expected in expected_attempt_identity.items():
+            if proof_fields.get(field) != expected:
+                raise ProjectionIntegrityError(f"Claim Catalog proof {field} differs from projection attempt")
+        values = dict(revision.get("value_fields", {}) or {})
+        raw_value = values.get("canonical_value", values.get("value", metadata.get("canonical_value", obj.title)))
+        title = raw_value if isinstance(raw_value, str) else canonical_json(raw_value)
+        qualifiers = dict(revision.get("qualifiers", {}) or {})
+        display_fields = dict(qualifiers.get("display_fields", {}) or {})
+        display_evidence = dict(qualifiers.get("display_field_evidence_refs", {}) or {})
+        valid_from = str(revision.get("valid_from") or "")
+        valid_to = str(revision.get("valid_to") or "")
+        created_at = str(revision.get("created_at") or obj.created_at)
+        transaction_time = str(revision.get("transaction_time") or created_at or obj.updated_at)
+        event_time = str(
+            revision.get("event_time")
+            or revision.get("occurred_at")
+            or valid_from
+            or created_at
+        )
+        tree_paths = self._canonical_tree_paths(metadata)
+        catalog_l2_uri = f"{record.l2_uri.rsplit('/', 1)[0]}/catalog-l2.json"
+        serving_digest = canonical_digest({"L0": l0_text, "L1": l1_text, "L2": l2_text})
+        self.source_store.write_content(catalog_l2_uri, l2_text)
+        projected = ContextObject.from_dict(obj.to_dict())
+        projected.title = title
+        projected.created_at = created_at
+        # ``updated_at`` is the derived row refresh time/source head time;
+        # transaction_time below remains revision-specific.
+        projected.updated_at = str(obj.updated_at or transaction_time or created_at)
+        projected.layers = ContextLayers(
+            l0_uri=record.l0_uri,
+            l1_uri=record.l1_uri,
+            l2_uri=catalog_l2_uri,
+        )
+        safe = self.sanitizer.sanitize(
+            title=title,
+            l0_text=l0_text,
+            l1_text=l1_text,
+            metadata={
+                **metadata,
+                **proof_fields,
+                # The Catalog row is one immutable Claim revision, not a
+                # second copy of the mutable Claim aggregate.  Keep the
+                # current Source scope/visibility/authority above, but bind
+                # every business payload mirror to the requested revision so
+                # public HISTORY results cannot accidentally expose the tail
+                # revision as if it belonged to this row.
+                "revision": source_revision,
+                "revisions": [dict(revision)],
+                "value_fields": values,
+                "evidence_refs": list(revision.get("evidence_refs", ()) or ()),
+                "proposal_id": str(revision.get("proposal_id") or ""),
+                "relation": str(revision.get("relation") or ""),
+                "qualifiers": qualifiers,
+                "previous_revision": revision.get("previous_revision"),
+                "record_kind": CatalogRecordKind.CLAIM_REVISION.value,
+                "source_kind": "canonical_claim",
+                "catalog_record_key": self._claim_catalog_record_key(metadata, source_revision),
+                "tree_paths": list(tree_paths),
+                "primary_tree_path": tree_paths[0],
+                "source_uri": projected.uri,
+                "source_digest": serving_digest,
+                "source_revision": source_revision,
+                "state": str(revision.get("state") or ""),
+                "canonical_value": raw_value,
+                "epistemic_status": str(revision.get("epistemic_status") or ""),
+                "created_at": created_at,
+                "updated_at": transaction_time,
+                "semantic_relation": str(revision.get("relation") or ""),
+                "display_fields": display_fields,
+                "display_field_evidence_refs": display_evidence,
+                "event_time": event_time,
+                "ingested_at": created_at,
+                "transaction_time": transaction_time,
+                "valid_from": valid_from,
+                "valid_to": valid_to,
+                "validity_end_derived": bool(
+                    not self._revision_payload(metadata, source_revision).get("valid_to") and valid_to
+                ),
+                "l0_text": l0_text,
+                "l1_text": l1_text,
+                "l2_uri": catalog_l2_uri,
+                "serving_tier": ServingTier.HOT.value,
+                "projection_status": CatalogProjectionStatus.PROJECTED.value,
+                "projection_effect_hash": record.input_effect_hash,
+                "projection_source_revision": source_revision,
+            },
+            source_kind="canonical_claim",
+        )
+        for field, expected in proof_fields.items():
+            if safe.metadata.get(field) != expected:
+                raise ProjectionIntegrityError(f"Claim Catalog sanitizer did not preserve proof field {field}")
+        projected.title = safe.title
+        projected.metadata = safe.metadata
+        catalog = CatalogRecord.from_context_object(
+            projected,
+            content=safe.l1_text,
+            record_key=self._claim_catalog_record_key(metadata, source_revision),
+            record_kind=CatalogRecordKind.CLAIM_REVISION.value,
+            tree_paths=tree_paths,
+        )
+        return replace(
+            catalog,
+            title=safe.title,
+            l0_text=safe.l0_text,
+            l1_text=safe.l1_text,
+            l2_uri=catalog_l2_uri,
+            source_digest=serving_digest,
+            canonical_revision=source_revision,
+            canonical_state=str(revision.get("state") or ""),
+        )
+
+    def _reconcile_claim_catalog_projections(
+        self,
+        obj: ContextObject,
+        metadata: dict[str, Any],
+        *,
+        published_revision: int,
+    ) -> None:
+        """Refresh every existing row from one bounded current Claim read.
+
+        Revision payload, event/transaction time, and validity remain bound to
+        each immutable revision.  Tenant/owner/scope/authority/tree placement
+        instead follows the current authoritative Claim so a repair or
+        reclassification cannot leave stale ACL/path/FTS/vector candidates.
+        """
+
+        get_catalog = getattr(self.index_store, "get_catalog", None)
+        upsert_catalog = getattr(self.index_store, "upsert_catalog", None)
+        if not callable(get_catalog) or not callable(upsert_catalog):
+            return
+        revisions = self._bounded_claim_revisions(metadata)
+        for raw_revision in revisions:
+            revision_number = int(raw_revision.get("revision", 0) or 0)
+            if revision_number == published_revision:
+                continue
+            effective = revision_payload_with_effective_validity(revisions, revision_number)
+            record_key = self._claim_catalog_record_key(metadata, revision_number)
+            loaded = get_catalog(record_key)
+            if loaded is None:
+                continue
+            if not isinstance(loaded, CatalogRecord):
+                raise ProjectionIntegrityError("canonical Claim refresh loaded an invalid Catalog record")
+            existing = loaded
+            proof = self._revision_bound_projection_proof(existing)
+            l0_text, l1_text, l2_text = self._sanitized_revision_layers(
+                obj,
+                metadata,
+                effective,
+                revision_number,
+            )
+            refreshed = self._claim_revision_catalog_record(
+                obj,
+                metadata,
+                proof,
+                effective,
+                proof_metadata={
+                    **dict(existing.metadata),
+                    # Serving ACL/scope identity follows the current Source.
+                    # The original receipt/publication remains immutable and
+                    # is validated by ``_revision_bound_projection_proof``.
+                    "claim_uri": obj.uri,
+                    "tenant_id": str(obj.tenant_id or "default"),
+                    "owner_user_id": str(obj.owner_user_id or ""),
+                    "canonical_kind": "claim",
+                    # A crash/rebuild may have left the disposable Catalog row
+                    # naming an equivalent but unpublished retry.  The proof
+                    # returned above is the exact immutable publication
+                    # attempt; always restore every attempt-owned field from
+                    # it instead of carrying the retry identity forward.
+                    "projection_revision": proof.projection_revision,
+                    "projection_attempt_id": proof.projection_attempt_id,
+                    "projection_input_effect_hash": proof.input_effect_hash,
+                    "projection_publish_token": proof.publish_token,
+                    "projection_content_digest": proof.projected_content_digest,
+                    "projection_relation_digest": proof.projected_relation_digest,
+                    "projection_manifest_uri": proof.manifest_uri,
+                    "projection_record_path": str(self.record_store.attempt_path_for(proof)),
+                },
+                l0_text=l0_text,
+                l1_text=l1_text,
+                l2_text=l2_text,
+            )
+            if existing.tenant_id != refreshed.tenant_id:
+                if self.vector_store is not None:
+                    self.vector_store.delete_vector(vector_row_id(existing.tenant_id, existing.record_key))
+                delete_catalog = getattr(self.index_store, "delete_catalog", None)
+                if not callable(delete_catalog) or not delete_catalog(
+                    existing.record_key,
+                    tenant_id=existing.tenant_id,
+                ):
+                    raise ProjectionIntegrityError("canonical Claim tenant repair could not retire its old row")
+            upsert_catalog(refreshed)
+            self._refresh_claim_vector(refreshed, proof=proof)
+
+    def _revision_bound_projection_proof(self, existing: CatalogRecord) -> ProjectionRecord:
+        """Load the exact attempt named by a serving row and verify publication.
+
+        ``ProjectionRecordStore.load(claim, revision)`` intentionally chooses a
+        preferred attempt and may therefore select a later failed/stale retry.
+        A historical refresh must instead remain bound to the attempt that was
+        actually published for this Catalog row.
+        """
+
+        metadata = dict(existing.metadata)
+        claim_uri = str(existing.canonical_claim_uri or metadata.get("claim_uri") or existing.uri)
+        source_revision = int(existing.source_revision or existing.canonical_revision or 0)
+        attempt_id = str(metadata.get("projection_attempt_id") or "")
+        if not claim_uri or source_revision < 1 or not attempt_id:
+            raise ProjectionIntegrityError("canonical Claim refresh proof identity is incomplete")
+        proof = self.record_store.load(
+            claim_uri,
+            source_revision,
+            projection_attempt_id=attempt_id,
+        )
+        if proof is None:
+            raise ProjectionIntegrityError("canonical Claim refresh has no exact projection attempt")
+        expected_attempt = {
+            "source_revision": source_revision,
+            "projection_revision": int(metadata.get("projection_revision", 0) or 0),
+            "projection_attempt_id": attempt_id,
+            "input_effect_hash": str(metadata.get("projection_input_effect_hash") or ""),
+            "publish_token": str(metadata.get("projection_publish_token") or ""),
+            "projected_content_digest": str(metadata.get("projection_content_digest") or ""),
+            "projected_relation_digest": str(metadata.get("projection_relation_digest") or ""),
+        }
+        actual_attempt = {
+            "source_revision": proof.source_revision,
+            "projection_revision": proof.projection_revision,
+            "projection_attempt_id": proof.projection_attempt_id,
+            "input_effect_hash": proof.input_effect_hash,
+            "publish_token": proof.publish_token,
+            "projected_content_digest": proof.projected_content_digest,
+            "projected_relation_digest": proof.projected_relation_digest,
+        }
+        if expected_attempt != actual_attempt:
+            raise ProjectionIntegrityError("canonical Claim refresh attempt differs from Catalog proof")
+        transaction_id = str(metadata.get("current_transaction_id") or "")
+        if not transaction_id:
+            raise ProjectionIntegrityError("canonical Claim refresh has no immutable transaction identity")
+        proof_store = ProjectionProofStore(self.root)
+        publication = proof_store.load_publication(transaction_id)
+        if publication is None:
+            # Compatibility for a pre-publication projection.  With no
+            # immutable publication to recover from, only a fully completed
+            # exact attempt is admissible.
+            if proof.status not in {ProjectionStatus.COMPLETED.value, ProjectionStatus.STALE.value}:
+                raise ProjectionIntegrityError("canonical Claim refresh attempt was never successfully published")
+            terminal_steps = {ProjectionStepStatus.COMPLETED.value, ProjectionStepStatus.SKIPPED.value}
+            if any(
+                status not in terminal_steps
+                for status in (
+                    proof.index_status,
+                    proof.vector_status,
+                    proof.relation_status,
+                    proof.scope_status,
+                    proof.taxonomy_status,
+                )
+            ):
+                raise ProjectionIntegrityError("canonical Claim refresh attempt has incomplete component state")
+            return proof
+
+        receipt = self._verified_publication_receipt(publication)
+        matches = [
+            item
+            for item in publication.get("claims", ())
+            if isinstance(item, dict)
+            and str(item.get("claim_uri") or "") == claim_uri
+            and int(item.get("source_revision", 0) or 0) == source_revision
+        ]
+        if len(matches) != 1:
+            raise ProjectionIntegrityError("canonical Claim refresh publication binding is not unique")
+        published = dict(matches[0])
+        published_domain = dict(published.get("domain_identity", {}) or {})
+        immutable_domain_fields = (
+            "claim_uri",
+            "canonical_kind",
+            "claim_state",
+            "canonical_head_digest",
+            "current_transaction_id",
+            "current_receipt_digest",
+            "current_claim_revision",
+        )
+        if (
+            str(publication.get("receipt_digest") or "")
+            != str(metadata.get("current_receipt_digest") or "")
+            or any(metadata.get(field) != published_domain.get(field) for field in immutable_domain_fields)
+        ):
+            raise ProjectionIntegrityError("canonical Claim refresh differs from immutable publication")
+        published_proof = self._verified_projection_record_from_publication(
+            published,
+            receipt=receipt,
+        )
+        if (
+            proof.source_revision != published_proof.source_revision
+            or proof.projection_revision != published_proof.projection_revision
+            or proof.input_effect_hash != published_proof.input_effect_hash
+            or proof.claim_uri != published_proof.claim_uri
+            or proof.slot_uri != published_proof.slot_uri
+        ):
+            raise ProjectionIntegrityError("canonical Claim retry differs from immutable published effect")
+        return published_proof
+
+    def _refresh_claim_vector(
+        self,
+        record: CatalogRecord,
+        *,
+        proof: ProjectionRecord | None = None,
+    ) -> None:
+        if self.vector_store is None:
+            return
+        proof = proof or self.record_store.load(record.canonical_claim_uri, record.source_revision)
+        if proof is None:
+            raise ProjectionIntegrityError("canonical refresh has no revision-bound projection proof")
+        embedding = self.embedding_provider.embed("\n".join((record.l0_text, record.l1_text)))
+        metadata = dict(record.metadata)
+        self.vector_store.upsert_vector(
+            vector_row_id(record.tenant_id, record.record_key),
+            embedding,
+            metadata={
+                **catalog_vector_metadata(record, sanitizer=self.sanitizer),
+                "public_uri": record.uri,
+                "claim_uri": record.canonical_claim_uri,
+                "claim_id": record.canonical_claim_id,
+                "slot_id": record.canonical_slot_id,
+                "canonical_kind": "claim",
+                "claim_state": record.canonical_state,
+                "current_transaction_id": metadata.get("current_transaction_id"),
+                "current_receipt_digest": metadata.get("current_receipt_digest"),
+                "current_claim_revision": metadata.get("current_claim_revision"),
+                "source_revision": proof.source_revision,
+                "projection_revision": proof.projection_revision,
+                "projection_attempt_id": proof.projection_attempt_id,
+                "input_effect_hash": proof.input_effect_hash,
+                "publish_token": proof.publish_token,
+                "projected_content_digest": proof.projected_content_digest,
+                "projected_relation_digest": proof.projected_relation_digest,
+                "embedding_model": self.embedding_provider.model_name,
+                "schema_version": "canonical_vector_projection_v5",
+            },
+        )
+
+    def _publish_catalog_vector(
+        self,
+        catalog_record: CatalogRecord,
+        embedding: list[float],
+        record: ProjectionRecord,
+    ) -> None:
+        assert self.vector_store is not None
+        metadata = dict(catalog_record.metadata)
+        self.vector_store.upsert_vector(
+            vector_row_id(catalog_record.tenant_id, catalog_record.record_key),
+            embedding,
+            metadata={
+                **catalog_vector_metadata(catalog_record, sanitizer=self.sanitizer),
+                "public_uri": catalog_record.uri,
+                "claim_uri": catalog_record.canonical_claim_uri,
+                "claim_id": catalog_record.canonical_claim_id,
+                "slot_id": catalog_record.canonical_slot_id,
+                "canonical_kind": "claim",
+                "claim_state": metadata.get("claim_state"),
+                "current_transaction_id": metadata.get("current_transaction_id"),
+                "current_receipt_digest": metadata.get("current_receipt_digest"),
+                "current_claim_revision": metadata.get("current_claim_revision"),
+                "source_revision": record.source_revision,
+                "projection_revision": record.projection_revision,
+                "projection_attempt_id": record.projection_attempt_id,
+                "input_effect_hash": record.input_effect_hash,
+                "publish_token": record.publish_token,
+                "projected_content_digest": record.projected_content_digest,
+                "projected_relation_digest": record.projected_relation_digest,
+                "embedding_model": self.embedding_provider.model_name,
+                "schema_version": "canonical_vector_projection_v5",
+            },
+        )
 
     def _publish_vector(
         self,
@@ -620,14 +1576,19 @@ class CanonicalMemoryProjector:
         record: ProjectionRecord,
     ) -> None:
         assert self.vector_store is not None
+        catalog_record = CatalogRecord.from_context_object(
+            obj,
+            record_key=self._claim_catalog_record_key(obj.metadata, record.source_revision),
+            record_kind=CatalogRecordKind.CLAIM_REVISION.value,
+            tree_paths=tuple(obj.metadata.get("tree_paths", ()) or ()),
+        )
         self.vector_store.upsert_vector(
-            obj.uri,
+            vector_row_id(catalog_record.tenant_id, catalog_record.record_key),
             embedding,
             metadata={
+                **catalog_vector_metadata(catalog_record, sanitizer=self.sanitizer),
+                "public_uri": obj.uri,
                 "claim_uri": obj.uri,
-                "tenant_id": obj.tenant_id or "default",
-                "owner_user_id": obj.owner_user_id or "",
-                "context_type": obj.context_type.value,
                 "claim_id": obj.metadata.get("claim_id"),
                 "slot_id": obj.metadata.get("slot_id"),
                 "canonical_kind": obj.metadata.get("canonical_kind"),
@@ -643,9 +1604,66 @@ class CanonicalMemoryProjector:
                 "projected_content_digest": record.projected_content_digest,
                 "projected_relation_digest": record.projected_relation_digest,
                 "embedding_model": self.embedding_provider.model_name,
-                "schema_version": "canonical_vector_projection_v4",
+                "schema_version": "canonical_vector_projection_v5",
             },
         )
+
+    @staticmethod
+    def _claim_catalog_record_key(metadata: Any, source_revision: int) -> str:
+        values = dict(metadata) if isinstance(metadata, dict) else {}
+        claim_id = str(values.get("claim_id") or "")
+        if not claim_id or source_revision < 1:
+            raise ProjectionIntegrityError("canonical Claim Catalog identity is incomplete")
+        return f"claim:{claim_id}:revision:{source_revision}"
+
+    def _canonical_tree_paths(self, metadata: dict[str, Any]) -> tuple[str, ...]:
+        """Derive bounded schema-owned paths without affecting Canonical Identity."""
+
+        identity = dict(metadata.get("identity_fields", {}) or {})
+        memory_type = str(metadata.get("memory_type") or "state")
+        category = {
+            "preference": "preferences",
+            "profile": "profiles",
+            "project_rule": "rules",
+            "project_decision": "decisions",
+            "agent_experience": "experiences",
+            "entity": "entities",
+            "event": "events",
+        }.get(memory_type, "state")
+        dynamic: tuple[Any, ...]
+        if memory_type == "preference":
+            dynamic = (identity.get("subject") or "general", identity.get("dimension") or "general")
+        elif memory_type == "profile":
+            dynamic = (identity.get("attribute_key") or "general",)
+        elif memory_type == "project_rule":
+            dynamic = (identity.get("rule_topic") or "general",)
+        elif memory_type == "project_decision":
+            dynamic = (identity.get("decision_topic") or "general",)
+        elif memory_type == "agent_experience":
+            dynamic = (identity.get("task_pattern") or "general",)
+        elif memory_type == "entity":
+            dynamic = (identity.get("canonical_entity_id") or "general",)
+        elif memory_type == "event":
+            dynamic = (identity.get("event_type") or identity.get("subject") or "general",)
+        else:
+            dynamic = (memory_type, identity.get("dimension") or identity.get("subject") or "general")
+        paths = ["/".join(("memories", category, *(self._canonical_path_segment(value) for value in dynamic)))]
+        raw_scope = metadata.get("scope")
+        if not isinstance(raw_scope, dict):
+            raise ProjectionIntegrityError("canonical Claim scope is missing from projection")
+        try:
+            scope = MemoryScope.from_dict(raw_scope)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ProjectionIntegrityError("canonical Claim scope is invalid for tree projection") from exc
+        for scope_ref in scope.applicability.all_of:
+            if scope_ref.kind == "workspace":
+                paths.append(f"projects/{self._canonical_path_segment(scope_ref.id)}")
+                break
+        return validate_tree_paths(tuple(paths))
+
+    def _canonical_path_segment(self, value: Any) -> str:
+        text = canonical_json(value) if isinstance(value, dict | list | tuple) else str(value or "general")
+        return self._segment(text)
 
     def _write_scope_views(self, obj: ContextObject, record: ProjectionRecord) -> None:
         metadata = dict(obj.metadata or {})
@@ -715,27 +1733,32 @@ class CanonicalMemoryProjector:
 
     def _view_reference(self, obj: ContextObject, record: ProjectionRecord) -> dict[str, Any]:
         metadata = dict(obj.metadata or {})
-        return {
-            "claim_uri": obj.uri,
-            "slot_uri": record.slot_uri,
-            "tenant_id": obj.tenant_id or "default",
-            "owner_user_id": obj.owner_user_id or "",
-            "canonical_kind": metadata.get("canonical_kind"),
-            "claim_state": metadata.get("claim_state"),
-            "current_transaction_id": metadata.get("current_transaction_id"),
-            "current_receipt_digest": metadata.get("current_receipt_digest"),
-            "slot_id": metadata.get("slot_id"),
-            "claim_id": metadata.get("claim_id"),
-            "source_revision": record.source_revision,
-            "projection_revision": record.projection_revision,
-            "projection_attempt_id": record.projection_attempt_id,
-            "input_effect_hash": record.input_effect_hash,
-            "publish_token": record.publish_token,
-            "projected_content_digest": record.projected_content_digest,
-            "projected_relation_digest": record.projected_relation_digest,
-            "current_claim_revision": record.current_claim_revision,
-            "projection_record_path": str(self.record_store.attempt_path_for(record)),
-        }
+        return dict(
+            self.sanitizer.sanitize_trace(
+                {
+                    "claim_uri": obj.uri,
+                    "slot_uri": record.slot_uri,
+                    "tenant_id": obj.tenant_id or "default",
+                    "owner_user_id": obj.owner_user_id or "",
+                    "canonical_kind": metadata.get("canonical_kind"),
+                    "claim_state": metadata.get("claim_state"),
+                    "canonical_head_digest": metadata.get("canonical_head_digest"),
+                    "current_transaction_id": metadata.get("current_transaction_id"),
+                    "current_receipt_digest": metadata.get("current_receipt_digest"),
+                    "slot_id": metadata.get("slot_id"),
+                    "claim_id": metadata.get("claim_id"),
+                    "source_revision": record.source_revision,
+                    "projection_revision": record.projection_revision,
+                    "projection_attempt_id": record.projection_attempt_id,
+                    "input_effect_hash": record.input_effect_hash,
+                    "publish_token": record.publish_token,
+                    "projected_content_digest": record.projected_content_digest,
+                    "projected_relation_digest": record.projected_relation_digest,
+                    "current_claim_revision": record.current_claim_revision,
+                    "projection_record_path": str(self.record_store.attempt_path_for(record)),
+                }
+            )
+        )
 
     def _taxonomy_path(self, metadata: dict[str, Any]) -> Path:
         memory_type = str(metadata.get("memory_type", "memory"))
@@ -877,7 +1900,8 @@ class CanonicalMemoryProjector:
             self.status_callback(record)
 
     def _segment(self, value: Any) -> str:
-        cleaned = re.sub(r"[^a-zA-Z0-9._:-]+", "-", str(value)).strip("-.")
+        safe_value = str(self.sanitizer.sanitize_trace(str(value)))
+        cleaned = re.sub(r"[^a-zA-Z0-9._:-]+", "-", safe_value).strip("-.")
         return cleaned[:120] or "unknown"
 
     def _read_json_optional(self, path: Path) -> dict[str, Any] | None:
@@ -910,13 +1934,50 @@ class MemoryProjectionWorker:
         projector: CanonicalMemoryProjector,
         queue_store: QueueStore,
         *,
+        current_slot_projector: CurrentSlotProjection | None = None,
+        migration_gate: Any = None,
         worker_id: str | None = None,
     ) -> None:
         self.projector = projector
         self.queue_store = queue_store
+        self.current_slot_projector = current_slot_projector
+        self.migration_gate = migration_gate
         self.proof_store = ProjectionProofStore(projector.root)
         self.worker_id = worker_id or f"memory-projection:{os.getpid()}:{uuid.uuid4().hex}"
         self.last_quarantined: list[str] = []
+        self._projection_fence_depth: ContextVar[int] = ContextVar(
+            f"memoryos_projection_worker_fence_depth_{id(self)}",
+            default=0,
+        )
+
+    @contextmanager
+    def _migration_projection_fence(self) -> Iterator[None]:
+        """Hold the tenant rebuild fence before dispatching or leasing work.
+
+        ``process_commit_group`` can be reached from startup/session recovery
+        while another guarded projection entry is already active.  Keep the
+        guard execution-context reentrant so a non-reentrant SQLite lease is
+        acquired exactly once.
+        """
+
+        depth = self._projection_fence_depth.get()
+        if depth:
+            depth_token = self._projection_fence_depth.set(depth + 1)
+            try:
+                yield
+            finally:
+                self._projection_fence_depth.reset(depth_token)
+            return
+        acquire = getattr(self.migration_gate, "acquire_projection_fence", None)
+        release = getattr(self.migration_gate, "release_projection_fence", None)
+        fence = acquire() if callable(acquire) else None
+        depth_token = self._projection_fence_depth.set(1)
+        try:
+            yield
+        finally:
+            self._projection_fence_depth.reset(depth_token)
+            if callable(release):
+                release(fence)
 
     def process_pending(
         self,
@@ -925,12 +1986,13 @@ class MemoryProjectionWorker:
         lease_seconds: int = 60,
         max_retries: int = 3,
     ) -> dict[str, list[str]]:
-        require_source_store_ready(self.projector.source_store)
-        return self._process_pending(
-            limit,
-            lease_seconds=lease_seconds,
-            max_retries=max_retries,
-        )
+        with self._migration_projection_fence():
+            require_source_store_ready(self.projector.source_store)
+            return self._process_pending(
+                limit,
+                lease_seconds=lease_seconds,
+                max_retries=max_retries,
+            )
 
     def _process_pending_during_startup(
         self,
@@ -939,12 +2001,13 @@ class MemoryProjectionWorker:
         lease_seconds: int = 60,
         max_retries: int = 3,
     ) -> dict[str, list[str]]:
-        require_source_store_recovering(self.projector.source_store)
-        return self._process_pending(
-            limit,
-            lease_seconds=lease_seconds,
-            max_retries=max_retries,
-        )
+        with self._migration_projection_fence():
+            require_source_store_recovering(self.projector.source_store)
+            return self._process_pending(
+                limit,
+                lease_seconds=lease_seconds,
+                max_retries=max_retries,
+            )
 
     def _process_pending(
         self,
@@ -1388,6 +2451,7 @@ class MemoryProjectionWorker:
             "owner_user_id": str(obj.owner_user_id or ""),
             "canonical_kind": "claim",
             "claim_state": str(materialized.get("state") or ""),
+            "canonical_head_digest": str(head_from_receipt_snapshot(snapshot, receipt)["head_digest"]),
             "current_transaction_id": str(receipt["transaction_id"]),
             "current_receipt_digest": str(receipt["receipt_digest"]),
             "current_claim_revision": int(materialized["revision"]),
@@ -1465,6 +2529,18 @@ class MemoryProjectionWorker:
         return {**claim_core, "claim_proof_digest": canonical_digest(claim_core)}
 
     def process_commit_group(
+        self,
+        group_id: str,
+        *,
+        transaction_ids: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        with self._migration_projection_fence():
+            return self._process_commit_group_unfenced(
+                group_id,
+                transaction_ids=transaction_ids,
+            )
+
+    def _process_commit_group_unfenced(
         self,
         group_id: str,
         *,
@@ -1996,22 +3072,98 @@ class MemoryProjectionWorker:
             label="manifest",
             domain_identity=domain_identity,
         )
-        index_metadata = self.projector.index_store.get_index_metadata(claim_uri)
-        if index_metadata is None:
-            raise ProjectionIntegrityError("projection index row is missing")
-        self._assert_projection_identity(
-            index_metadata,
-            record,
-            label="index",
-            domain_identity=domain_identity,
-        )
-        if index_metadata.get("index_content_digest") != canonical_digest(
-            "\n".join((layer_values["L0"], layer_values["L1"], layer_values["L2"]))
-        ):
-            raise ProjectionIntegrityError("projection index content digest does not match layers")
+        get_catalog = getattr(self.projector.index_store, "get_catalog", None)
+        if callable(get_catalog):
+            # Unified Catalog rows are revision-scoped and may intentionally
+            # differ from legacy materialized-current artifacts for a late
+            # historical transaction.  Verify the exact record key rather
+            # than asking the URI compatibility API to choose one row.
+            catalog = get_catalog(
+                self.projector._claim_catalog_record_key(metadata, source_revision),
+                tenant_id=str(committed.object.tenant_id or "default"),
+            )
+            if not isinstance(catalog, CatalogRecord):
+                raise ProjectionIntegrityError("projection Claim Revision Catalog row is missing")
+            self._assert_projection_identity(
+                dict(catalog.metadata),
+                record,
+                label="index",
+                domain_identity=domain_identity,
+            )
+            revisions = self.projector._bounded_claim_revisions(metadata)
+            requested_revision = revision_payload_with_effective_validity(
+                revisions,
+                source_revision,
+            )
+            expected_l0, expected_l1, expected_l2 = self.projector._sanitized_revision_layers(
+                committed.object,
+                metadata,
+                requested_revision,
+                source_revision,
+            )
+            expected_serving_digest = canonical_digest(
+                {"L0": expected_l0, "L1": expected_l1, "L2": expected_l2}
+            )
+            expected_catalog_identity = {
+                "record_key": self.projector._claim_catalog_record_key(metadata, source_revision),
+                "uri": claim_uri,
+                "tenant_id": str(committed.object.tenant_id or "default"),
+                "owner_user_id": str(committed.object.owner_user_id or ""),
+                "record_kind": CatalogRecordKind.CLAIM_REVISION.value,
+                "source_revision": source_revision,
+                "canonical_slot_id": str(metadata.get("slot_id") or ""),
+                "canonical_claim_id": str(metadata.get("claim_id") or ""),
+                "canonical_revision": source_revision,
+                "canonical_state": str(requested_revision.get("state") or ""),
+                "canonical_head_digest": str(domain_identity["canonical_head_digest"]),
+                "receipt_digest": str(domain_identity["current_receipt_digest"]),
+                "projection_effect_hash": record.input_effect_hash,
+                "l0_text": expected_l0,
+                "l1_text": expected_l1,
+                "source_digest": expected_serving_digest,
+            }
+            for field, expected in expected_catalog_identity.items():
+                if getattr(catalog, field) != expected:
+                    raise ProjectionIntegrityError(f"projection Claim Revision Catalog {field} mismatch")
+            if self.projector.source_store.read_content(catalog.l2_uri) != expected_l2:
+                raise ProjectionIntegrityError("projection Claim Revision Catalog L2 content mismatch")
+            # This is the exact row attested in the immutable publication.
+            # It intentionally mirrors the legacy metadata shape without a
+            # URI-level row selection that can pick another revision.
+            index_metadata = {
+                **dict(catalog.metadata),
+                "record_key": catalog.record_key,
+                "tenant_id": catalog.tenant_id,
+                "owner_user_id": catalog.owner_user_id,
+                "context_type": catalog.context_type,
+                "claim_state": str(catalog.metadata.get("claim_state") or ""),
+                "slot_id": catalog.canonical_slot_id,
+                "memory_type": str(catalog.metadata.get("memory_type") or ""),
+                "index_content_digest": canonical_digest(catalog.l1_text),
+            }
+        else:
+            legacy_index_metadata = self.projector.index_store.get_index_metadata(claim_uri)
+            if legacy_index_metadata is None:
+                raise ProjectionIntegrityError("projection index row is missing")
+            index_metadata = legacy_index_metadata
+            self._assert_projection_identity(
+                index_metadata,
+                record,
+                label="index",
+                domain_identity=domain_identity,
+            )
+            if index_metadata.get("index_content_digest") != canonical_digest(
+                "\n".join((layer_values["L0"], layer_values["L1"], layer_values["L2"]))
+            ):
+                raise ProjectionIntegrityError("projection index content digest does not match layers")
         vector_metadata: dict[str, Any] | None = None
         if self.projector.vector_store is not None:
-            vector_metadata = self.projector.vector_store.get_vector_metadata(claim_uri)
+            vector_metadata = self.projector.vector_store.get_vector_metadata(
+                vector_row_id(
+                    str(committed.object.tenant_id or "default"),
+                    self.projector._claim_catalog_record_key(metadata, source_revision),
+                )
+            )
             if vector_metadata is None:
                 raise ProjectionIntegrityError("projection vector row is missing")
             self._assert_projection_identity(
@@ -2086,6 +3238,7 @@ class MemoryProjectionWorker:
             "owner_user_id": str(obj.owner_user_id or ""),
             "canonical_kind": "claim",
             "claim_state": str(materialized_current.get("state") or ""),
+            "canonical_head_digest": str(head_from_receipt_snapshot(snapshot, receipt)["head_digest"]),
             "current_transaction_id": str(receipt["transaction_id"]),
             "current_receipt_digest": str(receipt["receipt_digest"]),
             "current_claim_revision": int(materialized_current["revision"]),
@@ -2223,6 +3376,7 @@ class MemoryProjectionWorker:
             "owner_user_id": str(obj.owner_user_id or ""),
             "canonical_kind": "claim",
             "claim_state": str(materialized.get("state") or ""),
+            "canonical_head_digest": str(head_from_receipt_snapshot(snapshot, receipt)["head_digest"]),
             "current_transaction_id": str(receipt["transaction_id"]),
             "current_receipt_digest": str(receipt["receipt_digest"]),
             "current_claim_revision": int(materialized["revision"]),
@@ -2467,6 +3621,7 @@ class MemoryProjectionWorker:
             "owner_user_id": ("owner_user_id",),
             "canonical_kind": ("canonical_kind",),
             "claim_state": ("claim_state",),
+            "canonical_head_digest": ("canonical_head_digest",),
             "current_transaction_id": ("current_transaction_id",),
             "current_receipt_digest": ("current_receipt_digest",),
             "current_claim_revision": ("current_claim_revision",),
@@ -2547,8 +3702,183 @@ class MemoryProjectionWorker:
             result = self.projector.project(str(item["uri"]), int(item["revision"]))
             if result.status == "skipped_stale":
                 stale.append(job_id)
+        if self.current_slot_projector is None:
+            return
+        if self.migration_gate is not None:
+            feature_gate = getattr(self.migration_gate, "feature_gate", None)
+            if feature_gate is None or not bool(getattr(feature_gate, "dual_write_enabled", False)):
+                # Claim revision projection is the compatibility serving path.
+                # CurrentSlot rows are rebuilt in bounded migration batches
+                # before the feature gate can reach cutover.
+                return
+        for target in self._current_slot_projection_targets(outbox):
+            if (
+                target.previous_active_claim_id is not None
+                and target.active_claim_id is not None
+                and target.previous_active_claim_id != target.active_claim_id
+            ):
+                if target.previous_source_revision is None:
+                    raise ValueError("active Claim switch has no previous Slot revision")
+                self.current_slot_projector.tombstone_active_claim_switch(
+                    slot_id=target.slot_id,
+                    slot_uri=target.slot_uri,
+                    tenant_id=target.tenant_id,
+                    previous_active_claim_id=target.previous_active_claim_id,
+                    active_claim_id=target.active_claim_id,
+                    previous_source_revision=target.previous_source_revision,
+                    replacement_source_revision=target.source_revision,
+                )
+            slot_result = self.current_slot_projector.project(target.slot_uri)
+            self._record_current_slot_equivalence(outbox, target, slot_result)
+
+    def _record_current_slot_equivalence(
+        self,
+        outbox: dict[str, Any],
+        target: _CurrentSlotProjectionTarget,
+        result: CurrentSlotProjectionResult,
+    ) -> None:
+        """Journal exact CurrentSlot identity derived from validated outbox work."""
+
+        recorder = getattr(self.migration_gate, "record_projection_equivalence", None)
+        if not callable(recorder):
+            return
+        catalog_store = getattr(self.current_slot_projector, "catalog_store", None)
+        getter = getattr(catalog_store, "get_catalog", None)
+        state = str(
+            getattr(
+                getattr(getattr(self.migration_gate, "feature_gate", None), "state", None),
+                "value",
+                "",
+            )
+        )
+        if not callable(getter):
+            if state == "SHADOW_VALIDATING":
+                raise RuntimeError("shadow CurrentSlot projection has no exact Catalog proof lookup")
+            return
+        actual = getter(result.record_key, tenant_id=target.tenant_id)
+        if actual is not None and not isinstance(actual, CatalogRecord):
+            raise TypeError("CurrentSlot proof lookup returned an invalid Catalog record")
+        expected_records = (result.record,) if result.record is not None else ()
+        actual_records = (actual,) if actual is not None else ()
+        receipt_digest = str(outbox.get("receipt_digest") or "")
+        if not receipt_digest:
+            raise ProjectionOutboxIntegrityError("projection outbox has no receipt evidence digest")
+        proof = build_projection_equivalence_proof(
+            plane="canonical_current_slot",
+            source_identity=target.slot_uri,
+            evidence_digest=receipt_digest,
+            expected_records=expected_records,
+            actual_records=actual_records,
+        )
+        recorder(proof)
+
+    @staticmethod
+    def _current_slot_projection_targets(
+        outbox: dict[str, Any],
+    ) -> tuple[_CurrentSlotProjectionTarget, ...]:
+        """Derive exact Slot work only from the already validated durable intent."""
+
+        tenant_id = outbox.get("tenant_id")
+        if not isinstance(tenant_id, str) or not tenant_id:
+            raise ValueError("projection outbox has no tenant identity")
+        before_by_uri: dict[str, dict[str, Any]] = {}
+        for snapshot in outbox.get("before_images", []) or []:
+            if not isinstance(snapshot, dict):
+                raise ValueError("projection outbox contains an invalid before image")
+            uri = snapshot.get("uri")
+            if not isinstance(uri, str) or not uri:
+                raise ValueError("projection outbox before image has no URI")
+            if snapshot.get("exists") is True:
+                before = snapshot.get("object")
+                if not isinstance(before, dict):
+                    raise ValueError("projection outbox existing before image has no object")
+                before_by_uri[uri] = before
+
+        targets: list[_CurrentSlotProjectionTarget] = []
+        seen: set[str] = set()
+        for raw_operation in outbox.get("operations", []) or []:
+            if not isinstance(raw_operation, dict):
+                raise ValueError("projection outbox contains an invalid operation")
+            payload = raw_operation.get("payload")
+            context_object = payload.get("context_object") if isinstance(payload, dict) else None
+            if not isinstance(context_object, dict):
+                continue
+            metadata_value = context_object.get("metadata")
+            metadata = dict(metadata_value) if isinstance(metadata_value, dict) else {}
+            if metadata.get("canonical_kind") != "slot":
+                continue
+            slot_uri = context_object.get("uri")
+            slot_id = metadata.get("slot_id")
+            source_revision = metadata.get("revision")
+            object_tenant_id = str(context_object.get("tenant_id") or "default")
+            if (
+                not isinstance(slot_uri, str)
+                or not slot_uri
+                or not isinstance(slot_id, str)
+                or not slot_id
+                or slot_uri.rsplit("/", 1)[-1] != slot_id
+                or isinstance(source_revision, bool)
+                or not isinstance(source_revision, int)
+                or source_revision < 1
+                or object_tenant_id != tenant_id
+            ):
+                raise ValueError("projection outbox Slot operation has an invalid revision identity")
+            if slot_uri in seen:
+                raise ValueError("projection outbox contains duplicate Slot projection work")
+            seen.add(slot_uri)
+            active_claim_id = MemoryProjectionWorker._optional_claim_id(
+                metadata.get("active_claim_id"),
+                label="Slot active_claim_id",
+            )
+
+            previous_source_revision: int | None = None
+            previous_active_claim_id: str | None = None
+            before = before_by_uri.get(slot_uri)
+            if before is not None:
+                before_metadata_value = before.get("metadata")
+                before_metadata = dict(before_metadata_value) if isinstance(before_metadata_value, dict) else {}
+                before_revision = before_metadata.get("revision")
+                if (
+                    before_metadata.get("canonical_kind") != "slot"
+                    or before_metadata.get("slot_id") != slot_id
+                    or str(before.get("tenant_id") or "default") != tenant_id
+                    or isinstance(before_revision, bool)
+                    or not isinstance(before_revision, int)
+                    or before_revision < 1
+                    or before_revision >= source_revision
+                ):
+                    raise ValueError("projection outbox Slot before image is detached from its replacement")
+                previous_source_revision = before_revision
+                previous_active_claim_id = MemoryProjectionWorker._optional_claim_id(
+                    before_metadata.get("active_claim_id"),
+                    label="previous Slot active_claim_id",
+                )
+            targets.append(
+                _CurrentSlotProjectionTarget(
+                    slot_uri=slot_uri,
+                    slot_id=slot_id,
+                    tenant_id=tenant_id,
+                    source_revision=source_revision,
+                    active_claim_id=active_claim_id,
+                    previous_source_revision=previous_source_revision,
+                    previous_active_claim_id=previous_active_claim_id,
+                )
+            )
+        return tuple(targets)
+
+    @staticmethod
+    def _optional_claim_id(value: object, *, label: str) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"projection outbox {label} is invalid")
+        return value
 
     def dispatch_outbox(self) -> list[str]:
+        with self._migration_projection_fence():
+            return self._dispatch_outbox_unfenced()
+
+    def _dispatch_outbox_unfenced(self) -> list[str]:
         outbox_root = self.projector.root / "system" / "outbox"
         if not outbox_root.exists():
             return []
@@ -2615,6 +3945,9 @@ class MemoryProjectionWorker:
                             "transaction_id": transaction_id,
                             "outbox_path": str(path),
                             "operation_ids": [str(item) for item in event.get("operation_ids", []) or []],
+                            "tenant_id": str(event.get("tenant_id") or "default"),
+                            "owner_user_id": str(event.get("user_id") or ""),
+                            "workspace_id": projection_workspace_id(operations),
                         },
                     ),
                 )
@@ -2627,11 +3960,19 @@ class MemoryProjectionWorker:
             existing = self.queue_store.get(expected.job_id)
             if existing is None:
                 continue
+            legacy_payload = {
+                "transaction_id": expected.payload["transaction_id"],
+                "outbox_path": expected.payload["outbox_path"],
+                "operation_ids": expected.payload["operation_ids"],
+            }
             if (
                 existing.queue_name != expected.queue_name
                 or existing.action != expected.action
                 or existing.target_uri != expected.target_uri
-                or existing.payload != expected.payload
+                or (
+                    existing.payload != expected.payload
+                    and existing.payload != legacy_payload
+                )
             ):
                 queue_conflict = QueueIdempotencyConflictError(
                     "projection queue identity conflicts with its committed outbox"
@@ -2658,6 +3999,9 @@ class MemoryProjectionWorker:
 
         dispatched: list[str] = []
         for transaction_id, expected in pending_jobs:
+            if self.queue_store.get(expected.job_id) is not None:
+                dispatched.append(transaction_id)
+                continue
             try:
                 self.queue_store.enqueue(expected)
             except QueueIdempotencyConflictError as exc:

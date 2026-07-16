@@ -7,10 +7,10 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from memoryos.adapters.agent_hooks.sanitizer import sanitize_text
 from memoryos.contextdb.retrieval.context_assembler import ContextAssembler
 from memoryos.core.time import utc_now
 from memoryos.operations.commit.effect_marker import atomic_write_json
+from memoryos.security.context_projection import ContextProjectionSanitizer
 
 
 class RetrievalService:
@@ -20,8 +20,9 @@ class RetrievalService:
         self.trace_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             self.trace_root.chmod(0o700)
-        except OSError:
-            pass
+        except OSError as exc:
+            raise PermissionError("recall trace directory permissions could not be secured") from exc
+        self.sanitizer = ContextProjectionSanitizer()
 
     def search(self, query: str, **kwargs: Any) -> tuple[list[dict[str, Any]], str]:
         self._require_ready()
@@ -76,6 +77,7 @@ class RetrievalService:
         value = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(value, dict) or value.get("trace_id") != canonical_id:
             raise ValueError("recall trace is invalid")
+        self.sanitizer.assert_safe(value)
         return value
 
     def _record(
@@ -85,7 +87,7 @@ class RetrievalService:
         trace = {
             "trace_id": trace_id,
             "created_at": utc_now(),
-            "query": sanitize_text(query, max_text=1000),
+            "query": query,
             "scope": {
                 key: kwargs.get(key) for key in ("tenant_id", "user_id", "project_id", "adapter_id", "search_scope")
             },
@@ -107,9 +109,12 @@ class RetrievalService:
             "token_budget": kwargs.get("token_budget"),
             "rerank_enabled": getattr(self.assembler, "reranker", None) is not None,
         }
+        safe_trace = self.sanitizer.sanitize_trace(trace)
+        if not isinstance(safe_trace, dict) or safe_trace.get("trace_id") != trace_id:
+            raise ValueError("recall trace sanitization produced an invalid payload")
         atomic_write_json(
             self.trace_root / f"{trace_id}.json",
-            trace,
+            safe_trace,
             artifact_root=self.trace_root,
         )
         return trace_id

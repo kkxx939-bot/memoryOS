@@ -72,7 +72,7 @@ def test_zero_relevance_is_not_promoted_by_hotness(tmp_path) -> None:
     assert store.search("PostgreSQL", filters={"owner_user_id": "u1"}) == []
 
 
-def test_contains_fallback_keeps_hotness_behind_base_relevance(tmp_path) -> None:
+def test_fts_disabled_does_not_run_contains_scan_or_apply_hotness(tmp_path) -> None:
     store = SQLiteIndexStore(tmp_path / "index.sqlite3")
     relevant = ContextObject(
         uri="memoryos://user/u1/memories/relevant",
@@ -93,18 +93,7 @@ def test_contains_fallback_keeps_hotness_behind_base_relevance(tmp_path) -> None
     store.upsert_index(unrelated, content="sunny outdoor activity")
     store.fts_enabled = False
 
-    hits = store.search("PostgreSQL", filters={"owner_user_id": "u1"})
-
-    assert [hit.uri for hit in hits] == [relevant.uri]
-    scores = hits[0].metadata["retrieval_scores"]
-    assert scores == {
-        "lexical": 1.0,
-        "vector": 0.0,
-        "identity": 0.0,
-        "base_relevance": 1.0,
-        "hotness": 0.0,
-        "score": 1.0,
-    }
+    assert store.search("PostgreSQL", filters={"owner_user_id": "u1"}) == []
 
 
 def test_metadata_exact_scene_key_and_action_are_prioritized(tmp_path) -> None:

@@ -51,6 +51,7 @@ class RedoLog:
     PHASES = {
         "begin",
         "started",
+        "tombstones_enqueued",
         "source_written",
         "index_written",
         "audit_written",
@@ -160,9 +161,7 @@ class RedoLog:
                     operation=ContextOperation.from_dict(payload),
                     phase=str(payload.get("redo_phase", "started")),
                     source_effect=dict(source_effect) if isinstance(source_effect, dict) else None,
-                    relation_manifest=(
-                        dict(relation_manifest) if isinstance(relation_manifest, dict) else None
-                    ),
+                    relation_manifest=(dict(relation_manifest) if isinstance(relation_manifest, dict) else None),
                 )
             )
         if quarantined:
@@ -189,8 +188,7 @@ class RedoLog:
             path.stem != operation.operation_id
             or payload.get("redo_operation_id") != operation.operation_id
             or payload.get("redo_user_id") != operation.user_id
-            or payload.get("redo_tenant_id")
-            != str(operation.payload.get("tenant_id") or "default")
+            or payload.get("redo_tenant_id") != str(operation.payload.get("tenant_id") or "default")
         ):
             raise ValueError("redo control file crosses its operation boundary")
         source_effect = payload.get("redo_source_effect")

@@ -10,6 +10,9 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+from memoryos.api.retrieval_contract import serialize_retrieval_options
+from memoryos.contextdb.retrieval.query_plan import RetrievalOptions
+
 
 @dataclass(frozen=True)
 class RemoteMemoryOSError(RuntimeError):
@@ -95,13 +98,33 @@ class HTTPMemoryOSClient:
             }
         }
 
-    def search_context(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
-        response = self.request("POST", "/v1/context/search", {"query": query, **kwargs})
+    def search_context(
+        self,
+        query: str,
+        *,
+        options: RetrievalOptions | dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        serialized_options = serialize_retrieval_options(options)
+        payload = {"query": query, **kwargs}
+        if serialized_options is not None:
+            payload["options"] = serialized_options
+        response = self.request("POST", "/v1/context/search", payload)
         _raise_remote_error(response)
         return list(response.get("results", []))
 
-    def assemble_context(self, query: str, **kwargs: Any) -> dict[str, Any]:
-        response = self.request("POST", "/v1/context/assemble", {"query": query, **kwargs})
+    def assemble_context(
+        self,
+        query: str,
+        *,
+        options: RetrievalOptions | dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        serialized_options = serialize_retrieval_options(options)
+        payload = {"query": query, **kwargs}
+        if serialized_options is not None:
+            payload["options"] = serialized_options
+        response = self.request("POST", "/v1/context/assemble", payload)
         _raise_remote_error(response)
         return response
 

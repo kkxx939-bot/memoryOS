@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import os
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import Any
 
 from memoryos.contextdb.session.planning_envelope import PlanningEnvelopeIntegrityError
 from memoryos.contextdb.session.session_commit import SessionCommitService
@@ -21,7 +24,33 @@ class MemoryProposalWorker:
         self.service = service
         self.worker_id = worker_id or f"memory-proposal:{os.getpid()}:{uuid.uuid4().hex}"
 
+    @contextmanager
+    def _migration_projection_fence(self) -> Iterator[None]:
+        gate: Any | None = getattr(self.service, "migration_gate", None)
+        acquire = getattr(gate, "acquire_projection_fence", None)
+        release = getattr(gate, "release_projection_fence", None)
+        fence = acquire() if callable(acquire) else None
+        try:
+            yield
+        finally:
+            if callable(release):
+                release(fence)
+
     def process_pending(self, *, batch_size: int = 10, lease_seconds: int = 60, max_retries: int = 3) -> dict:
+        with self._migration_projection_fence():
+            return self._process_pending_unfenced(
+                batch_size=batch_size,
+                lease_seconds=lease_seconds,
+                max_retries=max_retries,
+            )
+
+    def _process_pending_unfenced(
+        self,
+        *,
+        batch_size: int,
+        lease_seconds: int,
+        max_retries: int,
+    ) -> dict:
         require_session_service_ready(self.service)
         committed = failed = dead_letter = 0
         released: list[str] = []

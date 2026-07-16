@@ -6,6 +6,7 @@ from typing import Any
 
 from memoryos.api.mcp.config import MCPServerConfig
 from memoryos.api.mcp.errors import ToolValidationError
+from memoryos.api.retrieval_contract import retrieval_options_json_schema
 from memoryos.api.trusted_context import AUTHORITATIVE_FORGET, AUTHORITATIVE_REMEMBER
 from memoryos.connect import CapabilityProfile, ConnectMetadata, ConnectType, PipelineMode
 
@@ -29,6 +30,7 @@ TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
         "type": "object",
         "properties": {
             "query": {"type": "string"},
+            "options": retrieval_options_json_schema(),
             "user_id": {"type": "string"},
             "limit": {"type": "integer"},
             "context_type": {"type": "string"},
@@ -51,6 +53,7 @@ TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
         "type": "object",
         "properties": {
             "query": {"type": "string"},
+            "options": retrieval_options_json_schema(),
             "user_id": {"type": "string"},
             "token_budget": {"type": "integer"},
             "context_types": {"type": "array", "items": {"type": "string"}},
@@ -188,7 +191,15 @@ TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     },
 }
 
+# The short names are the public Unified Retrieval contract.  Keep the
+# pre-unification ``*_context`` names as exact-schema aliases so existing MCP
+# clients do not need a flag-day migration and the two surfaces cannot drift.
+TOOL_INPUT_SCHEMAS["memoryos_search"] = TOOL_INPUT_SCHEMAS["memoryos_search_context"]
+TOOL_INPUT_SCHEMAS["memoryos_assemble"] = TOOL_INPUT_SCHEMAS["memoryos_assemble_context"]
+
 TOOL_DESCRIPTIONS: dict[str, str] = {
+    "memoryos_search": "Search MemoryOS context through Unified Retrieval.",
+    "memoryos_assemble": "Assemble token-bounded MemoryOS context through Unified Retrieval.",
     "memoryos_search_context": "Search MemoryOS context for a coding agent.",
     "memoryos_assemble_context": "Assemble token-bounded MemoryOS context for prompt injection.",
     "memoryos_commit_session": "Commit a sanitized agent session archive.",

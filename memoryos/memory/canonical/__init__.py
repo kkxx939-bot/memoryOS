@@ -43,6 +43,13 @@ from memoryos.memory.canonical.projection_state import (
     ProjectionStatus,
     ProjectionStepStatus,
 )
+from memoryos.memory.canonical.promotion_policy import (
+    CANONICAL_PIPELINE_GATES,
+    CanonicalPromotionDecision,
+    CanonicalPromotionFacts,
+    CanonicalPromotionPolicy,
+    CanonicalPromotionResult,
+)
 from memoryos.memory.canonical.proposal import (
     Atomicity,
     Attribution,
@@ -66,8 +73,8 @@ from memoryos.memory.canonical.repository import CanonicalMemoryRepository
 from memoryos.memory.canonical.retrieval import (
     CanonicalInvariantViolation,
     CanonicalMemoryQuery,
-    CanonicalMemoryRetriever,
     CanonicalQueryIntent,
+    OfflineCanonicalMemoryRetriever,
 )
 from memoryos.memory.canonical.salience import EpisodeSalienceGate, SalienceDecision
 from memoryos.memory.canonical.scope import (
@@ -178,14 +185,19 @@ __all__ = [
     "ProjectionStatus",
     "ProjectionStepStatus",
     "CanonicalMemoryQuery",
-    "CanonicalMemoryRetriever",
     "CanonicalQueryIntent",
     "CanonicalInvariantViolation",
+    "OfflineCanonicalMemoryRetriever",
     "CanonicalFormationResult",
     "CanonicalMemoryFormationService",
     "CandidateProposalAdapter",
     "ExistingMemoryPrefetcher",
     "PrefetchedMemory",
+    "CANONICAL_PIPELINE_GATES",
+    "CanonicalPromotionDecision",
+    "CanonicalPromotionFacts",
+    "CanonicalPromotionPolicy",
+    "CanonicalPromotionResult",
     "OriginContext",
     "ScopeRef",
     "ScopeResolutionSource",

@@ -39,11 +39,10 @@ def test_nondefault_tenant_projector_and_retriever_share_only_injected_store(tmp
     assert record_a.input_effect_hash != record_b.input_effect_hash
     assert store_a.load_current(claim_b) is None
     assert store_b.load_current(claim_a) is None
-    retriever_a = tenant_a._context_assembler().canonical_retriever
-    retriever_b = tenant_b._context_assembler().canonical_retriever
-    assert retriever_a is not None and retriever_b is not None
-    assert retriever_a.projection_store is store_a
-    assert retriever_b.projection_store is store_b
+    resolver_a = tenant_a._context_assembler().unified_retrieval.resolver
+    resolver_b = tenant_b._context_assembler().unified_retrieval.resolver
+    assert resolver_a.projection_store is store_a
+    assert resolver_b.projection_store is store_b
     assert not (tmp_path / "system" / "projection-state").exists()
 
     recalled_a = tenant_a.search_context(

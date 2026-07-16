@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from memoryos.contextdb.context_db import ContextDB
+from memoryos.contextdb.retention import CatalogRetentionManager, RetentionPolicy
 from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
 from memoryos.contextdb.session.commit_group import CommitGroupStore
+from memoryos.contextdb.session.context_projector import SessionContextProjector
 from memoryos.contextdb.session.planners import ActionPolicyCommitPlanner, BehaviorCommitPlanner, MemoryCommitPlanner
 from memoryos.contextdb.session.planning_envelope import PlanningEnvelopeStore
 from memoryos.contextdb.session.session_archive import SessionArchiveStore
@@ -18,8 +22,19 @@ from memoryos.contextdb.store.sqlite_index_store import SQLiteIndexStore
 from memoryos.contextdb.store.sqlite_lock_store import SQLiteLockStore
 from memoryos.contextdb.store.sqlite_queue_store import SQLiteQueueStore
 from memoryos.contextdb.store.sqlite_relation_store import SQLiteRelationStore
-from memoryos.contextdb.store.vector_store import VectorStore
+from memoryos.contextdb.store.vector_store import (
+    VectorStore,
+    require_production_vector_capabilities,
+    vector_capabilities,
+)
+from memoryos.contextdb.tombstone import ProjectionTombstoneService
 from memoryos.contextdb.transaction.recovery import RecoveryService
+from memoryos.contextdb.unified_migration import (
+    CurrentSlotMigrationBackfill,
+    RuntimeMigrationCoordinator,
+    UnifiedContextMigration,
+    has_existing_session_archive_evidence,
+)
 from memoryos.core.path_safety import validate_authoritative_tree
 from memoryos.memory.canonical.event import canonical_digest
 from memoryos.memory.canonical.history import validate_canonical_receipt_history
@@ -30,6 +45,7 @@ from memoryos.memory.canonical.projection_state import ProjectionIntegrityError,
 from memoryos.memory.canonical.repository import CanonicalMemoryRepository
 from memoryos.memory.canonical.review_command import validate_pending_review_commands
 from memoryos.memory.canonical.salience_ledger import DurableSalienceLedger
+from memoryos.memory.canonical.slot_projection import CurrentSlotProjection
 from memoryos.memory.canonical.visibility import reconcile_committed_relation_store
 from memoryos.operations.commit.operation_committer import OperationCommitter
 from memoryos.operations.commit.planning_proof import ImmutablePlanningProofStore
@@ -67,6 +83,26 @@ class RuntimeContainer:
     recovery_service: RecoveryService
     recovery_worker: RecoveryWorker
     readiness: RuntimeReadiness
+    tombstone_service: ProjectionTombstoneService | None = None
+    retention_manager: CatalogRetentionManager | None = None
+    migration_gate: RuntimeMigrationCoordinator | None = None
+    unified_context_migration: UnifiedContextMigration | None = None
+
+
+@contextmanager
+def _runtime_projection_fence(
+    migration_gate: RuntimeMigrationCoordinator | None,
+) -> Iterator[None]:
+    """Fence startup derived repair against another runtime's rebuild."""
+
+    acquire = getattr(migration_gate, "acquire_projection_fence", None)
+    release = getattr(migration_gate, "release_projection_fence", None)
+    fence = acquire() if callable(acquire) else None
+    try:
+        yield
+    finally:
+        if callable(release):
+            release(fence)
 
 
 def build_runtime_container(
@@ -107,13 +143,51 @@ def build_runtime_container(
     relation = relation_store or SQLiteRelationStore(index_root / "relations.sqlite3")
     queue = queue_store or SQLiteQueueStore(tenant_root / "queues" / "jobs.sqlite3")
     lock = lock_store or SQLiteLockStore(root_path / "system" / "locks.sqlite3")
+    session_archive_store = SessionArchiveStore(root_path, tenant_id=config.tenant_id)
+    has_preexisting_session_evidence = has_existing_session_archive_evidence(
+        session_archive_store,
+        tenant_id=config.tenant_id,
+    )
+    migration_gate = RuntimeMigrationCoordinator(
+        cast(Any, index),
+        tenant_id=config.tenant_id,
+        lock_store=lock,
+    )
+    if hasattr(source, "__dict__"):
+        vars(source)["migration_gate"] = migration_gate
+    schema_version_reader = getattr(index, "catalog_schema_version", None)
+    if has_preexisting_session_evidence and not migration_gate.greenfield_catalog_origin_exists:
+        if not callable(schema_version_reader):
+            raise RuntimeError("existing SessionArchive evidence requires a versioned Catalog migration store")
+        raw_schema_version: Any = schema_version_reader()
+        if not isinstance(raw_schema_version, int):
+            raise RuntimeError("existing SessionArchive evidence requires a valid Catalog schema version")
+        migration_gate.require_backfill(
+            reason="existing_session_archive_evidence",
+            schema_version=raw_schema_version,
+        )
+    elif not has_preexisting_session_evidence:
+        migration_gate.record_greenfield_catalog_origin()
     configured_embedding = embedding_provider or config.embedding
     configured_vector_store = vector_store or config.vector_store
+    configured_vector_capabilities = vector_capabilities(configured_vector_store)
+    if config.mode == "server" and configured_vector_store is not None:
+        configured_vector_capabilities = require_production_vector_capabilities(configured_vector_store)
     search = hybrid_search or (
         HybridSearch(
             index, vector_store=configured_vector_store, embedding_provider=configured_embedding, source_store=source
         )
         if configured_vector_store is not None and configured_embedding is not None
+        else None
+    )
+    tombstone_service = (
+        ProjectionTombstoneService(
+            index,
+            source_store=source,
+            vector_store=configured_vector_store,
+            relation_store=relation,
+        )
+        if callable(getattr(index, "enqueue_tombstone", None))
         else None
     )
     aliases = AliasRegistry(config.memory_aliases)
@@ -126,8 +200,21 @@ def build_runtime_container(
         queue_store=queue,
         tenant_id=config.tenant_id,
         alias_registry=aliases,
+        tombstone_service=tombstone_service,
+        migration_gate=migration_gate,
     )
-    session_archive_store = SessionArchiveStore(root_path, tenant_id=config.tenant_id)
+    session_projector = (
+        SessionContextProjector(
+            cast(Any, index),
+            vector_store=configured_vector_store,
+            embedding_provider=configured_embedding,
+            vectorize_important_events=bool(
+                dict(config.retrieval or {}).get("vectorize_important_session_events", False)
+            ),
+        )
+        if callable(getattr(index, "upsert_catalog", None))
+        else None
+    )
     projection_store = ProjectionRecordStore(tenant_root)
     canonical_projector = CanonicalMemoryProjector(
         source,
@@ -138,7 +225,40 @@ def build_runtime_container(
         embedding_provider=configured_embedding,
         record_store=projection_store,
     )
-    memory_projection_worker = MemoryProjectionWorker(canonical_projector, queue)
+    current_slot_projector = (
+        CurrentSlotProjection(
+            CanonicalMemoryRepository(source, relation),
+            cast(Any, index),
+            vector_store=configured_vector_store,
+            embedding_provider=configured_embedding,
+        )
+        if callable(getattr(index, "upsert_catalog", None)) and callable(getattr(index, "apply_tombstone", None))
+        else None
+    )
+    memory_projection_worker = MemoryProjectionWorker(
+        canonical_projector,
+        queue,
+        current_slot_projector=current_slot_projector,
+        migration_gate=migration_gate,
+    )
+    retention_manager = (
+        CatalogRetentionManager(
+            cast(Any, index),
+            vector_store=configured_vector_store,
+            tombstone_service=tombstone_service,
+            policy=RetentionPolicy.from_config(config.retention),
+        )
+        if all(
+            callable(getattr(index, name, None))
+            for name in (
+                "scan_catalog_batch",
+                "enqueue_tombstone",
+                "gc_orphan_paths",
+                "gc_applied_tombstones",
+            )
+        )
+        else None
+    )
     recovery_service = RecoveryService(committer.redo, committer)
     recovery_worker = RecoveryWorker(recovery_service)
     session_commit_service = SessionCommitService(
@@ -157,7 +277,28 @@ def build_runtime_container(
         behavior_planner=BehaviorCommitPlanner(index_store=index, source_store=source),
         action_policy_planner=ActionPolicyCommitPlanner(index_store=index, source_store=source),
         projection_worker=memory_projection_worker,
+        session_projector=session_projector,
+        migration_gate=migration_gate,
         commit_group_store=CommitGroupStore(tenant_root),
+    )
+    unified_context_migration = (
+        UnifiedContextMigration(
+            cast(Any, index),
+            session_archive_store,
+            session_projector,
+            tenant_id=config.tenant_id,
+            queue_store=queue,
+            lock_store=lock,
+            canonical_current_backfill=(
+                CurrentSlotMigrationBackfill(source, current_slot_projector)
+                if current_slot_projector is not None
+                else None
+            ),
+        )
+        if session_projector is not None
+        and callable(getattr(index, "get_migration_state", None))
+        and callable(getattr(index, "set_migration_state", None))
+        else None
     )
     context_db = ContextDB(
         source,
@@ -168,6 +309,11 @@ def build_runtime_container(
         committer=committer,
         projection_store=projection_store,
         canonical_projector=canonical_projector,
+        current_slot_projector=current_slot_projector,
+        tombstone_service=tombstone_service,
+        retention_manager=retention_manager,
+        migration_gate=migration_gate,
+        unified_context_migration=unified_context_migration,
         readiness=readiness,
     )
     engine = PredictionEngine(
@@ -182,6 +328,14 @@ def build_runtime_container(
     readiness.transition(RuntimeReadinessState.RECOVERING)
     startup_details: dict[str, Any] = {}
     try:
+        startup_details["vector_capabilities"] = {
+            "configured": configured_vector_store is not None,
+            "supports_metadata_filtering": configured_vector_capabilities.supports_metadata_filtering,
+            "supports_namespace_filtering": configured_vector_capabilities.supports_namespace_filtering,
+            "supports_time_filtering": configured_vector_capabilities.supports_time_filtering,
+            "supports_delete_by_filter": configured_vector_capabilities.supports_delete_by_filter,
+            "production_filtered_top_k_ready": (configured_vector_capabilities.production_filtered_top_k_ready),
+        }
         startup_details["artifact_path_topology"] = {
             "system": validate_authoritative_tree(
                 tenant_root / "system",
@@ -198,7 +352,8 @@ def build_runtime_container(
             source_store=source,
             relation_store=relation,
         )
-        startup_details["migration"] = migration.run(allow_inflight=True)
+        with _runtime_projection_fence(migration_gate):
+            startup_details["migration"] = migration.run(allow_inflight=True)
         planning_envelopes = PlanningEnvelopeStore(
             root_path,
             tenant_id=config.tenant_id,
@@ -225,6 +380,11 @@ def build_runtime_container(
         if recovery_result.get("failed_count") or recovery_result.get("quarantine_count"):
             failure = str(recovery_result.get("last_error") or "RecoveryIncomplete")
             raise RuntimeError(f"startup recovery left failed or quarantined transaction artifacts: {failure}")
+        startup_details["projection_tombstones"] = _replay_startup_projection_tombstones(
+            tombstone_service,
+            index,
+            migration_gate=migration_gate,
+        )
         startup_details["migration_post_recovery"] = migration.validate_current_state()
         # Establish an authoritative committed baseline before resuming a
         # semantic commit group.  In particular, a corrupt historical receipt
@@ -247,13 +407,18 @@ def build_runtime_container(
         # only projection terminal work means a committed canonical effect is
         # missing its required derived publication.
         startup_queue_names = ("session_commit", "memory_proposal", "memory_projection")
-        recovered_by_queue = {
-            queue_name: queue.recover_expired_leases(queue_name=queue_name) for queue_name in startup_queue_names
-        }
+        with _runtime_projection_fence(migration_gate):
+            recovered_by_queue = {
+                queue_name: queue.recover_expired_leases(queue_name=queue_name)
+                for queue_name in startup_queue_names
+            }
         startup_details["queue_lease_recovery"] = {
             "recovered_expired": sum(recovered_by_queue.values()),
         }
         startup_details["queue_lease_recovery_by_queue"] = recovered_by_queue
+        startup_details["session_projection_frontier_recovery"] = (
+            session_commit_service.recover_session_projection_frontier()
+        )
         queue_recovery_preflight = {
             queue_name: queue.stats(queue_name=queue_name) for queue_name in startup_queue_names
         }
@@ -286,9 +451,16 @@ def build_runtime_container(
             relation_store=relation,
         )
         _validate_startup_heads(source, relation)
-        startup_details["canonical_relations"] = reconcile_committed_relation_store(
-            source,
-            relation,
+        with _runtime_projection_fence(migration_gate):
+            startup_details["canonical_relations"] = reconcile_committed_relation_store(
+                source,
+                relation,
+            )
+        # The durable rebuild gate may survive a process crash after Catalog
+        # clear.  Resume only after transaction/queue/head recovery has made
+        # all immutable inputs quiescent, and before READY can expose reads.
+        startup_details["derived_serving_rebuild_recovery"] = (
+            context_db.resume_derived_serving_rebuild_if_needed()
         )
         # Outbox, queue identity and immutable projection proofs are the
         # authoritative inputs to every projection rebuild.  Validate them
@@ -310,10 +482,11 @@ def build_runtime_container(
                 # are rebuildable.  Repair them before consuming completion
                 # jobs so a corrupt derived current cannot dead-letter an
                 # otherwise intact immutable transaction/outbox chain.
-                startup_details["projection_prequeue"] = canonical_projector.rebuild(clear_views=True)
-                startup_details["projection_prequeue_validation"] = (
-                    memory_projection_worker.verify_current_projections()
-                )
+                with _runtime_projection_fence(migration_gate):
+                    startup_details["projection_prequeue"] = canonical_projector.rebuild(clear_views=True)
+                    startup_details["projection_prequeue_validation"] = (
+                        memory_projection_worker.verify_current_projections()
+                    )
                 break
             except ProjectionIntegrityError as exc:
                 projection_repairs.append(f"{type(exc).__name__}: {exc}")
@@ -334,18 +507,47 @@ def build_runtime_container(
                 # Scope/taxonomy currents are disposable.  Always rebuild the
                 # complete publication set so views for claims with no current
                 # head cannot survive an otherwise clean startup.
-                startup_details["projection"] = canonical_projector.rebuild(clear_views=True)
-                startup_details["projection_validation"] = memory_projection_worker.verify_current_projections()
-                startup_details["projection_commit_groups"] = _validate_completed_projection_consumers(
-                    session_commit_service,
-                    memory_projection_worker,
-                )
-                startup_details["projection_proofs"] = memory_projection_worker.validate_projection_proofs()
+                with _runtime_projection_fence(migration_gate):
+                    startup_details["projection"] = canonical_projector.rebuild(clear_views=True)
+                    startup_details["projection_validation"] = (
+                        memory_projection_worker.verify_current_projections()
+                    )
+                    startup_details["projection_commit_groups"] = _validate_completed_projection_consumers(
+                        session_commit_service,
+                        memory_projection_worker,
+                    )
+                    startup_details["projection_proofs"] = memory_projection_worker.validate_projection_proofs()
                 break
             except ProjectionIntegrityError as exc:
                 projection_repairs.append(f"{type(exc).__name__}: {exc}")
                 if repair_attempt == 2:
                     raise
+        if current_slot_projector is not None and migration_gate.feature_gate.dual_write_enabled:
+            with _runtime_projection_fence(migration_gate):
+                current_backfill = CurrentSlotMigrationBackfill(source, current_slot_projector)
+                current_checkpoint = ""
+                current_slots = 0
+                current_records = 0
+                while True:
+                    current_batch = current_backfill(current_checkpoint, 256)
+                    current_slots += current_batch.processed_slots
+                    current_records += current_batch.projected_records
+                    current_checkpoint = current_batch.checkpoint
+                    if current_batch.complete:
+                        break
+            startup_details["current_slot_projection_rebuild"] = {
+                "processed_slots": current_slots,
+                "projected_records": current_records,
+                "checkpoint": current_checkpoint,
+                "complete": True,
+            }
+        else:
+            startup_details["current_slot_projection_rebuild"] = {
+                "processed_slots": 0,
+                "projected_records": 0,
+                "complete": False,
+                "reason": "migration_dual_write_disabled",
+            }
         startup_details["projection_repairs"] = projection_repairs
         projection_queue_stats = queue.stats(queue_name="memory_projection")
         startup_details["projection_queue_final"] = projection_queue_stats
@@ -397,7 +599,62 @@ def build_runtime_container(
         recovery_service=recovery_service,
         recovery_worker=recovery_worker,
         readiness=readiness,
+        tombstone_service=tombstone_service,
+        retention_manager=retention_manager,
+        migration_gate=migration_gate,
+        unified_context_migration=unified_context_migration,
     )
+
+
+def _replay_startup_projection_tombstones(
+    service: ProjectionTombstoneService | None,
+    index_store: object,
+    *,
+    migration_gate: RuntimeMigrationCoordinator | None = None,
+) -> dict[str, int]:
+    """Drain durable DELETE outboxes before the runtime becomes readable."""
+
+    acquire = getattr(migration_gate, "acquire_projection_fence", None)
+    release = getattr(migration_gate, "release_projection_fence", None)
+    fence = acquire() if callable(acquire) else None
+    try:
+        return _replay_startup_projection_tombstones_unfenced(service, index_store)
+    finally:
+        if callable(release):
+            release(fence)
+
+
+def _replay_startup_projection_tombstones_unfenced(
+    service: ProjectionTombstoneService | None,
+    index_store: object,
+) -> dict[str, int]:
+    """Implementation for a caller already holding the tenant fence."""
+
+    if service is None:
+        return {"processed": 0, "stale": 0, "batches": 0}
+    pending = getattr(index_store, "get_pending_tombstones", None)
+    if not callable(pending):
+        raise RuntimeError("production Catalog has no durable tombstone replay API")
+    processed = 0
+    stale = 0
+    batches = 0
+    while True:
+        rows = pending(limit=1_000)
+        if not isinstance(rows, list):
+            raise RuntimeError("durable tombstone replay returned an invalid batch")
+        if not rows:
+            return {"processed": processed, "stale": stale, "batches": batches}
+        tombstone_ids = tuple(str(row.get("tombstone_id") or "") for row in rows if isinstance(row, dict))
+        if len(tombstone_ids) != len(rows) or any(not tombstone_id for tombstone_id in tombstone_ids):
+            raise RuntimeError("durable tombstone replay returned an invalid identity")
+        result = service.process_tombstones(tombstone_ids)
+        batches += 1
+        processed += len(result.processed)
+        stale += len(result.stale)
+        if result.failed:
+            raise RuntimeError("startup projection tombstone cleanup is retryable but incomplete")
+        if not result.processed and not result.stale:
+            raise RuntimeError("startup projection tombstone replay made no progress")
 
 
 def _validate_startup_heads(source: SourceStore, relation: RelationStore) -> None:

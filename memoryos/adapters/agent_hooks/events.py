@@ -8,10 +8,10 @@ import os
 import subprocess
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from pathlib import Path
 from typing import Any
 
 from memoryos.core.time import utc_now
+from memoryos.security.workspace_identity import repository_workspace_id
 
 
 class AgentEventType(str, Enum):
@@ -254,11 +254,7 @@ EVENT_TYPE_MAP = {
 
 
 def project_identity(repo_root: str | None, cwd: str | None, git_remote: str | None = None) -> str:
-    identity = _normalize_git_remote(git_remote or "")
-    if not identity:
-        path = Path(repo_root or cwd or ".").expanduser().resolve()
-        identity = f"local-repository-realpath:{path.as_posix()}"
-    return "project-" + hashlib.sha256(identity.encode()).hexdigest()[:24]
+    return repository_workspace_id(repo_root=repo_root or "", cwd=cwd or "", git_remote=git_remote or "")
 
 
 def make_session_key(
@@ -275,19 +271,6 @@ def make_session_key(
     )
     raw = "|".join(parts)
     return "session-" + hashlib.sha256(raw.encode()).hexdigest()[:32]
-
-
-def _normalize_git_remote(remote: str) -> str:
-    value = remote.strip().lower().removesuffix(".git").rstrip("/")
-    if not value:
-        return ""
-    if value.startswith("git@") and ":" in value:
-        host, path = value[4:].split(":", 1)
-        return f"{host}/{path}"
-    value = value.removeprefix("https://").removeprefix("http://").removeprefix("ssh://")
-    if "@" in value.split("/", 1)[0]:
-        value = value.split("@", 1)[1]
-    return value
 
 
 def _stable_hash(payload: dict[str, Any]) -> str:

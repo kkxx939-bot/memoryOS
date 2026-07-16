@@ -219,7 +219,11 @@ class SessionArchiveEpisodeAdapter:
         )
         if ingested_raw in (None, ""):
             ingested_inferred = True
-        occurred_raw = row.get("occurred_at") or row.get("created_at")
+        # ``event_time`` is the Unified Context public name for when an
+        # activity happened.  Session adapters historically used
+        # ``occurred_at``; accept both at this single evidence boundary while
+        # keeping the explicit legacy field authoritative when both exist.
+        occurred_raw = row.get("occurred_at") or row.get("event_time") or row.get("created_at")
         occurred_at, occurred_inferred, occurred_invalid = _parse_time(occurred_raw, fallback=ingested_at)
         raw_sequence = row.get("sequence", row.get("source_sequence"))
         sequence_inferred = raw_sequence is None

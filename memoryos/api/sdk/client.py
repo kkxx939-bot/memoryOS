@@ -6,10 +6,13 @@ import inspect
 import json
 import math
 import threading
+import uuid
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 from memoryos.action_policy.model.action_policy import ActionPolicy
+from memoryos.api.retrieval_contract import parse_retrieval_options
 from memoryos.api.sdk.result import ProcessObservationResult
 from memoryos.api.trusted_context import (
     AUTHORITATIVE_FORGET,
@@ -30,15 +33,26 @@ from memoryos.contextdb.model.context_uri import ContextURI
 from memoryos.contextdb.model.lifecycle import LifecycleState
 from memoryos.contextdb.retrieval.context_assembler import ContextAssembler
 from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
+from memoryos.contextdb.retrieval.orchestrator import UnifiedRetrievalOrchestrator, UnifiedRetrievalResult
+from memoryos.contextdb.retrieval.query_plan import CanonicalResolutionMode, RetrievalOptions, RetrievalQueryIntent
+from memoryos.contextdb.retrieval.query_planner import (
+    QueryPlanner,
+    TrustedRetrievalScope,
+    merge_retrieval_options,
+    retrieval_options_from_legacy,
+)
 from memoryos.contextdb.retrieval.service import RetrievalService
+from memoryos.contextdb.session.session_archive import EvidenceArchiveIntegrityError
 from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.contextdb.store import IndexStore, RelationStore, SourceStore
 from memoryos.contextdb.store.source_store import LockStore, QueueStore
 from memoryos.contextdb.store.vector_store import VectorStore
 from memoryos.contextdb.transaction.path_lock import PathLock
-from memoryos.core.ids import require_safe_path_segment, stable_hash
+from memoryos.core.ids import stable_hash
+from memoryos.core.time import utc_now
 from memoryos.memory.canonical import (
     IDENTITY_ALGORITHM_V2,
+    AliasRegistry,
     Atomicity,
     Attribution,
     CanonicalMemoryRepository,
@@ -54,6 +68,7 @@ from memoryos.memory.canonical import (
     ModalForce,
     ProposalEvidenceValidator,
     ResolvedMemoryIdentity,
+    ScopeRef,
     SemanticAssessment,
     UtteranceMode,
     bind_field_evidence,
@@ -68,6 +83,7 @@ from memoryos.memory.canonical.review_command import (
 from memoryos.memory.canonical.visibility import committed_content, read_committed_canonical
 from memoryos.memory.extraction import MemoryEgressPolicy, MemoryExtractorBackend
 from memoryos.memory.schema import MemoryType, MemoryTypeRegistry
+from memoryos.operations.commit.effect_marker import atomic_write_json
 from memoryos.operations.model.context_diff import ContextDiff
 from memoryos.operations.model.context_operation import ContextOperation
 from memoryos.operations.model.operation_action import OperationAction
@@ -76,6 +92,7 @@ from memoryos.prediction.model.prediction_result import PredictionResult
 from memoryos.providers.embedding import EmbeddingProvider
 from memoryos.providers.rerank import Reranker
 from memoryos.runtime import RuntimeConfig, build_runtime_container
+from memoryos.security.context_projection import ContextProjectionSanitizer
 from memoryos.skill.tool_registry import ToolRegistry
 
 
@@ -143,6 +160,8 @@ class MemoryOSClient:
         self.recovery_service = container.recovery_service
         self.recovery_worker = container.recovery_worker
         self.readiness = container.readiness
+        self.migration_gate = container.migration_gate
+        self.unified_context_migration = container.unified_context_migration
         self._tenant_clients: dict[str, MemoryOSClient] = {}
         self._tenant_clients_lock = threading.RLock()
         self._tenant_mode = mode
@@ -261,6 +280,7 @@ class MemoryOSClient:
         self,
         query: str,
         *,
+        options: RetrievalOptions | Mapping[str, Any] | None = None,
         user_id: str | None = None,
         context_type: object | None = None,
         limit: int = 10,
@@ -279,11 +299,16 @@ class MemoryOSClient:
     ) -> list[dict[str, Any]]:
         """按用户、工作区、状态和查询意图检索上下文。"""
 
-        tenant_id = self._effective_tenant(caller, tenant_id)
+        structured_options = parse_retrieval_options(options)
+        tenant_id = self._effective_tenant(
+            caller,
+            _compatible_scalar(tenant_id, structured_options.tenant_id if structured_options else None, "tenant_id"),
+        )
         scoped = self._client_for_tenant(tenant_id)
         if scoped is not self:
             return scoped.search_context(
                 query,
+                options=structured_options,
                 user_id=user_id,
                 context_type=context_type,
                 limit=limit,
@@ -303,41 +328,77 @@ class MemoryOSClient:
         self._require_ready()
         if caller is not None:
             caller.require(READ_CONTEXT)
-            caller.assert_identity(user_id=user_id, tenant_id=tenant_id)
-            caller.assert_applicability_scopes(applicability_scopes)
+            caller.assert_identity(
+                user_id=_compatible_scalar(
+                    user_id,
+                    structured_options.owner_user_id if structured_options else None,
+                    "owner_user_id",
+                ),
+                tenant_id=tenant_id,
+            )
             user_id = caller.user_id
-            project_id = caller.bind_read_workspace(project_id)
+            project_id = caller.bind_read_workspace(
+                _requested_workspace(project_id, structured_options.workspace_ids if structured_options else ())
+            )
+            caller.assert_applicability_scopes(
+                applicability_scopes,
+                workspace_id=project_id,
+            )
 
         connect_filters = self._connect_filters_from_metadata(connect_metadata)
-        metadata = self._parse_connect_metadata(connect_metadata)
-        assembler = self._context_assembler()
-        kwargs = {
-            "user_id": user_id,
-            "context_type": context_type,
-            "limit": limit,
-            "connect_filters": connect_filters,
-            "search_scope": search_scope,
-            "retrieval_views": retrieval_views,
-            "project_id": project_id or self._project_id_from_metadata(connect_metadata),
-            "adapter_id": metadata.adapter_id,
-            "tenant_id": tenant_id,
-            "applicability_scope_keys": _scope_keys(applicability_scopes),
-            "memory_states": memory_states,
-            "memory_types": memory_types,
-            "claim_uris": claim_uris,
-            "slot_uris": slot_uris,
-            "query_intent": query_intent,
-        }
-        service = RetrievalService(assembler, _trace_root(self))
-        results, trace_id = service.search(query, **_supported_kwargs(assembler.search, kwargs))
+        resolved_scope_keys = _scope_keys(
+            applicability_scopes,
+            aliases=getattr(self, "_tenant_memory_aliases", None),
+        )
+        legacy_options = retrieval_options_from_legacy(
+            {
+                "user_id": user_id,
+                "context_type": context_type,
+                "limit": limit,
+                "candidate_limit": min(1000, max(50, limit * 5)),
+                "metadata_filters": {"connect_filters": dict(connect_filters)},
+                "search_scope": search_scope,
+                "retrieval_views": retrieval_views,
+                "project_id": project_id or self._project_id_from_metadata(connect_metadata),
+                "adapter_id": connect_filters.get("adapter_id"),
+                "tenant_id": tenant_id,
+                "applicability_scope_keys": resolved_scope_keys or None,
+                "memory_states": memory_states,
+                "memory_types": memory_types,
+                "claim_uris": claim_uris,
+                "slot_uris": slot_uris,
+                "query_intent": query_intent,
+            }
+        )
+        effective_options = _merge_public_retrieval_options(
+            structured_options,
+            legacy_options,
+            legacy_limit=limit,
+            legacy_limit_default=10,
+            legacy_query_intent=query_intent,
+        )
+        trusted_scope = _trusted_retrieval_scope(
+            caller=caller,
+            tenant_id=tenant_id,
+            project_id=project_id,
+            derived_scope_keys=resolved_scope_keys,
+        )
+        plan = QueryPlanner().build(query, options=effective_options, trusted_scope=trusted_scope)
+        try:
+            unified = self._retrieval_orchestrator().execute(plan)
+        except Exception:
+            self._require_ready()
+            raise
         self._require_ready()
+        trace_id = _record_unified_recall(self, unified)
         self.last_recall_trace_id = trace_id
-        return results
+        return unified.search_payload()
 
     def assemble_context(
         self,
         query: str,
         *,
+        options: RetrievalOptions | Mapping[str, Any] | None = None,
         user_id: str | None = None,
         token_budget: int = 2000,
         context_types: list[object] | None = None,
@@ -357,11 +418,16 @@ class MemoryOSClient:
     ) -> dict[str, Any]:
         """检索并打包本次请求能看到的上下文。"""
 
-        tenant_id = self._effective_tenant(caller, tenant_id)
+        structured_options = parse_retrieval_options(options)
+        tenant_id = self._effective_tenant(
+            caller,
+            _compatible_scalar(tenant_id, structured_options.tenant_id if structured_options else None, "tenant_id"),
+        )
         scoped = self._client_for_tenant(tenant_id)
         if scoped is not self:
             return scoped.assemble_context(
                 query,
+                options=structured_options,
                 user_id=user_id,
                 token_budget=token_budget,
                 context_types=context_types,
@@ -382,41 +448,89 @@ class MemoryOSClient:
         self._require_ready()
         if caller is not None:
             caller.require(READ_CONTEXT)
-            caller.assert_identity(user_id=user_id, tenant_id=tenant_id)
-            caller.assert_applicability_scopes(applicability_scopes)
+            caller.assert_identity(
+                user_id=_compatible_scalar(
+                    user_id,
+                    structured_options.owner_user_id if structured_options else None,
+                    "owner_user_id",
+                ),
+                tenant_id=tenant_id,
+            )
             user_id = caller.user_id
-            project_id = caller.bind_read_workspace(project_id)
+            project_id = caller.bind_read_workspace(
+                _requested_workspace(project_id, structured_options.workspace_ids if structured_options else ())
+            )
+            caller.assert_applicability_scopes(
+                applicability_scopes,
+                workspace_id=project_id,
+            )
 
         metadata = self._parse_connect_metadata(connect_metadata)
         connect_filters = self._connect_filters_from_metadata(connect_metadata)
-        parsed_types: list[object] | None = (
-            [self._parse_context_type(item) for item in context_types] if context_types else None
+        resolved_scope_keys = _scope_keys(
+            applicability_scopes,
+            aliases=getattr(self, "_tenant_memory_aliases", None),
         )
-        assembler = self._context_assembler()
-        kwargs = {
-            "user_id": user_id,
-            "token_budget": token_budget,
-            "context_types": parsed_types,
-            "limit": limit,
-            "connect_metadata": metadata.to_dict(),
-            "connect_filters": connect_filters,
-            "search_scope": search_scope,
-            "retrieval_views": retrieval_views,
-            "project_id": project_id or self._project_id_from_metadata(connect_metadata),
-            "adapter_id": metadata.adapter_id,
-            "tenant_id": tenant_id,
-            "applicability_scope_keys": _scope_keys(applicability_scopes),
-            "memory_states": memory_states,
-            "memory_types": memory_types,
-            "claim_uris": claim_uris,
-            "slot_uris": slot_uris,
-            "query_intent": query_intent,
-        }
-        service = RetrievalService(assembler, _trace_root(self))
-        result = service.assemble(query, **_supported_kwargs(assembler.assemble, kwargs))
+        legacy_options = retrieval_options_from_legacy(
+            {
+                "user_id": user_id,
+                "token_budget": token_budget,
+                "context_types": context_types,
+                "limit": limit,
+                "candidate_limit": min(1000, max(50, limit * 5)),
+                "metadata_filters": {"connect_filters": dict(connect_filters)},
+                "search_scope": search_scope,
+                "retrieval_views": retrieval_views,
+                "project_id": project_id or self._project_id_from_metadata(connect_metadata),
+                "adapter_id": connect_filters.get("adapter_id"),
+                "tenant_id": tenant_id,
+                "applicability_scope_keys": resolved_scope_keys or None,
+                "memory_states": memory_states,
+                "memory_types": memory_types,
+                "claim_uris": claim_uris,
+                "slot_uris": slot_uris,
+                "query_intent": query_intent,
+            }
+        )
+        effective_options = _merge_public_retrieval_options(
+            structured_options,
+            legacy_options,
+            legacy_limit=limit,
+            legacy_limit_default=20,
+            legacy_token_budget=token_budget,
+            legacy_token_budget_default=2000,
+            legacy_query_intent=query_intent,
+        )
+        trusted_scope = _trusted_retrieval_scope(
+            caller=caller,
+            tenant_id=tenant_id,
+            project_id=project_id,
+            derived_scope_keys=resolved_scope_keys,
+        )
+        plan = QueryPlanner().build(query, options=effective_options, trusted_scope=trusted_scope)
+        try:
+            unified = self._retrieval_orchestrator().execute(plan)
+        except Exception:
+            self._require_ready()
+            raise
         self._require_ready()
-        self.last_recall_trace_id = str(result.get("trace_id", ""))
-        return result
+        trace_id = _record_unified_recall(self, unified)
+        self.last_recall_trace_id = trace_id
+        result = unified.assemble_payload()
+        contexts = list(result.get("contexts", []))
+        return {
+            **result,
+            "trace_id": trace_id,
+            "packed_context": "\n\n".join(str(item.get("content") or item.get("text") or "") for item in contexts),
+            "source_uris": list(
+                dict.fromkeys(
+                    source_uri
+                    for item in contexts
+                    if (source_uri := str(item.get("source_uri") or item.get("uri") or ""))
+                )
+            ),
+            "connect_metadata": metadata.to_dict(),
+        }
 
     def recall_trace(
         self,
@@ -708,6 +822,10 @@ class MemoryOSClient:
         if formed.decision.value != "ACCEPT_FOR_RECONCILE":
             raise ValueError(f"explicit memory was not admitted: {formed.reason}")
         if not operations:
+            # A semantic no-op may be a retry of an authoritative commit whose
+            # derived CurrentSlot publication previously failed.  Drain that
+            # exact durable outbox before reporting an idempotent success.
+            self._process_memory_projections_or_raise()
             identity = formed.resolved_identity
             if identity is None:
                 raise RuntimeError("canonical no-op has no resolved Identity V2 proof")
@@ -742,7 +860,7 @@ class MemoryOSClient:
                 "idempotent_replay": True,
             }
         diff = self.committer.commit(user_id, operations)
-        self.memory_projection_worker.process_pending()
+        self._process_memory_projections_or_raise()
         uri = next(
             str(operation.target_uri)
             for operation in operations
@@ -827,11 +945,19 @@ class MemoryOSClient:
         )
         diff = self.context_db.commit_operation(operation)
         _require_committed_diff(diff, {operation.operation_id})
+        committed_operation = next(item for item in diff.operations if item.operation_id == operation.operation_id)
+        raw_tombstone_ids = committed_operation.payload.get("projection_tombstone_ids", ())
+        if not isinstance(raw_tombstone_ids, (list, tuple)):
+            raise RuntimeError("committed DELETE has an invalid durable tombstone binding")
+        tombstone_ids = tuple(str(item) for item in raw_tombstone_ids if str(item))
+        if callable(getattr(self.index_store, "enqueue_tombstone", None)) and not tombstone_ids:
+            raise RuntimeError("committed production DELETE has no durable tombstone binding")
         return {
             "uri": uri,
             "status": "COMMITTED",
             "lifecycle_state": LifecycleState.DELETED.value,
             "diff_id": diff.diff_id,
+            "tombstone_ids": list(tombstone_ids),
         }
 
     def list_pending(
@@ -1116,7 +1242,7 @@ class MemoryOSClient:
                 review_request_digest=review_request_digest,
             )
             diff = self.committer.commit(user_id, list(corrected.operations))
-            self.memory_projection_worker.process_pending()
+            self._process_memory_projections_or_raise()
             final = repository.load_pending(
                 pending_uri,
                 tenant_id=tenant_id,
@@ -1214,7 +1340,7 @@ class MemoryOSClient:
             review_request_digest=review_request_digest,
         )
         diff = self.committer.commit(user_id, list(resolved.operations))
-        self.memory_projection_worker.process_pending()
+        self._process_memory_projections_or_raise()
         final = repository.load_pending(
             pending_uri,
             tenant_id=tenant_id,
@@ -1426,7 +1552,7 @@ class MemoryOSClient:
             operations,
         )
         _require_committed_diff(diff, {operation.operation_id for operation in operations})
-        self.memory_projection_worker.process_pending()
+        self._process_memory_projections_or_raise()
         return {"uri": obj.uri, "status": "COMMITTED", "memory_state": state, "diff_id": diff.diff_id}
 
     def _persist_structured_command_archive(self, archive: SessionArchive) -> SessionArchive:
@@ -1483,6 +1609,8 @@ class MemoryOSClient:
         caller: TrustedRequestContext | None = None,
         project_id: str = "",
     ) -> list[dict[str, Any]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1 or limit > 100:
+            raise ValueError("archive search limit must be between 1 and 100")
         tenant_id = self._effective_tenant(caller, tenant_id)
         scoped = self._client_for_tenant(tenant_id)
         if scoped is not self:
@@ -1499,24 +1627,70 @@ class MemoryOSClient:
             caller.require(READ_CONTEXT)
             caller.assert_identity(user_id=user_id, tenant_id=tenant_id)
             project_id = caller.bind_read_workspace(project_id)
-        results = []
-        needle = query.lower()
-        tenant_root = Path(self.root) / "tenants" / tenant_id
-        safe_user_id = require_safe_path_segment(user_id, "archive search user_id")
-        history_root = tenant_root / "users" / safe_user_id / "sessions" / "history"
-        for head_path in history_root.glob("**/commit_head.json"):
-            archive = self.session_archive_store.read_archive_from_commit_head(
-                head_path,
+        expanded_limit = min(200, max(limit, limit * 5))
+        contexts = self.search_context(
+            query,
+            options=RetrievalOptions(
+                context_types=(ContextType.SESSION,),
                 tenant_id=tenant_id,
-                user_id=safe_user_id,
-            )
-            if not self._workspace_matches(dict(archive.metadata or {}), project_id, caller):
+                owner_user_id=user_id,
+                workspace_ids=((project_id,) if project_id else ()),
+                query_intent=RetrievalQueryIntent.OPEN_RECALL,
+                canonical_resolution_mode=CanonicalResolutionMode.DISABLED,
+                candidate_limit=max(100, expanded_limit),
+                final_limit=expanded_limit,
+                metadata_filters={"minimum_lexical_relevance": 1.0},
+            ),
+            user_id=user_id,
+            project_id=project_id,
+            tenant_id=tenant_id,
+            caller=caller,
+        )
+        results: list[dict[str, Any]] = []
+        seen_archives: set[str] = set()
+        for item in contexts:
+            metadata = dict(item.get("metadata", {}) or {})
+            archive_uri = str(metadata.get("archive_uri") or item.get("source_uri") or "")
+            if not archive_uri or archive_uri in seen_archives:
                 continue
-            text = "\n".join(str(item.get("content", item.get("text", ""))) for item in archive.messages)
-            if needle in text.lower():
-                results.append(
-                    {"archive_uri": archive.archive_uri, "session_id": archive.session_id, "preview": text[:500]}
+            seen_archives.add(archive_uri)
+            # Compatibility reads are exact and candidate-bounded: they verify
+            # the immutable archive evidence without restoring the former
+            # recursive directory scan.
+            try:
+                archive_payload = self.archive_read(archive_uri, tenant_id=tenant_id, caller=caller)
+            except EvidenceArchiveIntegrityError as exc:
+                raise EvidenceArchiveIntegrityError(f"archive commit head evidence is invalid: {exc}") from exc
+            archive_manifest = dict(archive_payload.get("archive", {}) or {})
+            # The unified Catalog already performed lexical/semantic matching
+            # over its sanitized projection.  Do not restore the legacy second
+            # Python substring pass over full immutable archive contents.
+            catalog_preview = str(item.get("content") or item.get("text") or "")
+            safe_preview = (
+                ContextProjectionSanitizer()
+                .sanitize(
+                    title=str(item.get("title") or ""),
+                    l0_text="",
+                    l1_text=catalog_preview,
+                    metadata={},
+                    source_kind=str(metadata.get("source_kind") or "session"),
                 )
+                .l1_text
+            )
+            session_id = str(
+                metadata.get("session_id")
+                or archive_manifest.get("session_id")
+                or archive_uri.rstrip("/").rsplit("/", 1)[-1]
+            )
+            preview = safe_preview[:500]
+            results.append(
+                {
+                    **dict(item),
+                    "archive_uri": archive_uri,
+                    "session_id": session_id,
+                    "preview": preview,
+                }
+            )
             if len(results) >= limit:
                 break
         return results
@@ -1795,6 +1969,36 @@ class MemoryOSClient:
         if readiness is not None:
             readiness.require_ready()
 
+    def _process_memory_projections_or_raise(self) -> dict[str, list[str]]:
+        """A committed canonical write must never report a false serving success."""
+
+        combined: dict[str, list[str]] = {
+            key: []
+            for key in ("processed", "stale", "failed", "dead_letter", "quarantine", "released")
+        }
+        # Bound synchronous assistance. A larger backlog remains durable and
+        # explicitly unavailable instead of making this request wait without
+        # limit or falsely claiming that its CurrentSlot row is serving.
+        for _ in range(10):
+            result = self.memory_projection_worker.process_pending(limit=10)
+            for key in combined:
+                combined[key].extend(str(item) for item in result.get(key, ()))
+            terminal = tuple(result.get("dead_letter", ())) + tuple(result.get("quarantine", ()))
+            failed = tuple(result.get("failed", ()))
+            if failed or terminal:
+                raise RuntimeError(
+                    "canonical transaction committed but its serving projection is unavailable; "
+                    f"failed={len(failed)}, terminal={len(terminal)}"
+                )
+            stats = self.queue_store.stats(queue_name="memory_projection")
+            if not any(int(stats.get(status, 0) or 0) for status in ("pending", "leased")):
+                return combined
+            if not result.get("processed"):
+                break
+        raise RuntimeError(
+            "canonical transaction committed but its serving projection remains pending after bounded replay"
+        )
+
     def _require_exact_workspace(
         self,
         metadata: dict[str, Any],
@@ -1879,6 +2083,15 @@ class MemoryOSClient:
         kwargs = _supported_kwargs(ContextAssembler, {"reranker": reranker, "hybrid_search": hybrid_search})
         return ContextAssembler(self.context_db, **kwargs)
 
+    def _retrieval_orchestrator(self) -> UnifiedRetrievalOrchestrator:
+        return UnifiedRetrievalOrchestrator(
+            self.context_db,
+            vector_store=getattr(self, "vector_store", None),
+            embedding_provider=getattr(self, "embedding_provider", None),
+            reranker=getattr(self, "reranker", None),
+            projection_store=getattr(self.context_db, "projection_store", None),
+        )
+
     def _project_id_from_metadata(self, connect_metadata: dict[str, Any] | None) -> str:
         metadata = dict(connect_metadata or {})
         for key in ("project_id", "project"):
@@ -1961,18 +2174,154 @@ def _supported_kwargs(function: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in kwargs.items() if key in parameters}
 
 
+def _compatible_scalar(left: str | None, right: str | None, label: str) -> str | None:
+    normalized_left = str(left).strip() if left is not None else ""
+    normalized_right = str(right).strip() if right is not None else ""
+    if normalized_left and normalized_right and normalized_left != normalized_right:
+        raise ValueError(f"structured options conflict with legacy {label}")
+    return normalized_left or normalized_right or None
+
+
+def _requested_workspace(project_id: str, option_workspace_ids: tuple[str, ...]) -> str | None:
+    requested = str(project_id or "").strip()
+    if requested:
+        if option_workspace_ids and option_workspace_ids != (requested,):
+            raise ValueError("structured options conflict with legacy workspace_ids")
+        return requested
+    if len(option_workspace_ids) > 1:
+        raise ValueError("trusted caller must select one workspace_id")
+    return option_workspace_ids[0] if option_workspace_ids else None
+
+
+def _merge_public_retrieval_options(
+    structured: RetrievalOptions | None,
+    legacy: RetrievalOptions,
+    *,
+    legacy_limit: int,
+    legacy_limit_default: int,
+    legacy_token_budget: int | None = None,
+    legacy_token_budget_default: int | None = None,
+    legacy_query_intent: str | None = None,
+) -> RetrievalOptions:
+    if structured is None:
+        return legacy
+    if legacy_limit != legacy_limit_default and legacy_limit != structured.final_limit:
+        raise ValueError("structured options conflict with legacy limit")
+    if (
+        legacy_token_budget is not None
+        and legacy_token_budget_default is not None
+        and legacy_token_budget != legacy_token_budget_default
+        and legacy_token_budget != structured.token_budget
+    ):
+        raise ValueError("structured options conflict with legacy token_budget")
+    if legacy_query_intent:
+        try:
+            normalized_intent = RetrievalQueryIntent(str(legacy_query_intent).strip().upper())
+        except ValueError as exc:
+            raise ValueError(f"unknown query_intent: {legacy_query_intent!r}") from exc
+        if normalized_intent != structured.query_intent:
+            raise ValueError("structured options conflict with legacy query_intent")
+    return merge_retrieval_options(structured, legacy)
+
+
+def _trusted_retrieval_scope(
+    *,
+    caller: TrustedRequestContext | None,
+    tenant_id: str,
+    project_id: str,
+    derived_scope_keys: Sequence[str] = (),
+) -> TrustedRetrievalScope:
+    if caller is None:
+        authorized_scope_keys = None
+    else:
+        authorized_scope_keys = tuple(
+            sorted(
+                {
+                    *caller.retrieval_scope_keys(workspace_id=project_id),
+                    *derived_scope_keys,
+                }
+            )
+        )
+    return TrustedRetrievalScope(
+        tenant_id=tenant_id,
+        owner_user_id=(caller.user_id if caller is not None else None),
+        workspace_ids=((project_id,) if caller is not None and project_id else None),
+        adapter_id=(caller.actor_id if caller is not None else None),
+        service_id=(caller.actor_id if caller is not None and caller.actor_kind == "service" else None),
+        authorized_scope_keys=authorized_scope_keys,
+    )
+
+
+def _record_unified_recall(client: Any, result: UnifiedRetrievalResult) -> str:
+    trace_id = str(uuid.uuid4())
+    plan = result.plan
+    metrics = result.metrics.to_dict()
+    trace = {
+        "trace_id": trace_id,
+        "created_at": utc_now(),
+        "query": plan.semantic_query,
+        "query_plan": plan.to_dict(),
+        "scope": {
+            "tenant_id": plan.tenant_id,
+            "user_id": plan.owner_user_id,
+            "project_id": plan.workspace_ids[0] if len(plan.workspace_ids) == 1 else "",
+            "workspace_ids": list(plan.workspace_ids),
+            "session_ids": list(plan.session_ids),
+            "adapter_id": plan.adapter_id,
+            "search_scope": plan.legacy_search_scope,
+        },
+        "retrieval_views": list(plan.legacy_retrieval_views),
+        "metadata_filters": dict(plan.metadata_filters),
+        **metrics,
+        "candidate_count": metrics["fusion_candidates"],
+        "selected": [
+            {
+                "uri": item.get("uri"),
+                "source_uri": item.get("source_uri"),
+                "score": item.get("score"),
+                "layer": item.get("selected_layer") or item.get("layer"),
+                "canonical_validation_status": item.get("canonical_validation_status"),
+                "projection_lag": item.get("projection_lag"),
+                "degraded_mode": item.get("degraded_mode"),
+            }
+            for item in result.contexts
+        ],
+        "dropped": [dict(item) for item in result.dropped_contexts],
+        "token_budget": plan.token_budget,
+        "degraded_modes": list(result.degraded_modes),
+        "reranker_fallback": result.reranker_fallback,
+    }
+    safe_trace = ContextProjectionSanitizer().sanitize_trace(trace)
+    if not isinstance(safe_trace, dict):
+        raise ValueError("recall trace sanitization produced an invalid payload")
+    root = _trace_root(client)
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        root.chmod(0o700)
+    except OSError as exc:
+        raise PermissionError("recall trace directory permissions could not be secured") from exc
+    atomic_write_json(root / f"{trace_id}.json", safe_trace, artifact_root=root)
+    return trace_id
+
+
 def _trace_root(client: Any) -> Path:
     root = Path(str(getattr(client, "root", "/tmp/memoryos-test")))
     tenant_id = str(getattr(client, "tenant_id", "default"))
     return root / "recall-traces" if tenant_id == "default" else root / "tenants" / tenant_id / "recall-traces"
 
 
-def _scope_keys(scopes: list[dict[str, Any]] | None) -> list[str]:
+def _scope_keys(
+    scopes: list[dict[str, Any]] | None,
+    *,
+    aliases: Mapping[str, Mapping[str, str]] | None = None,
+) -> list[str]:
     keys = []
+    registry = AliasRegistry(aliases)
     for scope in scopes or []:
         if not isinstance(scope, dict) or not scope.get("kind") or not scope.get("id"):
             raise ValueError("applicability_scopes must contain scope objects with kind and id")
         keys.append(scope_key_from_payload(scope))
+        keys.append(registry.canonical_scope(ScopeRef.from_dict(scope)).key)
     return list(dict.fromkeys(keys))
 
 

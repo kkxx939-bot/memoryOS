@@ -7,9 +7,10 @@ from memoryos.api.sdk.client import MemoryOSClient
 from memoryos.behavior.model.behavior_pattern import BehaviorPattern
 from memoryos.connect import ConnectMetadata
 from memoryos.contextdb.model.context_object import ContextObject
-from memoryos.contextdb.model.context_relation import ContextRelation
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.model.lifecycle import LifecycleState
+from memoryos.operations.model.context_operation import ContextOperation
+from memoryos.operations.model.operation_action import OperationAction
 from memoryos.prediction.model.prediction_request import PredictionRequest
 from memoryos.prediction.pipeline.observation_normalizer import ObservationNormalizer
 
@@ -23,13 +24,16 @@ def _seed_policy(
     obj = policy.to_context_object()
     obj.lifecycle_state = lifecycle
     client.context_db.seed_object(anchor, content="anchor")
-    client.context_db.seed_object(obj, content=json.dumps(policy.to_dict()))
-    client.context_db.add_relation(
-        ContextRelation(
-            source_uri=policy.uri,
-            relation_type="anchored_by",
-            target_uri=policy.memory_anchor_uri,
-            metadata={"owner_user_id": policy.user_id},
+    client.context_db.commit_operation(
+        ContextOperation(
+            user_id=policy.user_id,
+            context_type=ContextType.ACTION_POLICY,
+            action=OperationAction.ADD,
+            target_uri=policy.uri,
+            payload={
+                "context_object": obj.to_dict(),
+                "content": json.dumps(policy.to_dict()),
+            },
         )
     )
 
@@ -64,6 +68,18 @@ def test_prediction_loads_policy_from_contextdb_without_manual_policies(tmp_path
 
 def test_available_actions_and_deleted_obsolete_filtering(tmp_path) -> None:
     client = MemoryOSClient(str(tmp_path))
+    deleted_policy = ActionPolicy(
+        user_id="u1",
+        scene_key="hot",
+        action="turn_on_fan",
+        memory_anchor_uri="memoryos://user/u1/memories/anchors/hot",
+    )
+    obsolete_policy = ActionPolicy(
+        user_id="u1",
+        scene_key="hot",
+        action="smoke",
+        memory_anchor_uri="memoryos://user/u1/memories/anchors/hot",
+    )
     _seed_policy(
         client,
         ActionPolicy(
@@ -75,21 +91,26 @@ def test_available_actions_and_deleted_obsolete_filtering(tmp_path) -> None:
     )
     _seed_policy(
         client,
-        ActionPolicy(
-            user_id="u1",
-            scene_key="hot",
-            action="turn_on_fan",
-            memory_anchor_uri="memoryos://user/u1/memories/anchors/hot",
-        ),
+        deleted_policy,
         lifecycle=LifecycleState.DELETED,
     )
     _seed_policy(
         client,
-        ActionPolicy(
-            user_id="u1", scene_key="hot", action="smoke", memory_anchor_uri="memoryos://user/u1/memories/anchors/hot"
-        ),
+        obsolete_policy,
         lifecycle=LifecycleState.OBSOLETE,
     )
+
+    # Lifecycle controls the derived RelationStore, not the durable ordinary
+    # Source fact.  A rebuild can still inspect the Source relation, while
+    # online ActionPolicy lookup cannot traverse either retired endpoint.
+    for policy in (deleted_policy, obsolete_policy):
+        source = client.source_store.read_object(policy.uri)
+        assert any(
+            relation.relation_type == "anchored_by"
+            and relation.target_uri == policy.memory_anchor_uri
+            for relation in source.relations
+        )
+        assert client.relation_store.relations_of(policy.uri, tenant_id="default") == []
 
     result = client.predict(_request(["turn_on_fan", "smoke", "ask_user", "do_nothing"]))
 

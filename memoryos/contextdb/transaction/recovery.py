@@ -304,7 +304,10 @@ class RecoveryService:
         actual_relations = sorted(
             (
                 self.committer._relation_effect_spec(relation)
-                for relation in self.committer.relation_store.relations_of(uri)
+                for relation in self.committer.relation_store.relations_of(
+                    uri,
+                    tenant_id=self.committer.tenant_id,
+                )
             ),
             key=canonical_json,
         )

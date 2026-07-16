@@ -250,7 +250,11 @@ class CanonicalFinalStateValidator:
             tenant_id=tenant_id,
             owner_user_id=owner_user_id,
         )
-        self._validate_relation_membership(desired_slot, final_by_id)
+        self._validate_relation_membership(
+            desired_slot,
+            final_by_id,
+            tenant_id=tenant_id,
+        )
         # Validate derived object/content mirrors only after the semantic
         # boundary checks above.  This preserves precise, typed failures for
         # forged identity, revision-prefix, no-op, and domain-invariant
@@ -1015,12 +1019,21 @@ class CanonicalFinalStateValidator:
         ):
             raise RevisionEvidenceError(f"changed {label} has no current evidence: {field_name}")
 
-    def _validate_relation_membership(self, slot: MemorySlot, final_by_id: dict[str, MemoryClaim]) -> None:
+    def _validate_relation_membership(
+        self,
+        slot: MemorySlot,
+        final_by_id: dict[str, MemoryClaim],
+        *,
+        tenant_id: str,
+    ) -> None:
         if self.relation_store is None:
             return
         related_claim_uris = {
             relation.target_uri
-            for relation in self.relation_store.relations_of(slot.uri)
+            for relation in self.relation_store.relations_of(
+                slot.uri,
+                tenant_id=tenant_id,
+            )
             if relation.source_uri == slot.uri and relation.relation_type == "has_claim"
         }
         allowed = {claim.uri for claim in final_by_id.values() if claim.claim_id in slot.claim_ids}

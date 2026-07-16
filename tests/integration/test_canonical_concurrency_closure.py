@@ -10,9 +10,9 @@ import pytest
 from memoryos.api.sdk.client import MemoryOSClient
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_type import ContextType
+from memoryos.contextdb.retrieval.orchestrator import RetrievalUnavailableError
 from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.memory.canonical import CanonicalMemoryRepository
-from memoryos.memory.canonical import retrieval as canonical_retrieval
 from memoryos.memory.canonical.history import validate_canonical_receipt_history
 from memoryos.operations.commit import operation_committer as committer_module
 from memoryos.operations.model.context_operation import ContextOperation
@@ -340,7 +340,7 @@ def test_rebuild_and_queries_share_only_committed_snapshots(tmp_path: Path) -> N
     assert restarted.readiness.state == RuntimeReadinessState.READY
 
 
-def test_query_keeps_one_committed_snapshot_across_concurrent_head_advance(
+def test_bounded_final_candidate_validation_fails_closed_across_concurrent_head_advance(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -362,19 +362,15 @@ def test_query_keeps_one_committed_snapshot_across_concurrent_head_advance(
     )
     assert old["status"] == "COMMITTED" and pending_result["status"] == "PENDING"
     pending = client.list_pending(user_id="u1", lifecycle_states=["PENDING"])[0]
-    original_capture = canonical_retrieval.capture_committed_canonical_snapshot
+    orchestrator = client._retrieval_orchestrator()
+    original_resolve = orchestrator.resolver.resolve
     advanced = False
 
-    def capture_then_advance(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+    def advance_then_validate(candidates, *, plan):  # noqa: ANN001, ANN202
         nonlocal advanced
-        snapshot = original_capture(*args, **kwargs)
+        assert 0 < len(candidates) <= plan.candidate_limit
         if not advanced:
             advanced = True
-            monkeypatch.setattr(
-                canonical_retrieval,
-                "capture_committed_canonical_snapshot",
-                original_capture,
-            )
             client.review_pending(
                 user_id="u1",
                 pending_uri=pending["uri"],
@@ -384,20 +380,22 @@ def test_query_keeps_one_committed_snapshot_across_concurrent_head_advance(
                 command_id="advance-after-query-snapshot",
                 reason="test committed head advance",
             )
-        return snapshot
+        return original_resolve(candidates, plan=plan)
 
-    monkeypatch.setattr(
-        canonical_retrieval,
-        "capture_committed_canonical_snapshot",
-        capture_then_advance,
-    )
-    during = client.search_context(
-        "PostgreSQL",
-        user_id="u1",
-        project_id="memoryos",
-        context_type="memory",
-    )
-    assert [item["uri"] for item in during] == [old["uri"]]
+    monkeypatch.setattr(orchestrator.resolver, "resolve", advance_then_validate)
+    monkeypatch.setattr(client, "_retrieval_orchestrator", lambda: orchestrator)
+    with pytest.raises(
+        RetrievalUnavailableError,
+        match="Canonical Current candidate failed bounded authoritative validation",
+    ) as unavailable:
+        client.search_context(
+            "PostgreSQL",
+            user_id="u1",
+            project_id="memoryos",
+            context_type="memory",
+        )
+    assert advanced is True
+    assert unavailable.value.degraded_modes == ("stale_canonical_current_projection",)
 
     after = client.search_context(
         "MySQL",
@@ -406,4 +404,7 @@ def test_query_keeps_one_committed_snapshot_across_concurrent_head_advance(
         context_type="memory",
     )
     assert len(after) == 1
-    assert after[0]["metadata"]["canonical_value"] == "mysql"
+    # Resolver egress is rebuilt from the receipt-proved current Claim rather
+    # than the disposable Catalog candidate, so the authoritative value keeps
+    # its Source spelling instead of a projection-side normalized token.
+    assert after[0]["metadata"]["canonical_value"] == "MySQL"

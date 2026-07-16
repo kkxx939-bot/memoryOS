@@ -7,8 +7,8 @@ from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.memory.canonical import (
     CanonicalMemoryQuery,
     CanonicalMemoryRepository,
-    CanonicalMemoryRetriever,
     CanonicalQueryIntent,
+    OfflineCanonicalMemoryRetriever,
 )
 from memoryos.memory.canonical.current_head import load_current_head, publish_current_head_sets
 from memoryos.memory.canonical.history import validate_canonical_receipt_history
@@ -132,11 +132,12 @@ def test_ten_revision_history_keeps_every_receipt_immutable_and_only_latest_head
     assert not list((artifact_root / "system" / "redo").glob("*.json"))
     assert validate_canonical_receipt_history(artifact_root, tenant_id="t1")["transaction_receipts"] == 10
 
-    results = CanonicalMemoryRetriever(
+    results = OfflineCanonicalMemoryRetriever(
         restarted.source_store,
         restarted.index_store,
         restarted.relation_store,
         projection_store=restarted.memory_projection_worker.projector.record_store,
+        offline_admin=True,
     ).search(
         CanonicalMemoryQuery(
             text="Backend-10",

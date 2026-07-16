@@ -77,3 +77,5 @@ class SessionCommitResult:
     canonical_active_operation_count: int = 0
     pending_count: int = 0
     pending_persisted: bool = False
+    session_projection_status: str = "not_configured"
+    session_projected_count: int = 0

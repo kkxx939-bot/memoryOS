@@ -18,6 +18,11 @@ from memoryos.contextdb.model.context_relation import ContextRelation
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.model.context_uri import ContextURI
 from memoryos.contextdb.model.lifecycle import LifecycleState
+from memoryos.contextdb.ordinary_relations import (
+    OrdinaryRelationEligibility,
+    ordinary_relation_serving_eligibility,
+    ordinary_relation_specs_for_object,
+)
 from memoryos.contextdb.session.planning_envelope import (
     PlanningEnvelopeIntegrityError,
     PlanningEnvelopeStore,
@@ -85,6 +90,7 @@ from memoryos.operations.commit.outbox_envelope import (
     assert_transition,
     build_outbox,
     planned_effect_manifest,
+    projection_workspace_id,
     validate_outbox,
 )
 from memoryos.operations.commit.planning_proof import (
@@ -101,7 +107,7 @@ from memoryos.operations.commit.receipt import (
     load_transaction_receipt,
     validate_transaction_receipt,
 )
-from memoryos.operations.commit.redo_log import RedoIntegrityError, RedoLog
+from memoryos.operations.commit.redo_log import RedoEntry, RedoIntegrityError, RedoLog
 from memoryos.operations.model.context_diff import ContextDiff
 from memoryos.operations.model.context_operation import ContextOperation
 from memoryos.operations.model.operation_action import OperationAction
@@ -132,6 +138,8 @@ class OperationCommitter:
         tenant_id: str | None = None,
         test_hook=None,  # noqa: ANN001
         alias_registry: AliasRegistry | None = None,
+        tombstone_service=None,  # noqa: ANN001
+        migration_gate=None,  # noqa: ANN001
     ) -> None:
         source_tenant = getattr(source_store, "tenant_id", None)
         if source_tenant is not None:
@@ -159,6 +167,8 @@ class OperationCommitter:
         self.action_policy_updater = ActionPolicyUpdater()
         self.tenant_id = bound_tenant
         self.test_hook = test_hook
+        self.tombstone_service = tombstone_service
+        self.migration_gate = migration_gate
         self.final_state_validator = CanonicalFinalStateValidator(
             source_store,
             relation_store,
@@ -170,6 +180,89 @@ class OperationCommitter:
             f"memoryos_startup_recovery_group_{id(self)}",
             default="",
         )
+        self._projection_fence_depth: ContextVar[int] = ContextVar(
+            f"memoryos_operation_projection_fence_depth_{id(self)}",
+            default=0,
+        )
+
+    @staticmethod
+    def _delete_tombstone_ids(operation: ContextOperation) -> tuple[str, ...]:
+        raw = operation.payload.get("projection_tombstone_ids", ())
+        if not isinstance(raw, (list, tuple)) or any(not isinstance(item, str) or not item for item in raw):
+            return ()
+        return tuple(dict.fromkeys(raw))
+
+    def _require_delete_tombstone_capability(self, operations: list[ContextOperation]) -> None:
+        """Reject a production DELETE before its first durable or Source effect.
+
+        InMemoryIndexStore remains a deliberately small compatibility test
+        backend.  A Catalog store advertising the durable tombstone API may
+        never fall back to synchronous ``delete_index``.
+        """
+
+        if not any(operation.action == OperationAction.DELETE for operation in operations):
+            return
+        durable_catalog = callable(getattr(self.index_store, "enqueue_tombstone", None))
+        if durable_catalog and self.tombstone_service is None:
+            raise RuntimeError("production DELETE requires ProjectionTombstoneService")
+
+    def _prepare_delete_tombstones(
+        self,
+        operation: ContextOperation,
+        *,
+        trust_durable_binding: bool = False,
+    ) -> tuple[str, ...]:
+        """Journal every derived projection before retiring the Source object."""
+
+        if operation.action != OperationAction.DELETE or not operation.target_uri:
+            return ()
+        bound = self._delete_tombstone_ids(operation)
+        if trust_durable_binding and bound:
+            return bound
+        if self.tombstone_service is None:
+            if callable(getattr(self.index_store, "enqueue_tombstone", None)):
+                raise RuntimeError("production DELETE requires ProjectionTombstoneService")
+            operation.payload.pop("projection_tombstone_ids", None)
+            return ()
+        enqueue = getattr(self.tombstone_service, "enqueue_uri", None)
+        if not callable(enqueue):
+            raise TypeError("ProjectionTombstoneService has no durable URI enqueue operation")
+        raw_ids = enqueue(
+            operation.target_uri,
+            tenant_id=self.tenant_id,
+            reason=str(operation.payload.get("reason") or OperationAction.DELETE.value),
+            require_source_retired=True,
+        )
+        if not isinstance(raw_ids, (list, tuple)):
+            raise RuntimeError("durable projection tombstone journal returned an invalid result")
+        tombstone_ids = tuple(dict.fromkeys(str(item) for item in raw_ids if str(item)))
+        if not tombstone_ids:
+            raise RuntimeError("production DELETE did not journal a projection tombstone")
+        operation.payload["projection_tombstone_ids"] = list(tombstone_ids)
+        return tombstone_ids
+
+    def _settle_delete_tombstones(self, operations: list[ContextOperation]) -> None:
+        """Replay each committed DELETE's exact durable projection journal."""
+
+        if self.tombstone_service is None:
+            return
+        process = getattr(self.tombstone_service, "process_tombstones", None)
+        if not callable(process):
+            raise TypeError("ProjectionTombstoneService has no exact replay operation")
+        for operation in operations:
+            if operation.action != OperationAction.DELETE:
+                continue
+            tombstone_ids = self._delete_tombstone_ids(operation)
+            if not tombstone_ids:
+                raise RuntimeError("committed production DELETE has no durable tombstone binding")
+            result = process(tombstone_ids)
+            failed = getattr(result, "failed", None)
+            processed = getattr(result, "processed", None)
+            stale = getattr(result, "stale", None)
+            if failed is None or processed is None or stale is None:
+                raise RuntimeError("durable projection tombstone cleanup returned an invalid result")
+            if failed:
+                raise RuntimeError("derived projection tombstone cleanup is retryable but incomplete")
 
     @contextmanager
     def _durable_startup_recovery_scope(self, group_id: str) -> Iterator[None]:
@@ -190,6 +283,35 @@ class OperationCommitter:
             yield
         finally:
             self._startup_recovery_group.reset(token)
+
+    @contextmanager
+    def _migration_projection_fence(self) -> Iterator[None]:
+        """Serialize all Source mutations with a tenant serving rebuild.
+
+        ``commit`` recursively handles mixed canonical/regular batches and
+        recovery entry points call one another.  Context-local depth keeps
+        those nested calls reentrant without reacquiring the non-reentrant
+        durable SQLite lease.
+        """
+
+        depth = self._projection_fence_depth.get()
+        if depth:
+            depth_token = self._projection_fence_depth.set(depth + 1)
+            try:
+                yield
+            finally:
+                self._projection_fence_depth.reset(depth_token)
+            return
+        acquire = getattr(self.migration_gate, "acquire_projection_fence", None)
+        release = getattr(self.migration_gate, "release_projection_fence", None)
+        fence = acquire() if callable(acquire) else None
+        depth_token = self._projection_fence_depth.set(1)
+        try:
+            yield
+        finally:
+            self._projection_fence_depth.reset(depth_token)
+            if callable(release):
+                release(fence)
 
     def _require_commit_ready(
         self,
@@ -332,10 +454,9 @@ class OperationCommitter:
                         "head-published redo transaction "
                         f"{transaction_id} current head for {uri} is not a legal later revision"
                     )
-            elif (
-                str(head.get("receipt_digest") or "") != str(receipt.get("receipt_digest") or "")
-                or str(bound_receipt.get("receipt_digest") or "") != str(receipt.get("receipt_digest") or "")
-            ):
+            elif str(head.get("receipt_digest") or "") != str(receipt.get("receipt_digest") or "") or str(
+                bound_receipt.get("receipt_digest") or ""
+            ) != str(receipt.get("receipt_digest") or ""):
                 raise RedoIntegrityError(
                     "head-published redo transaction "
                     f"{transaction_id} current head for {uri} is detached from its receipt"
@@ -348,8 +469,7 @@ class OperationCommitter:
                 read_committed_canonical(self.source_store, uri, self.relation_store)
             except (FileNotFoundError, RuntimeError, ValueError) as exc:
                 raise RedoIntegrityError(
-                    "head-published redo transaction "
-                    f"{transaction_id} current Source bundle for {uri} is invalid"
+                    f"head-published redo transaction {transaction_id} current Source bundle for {uri} is invalid"
                 ) from exc
         if not receipt_path.exists():
             raise RedoIntegrityError(
@@ -474,6 +594,40 @@ class OperationCommitter:
         self._validate_recovery_artifact_tenant(source_effect, "redo source effect")
         self._validate_recovery_artifact_tenant(relation_manifest, "redo relation manifest")
 
+    def _load_exact_redo_entry(
+        self,
+        user_id: str,
+        operation: ContextOperation,
+        phase: str,
+        *,
+        source_effect: dict | None,
+        relation_manifest: dict | None,
+    ) -> RedoEntry:
+        """Bind recovery to the single integrity-checked durable redo entry.
+
+        ``resume`` is a recovery entry point, not a second write API.  Caller
+        supplied operation data therefore cannot select another tombstone,
+        Source effect, relation manifest, or recovery phase.
+        """
+
+        matches = [entry for entry in self.redo.pending_entries() if entry.operation_id == operation.operation_id]
+        if len(matches) != 1:
+            raise RedoIntegrityError("redo recovery requires exactly one durable operation entry")
+        entry = matches[0]
+        if entry.user_id != user_id or not self._operation_matches_bound_tenant(entry.operation):
+            raise RedoIntegrityError("durable redo entry crosses its user or tenant boundary")
+        if canonical_json(entry.operation.to_dict()) != canonical_json(operation.to_dict()):
+            raise RedoIntegrityError("redo recovery operation does not match its durable entry")
+        if phase != entry.phase:
+            raise RedoIntegrityError("redo recovery phase does not match its durable entry")
+        if source_effect is not None and canonical_json(source_effect) != canonical_json(entry.source_effect):
+            raise RedoIntegrityError("redo Source effect does not match its durable entry")
+        if relation_manifest is not None and canonical_json(relation_manifest) != canonical_json(
+            entry.relation_manifest
+        ):
+            raise RedoIntegrityError("redo Relation manifest does not match its durable entry")
+        return entry
+
     def _validate_canonical_artifact_keys(self, operation: ContextOperation) -> tuple[str, str]:
         transaction_id = require_safe_path_segment(
             operation.payload.get("transaction_id"),
@@ -498,8 +652,43 @@ class OperationCommitter:
                 continue
             if entry.operation.user_id != user_id or not self._operation_matches_bound_tenant(entry.operation):
                 raise RedoIntegrityError("redo operation id is already bound to another user or tenant")
+            requested = next(item for item in operations if item.operation_id == entry.operation_id)
+            if (
+                bool(entry.operation.payload.get("canonical_memory"))
+                != bool(requested.payload.get("canonical_memory"))
+                or not self._redo_request_matches_durable_effect(entry.operation, requested)
+            ):
+                raise RedoIntegrityError("redo operation id is bound to a different durable effect")
+
+    def _redo_request_matches_durable_effect(
+        self,
+        durable: ContextOperation,
+        requested: ContextOperation,
+    ) -> bool:
+        """Compare caller intent with the resolver-bound durable operation.
+
+        A regular UPDATE/MERGE/DELETE may legitimately omit ``target_uri``;
+        TargetResolver then binds it from a declared payload URI or a scoped
+        candidate.  A retry recreates the original pre-resolution request,
+        while the redo entry necessarily stores the resolved target.  Treat
+        that difference as equivalent only after rebinding a copy of the
+        exact caller payload to the durable target.  An explicitly supplied
+        different target remains a hard cross-boundary collision.
+        """
+
+        if bool(durable.payload.get("canonical_memory")):
+            return self._operation_effect_fingerprint(durable) == self._operation_effect_fingerprint(requested)
+        if requested.target_uri is not None and requested.target_uri != durable.target_uri:
+            return False
+        rebound = ContextOperation.from_dict(requested.to_dict())
+        rebound.target_uri = durable.target_uri
+        return self._operation_effect_fingerprint(durable) == self._operation_effect_fingerprint(rebound)
 
     def commit(self, user_id: str, operations: list[ContextOperation]) -> ContextDiff:
+        with self._migration_projection_fence():
+            return self._commit_unfenced(user_id, operations)
+
+    def _commit_unfenced(self, user_id: str, operations: list[ContextOperation]) -> ContextDiff:
         """执行这一步处理，并保持已有状态约束。"""
 
         self._require_commit_ready(user_id, operations)
@@ -514,6 +703,7 @@ class OperationCommitter:
         if canonical:
             diffs: list[ContextDiff] = []
             regular = [operation for operation in operations if operation.payload.get("canonical_memory") is not True]
+            self._require_delete_tombstone_capability(regular)
             grouped: dict[str, list[ContextOperation]] = {}
             for operation in canonical:
                 transaction_id = str(operation.payload.get("transaction_id", ""))
@@ -543,6 +733,36 @@ class OperationCommitter:
                 partial = self._combine_diffs(user_id, partials) if partials else None
                 raise RevisionConflictError(str(exc), committed_diff=partial) from exc
             return self._combine_diffs(user_id, diffs)
+        pending_regular = {
+            entry.operation_id: entry
+            for entry in self.redo.pending_entries()
+            if entry.operation.payload.get("canonical_memory") is not True
+        }
+        recovered_regular_diffs: list[ContextDiff] = []
+        unresolved_operations: list[ContextOperation] = []
+        for operation in operations:
+            entry = pending_regular.get(operation.operation_id)
+            if entry is None:
+                unresolved_operations.append(operation)
+                continue
+            self.resume(
+                user_id,
+                entry.operation,
+                entry.phase,
+                source_effect=entry.source_effect,
+                relation_manifest=entry.relation_manifest,
+            )
+            marker = self._operation_marker(entry.operation_id)
+            self._reject_control_symlink(marker, "operation receipt")
+            if not marker.exists():
+                raise RedoIntegrityError("regular redo recovery completed without an operation receipt")
+            persisted = self._validate_operation_marker(marker, entry.operation)
+            if persisted.payload.get("canonical_pending_proposal") is True:
+                self._validate_head_published_receipt(marker, load_transaction_receipt(marker))
+            recovered_regular_diffs.append(self._ensure_single_operation_diff(user_id, persisted))
+        operations = unresolved_operations
+        if not operations:
+            return self._combine_diffs(user_id, recovered_regular_diffs)
         resolved_operations: list[ContextOperation] = []
         pending: list[ContextOperation] = []
         target_rejected: list[ContextOperation] = []
@@ -560,6 +780,7 @@ class OperationCommitter:
             operation.status = OperationStatus.REJECTED
         committed: list[ContextOperation] = []
         pending_redo = {entry.operation_id: entry for entry in self.redo.pending_entries()}
+        self._require_delete_tombstone_capability(conflict_result.accepted)
         self._preflight_regular_operations(conflict_result.accepted)
         with ExitStack() as lock_stack:
             guard_by_key = {
@@ -586,7 +807,11 @@ class OperationCommitter:
                         marker = self._operation_marker(operation.operation_id)
                         self._reject_control_symlink(marker, "operation receipt")
                         pending_entry = pending_redo.get(operation.operation_id)
-                        if pending_entry is not None and pending_entry.phase not in {"started", "begin"}:
+                        if pending_entry is not None and pending_entry.phase not in {
+                            "started",
+                            "begin",
+                            "tombstones_enqueued",
+                        }:
                             self._resume_under_guard(
                                 user_id,
                                 pending_entry.operation,
@@ -627,11 +852,25 @@ class OperationCommitter:
                                 )
                             except PlanningProofIntegrityError as exc:
                                 raise ValueError("pending lifecycle prepared intent is invalid") from exc
+                        if operation.action == OperationAction.DELETE:
+                            # This field is an internal outbox binding, never
+                            # caller authority.  Persist the semantic intent
+                            # first, then replace it only with IDs returned by
+                            # the durable Catalog journal.
+                            operation.payload.pop("projection_tombstone_ids", None)
                         self.redo.begin(
                             operation,
                             phase="started",
                             relation_manifest=relation_manifest,
                         )
+                        if operation.action == OperationAction.DELETE:
+                            tombstone_ids = self._prepare_delete_tombstones(operation)
+                            if tombstone_ids:
+                                self.redo.advance(
+                                    operation,
+                                    phase="tombstones_enqueued",
+                                    relation_manifest=relation_manifest,
+                                )
                         self._apply_source(operation)
                         self._apply_regular_relation_manifest(operation, relation_manifest)
                         source_effect = self._capture_regular_source_effect(
@@ -665,23 +904,23 @@ class OperationCommitter:
                         )
                     committed.append(operation)
             except RevisionConflictError as exc:
-                regular_partials: list[ContextDiff] = []
+                regular_partials: list[ContextDiff] = list(recovered_regular_diffs)
                 if committed or pending or target_rejected or conflict_result.rejected:
-                    regular_partials.append(
-                        self._finalize_regular_diff(
-                            user_id,
-                            committed,
-                            pending,
-                            target_rejected,
-                            conflict_result.rejected,
-                            held_guards=held_guards,
-                        )
+                    partial = self._finalize_regular_diff(
+                        user_id,
+                        committed,
+                        pending,
+                        target_rejected,
+                        conflict_result.rejected,
+                        held_guards=held_guards,
                     )
+                    self._settle_delete_tombstones(partial.operations)
+                    regular_partials.append(partial)
                 if exc.committed_diff is not None:
                     regular_partials.append(exc.committed_diff)
                 committed_diff = self._combine_diffs(user_id, regular_partials) if regular_partials else None
                 raise RevisionConflictError(str(exc), committed_diff=committed_diff) from exc
-            return self._finalize_regular_diff(
+            diff = self._finalize_regular_diff(
                 user_id,
                 committed,
                 pending,
@@ -689,6 +928,8 @@ class OperationCommitter:
                 conflict_result.rejected,
                 held_guards=held_guards,
             )
+            self._settle_delete_tombstones(diff.operations)
+            return self._combine_diffs(user_id, [*recovered_regular_diffs, diff])
 
     def _finalize_regular_diff(
         self,
@@ -2634,6 +2875,7 @@ class OperationCommitter:
                 str(key["source_uri"]),
                 str(key["relation_type"]),
                 str(key["target_uri"]),
+                tenant_id=str(manifest["tenant_id"]),
             )
         self._ensure_relation_specs([dict(item) for item in manifest.get("expected", []) or []])
         self._validate_canonical_relation_manifest_effect(manifest)
@@ -2646,7 +2888,10 @@ class OperationCommitter:
         for spec in manifest.get("expected", []) or []:
             actual = {
                 canonical_json(self._relation_effect_spec(relation))
-                for relation in self.relation_store.relations_of(str(spec["source_uri"]))
+                for relation in self.relation_store.relations_of(
+                    str(spec["source_uri"]),
+                    tenant_id=str(manifest["tenant_id"]),
+                )
             }
             if canonical_json(spec) not in actual:
                 raise RedoIntegrityError("canonical RelationStore effect is incomplete")
@@ -2655,7 +2900,10 @@ class OperationCommitter:
                 relation.source_uri == key["source_uri"]
                 and relation.relation_type == key["relation_type"]
                 and relation.target_uri == key["target_uri"]
-                for relation in self.relation_store.relations_of(str(key["source_uri"]))
+                for relation in self.relation_store.relations_of(
+                    str(key["source_uri"]),
+                    tenant_id=str(manifest["tenant_id"]),
+                )
             ):
                 raise RedoIntegrityError("canonical RelationStore retained a removed managed relation")
 
@@ -2974,13 +3222,15 @@ class OperationCommitter:
             if self.relation_store is None:
                 continue
             original = list(snapshot["relations"])
-            current = self.relation_store.relations_of(uri)
+            tenant_id = str(snapshot["object"].tenant_id or "default") if snapshot["exists"] else self.tenant_id
+            current = self.relation_store.relations_of(uri, tenant_id=tenant_id)
             for relation in current:
                 if relation not in original:
                     self.relation_store.delete_relation(
                         relation.source_uri,
                         relation.relation_type,
                         relation.target_uri,
+                        tenant_id=tenant_id,
                     )
             for relation in original:
                 self.relation_store.add_relation(relation)
@@ -3006,6 +3256,9 @@ class OperationCommitter:
                         "transaction_id": transaction_id,
                         "outbox_path": str(outbox_path),
                         "operation_ids": [operation.operation_id for operation in operations],
+                        "tenant_id": self.tenant_id,
+                        "owner_user_id": operations[0].user_id,
+                        "workspace_id": projection_workspace_id(operations),
                     },
                 )
             )
@@ -3351,8 +3604,37 @@ class OperationCommitter:
         source_effect: dict | None = None,
         relation_manifest: dict | None = None,
     ) -> bool:
+        with self._migration_projection_fence():
+            return self._resume_unfenced(
+                user_id,
+                operation,
+                phase,
+                source_effect=source_effect,
+                relation_manifest=relation_manifest,
+            )
+
+    def _resume_unfenced(
+        self,
+        user_id: str,
+        operation: ContextOperation,
+        phase: str,
+        *,
+        source_effect: dict | None = None,
+        relation_manifest: dict | None = None,
+    ) -> bool:
         """处理 resume 这一步。"""
 
+        entry = self._load_exact_redo_entry(
+            user_id,
+            operation,
+            phase,
+            source_effect=source_effect,
+            relation_manifest=relation_manifest,
+        )
+        operation = entry.operation
+        phase = entry.phase
+        source_effect = entry.source_effect
+        relation_manifest = entry.relation_manifest
         self._validate_redo_boundary(
             user_id,
             operation,
@@ -3370,27 +3652,42 @@ class OperationCommitter:
             if not entries:
                 raise RedoIntegrityError("canonical recovery requires the complete durable transaction batch")
             return operation.operation_id in self.resume_canonical_batch(user_id, entries)
-        if phase in {"started", "begin"}:
-            return self._resume_started_source_effect(
+        self._require_delete_tombstone_capability([operation])
+        if operation.action == OperationAction.DELETE:
+            already_bound = bool(self._delete_tombstone_ids(operation))
+            tombstone_ids = self._prepare_delete_tombstones(operation, trust_durable_binding=True)
+            if tombstone_ids and (not already_bound or phase in {"started", "begin"}):
+                self.redo.advance(
+                    operation,
+                    phase="tombstones_enqueued",
+                    source_effect=source_effect,
+                    relation_manifest=relation_manifest,
+                )
+                phase = "tombstones_enqueued"
+        if phase in {"started", "begin", "tombstones_enqueued"}:
+            resumed = self._resume_started_source_effect(
                 user_id,
                 operation,
                 relation_manifest=relation_manifest,
             )
-        with ExitStack() as locks:
-            guards = [
-                locks.enter_context(self.path_lock.acquire(self._lock_key(lock_key)))
-                for lock_key in self._regular_lock_keys(operation)
-            ]
-            guard = guards[0]
-            with self.path_lock.fenced(guards):
-                return self._resume_under_guard(
-                    user_id,
-                    operation,
-                    phase,
-                    source_effect=source_effect,
-                    relation_manifest=relation_manifest,
-                    guard=guard,
-                )
+        else:
+            with ExitStack() as locks:
+                guards = [
+                    locks.enter_context(self.path_lock.acquire(self._lock_key(lock_key)))
+                    for lock_key in self._regular_lock_keys(operation)
+                ]
+                guard = guards[0]
+                with self.path_lock.fenced(guards):
+                    resumed = self._resume_under_guard(
+                        user_id,
+                        operation,
+                        phase,
+                        source_effect=source_effect,
+                        relation_manifest=relation_manifest,
+                        guard=guard,
+                    )
+        self._settle_delete_tombstones([operation])
+        return resumed
 
     def _resume_started_source_effect(
         self,
@@ -3485,9 +3782,7 @@ class OperationCommitter:
                     try:
                         receipt = load_transaction_receipt(marker)
                     except ReceiptIntegrityError as exc:
-                        raise RedoIntegrityError(
-                            "committed pending redo has no valid immutable receipt"
-                        ) from exc
+                        raise RedoIntegrityError("committed pending redo has no valid immutable receipt") from exc
                     # ``committed`` is a legacy post-publication redo phase.
                     # It cannot authorize publication of a missing lifecycle
                     # head: doing so would turn historical receipt replay into
@@ -3820,10 +4115,11 @@ class OperationCommitter:
 
         expected: list[dict] = []
         previous: list[dict] = []
+        desired: ContextObject | None = None
+        current: ContextObject | None = None
         if self.relation_store is not None:
             object_payload = operation.payload.get("context_object")
             desired = ContextObject.from_dict(object_payload) if isinstance(object_payload, dict) else None
-            current: ContextObject | None = None
             current_uri = operation.target_uri or (desired.uri if desired is not None else None)
             if current_uri:
                 try:
@@ -3873,9 +4169,34 @@ class OperationCommitter:
         previous = self._unique_relation_specs(previous)
         if any(self._regular_relation_has_canonical_endpoint(spec) for spec in expected):
             raise ValueError(
-                "regular operations cannot publish relations to canonical memory; "
-                "canonical relations require an immutable canonical receipt"
+                "regular operations cannot publish a canonical Source relation; "
+                "canonical Source relations require an immutable canonical receipt"
             )
+        authority_uri = str(
+            (desired.uri if desired is not None else "")
+            or (current.uri if current is not None else "")
+            or operation.target_uri
+            or ""
+        )
+        previous_keys = {self._relation_spec_key(spec) for spec in previous}
+        serving_expected: list[dict] = []
+        for spec in expected:
+            eligibility = self._ordinary_relation_eligibility(
+                spec,
+                authority_uri=authority_uri,
+                authority_object=desired or current,
+            )
+            if eligibility.allowed:
+                serving_expected.append(spec)
+                continue
+            if self._action_policy_source_only_relation(desired, spec, eligibility):
+                # A retired ActionPolicy still owns its schema-declared
+                # evidence relation in Source, but the relation is
+                # deliberately absent from the serving manifest.
+                continue
+            if self._relation_spec_key(spec) not in previous_keys:
+                raise ValueError(f"ordinary relation is not serving-eligible: {eligibility.reason}")
+        expected = self._unique_relation_specs(serving_expected)
         expected_keys = {self._relation_spec_key(spec) for spec in expected}
         remove = [
             self._relation_key_payload(spec) for spec in previous if self._relation_spec_key(spec) not in expected_keys
@@ -3893,6 +4214,30 @@ class OperationCommitter:
             "remove": remove,
         }
         return {**core, "fingerprint": stable_hash(core, length=64)}
+
+    def _action_policy_source_only_relation(
+        self,
+        desired: ContextObject | None,
+        spec: dict,
+        eligibility: OrdinaryRelationEligibility,
+    ) -> bool:
+        """Allow only typed retired-policy facts to bypass serving publication."""
+
+        if (
+            desired is None
+            or desired.context_type != ContextType.ACTION_POLICY
+            or desired.lifecycle_state == LifecycleState.ACTIVE
+            or str(spec.get("source_uri") or "") != desired.uri
+            or eligibility.reason != "source endpoint is not serving"
+        ):
+            return False
+        schema_authority = ContextObject.from_dict(desired.to_dict())
+        schema_authority.relations = []
+        schema_keys = {
+            self._relation_spec_key(item)
+            for item in ordinary_relation_specs_for_object(schema_authority)
+        }
+        return self._relation_spec_key(spec) in schema_keys
 
     def _validate_regular_relation_manifest(
         self,
@@ -3944,6 +4289,7 @@ class OperationCommitter:
                 str(key["source_uri"]),
                 str(key["relation_type"]),
                 str(key["target_uri"]),
+                tenant_id=str(manifest["tenant_id"]),
             )
         self._ensure_relation_specs([dict(item) for item in manifest.get("expected", []) or []])
         self._validate_regular_relation_manifest_effect(manifest)
@@ -3954,10 +4300,19 @@ class OperationCommitter:
                 raise RedoIntegrityError("regular relation effect has no RelationStore")
             return
         for spec in manifest.get("expected", []) or []:
-            actual = {
-                canonical_json(self._relation_effect_spec(relation))
-                for relation in self.relation_store.relations_of(str(spec["source_uri"]))
-            }
+            relations = self.relation_store.relations_of(
+                str(spec["source_uri"]),
+                tenant_id=str(manifest["tenant_id"]),
+            )
+            actual = {canonical_json(self._relation_effect_spec(relation)) for relation in relations}
+            eligibility = self._ordinary_relation_eligibility(
+                dict(spec),
+                authority_uri=str(manifest.get("target_uri") or ""),
+            )
+            if not eligibility.allowed:
+                if canonical_json(spec) in actual:
+                    raise RedoIntegrityError("retired ordinary relation remained in RelationStore")
+                continue
             if canonical_json(spec) not in actual:
                 raise RedoIntegrityError("regular redo RelationStore effect is incomplete")
         for key in manifest.get("remove", []) or []:
@@ -3965,7 +4320,10 @@ class OperationCommitter:
                 relation.source_uri == key["source_uri"]
                 and relation.relation_type == key["relation_type"]
                 and relation.target_uri == key["target_uri"]
-                for relation in self.relation_store.relations_of(str(key["source_uri"]))
+                for relation in self.relation_store.relations_of(
+                    str(key["source_uri"]),
+                    tenant_id=str(manifest["tenant_id"]),
+                )
             ):
                 raise RedoIntegrityError("regular redo RelationStore retained a removed managed relation")
 
@@ -3987,20 +4345,41 @@ class OperationCommitter:
         }
 
     def _regular_relation_has_canonical_endpoint(self, spec: dict) -> bool:
-        for uri in (str(spec.get("source_uri") or ""), str(spec.get("target_uri") or "")):
-            if not uri:
-                continue
-            if not uri.startswith("memoryos://"):
-                continue
-            if is_canonical_memory_uri(uri):
-                return True
-            try:
-                obj = self.source_store.read_object(uri)
-            except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
-                continue
-            if is_canonical_memory_object(obj):
-                return True
+        uri = str(spec.get("source_uri") or "")
+        if not uri or not uri.startswith("memoryos://"):
+            return False
+        if is_canonical_memory_uri(uri):
+            return True
+        try:
+            obj = self.source_store.read_object(uri)
+        except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+            return False
+        if is_canonical_memory_object(obj):
+            return True
         return False
+
+    def _ordinary_relation_eligibility(
+        self,
+        spec: dict,
+        *,
+        authority_uri: str = "",
+        authority_object: ContextObject | None = None,
+    ) -> OrdinaryRelationEligibility:
+        tenant_id = str(dict(spec.get("metadata", {}) or {}).get("tenant_id") or self.tenant_id)
+        return ordinary_relation_serving_eligibility(
+            spec,
+            authority_uri=authority_uri,
+            tenant_id=tenant_id,
+            source_store=self.source_store,
+            index_store=self.index_store,
+            authority_object=authority_object,
+            canonical_reader=lambda uri: read_committed_canonical(
+                self.source_store,
+                uri,
+                self.relation_store,
+            ).object,
+            allow_virtual_targets=True,
+        )
 
     def _relation_spec_key(self, spec: dict) -> tuple[str, str, str]:
         return (
@@ -4095,10 +4474,17 @@ class OperationCommitter:
                 raise RedoIntegrityError("regular redo relation effect has no RelationStore")
             return
         for spec in expected:
-            actual = {
-                canonical_json(self._relation_effect_spec(relation))
-                for relation in self.relation_store.relations_of(str(spec["source_uri"]))
-            }
+            tenant_id = str(dict(spec.get("metadata", {}) or {}).get("tenant_id") or self.tenant_id)
+            relations = self.relation_store.relations_of(
+                str(spec["source_uri"]),
+                tenant_id=tenant_id,
+            )
+            actual = {canonical_json(self._relation_effect_spec(relation)) for relation in relations}
+            eligibility = self._ordinary_relation_eligibility(spec)
+            if not eligibility.allowed:
+                if canonical_json(spec) in actual:
+                    raise RedoIntegrityError("retired ordinary relation remained in RelationStore")
+                continue
             if canonical_json(spec) not in actual:
                 raise RedoIntegrityError("regular redo RelationStore effect is incomplete")
 
@@ -4117,6 +4503,10 @@ class OperationCommitter:
         return self.tenant_id
 
     def resume_canonical_batch(self, user_id: str, entries: list) -> list[str]:  # noqa: ANN001
+        with self._migration_projection_fence():
+            return self._resume_canonical_batch_unfenced(user_id, entries)
+
+    def _resume_canonical_batch_unfenced(self, user_id: str, entries: list) -> list[str]:  # noqa: ANN001
         """从事务日志记录的阶段继续完成整批写入。"""
 
         operations = [entry.operation for entry in entries]
@@ -4410,6 +4800,18 @@ class OperationCommitter:
         *,
         commit_group_id: str | None = None,
     ) -> list[str]:
+        with self._migration_projection_fence():
+            return self._recover_pending_canonical_unfenced(
+                user_id,
+                commit_group_id=commit_group_id,
+            )
+
+    def _recover_pending_canonical_unfenced(
+        self,
+        user_id: str,
+        *,
+        commit_group_id: str | None = None,
+    ) -> list[str]:
         """恢复卡在准备阶段或源数据已写入阶段的记忆事务。"""
 
         grouped: dict[str, list] = {}
@@ -4432,6 +4834,18 @@ class OperationCommitter:
         return recovered
 
     def recover_pending_regular_memory(
+        self,
+        user_id: str,
+        *,
+        commit_group_id: str,
+    ) -> list[str]:
+        with self._migration_projection_fence():
+            return self._recover_pending_regular_memory_unfenced(
+                user_id,
+                commit_group_id=commit_group_id,
+            )
+
+    def _recover_pending_regular_memory_unfenced(
         self,
         user_id: str,
         *,
@@ -4637,7 +5051,16 @@ class OperationCommitter:
             user_id=operation.user_id,
             operation_ids=[operation.operation_id],
             object_effects=object_effects,
-            relation_effects=relation_effects_from_manifest(relation_manifest),
+            # A regular DELETE retires derived RelationStore rows through its
+            # receipt-bound projection tombstones after the Source effect is
+            # committed.  Binding their transient pre-cleanup presence into
+            # the immutable Source marker would make a successful delete
+            # impossible to replay once that outbox has done its job.
+            relation_effects=(
+                []
+                if operation.action == OperationAction.DELETE
+                else relation_effects_from_manifest(relation_manifest)
+            ),
             diff=diff.to_dict(),
             operations=[stored_operation],
         )
@@ -4855,7 +5278,10 @@ class OperationCommitter:
                         continue
                     matches = [
                         relation
-                        for relation in self.relation_store.relations_of(identity["source_uri"])
+                        for relation in self.relation_store.relations_of(
+                            identity["source_uri"],
+                            tenant_id=self.tenant_id,
+                        )
                         if relation.source_uri == identity["source_uri"]
                         and relation.relation_type == identity["relation_type"]
                         and relation.target_uri == identity["target_uri"]
@@ -4894,7 +5320,16 @@ class OperationCommitter:
             effect_payload = {
                 key: value
                 for key, value in operation.payload.items()
-                if key not in {"target_resolution_reason", "target_candidates"}
+                if key
+                not in {
+                    "target_resolution_reason",
+                    "target_candidates",
+                    # Internal durable outbox bindings are receipt-covered but
+                    # are not part of the caller's semantic delete request.
+                    # Excluding them lets a retry with the same operation id
+                    # load the exact persisted binding from its marker.
+                    "projection_tombstone_ids",
+                }
             }
         effect = {
             "operation_id": operation.operation_id,
@@ -4911,7 +5346,7 @@ class OperationCommitter:
         payload = operation.payload.get("context_object")
         if not isinstance(payload, dict):
             return payload
-        obj = ContextObject.from_dict(payload)
+        obj = self._materialize_action_policy_source_relations(ContextObject.from_dict(payload))
         if operation.payload.get("content"):
             obj.layers = ContextLayers(
                 l0_uri=f"{obj.uri}/.abstract.md",
@@ -4940,6 +5375,7 @@ class OperationCommitter:
             object_payload = operation.payload.get("context_object")
             if isinstance(object_payload, dict):
                 obj = ContextObject.from_dict(object_payload)
+                obj = self._materialize_action_policy_source_relations(obj)
                 content = str(operation.payload.get("content", ""))
                 self.source_store.write_object(obj, content=content)
                 canonical_kind = str(dict(obj.metadata or {}).get("canonical_kind") or "")
@@ -5011,6 +5447,12 @@ class OperationCommitter:
                 self.index_store.upsert_index(obj, content=str(operation.payload.get("content", "")))
             return
         if operation.action == OperationAction.DELETE and operation.target_uri:
+            if self._delete_tombstone_ids(operation):
+                # The durable projection worker owns Catalog/FTS/Vector/Path/
+                # Relation cleanup.  Synchronously deleting only SQLite here
+                # would make the Source transaction look complete while
+                # external derived state remained searchable.
+                return
             self.index_store.delete_index(operation.target_uri)
             return
         if operation.target_uri and operation.action in {
@@ -5109,7 +5551,7 @@ class OperationCommitter:
         return ActionPolicy(**data)
 
     def _write_action_policy(self, policy: ActionPolicy) -> None:
-        obj = policy.to_context_object()
+        obj = self._materialize_action_policy_source_relations(policy.to_context_object())
         self.source_store.write_object(
             obj,
             content=json.dumps(policy.to_dict(), ensure_ascii=False, indent=2),
@@ -5125,6 +5567,43 @@ class OperationCommitter:
             ),
         )
 
+    def _materialize_action_policy_source_relations(self, obj: ContextObject) -> ContextObject:
+        """Persist ActionPolicy relation facts even when they cannot be served.
+
+        Public ``ContextDB.add_relation`` is an online-serving operation and
+        therefore rejects deleted or obsolete endpoints.  ActionPolicy writes
+        have a narrower requirement: their typed anchor/resource/skill fields
+        are durable Source facts, while ``_apply_relations`` independently
+        decides whether a rebuildable RelationStore row is currently eligible.
+        Materializing those facts here keeps the two contracts separate.
+        """
+
+        if obj.context_type != ContextType.ACTION_POLICY:
+            return obj
+        by_identity = {
+            (relation.source_uri, relation.relation_type, relation.target_uri): relation
+            for relation in obj.relations
+        }
+        for spec in ordinary_relation_specs_for_object(obj):
+            identity = (
+                str(spec["source_uri"]),
+                str(spec["relation_type"]),
+                str(spec["target_uri"]),
+            )
+            by_identity.setdefault(
+                identity,
+                ContextRelation(
+                    source_uri=identity[0],
+                    relation_type=identity[1],
+                    target_uri=identity[2],
+                    weight=float(spec.get("weight", 1.0)),
+                    metadata=dict(spec.get("metadata", {}) or {}),
+                    created_at=str(obj.created_at or obj.updated_at or ""),
+                ),
+            )
+        obj.relations = [by_identity[key] for key in sorted(by_identity)]
+        return obj
+
     def _apply_relations(self, obj: ContextObject, operation: ContextOperation) -> None:
         del operation
         if self.relation_store is None:
@@ -5132,48 +5611,7 @@ class OperationCommitter:
         self._ensure_relation_specs(self._relation_specs_for_object(obj))
 
     def _relation_specs_for_object(self, obj: ContextObject) -> list[dict]:
-        metadata = dict(obj.metadata)
-        relation_metadata = {"tenant_id": obj.tenant_id or "default", "owner_user_id": obj.owner_user_id}
-        specs: list[dict] = []
-
-        def add(source_uri: str, relation_type: str, target_uri: str, relation_meta: dict) -> None:
-            if not target_uri:
-                return
-            specs.append(
-                {
-                    "source_uri": source_uri,
-                    "relation_type": relation_type,
-                    "target_uri": target_uri,
-                    "weight": 1.0,
-                    "metadata": {key: value for key, value in relation_meta.items() if value is not None},
-                }
-            )
-
-        if obj.context_type == ContextType.ACTION_POLICY:
-            add(obj.uri, "anchored_by", str(metadata.get("memory_anchor_uri", "")), relation_metadata)
-            for uri in metadata.get("required_resource_uris", []) or []:
-                add(obj.uri, "requires_resource", str(uri), relation_metadata)
-            for uri in metadata.get("required_skill_uris", []) or []:
-                add(obj.uri, "requires_skill", str(uri), relation_metadata)
-            for uri in metadata.get("supported_behavior_pattern_uris", []) or []:
-                add(obj.uri, "supported_by", str(uri), relation_metadata)
-            for uri in metadata.get("constrained_by_memory_uris", []) or []:
-                add(obj.uri, "constrained_by", str(uri), relation_metadata)
-        elif obj.context_type in {ContextType.BEHAVIOR_PATTERN, ContextType.BEHAVIOR_CLUSTER}:
-            add(obj.uri, "anchored_by", str(metadata.get("memory_anchor_uri", "")), relation_metadata)
-            for uri in metadata.get("case_refs", []) or []:
-                add(obj.uri, "aggregated_from", str(uri), relation_metadata)
-            for uri in metadata.get("related_policy_uris", []) or metadata.get("policy_uris", []) or []:
-                add(str(uri), "supported_by", obj.uri, relation_metadata)
-        elif obj.context_type == ContextType.MEMORY:
-            for policy_uri in metadata.get("constrains_policy_uris", []) or []:
-                add(str(policy_uri), "constrained_by", obj.uri, relation_metadata)
-            for behavior_uri in metadata.get("supporting_behavior_uris", []) or []:
-                add(obj.uri, "evidence_for", str(behavior_uri), relation_metadata)
-        for relation in obj.relations:
-            specs.append(self._relation_effect_spec(relation))
-        unique = {canonical_json(spec): spec for spec in specs}
-        return [unique[key] for key in sorted(unique)]
+        return ordinary_relation_specs_for_object(obj)
 
     def _add_relation(self, source_uri: str, relation_type: str, target_uri: str, metadata: dict) -> None:
         if self.relation_store is None or not target_uri:
@@ -5194,7 +5632,11 @@ class OperationCommitter:
         if self.relation_store is None:
             return
         for spec in specs:
-            existing = self.relation_store.relations_of(str(spec["source_uri"]))
+            tenant_id = str(dict(spec.get("metadata", {}) or {}).get("tenant_id") or self.tenant_id)
+            existing = self.relation_store.relations_of(
+                str(spec["source_uri"]),
+                tenant_id=tenant_id,
+            )
             matching_key = next(
                 (
                     relation
@@ -5205,6 +5647,17 @@ class OperationCommitter:
                 ),
                 None,
             )
+            if not is_canonical_memory_uri(str(spec["source_uri"])):
+                eligibility = self._ordinary_relation_eligibility(spec)
+                if not eligibility.allowed:
+                    if matching_key is not None:
+                        self.relation_store.delete_relation(
+                            matching_key.source_uri,
+                            matching_key.relation_type,
+                            matching_key.target_uri,
+                            tenant_id=tenant_id,
+                        )
+                    continue
             if matching_key is not None and self._relation_effect_spec(matching_key) == spec:
                 continue
             if matching_key is not None:
@@ -5212,6 +5665,7 @@ class OperationCommitter:
                     matching_key.source_uri,
                     matching_key.relation_type,
                     matching_key.target_uri,
+                    tenant_id=tenant_id,
                 )
             self.relation_store.add_relation(
                 ContextRelation(

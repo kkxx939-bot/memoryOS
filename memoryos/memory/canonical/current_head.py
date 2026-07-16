@@ -100,6 +100,27 @@ def _head_from_snapshot(
     return {**core, "head_digest": canonical_digest(core)}
 
 
+def head_from_receipt_snapshot(
+    snapshot: dict[str, Any],
+    receipt: dict[str, Any],
+) -> dict[str, Any]:
+    """Reconstruct the immutable current-head identity bound by a receipt.
+
+    Projection history uses this deterministic form instead of consulting the
+    mutable current-head pointer after a later revision has been committed.
+    """
+
+    idempotency_key = require_safe_path_segment(
+        receipt.get("idempotency_key"),
+        "canonical receipt idempotency_key",
+    )
+    return _head_from_snapshot(
+        snapshot,
+        receipt,
+        receipt_path=f"system/transactions/{idempotency_key}.json",
+    )
+
+
 def validate_current_head(head: object) -> dict[str, Any]:
     if not isinstance(head, dict) or head.get("schema_version") != CURRENT_HEAD_SCHEMA_VERSION:
         raise CurrentHeadIntegrityError("current head schema is unsupported")

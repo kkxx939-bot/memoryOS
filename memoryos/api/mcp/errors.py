@@ -7,6 +7,7 @@ from typing import Any
 
 from memoryos.adapters.agent_hooks.sanitizer import sanitize_error_text
 from memoryos.api.sdk.http_client import RemoteMemoryOSError
+from memoryos.contextdb.retrieval.orchestrator import RetrievalUnavailableError
 from memoryos.runtime.readiness import RuntimeNotReadyError
 
 
@@ -80,6 +81,13 @@ def exception_payload(exc: Exception) -> dict[str, Any]:
             str(exc),
             retryable=True,
             details={"runtime_state": exc.state.value},
+        )
+    if isinstance(exc, RetrievalUnavailableError):
+        return error_payload(
+            MCPErrorCode.NOT_READY,
+            str(exc),
+            retryable=True,
+            details={"degraded_modes": list(exc.degraded_modes)},
         )
     if isinstance(exc, ToolValidationError | ValueError):
         return error_payload(MCPErrorCode.VALIDATION_ERROR, str(exc), retryable=False)

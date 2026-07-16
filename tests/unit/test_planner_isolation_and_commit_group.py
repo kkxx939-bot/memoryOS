@@ -6,10 +6,14 @@ import threading
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
+
 from memoryos.api.sdk.client import MemoryOSClient
 from memoryos.connect import ConnectMetadata
+from memoryos.contextdb.retrieval.orchestrator import RetrievalUnavailableError
 from memoryos.contextdb.session.planners.memory_commit_planner import MemoryCommitPlanner
 from memoryos.contextdb.session.session_model import SessionArchive
+from memoryos.contextdb.store.sqlite_index_store import SQLiteIndexStore
 from memoryos.memory.canonical import CandidateProposalAdapter, MemorySemanticProposal, SessionArchiveEpisodeAdapter
 from memoryos.memory.canonical.event import canonical_digest
 from memoryos.memory.extraction import FakeMemoryModelProvider, LLMMemoryExtractorBackend
@@ -160,9 +164,7 @@ def test_commit_group_restart_retries_only_failed_projection_consumer(tmp_path, 
                     "value_fields": values,
                     "semantic": semantic,
                     "epistemic_status": "EXPLICIT",
-                    "suggested_scope_refs": [
-                        {"namespace": "memoryos", "kind": "workspace", "id": "memoryos"}
-                    ],
+                    "suggested_scope_refs": [{"namespace": "memoryos", "kind": "workspace", "id": "memoryos"}],
                     "evidence_refs": [atomic],
                     "atomic_evidence_ref": atomic,
                     "field_evidence_refs": {
@@ -181,6 +183,7 @@ def test_commit_group_restart_retries_only_failed_projection_consumer(tmp_path, 
         str(tmp_path),
         memory_extractor=LLMMemoryExtractorBackend(FakeMemoryModelProvider(response)),
     )
+    assert isinstance(client.index_store, SQLiteIndexStore)
     projection_calls = 0
 
     def fail_projection(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
@@ -212,20 +215,34 @@ def test_commit_group_restart_retries_only_failed_projection_consumer(tmp_path, 
     assert before["canonical_status"] == "completed"
     assert before["consumers"]["projection"]["status"] == "failed"
     assert before["consumers"]["context"]["status"] == "completed"
-    assert client.search_context(
-        "SQLite",
-        user_id="u1",
-        project_id="memoryos",
-        context_type="memory",
+    # The projection consumer is the only writer of Current Slot serving
+    # records. Until its durable outbox job is replayed, CURRENT retrieval
+    # must fail closed instead of reviving the legacy full-Source scan.
+    with pytest.raises(RetrievalUnavailableError, match="Canonical Current projection"):
+        client.search_context(
+            "SQLite",
+            user_id="u1",
+            project_id="memoryos",
+            context_type="memory",
+        )
+    assert (
+        client.index_store.list_catalog(
+            filters={"tenant_id": "default", "record_kinds": ("current_slot",)},
+            limit=10,
+        )
+        == []
     )
+    assert client.queue_store.stats(queue_name="memory_projection") == {"pending": 1}
+    outbox_files = list((tmp_path / "system" / "outbox").glob("*.json"))
+    assert len(outbox_files) == 1
+    assert json.loads(outbox_files[0].read_text(encoding="utf-8"))["status"] == "committed"
     archived = client.session_archive_store.read_archive(result.archive_uri)
     assert not client.session_archive_store.async_outputs_done_for_task(archived)
 
     restarted = MemoryOSClient(str(tmp_path))
-    assert restarted.readiness.state == RuntimeReadinessState.READY
-    startup_recovered = restarted.session_commit_service.commit_group_store.load(
-        result.commit_group_id
-    )
+    assert isinstance(restarted.index_store, SQLiteIndexStore)
+    assert restarted.readiness.state == RuntimeReadinessState.READY, restarted.readiness.reasons
+    startup_recovered = restarted.session_commit_service.commit_group_store.load(result.commit_group_id)
     assert startup_recovered is not None and startup_recovered.complete
     recovery = SessionCommitWorker(restarted.session_commit_service).process_pending()
     assert recovery["recovered"] == 0
@@ -244,6 +261,22 @@ def test_commit_group_restart_retries_only_failed_projection_consumer(tmp_path, 
     assert len(proof["proof_digest"]) == 64
     assert proof["claims"][0]["projection_attempt_id"]
     assert proof["claims"][0]["publish_token"]
+    assert restarted.search_context(
+        "SQLite",
+        user_id="u1",
+        project_id="memoryos",
+        context_type="memory",
+    )
+    assert (
+        len(
+            restarted.index_store.list_catalog(
+                filters={"tenant_id": "default", "record_kinds": ("current_slot",)},
+                limit=10,
+            )
+        )
+        == 1
+    )
+    assert restarted.queue_store.stats(queue_name="memory_projection") == {"done": 1}
     for consumer in ("behavior", "action_policy", "context"):
         assert after.consumers[consumer].attempt_count == before["consumers"][consumer]["attempt_count"]
     assert restarted.session_archive_store.async_outputs_done_for_task(archived)

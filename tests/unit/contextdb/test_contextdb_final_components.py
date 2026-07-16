@@ -7,7 +7,8 @@ from memoryos.adapters.sqlite import SqliteIndexStore, SqliteQueueStore, SqliteR
 from memoryos.contextdb.layers import LayerRefresher
 from memoryos.contextdb.model import ContextObject, ContextRelation, ContextType
 from memoryos.contextdb.resource import ResourceImporter
-from memoryos.contextdb.retrieval import HierarchicalRetriever, QueryPlan
+from memoryos.contextdb.retrieval import QueryPlan
+from memoryos.contextdb.retrieval.hierarchical_retriever import OfflineHierarchicalRetriever
 from memoryos.contextdb.skill import Skill, SkillContextBuilder, SkillRegistry
 from memoryos.contextdb.store import FileSystemSourceStore
 from memoryos.contextdb.store.vector_store import InMemoryVectorStore
@@ -75,7 +76,10 @@ class ContextDBFinalComponentsTest(unittest.TestCase):
             )
             index.upsert_index(obj, "hot weather AC")
             plan = QueryPlan("hot weather", "gulf", [ContextType.BEHAVIOR_PATTERN], 1000)
-            self.assertEqual(HierarchicalRetriever(index).retrieve(plan).l2_uris, [obj.uri])
+            self.assertEqual(
+                OfflineHierarchicalRetriever(index, offline_admin=True).retrieve(plan).l2_uris,
+                [obj.uri],
+            )
             vector = InMemoryVectorStore()
             vector.upsert_vector(obj.uri, [1.0, 0.0])
             self.assertEqual(vector.search_vector([1.0, 0.0], "memoryos://user/gulf")[0].uri, obj.uri)

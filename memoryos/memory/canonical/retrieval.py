@@ -1,4 +1,11 @@
-"""Authoritative retrieval for canonical memory and revision-bound projections."""
+"""Offline/admin validation retrieval for canonical memory.
+
+This module intentionally contains the exhaustive canonical snapshot reader
+used by repair, audit, and migration tooling.  Product recall is owned by the
+bounded Unified Context orchestrator under ``memoryos.contextdb.retrieval``;
+the offline reader must never be wired into SDK, HTTP, MCP, or context
+assembly entrypoints.
+"""
 
 from __future__ import annotations
 
@@ -64,8 +71,16 @@ class CanonicalMemoryQuery:
     limit: int = 10
 
 
-class CanonicalMemoryRetriever:
-    """Recall candidates, then authorize and resolve every result from canonical state."""
+class OfflineCanonicalMemoryRetriever:
+    """Exhaustive canonical reader restricted to offline repair/admin work.
+
+    ``search()`` deliberately captures a complete committed Slot/Claim
+    snapshot so that audits can validate global invariants.  That O(N)
+    behavior is forbidden on the online retrieval path.  The explicit class
+    name and required ``offline_admin=True`` acknowledgement prevent this
+    implementation from becoming an accidental second product retrieval
+    chain.
+    """
 
     def __init__(
         self,
@@ -74,7 +89,11 @@ class CanonicalMemoryRetriever:
         relation_store: RelationStore | None = None,
         hybrid_search: HybridSearch | None = None,
         projection_store: ProjectionRecordStore | None = None,
+        *,
+        offline_admin: bool,
     ) -> None:
+        if offline_admin is not True:
+            raise PermissionError("OfflineCanonicalMemoryRetriever is restricted to offline admin/audit use")
         self.source_store = source_store
         self.index_store = index_store
         self.relation_store = relation_store
@@ -907,6 +926,6 @@ class CanonicalMemoryRetriever:
 __all__ = [
     "CanonicalInvariantViolation",
     "CanonicalMemoryQuery",
-    "CanonicalMemoryRetriever",
     "CanonicalQueryIntent",
+    "OfflineCanonicalMemoryRetriever",
 ]

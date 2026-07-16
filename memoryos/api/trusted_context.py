@@ -39,6 +39,7 @@ class TrustedRequestContext:
     actor_id: str = "generic_agent"
     capabilities: frozenset[str] = field(default_factory=lambda: DEFAULT_AGENT_CAPABILITIES)
     allowed_workspace_ids: frozenset[str] = field(default_factory=frozenset)
+    authorized_scope_keys: frozenset[str] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
         for name in ("tenant_id", "user_id", "actor_kind", "actor_id"):
@@ -57,6 +58,21 @@ class TrustedRequestContext:
                 or workspace_id == PRINCIPAL_ONLY_WORKSPACE
             ):
                 raise ValueError("trusted caller workspace IDs must be non-empty and non-reserved")
+        normalized_scope_keys: set[str] = set()
+        for scope_key in self.authorized_scope_keys:
+            if not isinstance(scope_key, str) or not scope_key.strip() or "\x00" in scope_key:
+                raise ValueError("trusted caller scope keys must be non-empty strings without NUL")
+            normalized = scope_key.strip()
+            normalized_scope_keys.add(normalized)
+            principal_prefix = "memoryos:principal:"
+            workspace_prefix = "memoryos:workspace:"
+            if normalized.startswith(principal_prefix) and normalized != f"{principal_prefix}{self.user_id}":
+                raise ValueError("trusted caller cannot authorize another principal scope")
+            if normalized.startswith(workspace_prefix):
+                workspace_id = normalized.removeprefix(workspace_prefix)
+                if workspace_id not in self.allowed_workspace_ids:
+                    raise ValueError("trusted caller workspace scope must match an allowed workspace")
+        object.__setattr__(self, "authorized_scope_keys", frozenset(normalized_scope_keys))
 
     def require(self, capability: str) -> None:
         if capability not in self.capabilities:
@@ -91,17 +107,54 @@ class TrustedRequestContext:
             raise PermissionError("caller has no authorized workspace for this write")
         return resolved
 
-    def assert_applicability_scopes(self, scopes: Any) -> None:
+    def retrieval_scope_keys(self, *, workspace_id: str | None = None) -> frozenset[str]:
+        """Return the complete, trusted allow-list for one retrieval request.
+
+        The principal and the selected workspace are derived from authenticated
+        transport identity. Additional team/environment/asset grants may only
+        come from trusted process configuration via ``authorized_scope_keys``.
+        """
+
+        selected_workspace = str(workspace_id or "").strip()
+        if selected_workspace and selected_workspace != PRINCIPAL_ONLY_WORKSPACE:
+            self.assert_workspace(selected_workspace)
+        keys = {f"memoryos:principal:{self.user_id}", *self.authorized_scope_keys}
+        if selected_workspace and selected_workspace != PRINCIPAL_ONLY_WORKSPACE:
+            keys.add(f"memoryos:workspace:{selected_workspace}")
+        return frozenset(keys)
+
+    def assert_applicability_scope_keys(self, scope_keys: Any, *, workspace_id: str | None = None) -> None:
+        """Reject user-declared applicability keys outside trusted grants."""
+
+        if scope_keys is None:
+            return
+        if not isinstance(scope_keys, Sequence) or isinstance(scope_keys, str | bytes):
+            raise PermissionError("applicability scope keys must be an array")
+        requested: set[str] = set()
+        for raw_key in scope_keys:
+            if not isinstance(raw_key, str) or not raw_key.strip() or "\x00" in raw_key:
+                raise PermissionError("applicability scope keys must contain non-empty strings")
+            requested.add(raw_key.strip())
+        unauthorized = requested - set(self.retrieval_scope_keys(workspace_id=workspace_id))
+        if unauthorized:
+            raise PermissionError("applicability scope keys exceed trusted caller grants")
+
+    def assert_applicability_scopes(self, scopes: Any, *, workspace_id: str | None = None) -> None:
         if scopes is None:
             return
         if not isinstance(scopes, Sequence) or isinstance(scopes, str | bytes):
             raise PermissionError("applicability scopes must be an array")
+        scope_keys: list[str] = []
         for item in scopes:
             if not isinstance(item, Mapping):
                 raise PermissionError("applicability scopes must contain objects")
-            kind = str(item.get("kind") or "").strip().casefold()
-            if kind in {"workspace", "project", "repository", "repo", "worktree"}:
-                self.assert_workspace(item.get("id"))
+            try:
+                from memoryos.memory.canonical.scope import scope_key_from_payload
+
+                scope_keys.append(scope_key_from_payload(item))
+            except (TypeError, ValueError) as exc:
+                raise PermissionError("applicability scopes contain an invalid scope") from exc
+        self.assert_applicability_scope_keys(scope_keys, workspace_id=workspace_id)
 
     def bind_agent_connect_metadata(self, payload: Any) -> dict[str, Any] | None:
         """Bind adapter identity and non-action capabilities for an agent request."""
@@ -142,6 +195,12 @@ def capabilities_from_csv(raw: str | None, *, default: frozenset[str] = DEFAULT_
 
 
 def workspace_ids_from_csv(raw: str | None) -> frozenset[str]:
+    return frozenset(item.strip() for item in str(raw or "").split(",") if item.strip())
+
+
+def scope_keys_from_csv(raw: str | None) -> frozenset[str]:
+    """Parse trusted, deployment-configured non-principal scope grants."""
+
     return frozenset(item.strip() for item in str(raw or "").split(",") if item.strip())
 
 

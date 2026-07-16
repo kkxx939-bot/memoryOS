@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import os
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import Any
 
 from memoryos.contextdb.session.commit_group import CommitGroupIntegrityError
 from memoryos.contextdb.session.planning_envelope import PlanningEnvelopeIntegrityError
@@ -25,7 +28,33 @@ class SessionCommitWorker:
         result = self.service.async_commit(archive)
         return {"task_id": result.task_id, "status": result.status, "done": result.done}
 
+    @contextmanager
+    def _migration_projection_fence(self) -> Iterator[None]:
+        gate: Any | None = getattr(self.service, "migration_gate", None)
+        acquire = getattr(gate, "acquire_projection_fence", None)
+        release = getattr(gate, "release_projection_fence", None)
+        fence = acquire() if callable(acquire) else None
+        try:
+            yield
+        finally:
+            if callable(release):
+                release(fence)
+
     def process_pending(self, *, batch_size: int = 10, lease_seconds: int = 60, max_retries: int = 3) -> dict:
+        with self._migration_projection_fence():
+            return self._process_pending_unfenced(
+                batch_size=batch_size,
+                lease_seconds=lease_seconds,
+                max_retries=max_retries,
+            )
+
+    def _process_pending_unfenced(
+        self,
+        *,
+        batch_size: int,
+        lease_seconds: int,
+        max_retries: int,
+    ) -> dict:
         # The readiness check precedes commit-group recovery and queue leasing:
         # a NOT_READY runtime must not call the extractor or mutate durable work.
         require_session_service_ready(self.service)

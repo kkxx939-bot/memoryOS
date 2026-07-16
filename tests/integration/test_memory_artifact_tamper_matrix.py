@@ -61,6 +61,25 @@ def _remember(
     )
 
 
+def _remember_with_projection_pending(
+    client: MemoryOSClient,
+    value: str,
+    *,
+    topic: str = "primary storage backend",
+) -> dict[str, str]:
+    """Commit canonical state while a fault injector holds the derived worker."""
+
+    outbox_root = Path(client.memory_projection_worker.projector.root) / "system" / "outbox"
+    before = {path.name for path in outbox_root.glob("*.json")} if outbox_root.exists() else set()
+    with pytest.raises(RuntimeError, match="serving projection remains pending"):
+        _remember(client, value, topic=topic)
+    created = sorted(path for path in outbox_root.glob("*.json") if path.name not in before)
+    assert len(created) == 1
+    job = _require_queue_job(client, f"outbox_{created[0].stem}")
+    assert job.status == "pending"
+    return {"uri": job.target_uri, "status": "COMMITTED", "job_id": job.job_id}
+
+
 def _require_queue_job(client: MemoryOSClient, job_id: str) -> QueueJob:
     job = client.queue_store.get(job_id)
     assert job is not None
@@ -436,8 +455,8 @@ def test_live_corrupt_committed_outbox_aborts_batch_and_marks_not_ready(
                 "quarantine": [],
             },
         )
-        first = _remember(client, "PostgreSQL", topic="storage-a")
-        second = _remember(client, "SQLite", topic="storage-b")
+        first = _remember_with_projection_pending(client, "PostgreSQL", topic="storage-a")
+        second = _remember_with_projection_pending(client, "SQLite", topic="storage-b")
 
     outboxes = sorted((tmp_path / "system" / "outbox").glob("*.json"))
     assert len(outboxes) == 2
@@ -482,8 +501,8 @@ def test_startup_corrupt_outbox_stops_before_valid_projection(
                 "quarantine": [],
             },
         )
-        first = _remember(client, "PostgreSQL", topic="startup-storage-a")
-        second = _remember(client, "SQLite", topic="startup-storage-b")
+        first = _remember_with_projection_pending(client, "PostgreSQL", topic="startup-storage-a")
+        second = _remember_with_projection_pending(client, "SQLite", topic="startup-storage-b")
     outboxes = sorted((tmp_path / "system" / "outbox").glob("*.json"))
     assert len(outboxes) == 2
     payload = json.loads(outboxes[0].read_text(encoding="utf-8"))
@@ -545,7 +564,7 @@ def test_projection_retry_stays_ready_but_terminal_dead_letter_fails_closed(
                 "quarantine": [],
             },
         )
-        committed = _remember(client, "PostgreSQL")
+        committed = _remember_with_projection_pending(client, "PostgreSQL")
     head, _receipt, _snapshot = load_current_head(tmp_path, committed["uri"])
     job_id = f"outbox_{head['current_transaction_id']}"
 
@@ -599,8 +618,8 @@ def test_authoritative_race_aborts_already_leased_projection_batch(
                 "released": [],
             },
         )
-        first = _remember(client, "PostgreSQL", topic="leased-race-a")
-        second = _remember(client, "SQLite", topic="leased-race-b")
+        first = _remember_with_projection_pending(client, "PostgreSQL", topic="leased-race-a")
+        second = _remember_with_projection_pending(client, "SQLite", topic="leased-race-b")
     heads = [load_current_head(tmp_path, item["uri"])[0] for item in (first, second)]
     transaction_ids = [str(head["current_transaction_id"]) for head in heads]
     job_ids = {f"outbox_{transaction_id}" for transaction_id in transaction_ids}

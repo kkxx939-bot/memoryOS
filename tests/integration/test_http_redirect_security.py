@@ -42,6 +42,7 @@ def test_cross_origin_redirect_never_receives_authentication_headers() -> None:
 
     class Redirect(_QuietHandler):
         def do_POST(self) -> None:  # noqa: N802
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
             self.send_response(302)
             self.send_header("Location", target_url)
             self.end_headers()
@@ -70,6 +71,7 @@ def test_same_origin_redirect_preserves_headers_and_compares_effective_port() ->
 
     class SameOrigin(_QuietHandler):
         def do_POST(self) -> None:  # noqa: N802
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
             self.send_response(302)
             self.send_header("Location", "/final")
             self.end_headers()

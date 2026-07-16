@@ -25,6 +25,12 @@ from memoryos.memory.canonical.identity import (
     ResolvedMemoryIdentity,
     StableMemoryIdentityResolver,
 )
+from memoryos.memory.canonical.promotion_policy import (
+    CanonicalPromotionDecision,
+    CanonicalPromotionFacts,
+    CanonicalPromotionPolicy,
+    CanonicalPromotionResult,
+)
 from memoryos.memory.canonical.proposal import (
     EpistemicStatus,
     MemorySemanticProposal,
@@ -55,7 +61,7 @@ from memoryos.memory.canonical.transition import (
     MemoryTransitionPolicy,
     PendingSemanticReconciliation,
 )
-from memoryos.memory.canonical.visibility import read_committed_pending
+from memoryos.memory.canonical.visibility import read_committed_canonical, read_committed_pending
 from memoryos.memory.schema import MemoryCandidateDraft, MemoryType, MemoryTypeRegistry
 from memoryos.operations.model.context_operation import ContextOperation
 from memoryos.operations.model.operation_action import OperationAction
@@ -423,8 +429,13 @@ class CanonicalMemoryFormationService:
         self.validator = ProposalEvidenceValidator()
         self.normalizer = MemorySemanticNormalizer()
         registry = MemoryTypeRegistry()
+        self.registry = registry
         eligibility = MemoryTypeEligibilityPolicy()
         self.admission = ProposalAdmissionGate(registry, eligibility_policy=eligibility)
+        self.promotion = CanonicalPromotionPolicy(
+            registry,
+            stateful_observational_types=(MemoryType.ENTITY,),
+        )
         self.identity = StableMemoryIdentityResolver(alias_registry, registry)
         self.reconciler = MemorySemanticReconciler()
         self.transition = MemoryTransitionPolicy(registry, eligibility)
@@ -442,6 +453,95 @@ class CanonicalMemoryFormationService:
                 obj = ContextObject.from_dict(payload)
                 request_staging[obj.uri] = obj
         return request_staging
+
+    def _promotion_result(
+        self,
+        proposal: MemorySemanticProposal,
+        *,
+        validation_valid: bool,
+        admission_decision: ProposalAdmissionDecision,
+        admission_score: float,
+        admission_threshold: float,
+        memory_scope: MemoryScope,
+        archive: SessionArchive,
+        episode: EvidenceEpisode,
+        confirmed_pending: PendingMemoryProposal | None,
+    ) -> CanonicalPromotionResult:
+        """Bind the promotion policy to trusted structural pipeline facts."""
+
+        memory_type = MemoryType(proposal.memory_type)
+        schema = self.registry.get(memory_type)
+        identity_stable = bool(schema.slot_identity_fields) and all(
+            proposal.identity_fields.get(field_name) not in (None, "")
+            for field_name in schema.slot_identity_fields
+        )
+        subject = memory_scope.canonical_subject
+        scope_resolved = bool(subject is not None and not subject.inferred)
+        authority_resolved = bool(
+            not memory_scope.authority.inferred
+            and (memory_scope.authority.principal_ids or memory_scope.authority.service_ids)
+        )
+        atomic_actor = str(getattr(proposal.atomic_evidence_ref, "actor_kind", "") or "").casefold()
+        source_role = atomic_actor or str(proposal.metadata.get("source_role") or "").casefold()
+        structured_remember = bool(
+            archive.metadata.get("structured_memory_command") is True
+            and proposal.metadata.get("effect_authority") == "structured_explicit_command"
+        )
+        explicit_review = confirmed_pending is not None
+        semantic = proposal.semantic
+        temporal_scope = str(getattr(getattr(semantic, "temporal_scope", ""), "value", "")).upper()
+        durability = str(getattr(getattr(semantic, "durability", ""), "value", "")).upper()
+        values = dict(proposal.value_fields)
+        experience_fields = tuple(str(values.get(name) or "").strip() for name in ("situation", "approach", "outcome"))
+        event_texts = {event.text().strip() for event in episode.events if event.text().strip()}
+        canonical_text = str(values.get("canonical_value") or values.get("outcome") or "").strip()
+        raw_tool_log = source_role == "tool" or all(event.actor.kind == "tool" for event in episode.events)
+        raw_agent_log = bool(
+            source_role in {"assistant", "agent"}
+            and canonical_text
+            and canonical_text in event_texts
+            and not all(experience_fields)
+        )
+        serialized_values = canonicalize(values)
+        value_text = str(serialized_values).casefold()
+        one_off_failure = bool(
+            re.search(r"\b(?:one[- ]off|single failure|failed once|一次性失败)\b", value_text)
+        )
+        transient_task_state = bool(
+            re.search(r"\b(?:temporary|for now|in progress|pending task|临时|暂时|进行中)\b", value_text)
+        )
+        deterministic_entity_rule = bool(
+            memory_type == MemoryType.ENTITY
+            and source_role in {"user", "system"}
+            and temporal_scope == "CURRENT"
+            and values.get("canonical_value") not in (None, "")
+        )
+        return self.promotion.evaluate(
+            memory_type,
+            facts=CanonicalPromotionFacts(
+                explicit_remember=structured_remember or explicit_review,
+                evidence_complete=validation_valid,
+                stable_identity=identity_stable,
+                scope_resolved=scope_resolved,
+                authority_resolved=authority_resolved,
+                deterministic_rule_approved=deterministic_entity_rule,
+                distilled_experience=bool(all(experience_fields) and canonical_text not in event_texts),
+                cross_session_reusable=bool(
+                    values.get("task_pattern")
+                    and values.get("environment_signature")
+                    and durability == "DURABLE"
+                ),
+                admission_threshold_met=bool(
+                    admission_decision == ProposalAdmissionDecision.ACCEPT_FOR_RECONCILE
+                    and admission_score >= admission_threshold
+                ),
+                raw_tool_log=raw_tool_log,
+                raw_agent_log=raw_agent_log,
+                one_off_failure=one_off_failure,
+                transient_task_state=transient_task_state,
+                admission_decision=admission_decision,
+            ),
+        )
 
     def plan(
         self,
@@ -565,6 +665,41 @@ class CanonicalMemoryFormationService:
                     staged_objects=staged_objects,
                 )
             return CanonicalFormationResult((), admission.decision, admission.reason, normalized)
+        promotion = self._promotion_result(
+            normalized,
+            validation_valid=validation.valid,
+            admission_decision=admission.decision,
+            admission_score=admission.admission_score,
+            admission_threshold=admission.admission_threshold,
+            memory_scope=memory_scope,
+            archive=archive,
+            episode=episode,
+            confirmed_pending=confirmed_pending,
+        )
+        normalized = replace(
+            normalized,
+            metadata={
+                **dict(normalized.metadata),
+                "canonical_promotion": {
+                    "decision": promotion.decision.value,
+                    "reason": promotion.reason,
+                    "policy_version": promotion.policy_version,
+                    "unmet_requirements": list(promotion.unmet_requirements),
+                },
+            },
+        )
+        if promotion.decision != CanonicalPromotionDecision.PROMOTE:
+            decision = (
+                ProposalAdmissionDecision.REJECT
+                if promotion.decision == CanonicalPromotionDecision.REJECT
+                else ProposalAdmissionDecision.ARCHIVE_ONLY
+            )
+            return CanonicalFormationResult(
+                (),
+                decision,
+                f"canonical_promotion:{promotion.reason}",
+                normalized,
+            )
         normalized = self._separate_display_fields(normalized)
         identity = self.identity.resolve(
             normalized,
@@ -595,6 +730,13 @@ class CanonicalMemoryFormationService:
                 staged_objects=staged_objects,
             )
         reconciled = self.reconciler.reconcile(normalized, identity, slot=slot, claims=claims)
+        normalized = self._bind_duplicate_evidence_policy(
+            normalized,
+            relation=reconciled.relation,
+            slot=slot,
+            archive=archive,
+            staged_objects=staged_objects,
+        )
         try:
             transition = (
                 self.transition._apply_confirmed_pending_review(
@@ -684,6 +826,47 @@ class CanonicalMemoryFormationService:
             admission.reason,
             normalized,
             resolved_identity=identity,
+        )
+
+    def _bind_duplicate_evidence_policy(
+        self,
+        proposal: MemorySemanticProposal,
+        *,
+        relation: SemanticRelation,
+        slot: MemorySlot | None,
+        archive: SessionArchive,
+        staged_objects: Mapping[str, ContextObject] | None,
+    ) -> MemorySemanticProposal:
+        """Keep shared-subject duplicate assertions owner-safe.
+
+        A workspace-scoped Slot has one immutable source owner even though its
+        visibility can be tenant/workspace shared.  A second principal may
+        read the state but cannot rewrite that owner's canonical receipt just
+        to attach duplicate evidence.  The new assertion remains durable in
+        SessionArchive; same-owner duplicate evidence can still append one
+        immutable Claim revision.
+        """
+
+        if relation != SemanticRelation.DUPLICATE or slot is None:
+            return proposal
+        current: ContextObject | None = None
+        staged = dict(staged_objects or {}).get(slot.uri)
+        if staged is not None:
+            current = staged
+        elif self.source_store is not None:
+            current = read_committed_canonical(
+                self.source_store,
+                slot.uri,
+                self.relation_store,
+            ).object
+        if current is None or str(current.owner_user_id or "") == archive.user_id:
+            return proposal
+        return replace(
+            proposal,
+            metadata={
+                **dict(proposal.metadata),
+                "canonical_duplicate_evidence_policy": "cross_owner_archive_only",
+            },
         )
 
     def _related_active_target_error(

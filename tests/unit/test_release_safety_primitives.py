@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import multiprocessing
 import os
 from datetime import datetime, timedelta, timezone
@@ -22,8 +23,14 @@ from memoryos.contextdb.store.local_stores import (
 from memoryos.contextdb.store.vector_store import InMemoryVectorStore
 from memoryos.core.file_lock import open_private_lock
 from memoryos.memory.canonical.evidence import EvidenceRef
-from memoryos.memory.canonical.retrieval import CanonicalMemoryRetriever, CanonicalQueryIntent
-from memoryos.memory.canonical.state import MemoryClaim, MemoryRevision, TransitionProfile
+from memoryos.memory.canonical.retrieval import CanonicalQueryIntent, OfflineCanonicalMemoryRetriever
+from memoryos.memory.canonical.state import (
+    CanonicalMemoryInvariantError,
+    MemoryClaim,
+    MemoryRevision,
+    TransitionProfile,
+    revision_payload_with_effective_validity,
+)
 from memoryos.operations.commit.audit_writer import AuditWriter
 from memoryos.operations.commit.diff_writer import DiffWriter
 from memoryos.operations.commit.effect_marker import atomic_create_json, atomic_write_json
@@ -82,7 +89,7 @@ def test_relation_and_vector_inputs_reject_nonfinite_values(value: float) -> Non
         vectors.search_vector([value, 0.0], namespace="")
 
 
-def test_regular_commit_cannot_publish_a_relation_to_canonical_memory(tmp_path: Path) -> None:
+def test_regular_commit_rejects_unproved_canonical_target_and_canonical_source(tmp_path: Path) -> None:
     source = FileSystemSourceStore(tmp_path, tenant_id="t1")
     relations = InMemoryRelationStore()
     committer = OperationCommitter(
@@ -121,12 +128,42 @@ def test_regular_commit_cannot_publish_a_relation_to_canonical_memory(tmp_path: 
         },
     )
 
-    with pytest.raises(ValueError, match="cannot publish relations to canonical memory"):
+    with pytest.raises(FileNotFoundError, match="canonical object is not committed"):
         committer.commit("u1", [operation])
-
     with pytest.raises(FileNotFoundError):
         source.read_object(ordinary_uri)
-    assert relations.relations_of(ordinary_uri) == []
+    assert not relations.relations_of(ordinary_uri, tenant_id="t1")
+
+    forged_authority = ContextObject(
+        uri="memoryos://user/u1/memories/ordinary-forged-authority",
+        context_type=ContextType.MEMORY,
+        title="ordinary authority carrying a forged canonical Source edge",
+        owner_user_id="u1",
+        tenant_id="t1",
+        relations=[
+            ContextRelation(
+                source_uri=canonical_uri,
+                relation_type="forged_outgoing",
+                target_uri=ordinary_uri,
+                metadata={"tenant_id": "t1", "owner_user_id": "u1"},
+            )
+        ],
+    )
+    forged = ContextOperation(
+        context_type=ContextType.MEMORY,
+        action=OperationAction.ADD,
+        target_uri=forged_authority.uri,
+        user_id="u1",
+        payload={
+            "tenant_id": "t1",
+            "context_object": forged_authority.to_dict(),
+            "content": "forged",
+        },
+    )
+    with pytest.raises(ValueError, match="canonical Source relation"):
+        committer.commit("u1", [forged])
+    with pytest.raises(FileNotFoundError):
+        source.read_object(forged_authority.uri)
 
 
 def test_api_limits_share_one_hard_bound() -> None:
@@ -214,10 +251,28 @@ def test_equal_effective_time_transition_is_normalized_to_legal_interval() -> No
     assert first_start < second_start
 
 
+def test_derived_revision_validity_is_half_open_and_fails_closed_on_corruption() -> None:
+    first = _revision(1, valid_from="2026-01-01T00:00:00+00:00")
+    second = _revision(2, valid_from="2026-01-02T00:00:00+00:00")
+    rows = (first.to_dict(), second.to_dict())
+
+    effective = revision_payload_with_effective_validity(rows, 1)
+
+    assert first.valid_to is None
+    assert effective["valid_to"] == second.valid_from
+    with pytest.raises(CanonicalMemoryInvariantError, match="duplicated"):
+        revision_payload_with_effective_validity((first.to_dict(), first.to_dict()), 1)
+    corrupt = first.to_dict()
+    corrupt["valid_to"] = first.valid_from
+    with pytest.raises(CanonicalMemoryInvariantError, match="later"):
+        revision_payload_with_effective_validity((corrupt,), 1)
+
+
 def test_current_effective_time_and_negated_intent_are_fail_closed(tmp_path: Path) -> None:
-    retriever = CanonicalMemoryRetriever(
+    retriever = OfflineCanonicalMemoryRetriever(
         FileSystemSourceStore(tmp_path),
         InMemoryIndexStore(),
+        offline_admin=True,
     )
     future = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
     expired_start = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
@@ -501,3 +556,38 @@ def test_recall_trace_redacts_secret_query_and_uses_private_file(tmp_path: Path)
     assert "<redacted>" in trace["query"]
     path = service.trace_root / f"{trace_id}.json"
     assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_recall_trace_sanitizes_all_fields_and_fails_closed(tmp_path: Path) -> None:
+    class SecretAssembler:
+        reranker = None
+
+        def search(self, _query: str, **_kwargs: Any) -> list[dict[str, Any]]:
+            return [
+                {
+                    "uri": "memoryos://resources/report",
+                    "metadata": {"authorization": "Bearer never-write-this-token"},
+                    "layer": "L0",
+                }
+            ]
+
+    service = RetrievalService(SecretAssembler(), tmp_path / "traces")  # type: ignore[arg-type]
+    _results, trace_id = service.search(
+        "report",
+        user_id="u1",
+        tenant_id="default",
+        connect_filters={"cookie": "session=never-write-this-cookie"},
+    )
+    encoded = json.dumps(service.read_trace(trace_id), ensure_ascii=False)
+    assert "never-write-this-token" not in encoded
+    assert "never-write-this-cookie" not in encoded
+
+    class BrokenSanitizer:
+        def sanitize_trace(self, _value: Any) -> Any:
+            raise ValueError("sanitization unavailable")
+
+    service.sanitizer = BrokenSanitizer()  # type: ignore[assignment]
+    before = set(service.trace_root.glob("*.json"))
+    with pytest.raises(ValueError, match="sanitization unavailable"):
+        service.search("safe query", user_id="u1", tenant_id="default")
+    assert set(service.trace_root.glob("*.json")) == before

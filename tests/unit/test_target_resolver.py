@@ -59,7 +59,7 @@ class TargetResolverTest(unittest.TestCase):
         self.assertEqual(op.target_uri, obj.uri)
 
     def test_low_confidence_candidates_go_pending(self) -> None:
-        class LowConfidenceIndex:
+        class LowConfidenceIndex(InMemoryIndexStore):
             def search(self, query: str, filters: dict | None = None, limit: int = 10) -> list[IndexHit]:
                 return [
                     IndexHit(

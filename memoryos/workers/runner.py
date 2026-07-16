@@ -87,6 +87,7 @@ class WorkerRunner:
             result["semantic"] = SemanticWorker(
                 self.client.source_store,
                 self.client.queue_store,
+                migration_gate=self.client.migration_gate,
             ).process_pending(
                 limit=self.batch_size,
                 lease_seconds=self.lease_seconds,
@@ -103,6 +104,7 @@ class WorkerRunner:
                     self.client.queue_store,
                     self.client.vector_store,
                     self.client.embedding_provider,
+                    migration_gate=self.client.migration_gate,
                 ).process_pending(
                     limit=self.batch_size,
                     lease_seconds=self.lease_seconds,

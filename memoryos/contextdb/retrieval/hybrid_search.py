@@ -1,13 +1,19 @@
-"""上下文数据库里的混合检索。"""
+"""Internal hybrid candidate primitive, not a public retrieval entrypoint.
+
+The Unified Context orchestrator may use this component only through its
+bounded compatibility adapter.  SDK, HTTP, MCP, and context assembly callers
+must not call :meth:`HybridSearch.search` as a second orchestration chain.
+"""
 
 from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from memoryos.contextdb.catalog import CatalogRecord
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.model.lifecycle import LifecycleState
 from memoryos.contextdb.store.source_store import (
@@ -17,7 +23,7 @@ from memoryos.contextdb.store.source_store import (
     is_canonical_memory_object,
     is_canonical_memory_uri,
 )
-from memoryos.contextdb.store.vector_store import VectorStore
+from memoryos.contextdb.store.vector_store import VectorStore, vector_row_id
 from memoryos.providers.embedding import EmbeddingProvider
 
 logger = logging.getLogger(__name__)
@@ -36,9 +42,10 @@ class HybridHit:
 
 
 class HybridSearch:
-    """合并关键词和向量结果，过滤条件始终以源数据为准。"""
+    """Internal lexical/vector primitive for planners and bounded adapters."""
 
     DEFAULT_MIN_VECTOR_SIMILARITY = 0.20
+    MAX_VECTOR_OVERFETCH = 200
     _OWNER_OPTIONAL_CONTEXT_TYPES = {ContextType.RESOURCE.value, ContextType.SKILL.value}
 
     def __init__(
@@ -107,23 +114,32 @@ class HybridSearch:
                 embedding = self.embedding_provider.embed(query)
                 if not embedding or any(not math.isfinite(float(value)) for value in embedding):
                     raise ValueError("embedding provider returned non-finite values")
-                vector_limit = limit
-                if "allowed_uris" in filters:
-                    # The vector backend applies ``limit`` before this layer
-                    # can enforce the authoritative URI allowlist.  Asking
-                    # only for ``len(allowed_uris)`` is therefore insufficient:
-                    # a higher-scoring disallowed row can consume the entire
-                    # result window and hide a legal candidate.  Enumerating
-                    # the derived vector keys avoids a second live Source read
-                    # while guaranteeing that filtering happens before the
-                    # caller-visible limit.
-                    vector_limit = max(limit, len(self.vector_store.vector_uris()))
-                for vector_hit in self.vector_store.search_vector(embedding, namespace=namespace, limit=vector_limit):
+                allowed_uris = tuple(dict.fromkeys(str(uri) for uri in filters.get("allowed_uris", []) or []))
+                candidate_search = getattr(self.vector_store, "search_vector_candidates", None)
+                degraded_mode = ""
+                vector_hits: Sequence[Any]
+                if "allowed_uris" in filters and callable(candidate_search):
+                    candidate_ids = self._vector_candidate_ids(allowed_uris, filters)
+                    raw_vector_hits = candidate_search(embedding, candidate_ids, limit=limit)
+                    vector_hits = raw_vector_hits if isinstance(raw_vector_hits, Sequence) else ()
+                else:
+                    vector_limit = min(self.MAX_VECTOR_OVERFETCH, max(limit, limit * 4))
+                    vector_hits = self.vector_store.search_vector(
+                        embedding,
+                        namespace=namespace,
+                        limit=vector_limit,
+                    )
+                    if "allowed_uris" in filters:
+                        degraded_mode = "bounded_vector_overfetch"
+                for vector_hit in vector_hits:
                     normalized_vector_score = self._bounded_score(vector_hit.score)
                     if normalized_vector_score < self.min_vector_similarity:
                         continue
+                    public_uri = self._public_vector_uri(vector_hit.uri, vector_hit.metadata)
+                    if not public_uri:
+                        continue
                     item = self._vector_item(
-                        vector_hit.uri,
+                        public_uri,
                         vector_hit.metadata,
                         filters,
                         context_type,
@@ -132,9 +148,9 @@ class HybridSearch:
                     if item is None:
                         continue
                     existing = combined.setdefault(
-                        vector_hit.uri,
+                        public_uri,
                         {
-                            "uri": vector_hit.uri,
+                            "uri": public_uri,
                             "title": item["title"],
                             "context_type": item["context_type"],
                             "index_score": None,
@@ -147,6 +163,9 @@ class HybridSearch:
                     existing["title"] = existing.get("title") or item["title"]
                     existing["context_type"] = existing.get("context_type") or item["context_type"]
                     existing["metadata"] = {**dict(existing.get("metadata", {})), **item["metadata"]}
+                    existing["metadata"]["vector_storage_id"] = str(vector_hit.uri)
+                    if degraded_mode:
+                        existing["metadata"]["vector_degraded_mode"] = degraded_mode
                     existing["vector_score"] = normalized_vector_score
                     existing["source"] = "hybrid" if existing.get("index_score") is not None else "vector"
             except Exception as exc:
@@ -208,6 +227,37 @@ class HybridSearch:
         results.sort(key=lambda hit: hit.score, reverse=True)
         return results[:limit]
 
+    def _vector_candidate_ids(self, allowed_uris: tuple[str, ...], filters: Mapping[str, Any]) -> tuple[str, ...]:
+        """Map a bounded public allowlist to tenant-scoped vector row IDs."""
+
+        tenant_id = str(filters.get("tenant_id") or "default")
+        identifiers: list[str] = []
+        getter = getattr(self.index_store, "get_catalog_by_uri", None)
+        for public_uri in allowed_uris[: self.MAX_VECTOR_OVERFETCH]:
+            # Preserve unique legacy rows while new projections use the
+            # tenant + Catalog identity below.
+            identifiers.append(public_uri)
+            if not callable(getter):
+                continue
+            raw_records: Any = getter(public_uri, tenant_id=tenant_id, limit=16)
+            if not isinstance(raw_records, Sequence) or isinstance(raw_records, (str, bytes, bytearray)):
+                raise TypeError("Catalog vector identity lookup returned an invalid result")
+            for record in raw_records:
+                if not isinstance(record, CatalogRecord) or record.tenant_id != tenant_id or record.uri != public_uri:
+                    continue
+                identifiers.append(vector_row_id(tenant_id, record.record_key))
+        return tuple(dict.fromkeys(identifiers))[: self.MAX_VECTOR_OVERFETCH]
+
+    @staticmethod
+    def _public_vector_uri(storage_id: object, metadata: Any) -> str:
+        values = dict(metadata) if isinstance(metadata, Mapping) else {}
+        for key in ("public_uri", "uri", "claim_uri", "source_uri"):
+            value = str(values.get(key) or "")
+            if value.startswith("memoryos://"):
+                return value
+        legacy = str(storage_id)
+        return legacy if legacy.startswith("memoryos://") and not legacy.startswith("memoryos-vector://") else ""
+
     def _vector_item(
         self,
         uri: str,
@@ -221,27 +271,44 @@ class HybridSearch:
         projected_revision = metadata.get("projection_source_revision")
         if projected_revision is None:
             projected_revision = metadata.get("source_revision")
+        canonical_validation_revision = projected_revision
+        current_slot_projection = str(metadata.get("record_kind") or "") == "current_slot" or str(
+            metadata.get("canonical_kind") or ""
+        ) == "current_slot_projection"
+        if current_slot_projection:
+            canonical_validation_revision = metadata.get("active_claim_revision")
+            if canonical_validation_revision is None:
+                canonical_validation_revision = metadata.get("canonical_revision")
+            if canonical_validation_revision is None:
+                return None
         title = str(metadata.get("title", ""))
         hit_type = str(metadata.get("context_type", ""))
         owner_user_id = metadata.get("owner_user_id")
         tenant_id = metadata.get("tenant_id")
         lifecycle_state = metadata.get("lifecycle_state")
         if self.source_store is not None:
+            source_validation_uri = uri
+            if current_slot_projection:
+                source_validation_uri = str(
+                    metadata.get("active_claim_uri") or metadata.get("canonical_claim_uri") or ""
+                )
+                if not source_validation_uri:
+                    return None
             try:
                 if source_snapshot is not None:
-                    obj = source_snapshot.get(uri)
+                    obj = source_snapshot.get(source_validation_uri)
                     if obj is None:
                         return None
-                elif is_canonical_memory_uri(uri):
+                elif is_canonical_memory_uri(source_validation_uri):
                     from memoryos.memory.canonical.visibility import read_committed_canonical
 
-                    obj = read_committed_canonical(self.source_store, uri).object
+                    obj = read_committed_canonical(self.source_store, source_validation_uri).object
                 else:
-                    obj = self.source_store.read_object(uri)
+                    obj = self.source_store.read_object(source_validation_uri)
                     if is_canonical_memory_object(obj):
                         from memoryos.memory.canonical.visibility import read_committed_canonical
 
-                        obj = read_committed_canonical(self.source_store, uri).object
+                        obj = read_committed_canonical(self.source_store, source_validation_uri).object
             except (FileNotFoundError, IsADirectoryError, NotADirectoryError, TypeError, ValueError):
                 return None
             if obj.lifecycle_state != LifecycleState.ACTIVE:
@@ -257,9 +324,9 @@ class HybridSearch:
             metadata = {**metadata, **source_metadata}
             canonical_revision = source_metadata.get("revision")
             if (
-                projected_revision is not None
+                canonical_validation_revision is not None
                 and canonical_revision is not None
-                and self._revision(projected_revision) != self._revision(canonical_revision)
+                and self._revision(canonical_validation_revision) != self._revision(canonical_revision)
             ):
                 return None
         if projected_revision is not None:
@@ -403,3 +470,9 @@ class HybridSearch:
         except (TypeError, ValueError):
             return None
         return score if math.isfinite(score) and score >= 0 else None
+
+
+# This module remains importable by internal planners and compatibility tests,
+# but it deliberately has no public wildcard surface.  Product callers use
+# RetrievalOptions -> QueryPlanner -> UnifiedRetrievalOrchestrator.
+__all__: list[str] = []

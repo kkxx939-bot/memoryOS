@@ -4,13 +4,19 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
+from typing import cast
 
 import pytest
 
 from memoryos.api.sdk.client import MemoryOSClient
 from memoryos.api.trusted_context import TrustedRequestContext
+from memoryos.contextdb.store.sqlite_index_store import SQLiteIndexStore
 from memoryos.memory.canonical import CanonicalMemoryRepository
 from memoryos.memory.canonical.event import canonical_digest
+from memoryos.memory.canonical.projection_proof import (
+    ProjectionProofStore,
+    projection_publication_record_digest,
+)
 from memoryos.memory.canonical.review_command import (
     PendingReviewCommandIntegrityError,
     PendingReviewCommandStore,
@@ -148,7 +154,7 @@ def test_two_concurrent_reviews_have_one_winner_and_one_terminal_cas_failure(
         context_type="memory",
         memory_states=["ACTIVE"],
     )
-    mysql = [item for item in active if item["metadata"].get("canonical_value") == "mysql"]
+    mysql = [item for item in active if item["metadata"].get("canonical_value") == "MySQL"]
     assert len(mysql) == 1
     commands = PendingReviewCommandStore(tmp_path, tenant_id="default")
     existing_states = []
@@ -230,6 +236,40 @@ def test_crashed_confirm_and_apply_command_keeps_exclusive_resolution_ownership(
     result = recovered.review_pending(**first_request)
     assert result["status"] == "resolved"
     assert commands.load(first_request["command_id"])["status"] == "completed"
+
+    # Startup rebuild deliberately creates a fresh disposable attempt for the
+    # then-current revision.  Once that revision becomes historical, its
+    # Catalog row must be rebound to the exact immutable publication attempt,
+    # never to the rebuild retry that happened to overwrite the row before the
+    # crash-resumed transition.
+    index_store = cast(SQLiteIndexStore, recovered.index_store)
+    history = index_store.list_catalog(
+        filters={"tenant_id": "default", "record_kinds": ("claim_revision",)},
+        limit=20,
+    )
+    superseded = next(item for item in history if item.canonical_state == "SUPERSEDED")
+    original = index_store.get_catalog(
+        f"claim:{superseded.canonical_claim_id}:revision:1",
+        tenant_id="default",
+    )
+    assert original is not None
+    original_metadata = dict(original.metadata)
+    transaction_id = str(original_metadata["current_transaction_id"])
+    publication = ProjectionProofStore(tmp_path).load_publication(transaction_id)
+    assert publication is not None
+    published = next(
+        item
+        for item in publication["claims"]
+        if item["claim_uri"] == original.canonical_claim_uri and item["source_revision"] == 1
+    )
+    assert original_metadata["projection_attempt_id"] == published["projection_attempt_id"]
+    published_record = recovered.memory_projection_worker.projector.record_store.load(
+        original.canonical_claim_uri,
+        1,
+        projection_attempt_id=str(published["projection_attempt_id"]),
+    )
+    assert published_record is not None
+    assert projection_publication_record_digest(published_record) == published["publication_record_digest"]
 
 
 def test_startup_completes_running_review_command_from_resolved_receipt(

@@ -428,6 +428,11 @@ class MemoryTransitionPolicy:
                 reconciliation.historical_only,
             )
             value_changed = dict(target.current.value_fields) != dict(merged.value_fields)
+            evidence_changed = proposal.evidence_refs != target.current.evidence_refs and not (
+                reconciliation.relation == SemanticRelation.DUPLICATE
+                and proposal.metadata.get("canonical_duplicate_evidence_policy")
+                == "cross_owner_archive_only"
+            )
             if value_changed:
                 qualifiers = {
                     **qualifiers,
@@ -471,6 +476,7 @@ class MemoryTransitionPolicy:
                 or qualifiers != dict(target.current.qualifiers)
                 or value_changed
                 or display_changed
+                or evidence_changed
             ):
                 target = target.with_revision(
                     self._revision(

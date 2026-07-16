@@ -448,23 +448,21 @@ def test_startup_recovers_expired_projection_lease_before_rebuild_gate(
             "released": [],
         },
     )
-    committed = client.remember(
-        user_id="u1",
-        content="PostgreSQL",
-        memory_type="project_decision",
-        project_id="memoryos",
-        identity_fields={"decision_topic": "expired projection lease recovery"},
-    )
-    head, _receipt, _snapshot = load_current_head(
-        client.memory_projection_worker.projector.root,
-        str(committed["uri"]),
-    )
-    job_id = f"outbox_{head['current_transaction_id']}"
+    with pytest.raises(RuntimeError, match="serving projection remains pending"):
+        client.remember(
+            user_id="u1",
+            content="PostgreSQL",
+            memory_type="project_decision",
+            project_id="memoryos",
+            identity_fields={"decision_topic": "expired projection lease recovery"},
+        )
     lease = client.queue_store.lease(
         "memory_projection",
         lease_owner="crashed-projection-worker",
-        job_ids=(job_id,),
+        limit=1,
     )[0]
+    job_id = lease.job_id
+    committed_uri = lease.target_uri
     queue_path = getattr(client.queue_store, "path", None)
     assert isinstance(queue_path, Path)
     with sqlite3.connect(queue_path) as connection:
@@ -480,7 +478,16 @@ def test_startup_recovers_expired_projection_lease_before_rebuild_gate(
     assert settled is not None and settled.status == "done"
     assert settled.lease_generation == lease.lease_generation + 1
     assert restarted.readiness.details["queue_lease_recovery"] == {"recovered_expired": 1}
-    assert restarted.index_store.get_index_metadata(str(committed["uri"])) is not None
+    current_rows = restarted.index_store.list_catalog(  # type: ignore[attr-defined]
+        filters={
+            "tenant_id": "default",
+            "canonical_slot_ids": (committed_uri.rsplit("/", 1)[-1],),
+            "record_kinds": ("current_slot",),
+        },
+        limit=2,
+    )
+    assert len(current_rows) == 1
+    assert current_rows[0].canonical_slot_uri == committed_uri
     assert restarted.memory_projection_worker.verify_current_projections() == {"verified": 1}
 
 
@@ -502,18 +509,21 @@ def test_startup_never_reports_ready_with_unconsumed_projection_work(
         "process_pending",
         lambda *args, **kwargs: dict(empty_run),
     )
-    committed = client.remember(
-        user_id="u1",
-        content="PostgreSQL",
-        memory_type="project_decision",
-        project_id="memoryos",
-        identity_fields={"decision_topic": "unconsumed startup projection"},
-    )
-    head, _receipt, _snapshot = load_current_head(
-        client.memory_projection_worker.projector.root,
-        str(committed["uri"]),
-    )
-    job_id = f"outbox_{head['current_transaction_id']}"
+    with pytest.raises(RuntimeError, match="serving projection remains pending"):
+        client.remember(
+            user_id="u1",
+            content="PostgreSQL",
+            memory_type="project_decision",
+            project_id="memoryos",
+            identity_fields={"decision_topic": "unconsumed startup projection"},
+        )
+    leased = client.queue_store.lease(
+        "memory_projection",
+        lease_owner="test-unconsumed-projection",
+        limit=1,
+    )[0]
+    job_id = leased.job_id
+    client.queue_store.release(leased, "leave durable work for startup gate")
     queued = client.queue_store.get(job_id)
     assert queued is not None and queued.status == "pending"
     worker_type = type(client.memory_projection_worker)

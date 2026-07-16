@@ -10,6 +10,7 @@ from memoryos.api.trusted_context import (
     DEFAULT_AGENT_CAPABILITIES,
     TrustedRequestContext,
     capabilities_from_csv,
+    scope_keys_from_csv,
     workspace_ids_from_csv,
 )
 from memoryos.connect import ConnectMetadata, ConnectType, PipelineMode
@@ -33,6 +34,7 @@ class MCPServerConfig:
     log_level: str = "WARNING"
     allowed_adapter_ids: tuple[str, ...] = DEFAULT_AGENT_ADAPTERS
     allowed_workspace_ids: frozenset[str] = frozenset()
+    authorized_scope_keys: frozenset[str] = frozenset()
 
     @classmethod
     def from_env(cls) -> MCPServerConfig:
@@ -50,6 +52,7 @@ class MCPServerConfig:
             actor_id=os.environ.get("MEMORYOS_ACTOR_ID", adapter_id),
             capabilities=capabilities_from_csv(os.environ.get("MEMORYOS_MCP_CAPABILITIES")),
             allowed_workspace_ids=workspace_ids_from_csv(os.environ.get("MEMORYOS_WORKSPACE_IDS")),
+            authorized_scope_keys=scope_keys_from_csv(os.environ.get("MEMORYOS_AUTHORIZED_SCOPE_KEYS")),
             token_budget=_env_int("MEMORYOS_TOKEN_BUDGET", 2000),
             enable_action_tools=os.environ.get("MEMORYOS_ENABLE_ACTION_TOOLS", "").lower() in {"1", "true", "yes"},
             hook_queue_path=queue_path,
@@ -65,6 +68,7 @@ class MCPServerConfig:
             actor_id=self.actor_id or self.adapter_id,
             capabilities=self.capabilities,
             allowed_workspace_ids=self.allowed_workspace_ids,
+            authorized_scope_keys=self.authorized_scope_keys,
         )
 
     def default_agent_metadata(self) -> ConnectMetadata:

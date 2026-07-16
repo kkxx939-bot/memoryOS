@@ -173,7 +173,11 @@ class ActionContextBuilder:
         if self.relation_store is None:
             return {}
         sections: dict[str, list[dict]] = {}
-        for relation in self.relation_store.relations_of(policy_uri, owner_user_id=user_id):
+        for relation in self.relation_store.relations_of(
+            policy_uri,
+            tenant_id=tenant_id,
+            owner_user_id=user_id,
+        ):
             if relation.source_uri != policy_uri:
                 continue
             section = self.relation_types.get(relation.relation_type)
@@ -331,7 +335,7 @@ class ActionContextBuilder:
         if context_type == ContextType.MEMORY and self.source_store is None:
             return []
         filters = {"owner_user_id": user_id, "context_type": context_type.value}
-        if context_type == ContextType.MEMORY and tenant_id:
+        if tenant_id:
             filters["tenant_id"] = tenant_id
         hits = self.index_store.search(query, filters=filters, limit=4)
         items = []
@@ -404,11 +408,7 @@ class ActionContextBuilder:
             return None
         if obj.context_type == ContextType.MEMORY and not self._is_active_authoritative_memory(obj):
             return None
-        if (
-            obj.context_type == ContextType.MEMORY
-            and tenant_id is not None
-            and str(obj.tenant_id or "default") != str(tenant_id)
-        ):
+        if tenant_id is not None and str(obj.tenant_id or "default") != str(tenant_id):
             return None
         if obj.owner_user_id not in {None, user_id} and not obj.uri.startswith(("memoryos://resources/", "memoryos://skills/")):
             return None

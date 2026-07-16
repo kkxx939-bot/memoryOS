@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ class RuntimeConfig:
     vector_store: Any | None = None
     reranker: Any | None = None
     retrieval: dict[str, Any] | None = None
+    retention: dict[str, Any] | None = None
     worker: dict[str, Any] | None = None
     http: dict[str, Any] | None = None
     tenant_id: str = "default"
@@ -33,6 +35,8 @@ class RuntimeConfig:
             or "\\" in self.tenant_id
         ):
             raise ValueError("tenant_id must be one safe non-empty path segment")
+        if self.retention is not None and not isinstance(self.retention, Mapping):
+            raise ValueError("retention must be a mapping")
 
     @property
     def root_path(self) -> Path:

@@ -8,6 +8,7 @@ import pytest
 
 from memoryos.action_policy.model.action_policy import ActionPolicy
 from memoryos.action_policy.retrieval import ActionPolicyRetriever
+from memoryos.api.sdk.client import MemoryOSClient
 from memoryos.behavior.model.behavior_pattern import BehaviorPattern
 from memoryos.behavior.model.observation import Observation
 from memoryos.behavior.retrieval.similar_behavior_retriever import SimilarBehaviorRetriever
@@ -48,11 +49,15 @@ class FixedEmbeddingProvider:
 def test_hybrid_search_falls_back_to_index_without_vector(tmp_path) -> None:
     source = FileSystemSourceStore(tmp_path)
     index = InMemoryIndexStore()
-    obj = ContextObject(uri="memoryos://user/u1/memories/m1", context_type=ContextType.MEMORY, title="hot", owner_user_id="u1")
+    obj = ContextObject(
+        uri="memoryos://user/u1/memories/m1", context_type=ContextType.MEMORY, title="hot", owner_user_id="u1"
+    )
     source.write_object(obj, content="hot room")
     index.upsert_index(obj, content="hot room")
 
-    hits = HybridSearch(index, source_store=source).search("hot", filters={"owner_user_id": "u1"}, namespace="memoryos://user/u1/", context_type=ContextType.MEMORY)
+    hits = HybridSearch(index, source_store=source).search(
+        "hot", filters={"owner_user_id": "u1"}, namespace="memoryos://user/u1/", context_type=ContextType.MEMORY
+    )
     assert hits[0].uri == obj.uri
     assert hits[0].source == "index"
 
@@ -80,7 +85,7 @@ def test_hybrid_and_assembler_keep_same_asset_ids_isolated_by_parent_path(tmp_pa
                             }
                         ]
                     }
-                }
+                },
             },
         )
 
@@ -103,27 +108,19 @@ def test_hybrid_and_assembler_keep_same_asset_ids_isolated_by_parent_path(tmp_pa
         ContextDB(source, index, InMemoryRelationStore()),
         hybrid_search=hybrid,
     )
-    allowed = assembler._allowed_source_uris(
-        user_id="u1",
-        tenant_id="default",
-        context_type=ContextType.MEMORY,
-        project_id="",
-        applicability_scope_keys=[first_key],
-    )
-    assert allowed == (first.uri,)
-    view_results = assembler._search_memory_views(
-        "camera",
-        user_id="u1",
-        context_type=ContextType.MEMORY,
-        limit=10,
-        search_scope=None,
-        retrieval_views=["test:camera"],
-        project_id="",
-        adapter_id="",
-        tenant_id="default",
-        applicability_scope_keys=[first_key],
-    )
-    assert [item["uri"] for item in view_results] == [first.uri]
+    assert [
+        item["uri"]
+        for item in assembler.search(
+            "camera",
+            user_id="u1",
+            context_type=ContextType.MEMORY,
+            limit=10,
+            retrieval_views=["test:camera"],
+            project_id="",
+            tenant_id="default",
+            applicability_scope_keys=[first_key],
+        )
+    ] == [first.uri]
 
 
 def test_mixed_valid_and_malformed_scope_is_not_retrievable(tmp_path) -> None:
@@ -159,20 +156,27 @@ def test_mixed_valid_and_malformed_scope_is_not_retrievable(tmp_path) -> None:
         context_type=ContextType.MEMORY,
     )
     assembler = ContextAssembler(ContextDB(source, index, InMemoryRelationStore()))
-    assert assembler._allowed_source_uris(
-        user_id="u1",
-        tenant_id="default",
-        context_type=ContextType.MEMORY,
-        project_id="",
-        applicability_scope_keys=["memoryos:workspace:w1"],
-    ) == ()
+    assert (
+        assembler.search(
+            "mixed",
+            user_id="u1",
+            context_type=ContextType.MEMORY,
+            limit=10,
+            project_id="",
+            tenant_id="default",
+            applicability_scope_keys=["memoryos:workspace:w1"],
+        )
+        == []
+    )
 
 
 def test_hybrid_search_logs_embedding_failure_and_returns_index_hits(tmp_path, caplog) -> None:
     source = FileSystemSourceStore(tmp_path)
     index = InMemoryIndexStore()
     vector = InMemoryVectorStore()
-    obj = ContextObject(uri="memoryos://user/u1/memories/m1", context_type=ContextType.MEMORY, title="hot", owner_user_id="u1")
+    obj = ContextObject(
+        uri="memoryos://user/u1/memories/m1", context_type=ContextType.MEMORY, title="hot", owner_user_id="u1"
+    )
     source.write_object(obj, content="hot room")
     index.upsert_index(obj, content="hot room")
 
@@ -193,7 +197,9 @@ def test_hybrid_search_logs_vector_store_failure_and_returns_index_hits(tmp_path
     source = FileSystemSourceStore(tmp_path)
     index = InMemoryIndexStore()
     provider = HashingEmbeddingProvider()
-    obj = ContextObject(uri="memoryos://user/u1/memories/m1", context_type=ContextType.MEMORY, title="hot", owner_user_id="u1")
+    obj = ContextObject(
+        uri="memoryos://user/u1/memories/m1", context_type=ContextType.MEMORY, title="hot", owner_user_id="u1"
+    )
     source.write_object(obj, content="hot room")
     index.upsert_index(obj, content="hot room")
 
@@ -215,17 +221,74 @@ def test_vector_only_hit_and_namespace_isolation(tmp_path) -> None:
     index = InMemoryIndexStore()
     vector = InMemoryVectorStore()
     provider = HashingEmbeddingProvider()
-    obj = ContextObject(uri="memoryos://user/u1/memories/m1", context_type=ContextType.MEMORY, title="hot", owner_user_id="u1")
-    other = ContextObject(uri="memoryos://user/u2/memories/m1", context_type=ContextType.MEMORY, title="hot other", owner_user_id="u2")
+    obj = ContextObject(
+        uri="memoryos://user/u1/memories/m1", context_type=ContextType.MEMORY, title="hot", owner_user_id="u1"
+    )
+    other = ContextObject(
+        uri="memoryos://user/u2/memories/m1", context_type=ContextType.MEMORY, title="hot other", owner_user_id="u2"
+    )
     source.write_object(obj, content="hot room")
     source.write_object(other, content="hot room")
-    vector.upsert_vector(obj.uri, provider.embed("hot room"), metadata={"owner_user_id": "u1", "context_type": "memory", "title": "hot"})
-    vector.upsert_vector(other.uri, provider.embed("hot room"), metadata={"owner_user_id": "u2", "context_type": "memory", "title": "hot other"})
+    vector.upsert_vector(
+        obj.uri, provider.embed("hot room"), metadata={"owner_user_id": "u1", "context_type": "memory", "title": "hot"}
+    )
+    vector.upsert_vector(
+        other.uri,
+        provider.embed("hot room"),
+        metadata={"owner_user_id": "u2", "context_type": "memory", "title": "hot other"},
+    )
 
-    hits = HybridSearch(index, vector, provider, source).search("hot room", filters={"owner_user_id": "u1"}, namespace="memoryos://user/u1/", context_type=ContextType.MEMORY)
+    hits = HybridSearch(index, vector, provider, source).search(
+        "hot room", filters={"owner_user_id": "u1"}, namespace="memoryos://user/u1/", context_type=ContextType.MEMORY
+    )
     assert [hit.uri for hit in hits] == [obj.uri]
     assert hits[0].source == "vector"
     assert hits[0].metadata["retrieval_scores"]["vector"] > HybridSearch.DEFAULT_MIN_VECTOR_SIMILARITY
+
+
+def test_real_canonical_projection_rebinds_hashed_vector_row_to_public_uri(tmp_path) -> None:
+    vector = InMemoryVectorStore()
+    provider = FixedEmbeddingProvider()
+    client = MemoryOSClient(
+        str(tmp_path),
+        vector_store=vector,
+        embedding_provider=provider,
+    )
+    remembered = client.remember(
+        user_id="u1",
+        memory_type="preference",
+        content="I like pistachio gelato",
+        identity_fields={"subject": "food", "dimension": "gelato_flavor"},
+    )
+    claim_uri = str(remembered["uri"])
+    assert any(row_id.startswith("memoryos-vector://v1/") for row_id in vector.vector_uris())
+    hybrid = HybridSearch(
+        client.index_store,
+        vector,
+        provider,
+        client.source_store,
+    )
+
+    allowlisted = hybrid.search(
+        "vector-only-query-with-no-lexical-overlap",
+        filters={
+            "tenant_id": "default",
+            "owner_user_id": "u1",
+            "allowed_uris": (claim_uri,),
+        },
+        namespace="memoryos://user/u1/",
+        context_type=ContextType.MEMORY,
+    )
+    namespaced = hybrid.search(
+        "another-vector-only-query",
+        filters={"tenant_id": "default", "owner_user_id": "u1"},
+        namespace="memoryos://user/u1/",
+        context_type=ContextType.MEMORY,
+    )
+
+    assert [hit.uri for hit in allowlisted] == [claim_uri]
+    assert claim_uri in {hit.uri for hit in namespaced}
+    assert all(hit.uri.startswith("memoryos://") for hit in (*allowlisted, *namespaced))
 
 
 def test_zero_or_below_threshold_vector_similarity_is_not_a_candidate(tmp_path) -> None:
@@ -265,7 +328,9 @@ def test_zero_or_below_threshold_vector_similarity_is_not_a_candidate(tmp_path) 
 @pytest.mark.parametrize("threshold", [float("nan"), float("inf"), -0.1, 1.1, True, "invalid"])
 def test_vector_similarity_threshold_must_be_finite_and_bounded(tmp_path, threshold) -> None:  # noqa: ANN001
     with pytest.raises(ValueError, match="min_vector_similarity must be a finite number between 0 and 1"):
-        HybridSearch(InMemoryIndexStore(), source_store=FileSystemSourceStore(tmp_path), min_vector_similarity=threshold)
+        HybridSearch(
+            InMemoryIndexStore(), source_store=FileSystemSourceStore(tmp_path), min_vector_similarity=threshold
+        )
 
 
 def test_high_index_score_without_base_relevance_and_nan_scores_are_excluded(tmp_path) -> None:
@@ -414,7 +479,6 @@ def test_context_assembler_without_principal_excludes_user_memory_but_keeps_expl
     assembler = ContextAssembler(db)
 
     assert assembler.search("shared search term", context_type=ContextType.MEMORY) == []
-    assembler.canonical_retriever = None
     assert [
         hit["uri"]
         for hit in assembler.search(
@@ -423,36 +487,29 @@ def test_context_assembler_without_principal_excludes_user_memory_but_keeps_expl
             context_type=ContextType.MEMORY,
         )
     ] == [u1.uri]
-    assert [
-        hit["uri"]
-        for hit in assembler.search("shared search term", context_type=ContextType.RESOURCE)
-    ] == [resource.uri]
+    assert [hit["uri"] for hit in assembler.search("shared search term", context_type=ContextType.RESOURCE)] == [
+        resource.uri
+    ]
 
 
-def test_context_assembler_without_principal_does_not_call_canonical_retrieval(tmp_path) -> None:
+def test_context_assembler_without_principal_does_not_call_unified_retrieval(tmp_path) -> None:
     source = FileSystemSourceStore(tmp_path)
     index = InMemoryIndexStore()
     assembler = ContextAssembler(ContextDB(source, index, InMemoryRelationStore()))
 
-    class LeakRetriever:
+    class LeakOrchestrator:
         def __init__(self) -> None:
             self.called = False
 
-        def search(self, query):  # noqa: ANN001, ANN201
+        def execute(self, plan):  # noqa: ANN001, ANN201
             self.called = True
-            return [
-                {
-                    "uri": "memoryos://user/u2/memories/canonical/private",
-                    "context_type": ContextType.MEMORY.value,
-                    "score": 1.0,
-                }
-            ]
+            raise AssertionError(f"unscoped memory query reached Unified retrieval: {plan!r}")
 
-    leak_retriever = LeakRetriever()
-    cast(Any, assembler).canonical_retriever = leak_retriever
+    leak_orchestrator = LeakOrchestrator()
+    cast(Any, assembler).unified_retrieval = leak_orchestrator
 
     assert assembler.search("private", context_type=ContextType.MEMORY) == []
-    assert leak_retriever.called is False
+    assert leak_orchestrator.called is False
 
 
 def test_source_store_metadata_overrides_stale_vector_metadata(tmp_path) -> None:
@@ -588,12 +645,18 @@ def test_index_and_vector_same_uri_merge_score(tmp_path) -> None:
     index = InMemoryIndexStore()
     vector = InMemoryVectorStore()
     provider = HashingEmbeddingProvider()
-    obj = ContextObject(uri="memoryos://user/u1/memories/m1", context_type=ContextType.MEMORY, title="hot", owner_user_id="u1")
+    obj = ContextObject(
+        uri="memoryos://user/u1/memories/m1", context_type=ContextType.MEMORY, title="hot", owner_user_id="u1"
+    )
     source.write_object(obj, content="hot room")
     index.upsert_index(obj, content="hot room")
-    vector.upsert_vector(obj.uri, provider.embed("hot room"), metadata={"owner_user_id": "u1", "context_type": "memory", "title": "hot"})
+    vector.upsert_vector(
+        obj.uri, provider.embed("hot room"), metadata={"owner_user_id": "u1", "context_type": "memory", "title": "hot"}
+    )
 
-    hit = HybridSearch(index, vector, provider, source).search("hot room", filters={"owner_user_id": "u1"}, namespace="memoryos://user/u1/", context_type=ContextType.MEMORY)[0]
+    hit = HybridSearch(index, vector, provider, source).search(
+        "hot room", filters={"owner_user_id": "u1"}, namespace="memoryos://user/u1/", context_type=ContextType.MEMORY
+    )[0]
     assert hit.uri == obj.uri
     assert hit.source == "hybrid"
     assert hit.score > 0
@@ -613,17 +676,29 @@ def test_behavior_and_action_policy_retrievers_return_vector_hits(tmp_path) -> N
         case_refs=["c1", "c2", "c3"],
         action_distribution=[{"action": "turn_on_ac", "count": 3}],
     )
-    policy = ActionPolicy(user_id="u1", scene_key="hot_room", action="turn_on_ac", memory_anchor_uri=pattern.memory_anchor_uri)
+    policy = ActionPolicy(
+        user_id="u1", scene_key="hot_room", action="turn_on_ac", memory_anchor_uri=pattern.memory_anchor_uri
+    )
     source.write_object(pattern.to_context_object(), content="hot room behavior")
     source.write_object(policy.to_context_object(), content=json.dumps(policy.to_dict()))
-    vector.upsert_vector(pattern.uri, provider.embed("hot room behavior"), metadata={"owner_user_id": "u1", "context_type": "behavior_pattern", "title": "pattern"})
-    vector.upsert_vector(policy.uri, provider.embed("hot room turn_on_ac"), metadata={"owner_user_id": "u1", "context_type": "action_policy", "title": "policy"})
+    vector.upsert_vector(
+        pattern.uri,
+        provider.embed("hot room behavior"),
+        metadata={"owner_user_id": "u1", "context_type": "behavior_pattern", "title": "pattern"},
+    )
+    vector.upsert_vector(
+        policy.uri,
+        provider.embed("hot room turn_on_ac"),
+        metadata={"owner_user_id": "u1", "context_type": "action_policy", "title": "policy"},
+    )
 
     similar = SimilarBehaviorRetriever(index, source_store=source, hybrid_search=hybrid).retrieve(
         "u1", Observation(user_id="u1", raw_text="hot room", location="home")
     )
     assert similar["patterns"][0]["uri"] == pattern.uri
-    policies = ActionPolicyRetriever(index, source, hybrid_search=hybrid).retrieve("u1", ["turn_on_ac"], scene_key="hot_room")
+    policies = ActionPolicyRetriever(index, source, hybrid_search=hybrid).retrieve(
+        "u1", ["turn_on_ac"], scene_key="hot_room"
+    )
     assert policies[0].uri == policy.uri
 
 
@@ -631,12 +706,24 @@ def test_prediction_engine_ignores_vector_provider_failure(tmp_path) -> None:
     source = FileSystemSourceStore(tmp_path)
     index = InMemoryIndexStore()
     vector = InMemoryVectorStore()
-    policy = ActionPolicy(user_id="u1", scene_key="hot_room", action="turn_on_ac", memory_anchor_uri="memoryos://user/u1/memories/anchors/hot")
+    policy = ActionPolicy(
+        user_id="u1",
+        scene_key="hot_room",
+        action="turn_on_ac",
+        memory_anchor_uri="memoryos://user/u1/memories/anchors/hot",
+    )
     source.write_object(policy.to_context_object(), content=json.dumps(policy.to_dict()))
     index.upsert_index(policy.to_context_object(), content="hot_room turn_on_ac")
 
-    result = PredictionEngine(index, PredictionLedger(tmp_path), source_store=source, vector_store=vector, embedding_provider=BrokenProvider()).process(
-        PredictionRequest(user_id="u1", episode_id="e1", observation={"scene_key": "hot_room", "raw_text": "hot room"}, available_actions=["turn_on_ac"])
+    result = PredictionEngine(
+        index, PredictionLedger(tmp_path), source_store=source, vector_store=vector, embedding_provider=BrokenProvider()
+    ).process(
+        PredictionRequest(
+            user_id="u1",
+            episode_id="e1",
+            observation={"scene_key": "hot_room", "raw_text": "hot room"},
+            available_actions=["turn_on_ac"],
+        )
     )
 
     assert result.candidates[0].action == "turn_on_ac"

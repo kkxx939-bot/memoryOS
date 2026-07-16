@@ -9,6 +9,7 @@ from memoryos.api.mcp.server import MemoryOSMCPServer
 from memoryos.api.sdk.client import MemoryOSClient
 from memoryos.api.trusted_context import AUTHORITATIVE_REMEMBER, DEFAULT_AGENT_CAPABILITIES
 from memoryos.connect import ConnectMetadata
+from memoryos.contextdb.model.context_type import ContextType
 from memoryos.runtime.readiness import RuntimeNotReadyError, RuntimeReadinessState
 
 
@@ -26,7 +27,7 @@ class FakeMCPClient:
         self.review_calls: list[dict[str, Any]] = []
         self.health_payload: dict[str, Any] = {
             "status": "ready",
-            "runtime": {"state": "READY", "ready": True, "reasons": []}
+            "runtime": {"state": "READY", "ready": True, "reasons": []},
         }
 
     def search_context(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
@@ -111,6 +112,7 @@ def _server(
         ),
         token_budget=64,
         enable_action_tools=enable_action_tools,
+        allowed_workspace_ids=frozenset({"memoryOS"}),
     )
     return MemoryOSMCPServer(cast(MemoryOSClient, client), config=config), client
 
@@ -136,9 +138,7 @@ def test_mcp_memory_identity_pending_list_and_review_are_strictly_bound() -> Non
         },
     )
     assert remembered["error"] is None
-    assert client.remember_calls[0]["identity_fields"] == {
-        "decision_topic": "primary storage backend"
-    }
+    assert client.remember_calls[0]["identity_fields"] == {"decision_topic": "primary storage backend"}
     listed = server.call_tool("memoryos_list_pending", {"lifecycle_states": ["PENDING"]})
     assert listed["error"] is None
     assert listed["results"][0]["lifecycle_revision"] == 1
@@ -188,9 +188,14 @@ def test_mcp_search_context_source_kind_filter_is_explicit_only() -> None:
     server, client = _server()
 
     server.call_tool("memoryos_search_context", {"query": "MCP"})
-    server.call_tool("memoryos_search_context", {"query": "MCP", "connect_metadata": {"adapter_id": "codex", "source_kind": "chat"}})
+    server.call_tool(
+        "memoryos_search_context", {"query": "MCP", "connect_metadata": {"adapter_id": "codex", "source_kind": "chat"}}
+    )
     server.call_tool("memoryos_assemble_context", {"query": "MCP"})
-    server.call_tool("memoryos_assemble_context", {"query": "MCP", "connect_metadata": {"adapter_id": "codex", "source_kind": "terminal"}})
+    server.call_tool(
+        "memoryos_assemble_context",
+        {"query": "MCP", "connect_metadata": {"adapter_id": "codex", "source_kind": "terminal"}},
+    )
 
     assert client.search_calls[0]["connect_metadata"] == {"adapter_id": "codex"}
     assert client.search_calls[1]["connect_metadata"] == {"adapter_id": "codex", "source_kind": "chat"}
@@ -201,14 +206,12 @@ def test_mcp_search_context_source_kind_filter_is_explicit_only() -> None:
 def test_mcp_search_context_supports_multiple_context_types() -> None:
     server, client = _server()
 
-    result = server.call_tool("memoryos_search_context", {"query": "MCP", "context_types": ["memory", "context"]})
+    result = server.call_tool("memoryos_search_context", {"query": "MCP", "context_types": ["memory", "session"]})
 
     assert result["error"] is None
-    assert [call["context_type"] for call in client.search_calls] == ["memory", "context"]
-    assert {item["uri"] for item in result["contexts"]} == {
-        "memoryos://user/u1/memories/anchors/memory",
-        "memoryos://user/u1/memories/anchors/context",
-    }
+    assert len(client.search_calls) == 1
+    assert client.search_calls[0]["context_type"] is None
+    assert client.search_calls[0]["options"].context_types == (ContextType.MEMORY, ContextType.SESSION)
 
 
 def test_mcp_search_context_passes_memory_scope_arguments() -> None:
@@ -234,7 +237,9 @@ def test_mcp_search_context_passes_memory_scope_arguments() -> None:
 def test_mcp_search_context_rejects_unknown_adapter_id() -> None:
     server, client = _server()
 
-    result = server.call_tool("memoryos_search_context", {"query": "MCP", "connect_metadata": {"adapter_id": "openclaw"}})
+    result = server.call_tool(
+        "memoryos_search_context", {"query": "MCP", "connect_metadata": {"adapter_id": "openclaw"}}
+    )
 
     assert result["error"]["code"] == "VALIDATION_ERROR"
     assert client.search_calls == []
@@ -303,7 +308,9 @@ def test_mcp_optional_int_rejects_bool_and_accepts_numbers() -> None:
 def test_mcp_commit_session_returns_structured_result() -> None:
     server, client = _server()
 
-    result = server.call_tool("memoryos_commit_session", {"session_id": "s1", "messages": [{"role": "user", "content": "hi"}]})
+    result = server.call_tool(
+        "memoryos_commit_session", {"session_id": "s1", "messages": [{"role": "user", "content": "hi"}]}
+    )
 
     assert result["error"] is None
     assert result["status"] == "done"
@@ -339,9 +346,7 @@ def test_mcp_connection_schema_and_health() -> None:
 
 def test_mcp_health_and_memory_calls_do_not_report_ready_before_runtime_recovery() -> None:
     server, client = _server()
-    client.health_payload = {
-        "runtime": {"state": "NOT_READY", "ready": False, "reasons": ["receipt mismatch"]}
-    }
+    client.health_payload = {"runtime": {"state": "NOT_READY", "ready": False, "reasons": ["receipt mismatch"]}}
 
     health = server.call_tool("memoryos_health", {})
 
@@ -405,7 +410,10 @@ def test_action_tools_default_closed_and_coding_agent_rejected() -> None:
 def test_action_tools_enabled_still_requires_embodied_metadata() -> None:
     server, client = _server(enable_action_tools=True)
 
-    missing = server.call_tool("memoryos_predict", {"request": {"user_id": "u1", "episode_id": "s1", "observation": "hot", "available_actions": ["turn_on_ac"]}})
+    missing = server.call_tool(
+        "memoryos_predict",
+        {"request": {"user_id": "u1", "episode_id": "s1", "observation": "hot", "available_actions": ["turn_on_ac"]}},
+    )
     result = server.call_tool("memoryos_predict", {"request": _request({"adapter_id": "codex"})})
 
     assert missing["error"]["code"] == "PERMISSION_DENIED"
@@ -430,7 +438,10 @@ def test_process_observation_requires_execute_capability() -> None:
     metadata["capabilities"]["can_execute_action"] = False
 
     denied = server.call_tool("memoryos_process_observation", {"request": _request(metadata)})
-    allowed = server.call_tool("memoryos_process_observation", {"request": _request(ConnectMetadata.action_capable_embodied("reachy_mini").to_dict())})
+    allowed = server.call_tool(
+        "memoryos_process_observation",
+        {"request": _request(ConnectMetadata.action_capable_embodied("reachy_mini").to_dict())},
+    )
 
     assert denied["error"]["code"] == "PERMISSION_DENIED"
     assert allowed["error"] is None
@@ -457,10 +468,19 @@ def test_action_tool_request_payload_schema_errors_are_validation_errors() -> No
     server, client = _server(enable_action_tools=True)
     metadata = ConnectMetadata.action_capable_embodied("reachy_mini").to_dict()
 
-    unknown = server.call_tool("memoryos_predict", {"request": {**_request(metadata), "unknown": "/Users/gulf token=abc"}})
+    unknown = server.call_tool(
+        "memoryos_predict", {"request": {**_request(metadata), "unknown": "/Users/gulf token=abc"}}
+    )
     missing = server.call_tool(
         "memoryos_predict",
-        {"request": {"episode_id": "s1", "observation": "hot", "available_actions": ["turn_on_ac"], "connect_metadata": metadata}},
+        {
+            "request": {
+                "episode_id": "s1",
+                "observation": "hot",
+                "available_actions": ["turn_on_ac"],
+                "connect_metadata": metadata,
+            }
+        },
     )
     bad_policy = server.call_tool("memoryos_predict", {"request": _request(metadata), "policies": ["not-object"]})
 
@@ -513,7 +533,9 @@ def test_stdio_action_tool_disabled_returns_permission_error_payload() -> None:
                 "method": "tools/call",
                 "params": {
                     "name": "memoryos_predict",
-                    "arguments": {"request": _request(ConnectMetadata.action_capable_embodied("reachy_mini").to_dict())},
+                    "arguments": {
+                        "request": _request(ConnectMetadata.action_capable_embodied("reachy_mini").to_dict())
+                    },
                 },
             }
         ),

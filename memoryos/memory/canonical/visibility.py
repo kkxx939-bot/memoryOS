@@ -508,6 +508,9 @@ def reconcile_committed_relation_store(
     """
 
     records = list_committed_canonical(source_store, relation_store)
+    tenant_id = str(getattr(source_store, "tenant_id", None) or "default")
+    if any(str(record.object.tenant_id or "default") != tenant_id for record in records):
+        raise RuntimeError("canonical relation reconcile Source snapshot crosses its tenant")
     expected_by_source: dict[str, dict[tuple[str, str, str], ContextRelation]] = {}
     for committed in records:
         source_uri = committed.object.uri
@@ -522,15 +525,22 @@ def reconcile_committed_relation_store(
     raw_relations = enumerate_relations() if callable(enumerate_relations) else ()
     all_relations = raw_relations if isinstance(raw_relations, Iterable) else ()
     for relation in all_relations:
+        if str(relation.metadata.get("tenant_id") or "default") != tenant_id:
+            continue
         if _canonical_uri(relation.source_uri) and relation.source_uri not in expected_by_source:
             relation_store.delete_relation(
                 relation.source_uri,
                 relation.relation_type,
                 relation.target_uri,
+                tenant_id=tenant_id,
             )
             deleted += 1
     for source_uri, expected in expected_by_source.items():
-        actual = [relation for relation in relation_store.relations_of(source_uri) if relation.source_uri == source_uri]
+        actual = [
+            relation
+            for relation in relation_store.relations_of(source_uri, tenant_id=tenant_id)
+            if relation.source_uri == source_uri
+        ]
         actual_by_identity: dict[tuple[str, str, str], list[ContextRelation]] = {}
         for relation in actual:
             identity = (relation.source_uri, relation.relation_type, relation.target_uri)
@@ -542,12 +552,12 @@ def reconcile_committed_relation_store(
                 or len(rows) != 1
                 or canonical_json(normalized_relation(rows[0])) != canonical_json(normalized_relation(wanted))
             ):
-                relation_store.delete_relation(*identity)
+                relation_store.delete_relation(*identity, tenant_id=tenant_id)
                 deleted += len(rows)
         for identity, wanted in expected.items():
             current = [
                 relation
-                for relation in relation_store.relations_of(source_uri)
+                for relation in relation_store.relations_of(source_uri, tenant_id=tenant_id)
                 if (relation.source_uri, relation.relation_type, relation.target_uri) == identity
             ]
             if len(current) == 1 and canonical_json(normalized_relation(current[0])) == canonical_json(
@@ -555,7 +565,7 @@ def reconcile_committed_relation_store(
             ):
                 continue
             if current:
-                relation_store.delete_relation(*identity)
+                relation_store.delete_relation(*identity, tenant_id=tenant_id)
                 deleted += len(current)
             relation_store.add_relation(wanted)
             written += 1
@@ -564,7 +574,7 @@ def reconcile_committed_relation_store(
     for source_uri, expected in expected_by_source.items():
         actual_by_key = {
             (relation.source_uri, relation.relation_type, relation.target_uri): relation
-            for relation in relation_store.relations_of(source_uri)
+            for relation in relation_store.relations_of(source_uri, tenant_id=tenant_id)
             if relation.source_uri == source_uri
         }
         if set(actual_by_key) != set(expected) or any(

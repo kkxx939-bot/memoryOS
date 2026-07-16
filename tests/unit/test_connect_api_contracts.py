@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from typing import Any, cast
 
 import pytest
@@ -25,7 +25,18 @@ from memoryos.skill.tool_registry import ToolRegistry
 
 class FakeContextDB:
     def __init__(self, hits: list[IndexHit] | None = None) -> None:
-        self.hits = hits or []
+        self.hits = [
+            replace(
+                hit,
+                metadata={
+                    "tenant_id": "default",
+                    "owner_user_id": "u1",
+                    "record_kind": "context",
+                    **dict(hit.metadata),
+                },
+            )
+            for hit in (hits or [])
+        ]
         self.search_calls: list[dict] = []
         self.committed: list[tuple[SessionArchive, bool]] = []
         self.fail_commit = False
@@ -266,9 +277,14 @@ def test_search_and_assemble_context_apply_connect_filters_without_behavior_or_a
         "world_domain": "digital",
         "source_kind": "terminal",
     }
-    search_results = client.search_context("terminal", connect_metadata=claude_metadata)
-    assembled = client.assemble_context("terminal", connect_metadata=claude_metadata, token_budget=500)
-    unfiltered_results = client.search_context("terminal")
+    search_results = client.search_context("terminal", user_id="u1", connect_metadata=claude_metadata)
+    assembled = client.assemble_context(
+        "terminal",
+        user_id="u1",
+        connect_metadata=claude_metadata,
+        token_budget=500,
+    )
+    unfiltered_results = client.search_context("terminal", user_id="u1")
 
     assert [item["uri"] for item in search_results] == ["memoryos://user/u1/memories/anchors/claude"]
     assert assembled["source_uris"] == ["memoryos://user/u1/memories/anchors/claude"]
@@ -295,9 +311,13 @@ def test_search_context_adapter_id_filter_does_not_apply_default_fields() -> Non
     )
     client = _client(context_db)
 
-    codex_results = client.search_context("terminal", connect_metadata={"adapter_id": "codex"})
-    claude_results = client.search_context("terminal", connect_metadata={"adapter_id": "claude_code"})
-    unfiltered_results = client.search_context("terminal")
+    codex_results = client.search_context(
+        "terminal", user_id="u1", connect_metadata={"adapter_id": "codex"}
+    )
+    claude_results = client.search_context(
+        "terminal", user_id="u1", connect_metadata={"adapter_id": "claude_code"}
+    )
+    unfiltered_results = client.search_context("terminal", user_id="u1")
 
     assert [item["uri"] for item in codex_results] == ["memoryos://user/u1/memories/anchors/codex"]
     assert claude_results == []
@@ -306,52 +326,13 @@ def test_search_context_adapter_id_filter_does_not_apply_default_fields() -> Non
     assert client.executor.called is False
 
 
-def test_assemble_context_passes_explicit_connect_filters(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[dict[str, Any]] = []
-
-    class RecordingAssembler:
-        def __init__(self, context_db: FakeContextDB) -> None:
-            self.context_db = context_db
-
-        def assemble(
-            self,
-            query: str,
-            *,
-            user_id: str | None = None,
-            token_budget: int = 2000,
-            context_types: list[object] | None = None,
-            limit: int = 20,
-            connect_metadata: dict[str, Any] | None = None,
-            connect_filters: dict[str, Any] | None = None,
-        ) -> dict[str, Any]:
-            calls.append(
-                {
-                    "query": query,
-                    "user_id": user_id,
-                    "token_budget": token_budget,
-                    "context_types": context_types,
-                    "limit": limit,
-                    "connect_metadata": connect_metadata,
-                    "connect_filters": connect_filters,
-                }
-            )
-            return {
-                "query": query,
-                "token_budget": token_budget,
-                "contexts": [],
-                "packed_context": "",
-                "source_uris": [],
-                "dropped_contexts": [],
-                "connect_metadata": dict(connect_metadata or {}),
-            }
-
-    monkeypatch.setattr("memoryos.api.sdk.client.ContextAssembler", RecordingAssembler)
-    client = _client()
+def test_assemble_context_passes_explicit_connect_filters() -> None:
+    client = _client(FakeContextDB())
 
     assembled = client.assemble_context("terminal", connect_metadata={"adapter_id": "codex"}, token_budget=500)
 
     assert assembled["connect_metadata"]["adapter_id"] == "codex"
-    assert calls[0]["connect_filters"] == {"adapter_id": "codex"}
+    assert assembled["query_plan"]["metadata_filters"]["connect_filters"] == {"adapter_id": "codex"}
     assert client.engine.called is False
     assert client.executor.called is False
 
@@ -381,6 +362,7 @@ def test_context_assembler_connect_filter_simple_fields() -> None:
 
     matched = assembler.search(
         "context",
+        user_id="u1",
         connect_filters={
             "connect_type": "agent",
             "adapter_id": "claude_code",
@@ -389,10 +371,15 @@ def test_context_assembler_connect_filter_simple_fields() -> None:
             "source_kind": "terminal",
         },
     )
-    adapter_miss = assembler.search("context", connect_filters={"adapter_id": "openclaw"})
-    domain_miss = assembler.search("context", connect_filters={"world_domain": "physical"})
+    adapter_miss = assembler.search(
+        "context", user_id="u1", connect_filters={"adapter_id": "openclaw"}
+    )
+    domain_miss = assembler.search(
+        "context", user_id="u1", connect_filters={"world_domain": "physical"}
+    )
     ignored_complex_filters = assembler.search(
         "context",
+        user_id="u1",
         connect_filters={"capabilities": {"can_predict_behavior": True}, "modality": ["text"], "extra": {"x": "y"}},
     )
 
@@ -428,7 +415,9 @@ def test_context_assembler_connect_filter_overfetches_before_limit_slice() -> No
     )
     assembler = ContextAssembler(cast(Any, context_db))
 
-    matched = assembler.search("context", limit=1, connect_filters={"adapter_id": "codex"})
+    matched = assembler.search(
+        "context", user_id="u1", limit=1, connect_filters={"adapter_id": "codex"}
+    )
 
     assert [item["uri"] for item in matched] == ["memoryos://user/u1/memories/anchors/codex"]
     assert context_db.search_calls[0]["limit"] == 50

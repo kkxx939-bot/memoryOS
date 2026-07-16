@@ -33,6 +33,7 @@ class ConsistencyVerifier:
         self.relation_store = relation_store
 
     def verify(self) -> ConsistencyReport:
+        tenant_id = str(getattr(self.source_store, "tenant_id", "default") or "default")
         objects = [
             obj
             for obj in self.source_store.list_objects()
@@ -43,7 +44,15 @@ class ConsistencyVerifier:
         deleted_in_default_search = []
         inactive_states = {LifecycleState.DELETED, LifecycleState.ARCHIVED, LifecycleState.OBSOLETE}
         for obj in objects:
-            hits = self.index_store.search(obj.title or obj.uri, filters={"context_type": obj.context_type.value, "owner_user_id": obj.owner_user_id}, limit=20)
+            hits = self.index_store.search(
+                obj.title or obj.uri,
+                filters={
+                    "tenant_id": tenant_id,
+                    "context_type": obj.context_type.value,
+                    "owner_user_id": obj.owner_user_id,
+                },
+                limit=20,
+            )
             hit_uris = {hit.uri for hit in hits}
             if obj.lifecycle_state not in inactive_states and obj.uri not in hit_uris:
                 missing_index.append(obj.uri)
@@ -55,7 +64,7 @@ class ConsistencyVerifier:
             if not self._canonical_uri(uri)
         }
         orphan_index = sorted(uri for uri in indexed_uris if uri not in source_uris)
-        broken_relations = self._broken_relations(source_uris)
+        broken_relations = self._broken_relations(source_uris, tenant_id=tenant_id)
         return ConsistencyReport(
             missing_index=sorted(missing_index),
             orphan_index=orphan_index,
@@ -63,12 +72,12 @@ class ConsistencyVerifier:
             broken_relations=broken_relations,
         )
 
-    def _broken_relations(self, source_uris: set[str]) -> list[dict]:
+    def _broken_relations(self, source_uris: set[str], *, tenant_id: str) -> list[dict]:
         if self.relation_store is None:
             return []
         broken = []
         for uri in source_uris:
-            for relation in self.relation_store.relations_of(uri):
+            for relation in self.relation_store.relations_of(uri, tenant_id=tenant_id):
                 if self._global_uri(relation.source_uri) or self._global_uri(relation.target_uri):
                     continue
                 if self._canonical_uri(relation.source_uri) or self._canonical_uri(relation.target_uri):

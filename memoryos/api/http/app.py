@@ -16,6 +16,7 @@ from memoryos.adapters.agent_hooks.events import AgentEventType, AgentHookEvent,
 from memoryos.adapters.agent_hooks.sanitizer import sanitize_error_text
 from memoryos.adapters.agent_hooks.session_service import AgentSessionService
 from memoryos.api.limits import MAX_RETRIEVAL_LIMIT, MAX_TOKEN_BUDGET, bounded_int
+from memoryos.api.retrieval_contract import parse_retrieval_options
 from memoryos.api.sdk.client import MemoryOSClient
 from memoryos.api.trusted_context import (
     AUTHORITATIVE_FORGET,
@@ -26,8 +27,10 @@ from memoryos.api.trusted_context import (
     TrustedRequestContext,
     capabilities_from_csv,
     sanitize_ingress_messages,
+    scope_keys_from_csv,
     workspace_ids_from_csv,
 )
+from memoryos.contextdb.retrieval.orchestrator import RetrievalUnavailableError
 from memoryos.prediction.model.prediction_request import PredictionRequest
 from memoryos.runtime.readiness import RuntimeNotReadyError
 
@@ -56,11 +59,12 @@ def handle(
     if route == "POST /context/assemble":
         return client.assemble_context(
             _required_str(payload, "query", route),
+            options=parse_retrieval_options(payload.get("options")),
             user_id=payload.get("user_id"),
             token_budget=bounded_int(
                 payload.get("token_budget"),
                 default=2000,
-                minimum=0,
+                minimum=1,
                 maximum=MAX_TOKEN_BUDGET,
                 label="token_budget",
             ),
@@ -68,7 +72,7 @@ def handle(
             limit=bounded_int(
                 payload.get("limit"),
                 default=20,
-                minimum=0,
+                minimum=1,
                 maximum=MAX_RETRIEVAL_LIMIT,
                 label="limit",
             ),
@@ -155,6 +159,8 @@ class MemoryOSASGI:
             status, body = 401, self._error("UNAUTHORIZED", exc, False, request_id)
         except PermissionError as exc:
             status, body = 403, self._error("FORBIDDEN", exc, False, request_id)
+        except RetrievalUnavailableError as exc:
+            status, body = 503, self._error("RETRIEVAL_UNAVAILABLE", exc, True, request_id)
         except RuntimeNotReadyError as exc:
             status, body = 503, self._error("NOT_READY", exc, True, request_id)
         except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
@@ -324,7 +330,13 @@ class MemoryOSASGI:
                 "results": self.client.archive_search(
                     _required_str(payload, "query", path),
                     user_id=caller.user_id,
-                    limit=int(payload.get("limit", 20)),
+                    limit=bounded_int(
+                        payload.get("limit"),
+                        default=20,
+                        minimum=1,
+                        maximum=100,
+                        label="limit",
+                    ),
                     tenant_id=caller.tenant_id,
                     caller=caller,
                     project_id=caller.bind_read_workspace(payload.get("project_id")),
@@ -451,12 +463,13 @@ def main(argv: list[str] | None = None) -> None:
 
 def _search_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
     return {
+        "options": parse_retrieval_options(payload.get("options")),
         "user_id": payload.get("user_id"),
         "context_type": payload.get("context_type"),
         "limit": bounded_int(
             payload.get("limit"),
             default=10,
-            minimum=0,
+            minimum=1,
             maximum=MAX_RETRIEVAL_LIMIT,
             label="limit",
         ),
@@ -476,11 +489,31 @@ def _search_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _bound_payload(payload: dict[str, Any], caller: TrustedRequestContext) -> dict[str, Any]:
     caller.require(READ_CONTEXT)
+    options = parse_retrieval_options(payload.get("options"))
     caller.assert_identity(user_id=payload.get("user_id"), tenant_id=payload.get("tenant_id"))
-    caller.assert_applicability_scopes(payload.get("applicability_scopes"))
-    project_id = caller.bind_read_workspace(payload.get("project_id"))
+    if options is not None:
+        caller.assert_identity(user_id=options.owner_user_id, tenant_id=options.tenant_id)
+    requested_project = str(payload.get("project_id") or "").strip()
+    option_workspaces = options.workspace_ids if options is not None else ()
+    if len(option_workspaces) > 1:
+        raise PermissionError("caller must select one authorized workspace")
+    if requested_project and option_workspaces and option_workspaces != (requested_project,):
+        raise PermissionError("structured options conflict with project_id")
+    project_id = caller.bind_read_workspace(requested_project or (option_workspaces[0] if option_workspaces else None))
+    caller.assert_applicability_scopes(
+        payload.get("applicability_scopes"),
+        workspace_id=project_id,
+    )
+    if options is not None:
+        caller.assert_applicability_scope_keys(
+            options.metadata_filters.get("applicability_scope_keys"),
+            workspace_id=project_id,
+        )
+    if options is not None and options.adapter_id is not None and options.adapter_id != caller.actor_id:
+        raise PermissionError("caller adapter_id does not match trusted actor")
     return {
         **payload,
+        "options": options,
         "user_id": caller.user_id,
         "tenant_id": caller.tenant_id,
         "project_id": project_id,
@@ -567,6 +600,7 @@ def _trusted_context_from_env() -> TrustedRequestContext:
         actor_id=actor_id,
         capabilities=capabilities_from_csv(os.environ.get("MEMORYOS_HTTP_CAPABILITIES")),
         allowed_workspace_ids=workspace_ids_from_csv(os.environ.get("MEMORYOS_WORKSPACE_IDS")),
+        authorized_scope_keys=scope_keys_from_csv(os.environ.get("MEMORYOS_AUTHORIZED_SCOPE_KEYS")),
     )
 
 

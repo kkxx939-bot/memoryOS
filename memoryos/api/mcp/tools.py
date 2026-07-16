@@ -21,6 +21,7 @@ from memoryos.api.mcp.schemas import (
     require_process_observation_metadata,
     required_str,
 )
+from memoryos.api.retrieval_contract import parse_retrieval_options
 from memoryos.api.trusted_context import (
     AUTHORITATIVE_FORGET,
     AUTHORITATIVE_REMEMBER,
@@ -29,6 +30,13 @@ from memoryos.api.trusted_context import (
     TrustedRequestContext,
 )
 from memoryos.contextdb.model.context_uri import ContextURI
+from memoryos.contextdb.retrieval.query_plan import (
+    DEFAULT_CANDIDATE_LIMIT,
+    DEFAULT_TOKEN_BUDGET,
+    RetrievalOptions,
+    RetrievalQueryIntent,
+)
+from memoryos.contextdb.retrieval.query_planner import merge_retrieval_options, retrieval_options_from_legacy
 from memoryos.prediction.model.prediction_request import PredictionRequest
 
 
@@ -44,9 +52,9 @@ class MCPToolRouter:
     def call(self, name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
         args = dict(arguments or {})
         try:
-            if name == "memoryos_search_context":
+            if name in {"memoryos_search", "memoryos_search_context"}:
                 return self.search_context(args)
-            if name == "memoryos_assemble_context":
+            if name in {"memoryos_assemble", "memoryos_assemble_context"}:
                 return self.assemble_context(args)
             if name == "memoryos_commit_session":
                 return self.commit_session(args)
@@ -191,7 +199,7 @@ class MCPToolRouter:
             args,
             "limit",
             10,
-            minimum=0,
+            minimum=1,
             maximum=MAX_RETRIEVAL_LIMIT,
         )
         metadata = normalize_agent_metadata(args.get("connect_metadata"), self.config)
@@ -202,53 +210,45 @@ class MCPToolRouter:
         project_id = str(args.get("project_id") or "")
         retrieval_views = optional_list(args, "retrieval_views")
         requested_types = [context_type] if context_type is not None else list(context_types or [])
-        if requested_types:
-            contexts = []
-            for requested_type in requested_types:
-                contexts.extend(
-                    self.client.search_context(
-                        query,
-                        user_id=self._bound_user(args),
-                        context_type=requested_type,
-                        limit=limit,
-                        connect_metadata=filter_metadata,
-                        search_scope=str(search_scope) if search_scope else None,
-                        retrieval_views=[str(item) for item in retrieval_views or []],
-                        project_id=project_id,
-                        tenant_id=self._bound_tenant(args),
-                        applicability_scopes=[dict(item) for item in optional_list(args, "applicability_scopes") or []],
-                        memory_states=[str(item) for item in optional_list(args, "memory_states") or []],
-                        memory_types=[str(item) for item in optional_list(args, "memory_types") or []],
-                        claim_uris=[str(item) for item in optional_list(args, "claim_uris") or []],
-                        slot_uris=[str(item) for item in optional_list(args, "slot_uris") or []],
-                        query_intent=str(args.get("query_intent")) if args.get("query_intent") else None,
-                        **self._local_caller_kwargs(),
-                    )
-                )
-            contexts = _dedupe_contexts(contexts)[:limit]
-        else:
-            contexts = self.client.search_context(
-                query,
-                user_id=self._bound_user(args),
-                context_type=None,
-                limit=limit,
-                connect_metadata=filter_metadata,
-                search_scope=str(search_scope) if search_scope else None,
-                retrieval_views=[str(item) for item in retrieval_views or []],
-                project_id=project_id,
-                tenant_id=self._bound_tenant(args),
-                applicability_scopes=[dict(item) for item in optional_list(args, "applicability_scopes") or []],
-                memory_states=[str(item) for item in optional_list(args, "memory_states") or []],
-                memory_types=[str(item) for item in optional_list(args, "memory_types") or []],
-                claim_uris=[str(item) for item in optional_list(args, "claim_uris") or []],
-                slot_uris=[str(item) for item in optional_list(args, "slot_uris") or []],
-                query_intent=str(args.get("query_intent")) if args.get("query_intent") else None,
-                **self._local_caller_kwargs(),
-            )
-        source_uris = [str(item.get("uri", "")) for item in contexts if item.get("uri")]
-        return ok_payload(
-            {"contexts": contexts, "results": contexts, "source_uris": source_uris, "metadata": {"connect": metadata}}
+        options = self._retrieval_options(
+            args,
+            context_types=tuple(str(item) for item in requested_types),
+            limit=limit,
         )
+        contexts = self.client.search_context(
+            query,
+            options=options,
+            user_id=self._bound_user(args),
+            context_type=None,
+            limit=limit,
+            connect_metadata=filter_metadata,
+            search_scope=str(search_scope) if search_scope else None,
+            retrieval_views=[str(item) for item in retrieval_views or []],
+            project_id=project_id,
+            tenant_id=self._bound_tenant(args),
+            applicability_scopes=[dict(item) for item in optional_list(args, "applicability_scopes") or []],
+            memory_states=[str(item) for item in optional_list(args, "memory_states") or []],
+            memory_types=[str(item) for item in optional_list(args, "memory_types") or []],
+            claim_uris=[str(item) for item in optional_list(args, "claim_uris") or []],
+            slot_uris=[str(item) for item in optional_list(args, "slot_uris") or []],
+            query_intent=str(args.get("query_intent")) if args.get("query_intent") else None,
+            **self._local_caller_kwargs(),
+        )
+        source_uris = list(
+            dict.fromkeys(
+                source_uri for item in contexts if (source_uri := str(item.get("source_uri") or item.get("uri") or ""))
+            )
+        )
+        payload = {
+            "contexts": contexts,
+            "results": contexts,
+            "source_uris": source_uris,
+            "metadata": {"connect": metadata},
+        }
+        trace_id = str(getattr(self.client, "last_recall_trace_id", "") or "")
+        if trace_id:
+            payload["trace_id"] = trace_id
+        return ok_payload(payload)
 
     def assemble_context(self, args: dict[str, Any]) -> dict[str, Any]:
         self.caller.require(READ_CONTEXT)
@@ -257,14 +257,14 @@ class MCPToolRouter:
             args,
             "token_budget",
             self.config.token_budget,
-            minimum=0,
+            minimum=1,
             maximum=MAX_TOKEN_BUDGET,
         )
         limit = optional_int(
             args,
             "limit",
             20,
-            minimum=0,
+            minimum=1,
             maximum=MAX_RETRIEVAL_LIMIT,
         )
         context_types = optional_list(args, "context_types")
@@ -273,10 +273,17 @@ class MCPToolRouter:
         retrieval_views = optional_list(args, "retrieval_views")
         metadata = normalize_agent_metadata(args.get("connect_metadata"), self.config)
         filter_metadata = agent_search_filter_metadata(args.get("connect_metadata"), self.config)
+        options = self._retrieval_options(
+            args,
+            context_types=tuple(str(item) for item in context_types or []),
+            limit=limit,
+            token_budget=token_budget,
+        )
         assembled = self.client.assemble_context(
             query,
+            options=options,
             user_id=self._bound_user(args),
-            token_budget=token_budget,
+            token_budget=(2000 if args.get("options") is not None and "token_budget" not in args else token_budget),
             context_types=context_types,
             limit=limit,
             connect_metadata=filter_metadata,
@@ -292,12 +299,14 @@ class MCPToolRouter:
             query_intent=str(args.get("query_intent")) if args.get("query_intent") else None,
             **self._local_caller_kwargs(),
         )
+        effective_budget = int(assembled.get("total_budget") or token_budget)
         payload = {
+            **assembled,
             "packed_context": assembled.get("packed_context", ""),
             "contexts": assembled.get("contexts", []),
             "source_uris": assembled.get("source_uris", []),
             "dropped_contexts": assembled.get("dropped_contexts", []),
-            "token_budget": token_budget,
+            "token_budget": effective_budget,
             "estimated_tokens": _estimate_tokens(str(assembled.get("packed_context", ""))),
             "metadata": {"connect": metadata},
         }
@@ -340,6 +349,64 @@ class MCPToolRouter:
 
     def _assert_identity(self, args: dict[str, Any]) -> None:
         self.caller.assert_identity(user_id=args.get("user_id"), tenant_id=args.get("tenant_id"))
+
+    def _retrieval_options(
+        self,
+        args: dict[str, Any],
+        *,
+        context_types: tuple[str, ...],
+        limit: int,
+        token_budget: int | None = None,
+    ) -> RetrievalOptions | None:
+        structured = parse_retrieval_options(args.get("options"))
+        requested_project = str(args.get("project_id") or "").strip()
+        option_workspaces = structured.workspace_ids if structured is not None else ()
+        if structured is not None:
+            self.caller.assert_identity(
+                user_id=structured.owner_user_id,
+                tenant_id=structured.tenant_id,
+            )
+            if len(option_workspaces) > 1:
+                raise PermissionError("caller must select one authorized workspace")
+            for workspace_id in option_workspaces:
+                self.caller.assert_workspace(workspace_id)
+            if requested_project and option_workspaces and option_workspaces != (requested_project,):
+                raise PermissionError("structured options conflict with project_id")
+            if structured.adapter_id is not None and structured.adapter_id != self.caller.actor_id:
+                raise PermissionError("caller adapter_id does not match trusted actor")
+            if "limit" in args and structured.final_limit != limit:
+                raise ValueError("structured options conflict with legacy limit")
+            if token_budget is not None and "token_budget" in args and structured.token_budget != token_budget:
+                raise ValueError("structured options conflict with legacy token_budget")
+            if args.get("query_intent") is not None:
+                requested_intent = RetrievalQueryIntent(str(args["query_intent"]).strip().upper())
+                if structured.query_intent is not requested_intent:
+                    raise ValueError("structured options conflict with legacy query_intent")
+        workspace_id = self.caller.bind_read_workspace(
+            requested_project or (option_workspaces[0] if option_workspaces else None)
+        )
+        self.caller.assert_applicability_scopes(
+            args.get("applicability_scopes"),
+            workspace_id=workspace_id,
+        )
+        if structured is not None:
+            self.caller.assert_applicability_scope_keys(
+                structured.metadata_filters.get("applicability_scope_keys"),
+                workspace_id=workspace_id,
+            )
+        if not context_types:
+            return structured
+        type_options = retrieval_options_from_legacy(
+            {
+                "context_types": context_types,
+                "candidate_limit": max(DEFAULT_CANDIDATE_LIMIT, limit),
+                "limit": limit,
+                "token_budget": token_budget if token_budget is not None else DEFAULT_TOKEN_BUDGET,
+                "memory_states": args.get("memory_states"),
+                "query_intent": args.get("query_intent"),
+            }
+        )
+        return type_options if structured is None else merge_retrieval_options(structured, type_options)
 
     def _bound_user(self, args: dict[str, Any]) -> str:
         self._assert_identity(args)

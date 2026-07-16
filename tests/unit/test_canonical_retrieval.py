@@ -19,16 +19,17 @@ from memoryos.contextdb.store.local_stores import (
     InMemoryIndexStore,
     InMemoryRelationStore,
 )
+from memoryos.contextdb.store.source_store import QueueStore
 from memoryos.contextdb.store.vector_store import InMemoryVectorStore
 from memoryos.memory.canonical import (
     CanonicalMemoryProjector,
     CanonicalMemoryQuery,
-    CanonicalMemoryRetriever,
     CanonicalQueryIntent,
     EvidenceRef,
     MemoryClaim,
     MemoryRevision,
     MemorySlot,
+    OfflineCanonicalMemoryRetriever,
     ScopeRef,
     SessionArchiveEpisodeAdapter,
     TransitionProfile,
@@ -84,6 +85,8 @@ def _write_committed_canonical_fixture(
     *,
     key: str,
     action: OperationAction = OperationAction.ADD,
+    queue_store: QueueStore | None = None,
+    finalize_outbox: bool = False,
 ) -> None:
     """Persist canonical fixtures behind an integrity-valid transaction marker."""
 
@@ -129,6 +132,7 @@ def _write_committed_canonical_fixture(
         InMemoryIndexStore(),
         str(source.root),
         relation_store=fixture_relations,
+        queue_store=queue_store,
         tenant_id=source.tenant_id,
     )
     before_images = committer._capture_canonical_state(operations)
@@ -179,6 +183,10 @@ def _write_committed_canonical_fixture(
         marker,
         json.loads(marker.read_text(encoding="utf-8")),
     )
+    if finalize_outbox:
+        if queue_store is None:
+            raise ValueError("finalized canonical fixture requires a QueueStore")
+        committer._finalize_canonical_outbox(transaction_id, idempotency_key, operations)
 
 
 def _write_claim(
@@ -390,7 +398,7 @@ def test_retrieval_distinguishes_current_options_history_visibility_and_scope(tm
         memory_type="project_decision",
         scope=workspace_scope,
     )
-    retriever = CanonicalMemoryRetriever(source, index, relations)
+    retriever = OfflineCanonicalMemoryRetriever(source, index, relations, offline_admin=True)
 
     def query(
         *,
@@ -451,7 +459,7 @@ def test_canonical_scope_filter_precedes_limit(tmp_path) -> None:  # noqa: ANN00
         memory_type="project_decision",
         scope=_scope(("workspace", "memoryos")),
     )
-    results = CanonicalMemoryRetriever(source, index).search(
+    results = OfflineCanonicalMemoryRetriever(source, index, offline_admin=True).search(
         CanonicalMemoryQuery(
             text="shared target",
             tenant_id="t1",
@@ -481,7 +489,7 @@ def test_reachy_preference_applies_to_person_and_environment_not_device_only(tmp
         ),
         owner_user_id="user_1",
     )
-    retriever = CanonicalMemoryRetriever(source, index)
+    retriever = OfflineCanonicalMemoryRetriever(source, index, offline_admin=True)
     visible = retriever.search(
         CanonicalMemoryQuery(
             text="music",
@@ -565,7 +573,13 @@ def test_canonical_retrieval_supports_exact_vector_and_relation_expansion(tmp_pa
     assert postgres == postgres_uri and cockroach == cockroach_uri
     relations.add_relation(related)
     hybrid = HybridSearch(index, vector_store=vectors, embedding_provider=embedding, source_store=source)
-    retriever = CanonicalMemoryRetriever(source, index, relations, hybrid_search=hybrid)
+    retriever = OfflineCanonicalMemoryRetriever(
+        source,
+        index,
+        relations,
+        hybrid_search=hybrid,
+        offline_admin=True,
+    )
 
     def query(
         text: str,
@@ -587,7 +601,12 @@ def test_canonical_retrieval_supports_exact_vector_and_relation_expansion(tmp_pa
     assert exact[0]["uri"] == sqlite
     vector = retriever.search(query("durable local database", intent=CanonicalQueryIntent.CURRENT))
     assert any(item["uri"] == sqlite for item in vector)
-    expanded = CanonicalMemoryRetriever(source, index, relations).search(query("postgresql"))
+    expanded = OfflineCanonicalMemoryRetriever(
+        source,
+        index,
+        relations,
+        offline_admin=True,
+    ).search(query("postgresql"))
     assert {item["uri"] for item in expanded} >= {postgres, cockroach}
     assert any(item["retrieval_source"] == "canonical_relation_expansion" for item in expanded)
 
@@ -605,7 +624,7 @@ def test_canonical_fallback_uses_token_boundaries_not_latin_substrings(tmp_path)
         memory_type="project_decision",
         scope=_scope(("workspace", "memoryos")),
     )
-    retriever = CanonicalMemoryRetriever(source, index)
+    retriever = OfflineCanonicalMemoryRetriever(source, index, offline_admin=True)
     query = CanonicalMemoryQuery(
         text="redis",
         tenant_id="t1",
@@ -639,7 +658,12 @@ def test_stale_index_vector_and_projection_hits_are_filtered_by_canonical_revisi
         project_current=False,
     )
     hybrid = HybridSearch(index, vector_store=vectors, embedding_provider=embedding, source_store=source)
-    retriever = CanonicalMemoryRetriever(source, index, hybrid_search=hybrid)
+    retriever = OfflineCanonicalMemoryRetriever(
+        source,
+        index,
+        hybrid_search=hybrid,
+        offline_admin=True,
+    )
     query = CanonicalMemoryQuery(
         text="legacyuniquetoken",
         tenant_id="t1",
@@ -661,7 +685,7 @@ def test_stale_index_vector_and_projection_hits_are_filtered_by_canonical_revisi
     assert current[0]["projection_revision"] == 2
 
 
-def test_vector_head_corruption_fails_closed_before_empty_search_trace(tmp_path) -> None:  # noqa: ANN001
+def test_final_canonical_candidate_head_corruption_fails_closed_without_trace(tmp_path) -> None:  # noqa: ANN001
     vectors = InMemoryVectorStore()
     client = MemoryOSClient(
         str(tmp_path),
@@ -678,7 +702,7 @@ def test_vector_head_corruption_fails_closed_before_empty_search_trace(tmp_path)
         identity_fields={"rule_topic": "release_validation"},
     )
     claim_uri = str(committed["uri"])
-    assert claim_uri in vectors.vector_uris()
+    assert vectors.get_vector_metadata(claim_uri) is not None
 
     tampered = False
     for path in (Path(tmp_path) / "system" / "current-heads").glob("*.json"):
@@ -702,7 +726,8 @@ def test_vector_head_corruption_fails_closed_before_empty_search_trace(tmp_path)
         client.search_context(
             "Always run tests before release",
             user_id="u1",
-            context_type=ContextType.RESOURCE,
+            project_id="p1",
+            context_type=ContextType.MEMORY,
         )
 
     assert client.readiness.state == RuntimeReadinessState.NOT_READY
@@ -710,7 +735,7 @@ def test_vector_head_corruption_fails_closed_before_empty_search_trace(tmp_path)
     assert traces_after == traces_before
 
 
-def test_canonical_hybrid_recall_reuses_the_query_committed_snapshot(
+def test_canonical_source_reads_begin_only_at_bounded_final_candidate_validation(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:  # noqa: ANN001
@@ -730,33 +755,32 @@ def test_canonical_hybrid_recall_reuses_the_query_committed_snapshot(
         identity_fields={"rule_topic": "snapshot_release_validation"},
     )
     claim_uri = str(committed["uri"])
-    assert client.hybrid_search is not None
-    original_search = client.hybrid_search.search
+    slot_uri = claim_uri.rsplit("/claims/", 1)[0]
+    orchestrator = client._retrieval_orchestrator()
+    original_resolve = orchestrator.resolver.resolve
     original_read = client.source_store.read_object
-    in_canonical_hybrid = False
-    canonical_calls = 0
+    phase = "candidate_generation"
+    canonical_read_phases: list[str] = []
 
-    def guarded_search(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
-        nonlocal in_canonical_hybrid, canonical_calls
-        allowed = set(dict(kwargs.get("filters") or {}).get("allowed_uris", ()) or ())
-        canonical_call = claim_uri in allowed
-        if canonical_call:
-            assert kwargs.get("source_snapshot", {}).get(claim_uri) is not None
-            canonical_calls += 1
-            in_canonical_hybrid = True
-        try:
-            return original_search(*args, **kwargs)
-        finally:
-            if canonical_call:
-                in_canonical_hybrid = False
-
-    def reject_live_canonical_reread(uri: str):  # noqa: ANN202
-        if in_canonical_hybrid and uri == claim_uri:
-            raise AssertionError("canonical hybrid recall re-read live Source after snapshot capture")
+    def guarded_read(uri: str):  # noqa: ANN202
+        if uri in {slot_uri, claim_uri}:
+            canonical_read_phases.append(phase)
+            if phase == "candidate_generation":
+                raise AssertionError("candidate generation read Canonical Source before final validation")
         return original_read(uri)
 
-    monkeypatch.setattr(client.hybrid_search, "search", guarded_search)
-    monkeypatch.setattr(client.source_store, "read_object", reject_live_canonical_reread)
+    def bounded_resolve(candidates, *, plan):  # noqa: ANN001, ANN202
+        nonlocal phase
+        assert 0 < len(candidates) <= plan.candidate_limit
+        phase = "bounded_canonical_validation"
+        try:
+            return original_resolve(candidates, plan=plan)
+        finally:
+            phase = "post_validation"
+
+    monkeypatch.setattr(orchestrator.resolver, "resolve", bounded_resolve)
+    monkeypatch.setattr(client, "_retrieval_orchestrator", lambda: orchestrator)
+    monkeypatch.setattr(client.source_store, "read_object", guarded_read)
 
     results = client.search_context(
         "Always run tests before release",
@@ -765,7 +789,9 @@ def test_canonical_hybrid_recall_reuses_the_query_committed_snapshot(
         context_type=ContextType.MEMORY,
     )
 
-    assert canonical_calls == 1
+    assert canonical_read_phases
+    assert "candidate_generation" not in canonical_read_phases
+    assert "bounded_canonical_validation" in canonical_read_phases
     assert [item["uri"] for item in results] == [claim_uri]
 
 
@@ -779,7 +805,7 @@ def test_history_expands_old_revision_while_current_returns_only_slot_current(tm
         old_value="historical sqlite choice",
         new_value="current postgres choice",
     )
-    retriever = CanonicalMemoryRetriever(source, index)
+    retriever = OfflineCanonicalMemoryRetriever(source, index, offline_admin=True)
     base = CanonicalMemoryQuery(
         text="",
         tenant_id="t1",
@@ -921,7 +947,7 @@ def test_late_historical_transaction_does_not_replace_effective_current_projecti
         action=OperationAction.UPDATE,
     )
     projector.project(claim_uri, 2)
-    retriever = CanonicalMemoryRetriever(source, index)
+    retriever = OfflineCanonicalMemoryRetriever(source, index, offline_admin=True)
     query = CanonicalMemoryQuery(
         text="",
         tenant_id="t1",
@@ -1018,7 +1044,7 @@ def test_multiple_active_claims_raise_invariant_violation_instead_of_returning_f
     _write_committed_canonical_fixture(source, entries, key="broken-multiple-active")
 
     with pytest.raises(CanonicalInvariantViolation, match="multiple ACTIVE claims"):
-        CanonicalMemoryRetriever(source, index).search(
+        OfflineCanonicalMemoryRetriever(source, index, offline_admin=True).search(
             CanonicalMemoryQuery(
                 text="",
                 tenant_id="t1",
@@ -1045,7 +1071,7 @@ def test_mixed_revision_layer_refs_are_rejected_by_retrieval_and_assembly(tmp_pa
     assert old is not None and current is not None
     records.save(replace(current, l0_uri=old.l0_uri))
 
-    retriever = CanonicalMemoryRetriever(source, index, relations)
+    retriever = OfflineCanonicalMemoryRetriever(source, index, relations, offline_admin=True)
     query = CanonicalMemoryQuery(
         text="",
         tenant_id="t1",
@@ -1132,10 +1158,11 @@ def test_canonical_results_still_obey_connect_and_authority_filters(tmp_path) ->
         scope=_scope(("workspace", "memoryos")),
         metadata_extra={"asserted_by": "u2"},
     )
-    blocked_authority = CanonicalMemoryRetriever(
+    blocked_authority = OfflineCanonicalMemoryRetriever(
         invalid_source,
         invalid_index,
         invalid_relations,
+        offline_admin=True,
     ).search(
         CanonicalMemoryQuery(
             text="canonical rule",
@@ -1168,7 +1195,90 @@ def test_prefetch_applicability_keeps_hierarchical_parent_path() -> None:
     assert not prefetcher._applicable(metadata, {"memoryos:asset:camera"})
 
 
-def test_mixed_valid_and_malformed_all_of_fails_closed() -> None:
+def test_prefetch_resolves_current_slot_catalog_uri_to_active_claim(tmp_path) -> None:  # noqa: ANN001
+    source = FileSystemSourceStore(tmp_path, tenant_id="t1")
+    fixture_index = InMemoryIndexStore()
+    projector = CanonicalMemoryProjector(source, fixture_index, tmp_path)
+    scope = _scope(("workspace", "memoryos"))
+    claim_uri = _write_claim(
+        source,
+        projector,
+        claim_id="current-slot-prefetch",
+        value="SQLite",
+        state="ACTIVE",
+        memory_type="project_decision",
+        scope=scope,
+    )
+    slot_uri = claim_uri.rsplit("/claims/", 1)[0]
+    slot_obj = source.read_object(slot_uri)
+    slot_obj.metadata = {**dict(slot_obj.metadata or {}), "revision": 2}
+    _write_committed_canonical_fixture(
+        source,
+        [(slot_obj, source.read_content(slot_uri))],
+        key="current-slot-prefetch-slot-r2",
+        action=OperationAction.UPDATE,
+    )
+    assert source.read_object(slot_uri).metadata["revision"] == 2
+    assert source.read_object(claim_uri).metadata["revision"] == 1
+    current_uri = f"{slot_uri}/serving/current"
+    current_index = InMemoryIndexStore()
+    current_record = ContextObject(
+        uri=current_uri,
+        context_type=ContextType.MEMORY,
+        title="primary storage backend: SQLite",
+        owner_user_id="u1",
+        tenant_id="t1",
+        metadata={
+            "record_kind": "current_slot",
+            "canonical_kind": "current_slot_projection",
+            "canonical_state": "ACTIVE",
+            "memory_type": "project_decision",
+            "active_claim_id": "current-slot-prefetch",
+            "canonical_claim_id": "current-slot-prefetch",
+            "active_claim_uri": claim_uri,
+            "canonical_claim_uri": claim_uri,
+            "canonical_slot_id": "current-slot-prefetch-slot",
+            "canonical_slot_uri": slot_uri,
+            "active_claim_revision": 1,
+            "canonical_revision": 1,
+            "projection_source_revision": 2,
+            "slot_revision": 2,
+            "scope": scope,
+            "asserted_by": "u1",
+        },
+    )
+    current_index.upsert_index(current_record, "primary storage backend SQLite")
+    episode = SessionArchiveEpisodeAdapter().adapt(
+        SessionArchive(
+            user_id="u1",
+            session_id="current-slot-prefetch",
+            archive_uri="memoryos://user/u1/sessions/history/current-slot-prefetch",
+            messages=[
+                {
+                    "id": "m1",
+                    "role": "user",
+                    "content": "Formally change the primary storage backend to PostgreSQL.",
+                }
+            ],
+            metadata={"tenant_id": "t1", "project_id": "memoryos"},
+        )
+    )
+    hybrid = HybridSearch(current_index, source_store=source)
+    prefetcher = ExistingMemoryPrefetcher(source, current_index, hybrid_search=hybrid)
+
+    prefetched = prefetcher.prefetch(episode, owner_user_id="u1")
+
+    assert [item.uri for item in prefetched] == [claim_uri]
+    assert prefetched[0].claim_id == "current-slot-prefetch"
+    assert prefetched[0].canonical_value == "SQLite"
+
+    current_record.metadata["active_claim_id"] = "stale-claim"
+    current_record.metadata["canonical_claim_id"] = "stale-claim"
+    current_index.upsert_index(current_record, "primary storage backend SQLite")
+    assert prefetcher.prefetch(episode, owner_user_id="u1") == ()
+
+
+def test_mixed_valid_and_malformed_all_of_fails_closed(tmp_path) -> None:  # noqa: ANN001
     scope = _scope(("workspace", "w1"))
     scope["applicability"] = {
         "all_of": [
@@ -1183,11 +1293,15 @@ def test_mixed_valid_and_malformed_all_of_fails_closed() -> None:
     available = {"memoryos:workspace:w1"}
 
     assert not ExistingMemoryPrefetcher(None, None)._applicable(metadata, available)
-    retriever = CanonicalMemoryRetriever(InMemoryIndexStore(), InMemoryIndexStore())  # type: ignore[arg-type]
+    retriever = OfflineCanonicalMemoryRetriever(
+        FileSystemSourceStore(tmp_path),
+        InMemoryIndexStore(),
+        offline_admin=True,
+    )
     assert not retriever._applicable(metadata, tuple(available))
 
 
-def test_canonical_visibility_and_authority_shapes_fail_closed() -> None:
+def test_canonical_visibility_and_authority_shapes_fail_closed(tmp_path) -> None:  # noqa: ANN001
     valid = _scope(("workspace", "w1"), tenant_id="default")
     query = CanonicalMemoryQuery(
         text="",
@@ -1195,7 +1309,11 @@ def test_canonical_visibility_and_authority_shapes_fail_closed() -> None:
         principal_id="attacker",
         applicability_scope_keys=("memoryos:workspace:w1",),
     )
-    retriever = CanonicalMemoryRetriever(InMemoryIndexStore(), InMemoryIndexStore())  # type: ignore[arg-type]
+    retriever = OfflineCanonicalMemoryRetriever(
+        FileSystemSourceStore(tmp_path),
+        InMemoryIndexStore(),
+        offline_admin=True,
+    )
     malformed_visibility = {"scope": {**valid, "visibility": []}, "asserted_by": "u1"}
     malformed_authority = {"scope": {**valid, "authority": []}, "asserted_by": "u1"}
 

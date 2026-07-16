@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -101,6 +101,65 @@ def materialized_current_revision_payload(metadata: Mapping[str, Any]) -> dict[s
     if qualifiers.get("non_current_historical", False):
         raise CanonicalMemoryInvariantError("canonical current revision pointer selects a historical-only revision")
     return matches[0]
+
+
+def revision_payload_with_effective_validity(
+    revisions: Sequence[Mapping[str, Any]],
+    revision_number: int,
+) -> dict[str, Any]:
+    """Return one immutable revision with its derived half-open validity end.
+
+    Canonical Source revisions are append-only, so advancing a Claim must not
+    rewrite ``valid_to`` in an older serialized revision.  Serving projections
+    and bounded AS_OF validation nevertheless need a closed interval.  When an
+    explicit end is absent, the earliest later *non-historical* revision start
+    deterministically supplies that end.  A late historical assertion can
+    therefore end at the already-known effective revision without changing
+    either Source payload.
+    """
+
+    if revision_number < 1:
+        raise CanonicalMemoryInvariantError("canonical revision number must be positive")
+    rows: list[tuple[int, dict[str, Any], datetime]] = []
+    seen_numbers: set[int] = set()
+    for raw in revisions:
+        if not isinstance(raw, Mapping):
+            raise CanonicalMemoryInvariantError("canonical revision payload is invalid")
+        try:
+            number = int(raw.get("revision", 0) or 0)
+        except (TypeError, ValueError) as exc:
+            raise CanonicalMemoryInvariantError("canonical revision number is invalid") from exc
+        if number < 1:
+            raise CanonicalMemoryInvariantError("canonical revision number must be positive")
+        if number in seen_numbers:
+            raise CanonicalMemoryInvariantError("canonical revision number is duplicated")
+        seen_numbers.add(number)
+        row = dict(raw)
+        start = _parse_timestamp(str(row.get("valid_from") or ""), "valid_from")
+        rows.append((number, row, start))
+    matches = [item for item in rows if item[0] == revision_number]
+    if len(matches) != 1:
+        raise CanonicalMemoryInvariantError("canonical revision must resolve exactly once")
+    _number, selected, selected_start = matches[0]
+    explicit_end = selected.get("valid_to")
+    if explicit_end:
+        end = _parse_timestamp(str(explicit_end), "valid_to")
+        if end <= selected_start:
+            raise CanonicalMemoryInvariantError("canonical revision valid_to must be later than valid_from")
+        return selected
+    next_effective = min(
+        (
+            (start, number, row)
+            for number, row, start in rows
+            if start > selected_start
+            and not bool(dict(row.get("qualifiers", {}) or {}).get("non_current_historical", False))
+        ),
+        default=None,
+        key=lambda item: (item[0], item[1]),
+    )
+    if next_effective is not None:
+        selected["valid_to"] = str(next_effective[2].get("valid_from") or "")
+    return selected
 
 
 def _parse_timestamp(value: str, label: str) -> datetime:

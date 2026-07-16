@@ -22,12 +22,34 @@ class SemanticWorker:
         queue_store: QueueStore,
         *,
         worker_id: str | None = None,
+        migration_gate=None,  # noqa: ANN001
     ) -> None:
         self.source_store = source_store
         self.queue_store = queue_store
         self.worker_id = worker_id or f"semantic:{os.getpid()}:{uuid.uuid4().hex}"
+        self.migration_gate = migration_gate or getattr(source_store, "migration_gate", None)
 
     def process_pending(
+        self,
+        limit: int = 10,
+        *,
+        lease_seconds: int = 60,
+        max_retries: int = 3,
+    ) -> dict:
+        acquire = getattr(self.migration_gate, "acquire_projection_fence", None)
+        release = getattr(self.migration_gate, "release_projection_fence", None)
+        fence = acquire() if callable(acquire) else None
+        try:
+            return self._process_pending_unfenced(
+                limit,
+                lease_seconds=lease_seconds,
+                max_retries=max_retries,
+            )
+        finally:
+            if callable(release):
+                release(fence)
+
+    def _process_pending_unfenced(
         self,
         limit: int = 10,
         *,

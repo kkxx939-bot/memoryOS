@@ -43,7 +43,7 @@ BehaviorCommitPlanner creates TemporaryBehaviorCase from the current archive, th
 
 ## Source And Index
 
-SourceStore is the fact source. SQLiteIndexStore is a rebuildable derived index with FTS5 when available and explicit fallback otherwise. ConsistencyVerifier reports missing index rows, orphan index rows, deleted objects still returned by default search, and broken relations. ReindexWorker rebuilds IndexStore from SourceStore without modifying source content.
+SourceStore is the fact source. SQLiteIndexStore is a rebuildable derived index with FTS5 when available; when FTS5 is unavailable, online lexical retrieval is disabled and only indexed exact/structured candidates remain, with no contains-scan fallback. ConsistencyVerifier reports missing index rows, orphan index rows, deleted objects still returned by default search, and broken relations. ReindexWorker rebuilds IndexStore from SourceStore without modifying source content.
 
 ## Checklist
 
@@ -59,4 +59,3 @@ SourceStore is the fact source. SQLiteIndexStore is a rebuildable derived index 
 - [x] Resource and Skill are ContextObject types required by ActionPolicy.
 - [x] SourceStore and IndexStore are separated and index can be rebuilt.
 - [x] Old service/domain/usecase/docs paths are removed.
-

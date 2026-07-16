@@ -33,6 +33,7 @@ class SQLiteQueueStore:
             raise ValueError("new queue jobs must be unleased and pending")
         now = utc_now()
         payload_json = self._canonical_payload(job.payload)
+        tenant_id, owner_user_id, workspace_id = self._job_scope(job)
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute("SELECT * FROM queue_jobs WHERE job_id = ?", (job.job_id,)).fetchone()
@@ -42,12 +43,22 @@ class SQLiteQueueStore:
                     raise QueueIdempotencyConflictError(
                         f"queue job id is already bound to another payload: {job.job_id}"
                     )
+                conn.execute(
+                    "UPDATE queue_jobs SET tenant_id = ?, owner_user_id = ?, workspace_id = ? "
+                    "WHERE job_id = ?",
+                    (tenant_id, owner_user_id, workspace_id, job.job_id),
+                )
+                row = conn.execute("SELECT * FROM queue_jobs WHERE job_id = ?", (job.job_id,)).fetchone()
                 conn.commit()
-                return self._row_to_job(existing)
+                assert row is not None
+                return self._row_to_job(row)
             conn.execute(
                 """
-                INSERT INTO queue_jobs(job_id, queue_name, action, target_uri, payload_json, status, leased_until, retry_count, created_at, updated_at, last_error)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO queue_jobs(
+                  job_id, queue_name, action, target_uri, payload_json,
+                  tenant_id, owner_user_id, workspace_id,
+                  status, leased_until, retry_count, created_at, updated_at, last_error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job.job_id,
@@ -55,6 +66,9 @@ class SQLiteQueueStore:
                     job.action,
                     job.target_uri,
                     payload_json,
+                    tenant_id,
+                    owner_user_id,
+                    workspace_id,
                     "pending",
                     None,
                     0,
@@ -334,6 +348,69 @@ class SQLiteQueueStore:
                 ).fetchall()
         return {str(row["status"]): int(row["count"]) for row in rows}
 
+    def stats_for_target_prefix(self, *, queue_name: str, target_uri_prefix: str) -> dict[str, int]:
+        if not queue_name or not target_uri_prefix:
+            raise ValueError("queue_name and target_uri_prefix are required")
+        upper = f"{target_uri_prefix}\uffff"
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT status, COUNT(*) AS count FROM queue_jobs "
+                "WHERE queue_name = ? AND target_uri >= ? AND target_uri < ? GROUP BY status",
+                (queue_name, target_uri_prefix, upper),
+            ).fetchall()
+        return {str(row["status"]): int(row["count"]) for row in rows}
+
+    def stats_for_scope(
+        self,
+        *,
+        queue_name: str,
+        tenant_id: str,
+        owner_user_id: str,
+        workspace_ids: Sequence[str] | None = None,
+    ) -> dict[str, int]:
+        if not queue_name or not tenant_id or not owner_user_id:
+            raise ValueError("queue_name, tenant_id, and owner_user_id are required")
+        workspace_sql = ""
+        scoped_params: list[object] = [queue_name, tenant_id, owner_user_id]
+        query_scoped = True
+        if workspace_ids is not None:
+            workspaces = tuple(dict.fromkeys(str(item) for item in workspace_ids))
+            if not workspaces:
+                query_scoped = False
+            else:
+                workspace_sql = f" AND workspace_id IN ({','.join('?' for _ in workspaces)})"
+                scoped_params.extend(workspaces)
+        blocking_statuses = ("pending", "leased", "dead_letter", "quarantine")
+        with self._connect() as conn:
+            scoped_rows = (
+                conn.execute(
+                    "SELECT status, COUNT(*) AS count FROM queue_jobs "
+                    "INDEXED BY queue_jobs_scope_status_idx "
+                    "WHERE queue_name = ? AND tenant_id = ? AND owner_user_id = ?"
+                    + workspace_sql
+                    + " GROUP BY status",
+                    scoped_params,
+                ).fetchall()
+                if query_scoped
+                else ()
+            )
+            # Pre-scope subject-hashed jobs cannot be attributed to one Owner or
+            # Workspace.  They conservatively block every principal in their
+            # own Tenant only.  Keep this as a separate indexed query: an OR
+            # branch here makes SQLite choose the queue-wide claim index.
+            unresolved_rows = conn.execute(
+                "SELECT status, COUNT(*) AS count FROM queue_jobs "
+                "INDEXED BY queue_jobs_scope_status_idx "
+                "WHERE queue_name = ? AND tenant_id = ? AND owner_user_id = '' "
+                "AND status IN (?, ?, ?, ?) GROUP BY status",
+                (queue_name, tenant_id, *blocking_statuses),
+            ).fetchall()
+        result: dict[str, int] = {}
+        for row in (*scoped_rows, *unresolved_rows):
+            status = str(row["status"])
+            result[status] = result.get(status, 0) + int(row["count"])
+        return result
+
     def _row_to_job(self, row: sqlite3.Row) -> QueueJob:
         return QueueJob(
             job_id=row["job_id"],
@@ -367,6 +444,9 @@ class SQLiteQueueStore:
                   action TEXT NOT NULL,
                   target_uri TEXT NOT NULL,
                   payload_json TEXT NOT NULL,
+                  tenant_id TEXT NOT NULL DEFAULT '',
+                  owner_user_id TEXT NOT NULL DEFAULT '',
+                  workspace_id TEXT NOT NULL DEFAULT '',
                   status TEXT NOT NULL,
                   leased_until TEXT,
                   retry_count INTEGER NOT NULL DEFAULT 0,
@@ -381,6 +461,9 @@ class SQLiteQueueStore:
                 "lease_token": "TEXT NOT NULL DEFAULT ''",
                 "lease_generation": "INTEGER NOT NULL DEFAULT 0",
                 "lease_owner": "TEXT NOT NULL DEFAULT ''",
+                "tenant_id": "TEXT NOT NULL DEFAULT ''",
+                "owner_user_id": "TEXT NOT NULL DEFAULT ''",
+                "workspace_id": "TEXT NOT NULL DEFAULT ''",
             }
             for column, declaration in migrations.items():
                 if column not in columns:
@@ -390,6 +473,25 @@ class SQLiteQueueStore:
                 "CREATE INDEX IF NOT EXISTS queue_jobs_claim_idx "
                 "ON queue_jobs(queue_name, status, leased_until, created_at)"
             )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS queue_jobs_target_status_idx "
+                "ON queue_jobs(queue_name, target_uri, status)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS queue_jobs_scope_status_idx "
+                "ON queue_jobs(queue_name, tenant_id, owner_user_id, workspace_id, status)"
+            )
+            rows = conn.execute(
+                "SELECT * FROM queue_jobs WHERE tenant_id = '' OR owner_user_id = ''"
+            ).fetchall()
+            for row in rows:
+                job = self._row_to_job(row)
+                tenant_id, owner_user_id, workspace_id = self._job_scope(job)
+                conn.execute(
+                    "UPDATE queue_jobs SET tenant_id = ?, owner_user_id = ?, workspace_id = ? "
+                    "WHERE job_id = ?",
+                    (tenant_id, owner_user_id, workspace_id, job.job_id),
+                )
             conn.commit()
         os.chmod(self.path, 0o600)
 
@@ -417,6 +519,17 @@ class SQLiteQueueStore:
             str(row["target_uri"]),
             self._canonical_payload(payload),
         )
+
+    @staticmethod
+    def _job_scope(job: QueueJob) -> tuple[str, str, str]:
+        payload = dict(job.payload or {})
+        tenant_id = str(payload.get("tenant_id") or "default")
+        owner_user_id = str(payload.get("owner_user_id") or "")
+        if not owner_user_id and job.target_uri.startswith("memoryos://user/"):
+            candidate = job.target_uri.removeprefix("memoryos://user/").split("/", 1)[0]
+            if candidate and not candidate.startswith("subject_"):
+                owner_user_id = candidate
+        return tenant_id, owner_user_id, str(payload.get("workspace_id") or "")
 
     def _now_dt(self):
         from datetime import datetime, timezone

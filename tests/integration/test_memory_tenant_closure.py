@@ -42,8 +42,8 @@ def test_callerless_sdk_keeps_all_memory_closure_artifacts_tenant_local(tmp_path
         project_id="memoryos",
         context_type="memory",
     )
-    assert {item["metadata"]["canonical_value"] for item in a_rows} == {"postgresql"}
-    assert {item["metadata"]["canonical_value"] for item in b_rows} == {"sqlite"}
+    assert {item["metadata"]["canonical_value"] for item in a_rows} == {"PostgreSQL"}
+    assert {item["metadata"]["canonical_value"] for item in b_rows} == {"SQLite"}
     assert a["uri"] != b["uri"]
 
     pending = _remember(tenant_a, "MySQL")

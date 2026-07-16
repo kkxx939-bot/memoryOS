@@ -15,6 +15,7 @@ from pathlib import Path
 
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_relation import ContextRelation
+from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.model.context_uri import ContextURI
 from memoryos.contextdb.model.lifecycle import LifecycleState
 from memoryos.contextdb.store.source_store import (
@@ -26,6 +27,7 @@ from memoryos.contextdb.store.source_store import (
     QueueJob,
     QueueLeaseIdentityError,
     is_canonical_memory_object,
+    is_canonical_memory_uri,
 )
 from memoryos.contextdb.store.sqlite_index_store import lexical_match_count, lexical_relevance, lexical_terms
 
@@ -445,6 +447,28 @@ class InMemoryIndexStore:
             else None
         )
 
+    def ordinary_relation_endpoint_state(
+        self,
+        uri: str,
+        *,
+        tenant_id: str,
+        session_id: str = "",
+    ) -> str:
+        del session_id
+        row = self.rows.get(uri)
+        if row is None:
+            return "missing"
+        obj = row[0]
+        if str(obj.tenant_id or "default") != str(tenant_id):
+            return "missing"
+        if obj.lifecycle_state in {
+            LifecycleState.DELETED,
+            LifecycleState.ARCHIVED,
+            LifecycleState.OBSOLETE,
+        }:
+            return "inactive"
+        return "active"
+
     def clear(self) -> None:
         self.rows.clear()
 
@@ -462,13 +486,99 @@ class InMemoryIndexStore:
                 continue
             if filters.get("lifecycle_state") and obj.lifecycle_state.value != filters["lifecycle_state"]:
                 continue
-            if filters.get("owner_user_id") and obj.owner_user_id != filters["owner_user_id"]:
-                continue
+            if filters.get("principal_owner_id") is not None:
+                expected_owner = str(filters["principal_owner_id"])
+                metadata = dict(obj.metadata or {})
+                raw_scope = dict(metadata.get("scope", {}) or {})
+                raw_applicability = dict(raw_scope.get("applicability", {}) or {})
+                raw_visibility = dict(raw_scope.get("visibility", {}) or {})
+                workspace = str(
+                    metadata.get("workspace_id")
+                    or metadata.get("project_id")
+                    or next(
+                        (
+                            str(item.get("id"))
+                            for item in raw_applicability.get("all_of", []) or []
+                            if isinstance(item, dict) and item.get("kind") == "workspace"
+                        ),
+                        "",
+                    )
+                )
+                shared_workspaces = {
+                    str(value)
+                    for value in filters.get("workspace_access_ids", ()) or ()
+                    if str(value) not in {"", "__memoryos_principal_only__"}
+                }
+                record_kind = str(metadata.get("record_kind") or "")
+                if not record_kind and str(metadata.get("canonical_kind") or "") == "claim":
+                    record_kind = "claim_revision"
+                canonical_shared = bool(
+                    obj.context_type == ContextType.MEMORY
+                    and record_kind in {"current_slot", "claim_revision"}
+                    and str(metadata.get("slot_id") or metadata.get("canonical_slot_id") or "")
+                    and str(metadata.get("claim_id") or metadata.get("canonical_claim_id") or "")
+                    and str(raw_visibility.get("tenant_id") or "") == str(obj.tenant_id or "default")
+                    and (
+                        expected_owner
+                        in {str(item) for item in raw_visibility.get("allowed_principal_ids", ()) or ()}
+                        or (
+                            raw_visibility.get("private") is False
+                            and raw_visibility.get("allowed_principal_ids") in ([], ())
+                            and raw_visibility.get("allowed_service_ids") in ([], ())
+                            and workspace in shared_workspaces
+                        )
+                    )
+                )
+                if (
+                    obj.owner_user_id != expected_owner
+                    and not (
+                        obj.owner_user_id in {None, ""}
+                        and obj.context_type in {ContextType.RESOURCE, ContextType.SKILL}
+                    )
+                    and not canonical_shared
+                ):
+                    continue
+            elif filters.get("owner_user_id") is not None:
+                expected_owner = str(filters["owner_user_id"])
+                if expected_owner:
+                    if obj.context_type not in {ContextType.RESOURCE, ContextType.SKILL}:
+                        if obj.owner_user_id != expected_owner:
+                            continue
+                    elif obj.owner_user_id not in {None, "", expected_owner}:
+                        continue
+                elif obj.owner_user_id not in {None, ""}:
+                    continue
             if filters.get("tenant_id") and str(obj.tenant_id or "default") != str(filters["tenant_id"]):
                 continue
             if filters.get("context_type") and obj.context_type.value != filters["context_type"]:
                 continue
             metadata = dict(obj.metadata or {})
+            if filters.get("adapter_access_id") is not None:
+                actual_adapter = str(
+                    metadata.get("source_adapter_id") or dict(metadata.get("connect", {}) or {}).get("adapter_id") or ""
+                )
+                if actual_adapter not in {"", str(filters["adapter_access_id"])}:
+                    record_kind = str(metadata.get("record_kind") or "")
+                    if obj.context_type not in {ContextType.SESSION, ContextType.RESOURCE, ContextType.SKILL} and (
+                        record_kind != "current_slot"
+                    ):
+                        continue
+            context_types = filters.get("context_types")
+            if context_types is not None and obj.context_type.value not in {str(value) for value in context_types}:
+                continue
+            source_kinds = filters.get("source_kinds")
+            if source_kinds is not None and str(metadata.get("source_kind") or "context") not in {
+                str(value) for value in source_kinds
+            }:
+                continue
+            record_kinds = filters.get("record_kinds")
+            if record_kinds is not None:
+                actual_record_kind = str(
+                    metadata.get("record_kind")
+                    or ("claim_revision" if metadata.get("canonical_kind") == "claim" else "context")
+                )
+                if actual_record_kind not in {str(value) for value in record_kinds}:
+                    continue
             try:
                 from memoryos.memory.canonical.scope import scope_keys_from_payloads
 
@@ -482,12 +592,10 @@ class InMemoryIndexStore:
             except (KeyError, TypeError, ValueError):
                 continue
             admission = dict(metadata.get("admission", {}) or {})
-            if filters.get("admission_status") is None and admission.get("decision") in {
-                "pending",
-                "restricted",
-                "archive_only",
-                "reject",
-            }:
+            excluded_admission = {"restricted", "archive_only", "reject"}
+            if not filters.get("include_candidates"):
+                excluded_admission.add("pending")
+            if filters.get("admission_status") is None and admission.get("decision") in excluded_admission:
                 continue
             if filters.get("project_id"):
                 scope = raw_scope
@@ -508,6 +616,27 @@ class InMemoryIndexStore:
                 if memory_type in {"project_rule", "project_decision", "agent_experience"} and project_id != str(
                     filters["project_id"]
                 ):
+                    continue
+            workspace_access = filters.get("workspace_access_ids")
+            if workspace_access is not None:
+                scope = raw_scope
+                fields = dict(metadata.get("fields", {}) or {})
+                applicability = raw_applicability
+                workspace = str(
+                    metadata.get("workspace_id")
+                    or metadata.get("project_id")
+                    or scope.get("project_id")
+                    or fields.get("project_id")
+                    or next(
+                        (
+                            str(item.get("id"))
+                            for item in applicability.get("all_of", []) or []
+                            if isinstance(item, dict) and item.get("kind") == "workspace"
+                        ),
+                        "",
+                    )
+                )
+                if workspace not in {str(value) for value in workspace_access}:
                     continue
             metadata_matches = True
             for field in ("adapter_id", "admission_status", "claim_state", "slot_id", "memory_type"):
@@ -531,6 +660,8 @@ class InMemoryIndexStore:
             required_scopes = set(filters.get("applicability_scope_keys", []) or [])
             if required_scopes and not actual_scope_keys.issubset(required_scopes):
                 continue
+            if filters.get("require_unscoped") and actual_scope_keys:
+                continue
             text = " ".join([obj.title, content, json.dumps(obj.metadata, ensure_ascii=False)]).casefold()
             lexical_matches = lexical_match_count(query, text)
             lexical = lexical_relevance(query, text)
@@ -547,7 +678,42 @@ class InMemoryIndexStore:
                 continue
             hotness = (obj.hotness + obj.semantic_hotness + obj.behavior_support_hotness) / 3.0
             score = max(float(lexical_matches), identity) + 0.05 * hotness
+            canonical_projection = bool(
+                is_canonical_memory_object(obj)
+                or str(metadata.get("canonical_kind") or "")
+                in {"slot", "claim", "pending_proposal", "current_slot_projection"}
+                or str(metadata.get("schema_version") or "").startswith("canonical_")
+            )
+            ordinary_serving_metadata = {
+                key: metadata[key]
+                for key in (
+                    "adapter_id",
+                    "admission",
+                    "connect",
+                    "memory_type",
+                    "project_id",
+                    "record_kind",
+                    "retrieval_views",
+                    "scope",
+                    "scope_keys",
+                    "session_id",
+                    "source_adapter_id",
+                    "source_kind",
+                    "workspace_id",
+                )
+                if key in metadata
+            }
             hit_metadata = {
+                # Preserve the pre-existing ordinary-context fallback contract:
+                # Behavior/Prediction consumers re-read Source for business
+                # metadata. Only controlled serving/scope fields cross the
+                # legacy IndexHit boundary; arbitrary reward/event payloads
+                # do not affect Behavior selection. Canonical offline
+                # validation requires the full projector proof envelope.
+                **(metadata if canonical_projection else ordinary_serving_metadata),
+                "tenant_id": str(obj.tenant_id or "default"),
+                "owner_user_id": str(obj.owner_user_id or ""),
+                "context_type": obj.context_type.value,
                 "retrieval_scores": {
                     "lexical": lexical,
                     "vector": 0.0,
@@ -587,6 +753,7 @@ class InMemoryRelationStore:
         *,
         tenant_id: str | None = None,
         owner_user_id: str | None = None,
+        limit: int | None = None,
     ) -> list[ContextRelation]:
         rows = [relation for relation in self.relations if relation.source_uri == uri or relation.target_uri == uri]
         if tenant_id is not None:
@@ -598,9 +765,27 @@ class InMemoryRelationStore:
                 if relation.metadata.get("owner_user_id") in {None, "", owner_user_id}
                 or relation.target_uri.startswith(("memoryos://resources/", "memoryos://skills/"))
             ]
-        return rows
+        rows.sort(key=lambda item: (-item.weight, item.created_at, item.source_uri, item.target_uri))
+        return rows[: max(0, int(limit))] if limit is not None else rows
 
-    def delete_relation(self, source_uri: str, relation_type: str, target_uri: str) -> None:
+    def delete_relation(
+        self,
+        source_uri: str,
+        relation_type: str,
+        target_uri: str,
+        *,
+        tenant_id: str | None = None,
+    ) -> None:
+        matching_tenants = {
+            str(relation.metadata.get("tenant_id") or "default")
+            for relation in self.relations
+            if relation.source_uri == source_uri
+            and relation.relation_type == relation_type
+            and relation.target_uri == target_uri
+        }
+        if tenant_id is None and len(matching_tenants) > 1:
+            raise ValueError("tenant_id is required for an ambiguous relation identity")
+        selected_tenant = tenant_id or next(iter(matching_tenants), None)
         self.relations = [
             relation
             for relation in self.relations
@@ -608,8 +793,170 @@ class InMemoryRelationStore:
                 relation.source_uri == source_uri
                 and relation.relation_type == relation_type
                 and relation.target_uri == target_uri
+                and (
+                    selected_tenant is None
+                    or str(relation.metadata.get("tenant_id") or "default") == selected_tenant
+                )
             )
         ]
+
+    def delete_projection_relations(
+        self,
+        uri: str,
+        *,
+        tenant_id: str,
+        catalog_record_key: str,
+        limit: int,
+    ) -> int:
+        maximum = max(1, min(int(limit), 1_000))
+        selected = [
+            relation
+            for relation in self.relations
+            if (relation.source_uri == uri or relation.target_uri == uri)
+            and str(relation.metadata.get("tenant_id") or "default") == tenant_id
+            and str(relation.metadata.get("catalog_record_key") or "") in {"", catalog_record_key}
+        ][:maximum]
+        identities = {
+            (
+                str(relation.metadata.get("tenant_id") or "default"),
+                relation.source_uri,
+                relation.relation_type,
+                relation.target_uri,
+            )
+            for relation in selected
+        }
+        self.relations = [
+            relation
+            for relation in self.relations
+            if (
+                str(relation.metadata.get("tenant_id") or "default"),
+                relation.source_uri,
+                relation.relation_type,
+                relation.target_uri,
+            )
+            not in identities
+        ]
+        return len(identities)
+
+    def delete_uri_relations(
+        self,
+        uri: str,
+        *,
+        tenant_id: str,
+        limit: int,
+    ) -> int:
+        maximum = max(1, min(int(limit), 1_000))
+        selected = [
+            relation
+            for relation in self.relations
+            if (relation.source_uri == uri or relation.target_uri == uri)
+            and str(relation.metadata.get("tenant_id") or "default") == tenant_id
+        ][:maximum]
+        identities = {
+            (
+                str(relation.metadata.get("tenant_id") or "default"),
+                relation.source_uri,
+                relation.relation_type,
+                relation.target_uri,
+            )
+            for relation in selected
+        }
+        self.relations = [
+            relation
+            for relation in self.relations
+            if (
+                str(relation.metadata.get("tenant_id") or "default"),
+                relation.source_uri,
+                relation.relation_type,
+                relation.target_uri,
+            )
+            not in identities
+        ]
+        return len(identities)
+
+    def clear_ordinary_relations(self, *, tenant_id: str, limit: int) -> int:
+        maximum = max(1, min(int(limit), 1_000))
+        selected = [
+            relation
+            for relation in self.relations
+            if str(relation.metadata.get("tenant_id") or "default") == tenant_id
+            and not is_canonical_memory_uri(relation.source_uri)
+        ][:maximum]
+        identities = {
+            (relation.source_uri, relation.relation_type, relation.target_uri)
+            for relation in selected
+        }
+        self.relations = [
+            relation
+            for relation in self.relations
+            if not (
+                str(relation.metadata.get("tenant_id") or "default") == tenant_id
+                and (relation.source_uri, relation.relation_type, relation.target_uri) in identities
+            )
+        ]
+        return len(identities)
+
+    def reconcile_ordinary_relations(
+        self,
+        relations: Sequence[ContextRelation],
+        *,
+        tenant_id: str,
+    ) -> dict[str, int]:
+        values = tuple(relations)
+        if len(values) > 1_000:
+            raise ValueError("ordinary relation reconcile batch exceeds 1000")
+        prepared: dict[tuple[str, str, str], ContextRelation] = {}
+        for relation in values:
+            relation_tenant = str(relation.metadata.get("tenant_id") or "default")
+            if relation_tenant != tenant_id:
+                raise ValueError("ordinary relation tenant differs from reconcile tenant")
+            if is_canonical_memory_uri(relation.source_uri):
+                raise ValueError("ordinary relation reconcile cannot mutate a canonical Source")
+            if str(relation.metadata.get("catalog_record_key") or ""):
+                raise ValueError("ordinary Source relation cannot claim Catalog projection ownership")
+            identity = (relation.source_uri, relation.relation_type, relation.target_uri)
+            prior = prepared.get(identity)
+            if prior is not None and not self._ordinary_projection_equal(prior, relation):
+                raise ValueError("ordinary relation batch contains a conflicting identity")
+            prepared[identity] = relation
+        written = 0
+        skipped = 0
+        for identity in sorted(prepared):
+            relation = prepared[identity]
+            existing = next(
+                (
+                    item
+                    for item in self.relations
+                    if item.source_uri == relation.source_uri
+                    and item.relation_type == relation.relation_type
+                    and item.target_uri == relation.target_uri
+                    and str(item.metadata.get("tenant_id") or "default") == tenant_id
+                ),
+                None,
+            )
+            if existing is not None and self._ordinary_projection_equal(existing, relation):
+                skipped += 1
+                continue
+            if existing is not None:
+                self.delete_relation(
+                    relation.source_uri,
+                    relation.relation_type,
+                    relation.target_uri,
+                    tenant_id=tenant_id,
+                )
+            self.add_relation(relation)
+            written += 1
+        return {"processed": len(prepared), "written": written, "skipped": skipped}
+
+    @staticmethod
+    def _ordinary_projection_equal(left: ContextRelation, right: ContextRelation) -> bool:
+        return (
+            left.source_uri == right.source_uri
+            and left.relation_type == right.relation_type
+            and left.target_uri == right.target_uri
+            and left.weight == right.weight
+            and dict(left.metadata or {}) == dict(right.metadata or {})
+        )
 
     def all_relations(self) -> list[ContextRelation]:
         return list(self.relations)
@@ -785,6 +1132,60 @@ class InMemoryQueueStore:
                     continue
                 result[job.status] = result.get(job.status, 0) + 1
         return result
+
+    def stats_for_target_prefix(self, *, queue_name: str, target_uri_prefix: str) -> dict[str, int]:
+        result: dict[str, int] = {}
+        with self._guard:
+            for job in self.jobs.values():
+                if job.queue_name != queue_name or not job.target_uri.startswith(target_uri_prefix):
+                    continue
+                result[job.status] = result.get(job.status, 0) + 1
+        return result
+
+    def stats_for_scope(
+        self,
+        *,
+        queue_name: str,
+        tenant_id: str,
+        owner_user_id: str,
+        workspace_ids: Sequence[str] | None = None,
+    ) -> dict[str, int]:
+        allowed_workspaces = None if workspace_ids is None else {str(item) for item in workspace_ids}
+        result: dict[str, int] = {}
+        with self._guard:
+            for job in self.jobs.values():
+                if job.queue_name != queue_name:
+                    continue
+                job_tenant, job_owner, job_workspace = self._job_scope(job)
+                scope_matches = (
+                    job_tenant == tenant_id
+                    and job_owner == owner_user_id
+                    and (allowed_workspaces is None or job_workspace in allowed_workspaces)
+                )
+                # A pre-scope unresolved job cannot be attributed safely. It
+                # blocks scoped CURRENT reads inside its own Tenant until
+                # replay drains it, but must not affect another Tenant.
+                unknown_unresolved = job_tenant == tenant_id and not job_owner and job.status in {
+                    "pending",
+                    "leased",
+                    "dead_letter",
+                    "quarantine",
+                }
+                if not scope_matches and not unknown_unresolved:
+                    continue
+                result[job.status] = result.get(job.status, 0) + 1
+        return result
+
+    @staticmethod
+    def _job_scope(job: QueueJob) -> tuple[str, str, str]:
+        payload = dict(job.payload or {})
+        tenant_id = str(payload.get("tenant_id") or "default")
+        owner_user_id = str(payload.get("owner_user_id") or "")
+        if not owner_user_id and job.target_uri.startswith("memoryos://user/"):
+            candidate = job.target_uri.removeprefix("memoryos://user/").split("/", 1)[0]
+            if candidate and not candidate.startswith("subject_"):
+                owner_user_id = candidate
+        return tenant_id, owner_user_id, str(payload.get("workspace_id") or "")
 
     def _settle(
         self,

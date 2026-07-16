@@ -4,11 +4,13 @@ import json
 import multiprocessing as mp
 import sqlite3
 import threading
+from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
+from memoryos.contextdb.catalog import CatalogRecordKind
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.store.local_stores import (
     FileSystemSourceStore,
@@ -17,7 +19,7 @@ from memoryos.contextdb.store.local_stores import (
 )
 from memoryos.contextdb.store.source_store import QueueJob
 from memoryos.contextdb.store.sqlite_index_store import SQLiteIndexStore
-from memoryos.contextdb.store.vector_store import InMemoryVectorStore
+from memoryos.contextdb.store.vector_store import InMemoryVectorStore, VectorStore, vector_row_id
 from memoryos.memory.canonical import (
     CanonicalMemoryProjector,
     EvidenceRef,
@@ -218,12 +220,9 @@ def _persist_committed_claim(source, artifact_root, obj, content: str) -> None: 
 
 def _enqueue(queue, tmp_path, revision: int, job_id: str) -> None:  # noqa: ANN001
     receipt = json.loads(
-        (
-            tmp_path
-            / "system"
-            / "transactions"
-            / f"projection-fixture-revision-{revision}.json"
-        ).read_text(encoding="utf-8")
+        (tmp_path / "system" / "transactions" / f"projection-fixture-revision-{revision}.json").read_text(
+            encoding="utf-8"
+        )
     )
     assert receipt["transaction_id"] == job_id
     operation = ContextOperation.from_dict(dict(receipt["operations"][0]))
@@ -281,7 +280,7 @@ def _multiprocess_project(
         source,
         index,
         artifact_root,
-        vector_store=SQLiteTestVectorStore(vector_path),
+        vector_store=cast(VectorStore, SQLiteTestVectorStore(vector_path)),
         test_hook=hook,
     )
     result = projector.project(_claim(1).uri, 1)
@@ -409,8 +408,569 @@ def test_projection_sidecar_retry_idempotency_stale_guard_and_rebuild(tmp_path) 
 
     new_scope_current.unlink()
     rebuilt = projector.rebuild()
-    assert rebuilt == {"projected": 1, "skipped": 0, "retired": 0}
+    assert rebuilt == {"projected": 1, "skipped": 0, "retired": 0, "historical_restored": 0}
     assert next((artifact_root / "views" / "scope").glob("**/current.json")).exists()
+
+
+def test_canonical_projection_sanitizes_layers_vector_index_and_view_metadata(tmp_path) -> None:  # noqa: ANN001
+    class CapturingEmbedding:
+        model_name = "capture-v1"
+        dimension = 2
+
+        def __init__(self) -> None:
+            self.texts: list[str] = []
+
+        def embed(self, text: str) -> list[float]:
+            self.texts.append(text)
+            return [1.0, 0.5]
+
+    secret = "Authorization: Token canonical-secret read /Users/u1/Desktop/private-plan.md"
+    claim = MemoryClaim(
+        "claim-secret",
+        "memoryos://user/u1/memories/canonical/slots/slot-secret/claims/claim-secret",
+        "slot-secret",
+        secret,
+        TransitionProfile.AUTHORITATIVE_STATE,
+        (
+            MemoryRevision(
+                revision=1,
+                state="ACTIVE",
+                value_fields={"canonical_value": secret},
+                evidence_refs=(EvidenceRef("e-secret", None, "digest-secret"),),
+                proposal_id="proposal-secret",
+                relation="UNRELATED",
+                epistemic_status="EXPLICIT",
+                qualifiers={"display_fields": {"details": secret}},
+            ),
+        ),
+    )
+    artifact_root = _artifact_root(tmp_path)
+    source = FileSystemSourceStore(tmp_path, tenant_id="t1")
+    index = InMemoryIndexStore()
+    vectors = InMemoryVectorStore()
+    embedding = CapturingEmbedding()
+    obj = claim.to_context_object(
+        tenant_id="t1",
+        owner_user_id="u1",
+        memory_type="project_decision",
+        scope=_scope(),
+    )
+    obj.metadata["identity_fields"] = {
+        "decision_topic": "Authorization: Token tree-path-secret",
+    }
+    _persist_committed_claim(source, artifact_root, obj, secret)
+
+    result = CanonicalMemoryProjector(
+        source,
+        index,
+        artifact_root,
+        vector_store=vectors,
+        embedding_provider=embedding,
+    ).project(claim.uri, 1)
+
+    record = ProjectionRecordStore(artifact_root).load_current(claim.uri, source_revision=1)
+    assert result.status == "projected" and record is not None
+    derived = "\n".join(
+        (
+            source.read_content(record.l0_uri),
+            source.read_content(record.l1_uri),
+            source.read_content(record.l2_uri),
+            repr(index.rows[claim.uri]),
+            repr(vectors.get_vector_metadata(claim.uri)),
+            "\n".join(embedding.texts),
+            "\n".join(path.read_text(encoding="utf-8") for path in (artifact_root / "views").glob("**/*.json")),
+        )
+    )
+    assert "canonical-secret" not in derived
+    assert "/Users/u1" not in derived
+    assert "tree-path-secret" not in derived
+    vector_metadata = vectors.get_vector_metadata(claim.uri)
+    assert vector_metadata is not None
+    assert {
+        "catalog_record_key",
+        "tenant_id",
+        "owner_user_id",
+        "workspace_id",
+        "session_id",
+        "adapter_id",
+        "context_type",
+        "source_kind",
+        "record_kind",
+        "lifecycle_state",
+        "primary_tree_path",
+        "tree_paths",
+        "scope_keys",
+        "created_at",
+        "updated_at",
+        "event_time",
+        "ingested_at",
+        "transaction_time",
+        "valid_from",
+        "valid_to",
+        "source_uri",
+        "source_digest",
+        "source_revision",
+        "canonical_slot_id",
+        "canonical_claim_id",
+        "canonical_revision",
+        "canonical_state",
+        "canonical_head_digest",
+        "receipt_digest",
+        "projection_effect_hash",
+        "serving_tier",
+        "projection_status",
+    } <= vector_metadata.keys()
+    assert vector_metadata["catalog_record_key"] == "claim:claim-secret:revision:1"
+    assert vector_metadata["workspace_id"] == "memoryos"
+    assert tuple(vector_metadata["scope_keys"]) == ("memoryos:workspace:memoryos",)
+    assert vector_metadata["record_kind"] == "claim_revision"
+    assert vector_metadata["source_revision"] == 1
+    assert vector_metadata["projection_effect_hash"] == result.input_effect_hash
+    assert vector_metadata["canonical_head_digest"]
+    assert vector_metadata["receipt_digest"]
+    assert vector_metadata["tree_paths"][0].startswith("memories/decisions/")
+    assert "projects/memoryos" in vector_metadata["tree_paths"]
+
+
+def test_claim_projection_derives_previous_valid_to_without_rewriting_source(tmp_path) -> None:  # noqa: ANN001
+    class CountingEmbedding:
+        model_name = "counting-validity-v1"
+        dimension = 2
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def embed(self, text: str) -> list[float]:
+            del text
+            self.calls += 1
+            return [1.0, 0.5]
+
+    artifact_root = _artifact_root(tmp_path)
+    source = FileSystemSourceStore(tmp_path, tenant_id="t1")
+    index = SQLiteIndexStore(artifact_root / "indexes" / "validity.sqlite3")
+    vectors = InMemoryVectorStore()
+    embedding = CountingEmbedding()
+    revision_one = MemoryRevision(
+        revision=1,
+        state="ACTIVE",
+        value_fields={"canonical_value": "SQLite"},
+        evidence_refs=(EvidenceRef("e1", None, "hash-1"),),
+        proposal_id="p1",
+        relation="UNRELATED",
+        epistemic_status="EXPLICIT",
+        valid_from="2026-07-14T00:00:00+00:00",
+    )
+    claim_one = MemoryClaim(
+        "claim-validity",
+        "memoryos://user/u1/memories/canonical/slots/slot-validity/claims/claim-validity",
+        "slot-validity",
+        "SQLite",
+        TransitionProfile.AUTHORITATIVE_STATE,
+        (revision_one,),
+    )
+    projector = CanonicalMemoryProjector(
+        source,
+        index,
+        artifact_root,
+        vector_store=vectors,
+        embedding_provider=embedding,
+    )
+    _persist_committed_claim(
+        source,
+        artifact_root,
+        claim_one.to_context_object(
+            tenant_id="t1",
+            owner_user_id="u1",
+            memory_type="project_decision",
+            scope=_scope(),
+        ),
+        "SQLite",
+    )
+    assert projector.project(claim_one.uri, 1).status == "projected"
+    published_revision_one = projector.record_store.load_current(claim_one.uri, source_revision=1)
+    assert published_revision_one is not None
+    assert embedding.calls == 1
+
+    revision_two = MemoryRevision(
+        revision=2,
+        state="SUPERSEDED",
+        value_fields={"canonical_value": "SQLite"},
+        evidence_refs=(EvidenceRef("e2", None, "hash-2"),),
+        proposal_id="p2",
+        relation="CORRECTS",
+        epistemic_status="EXPLICIT",
+        previous_revision=1,
+        valid_from="2026-07-15T00:00:00+00:00",
+    )
+    claim_two = claim_one.with_revision(revision_two)
+    _persist_committed_claim(
+        source,
+        artifact_root,
+        claim_two.to_context_object(
+            tenant_id="t1",
+            owner_user_id="u1",
+            memory_type="project_decision",
+            scope=_scope(),
+        ),
+        "SQLite",
+    )
+    assert projector.project(claim_two.uri, 2).status == "projected"
+
+    # A later failed retry is deliberately newer than the published revision
+    # 1 attempt.  Refresh must follow the Catalog's exact attempt id, never the
+    # record store's arbitrary preferred/latest attempt for a non-current
+    # revision.
+    failed_attempt_id = "f" * 32
+    failed_base = f"{claim_one.uri}/projections/rev-1/attempt-{failed_attempt_id}"
+    failed_attempt = projector.record_store.start(
+        claim_uri=claim_one.uri,
+        slot_uri=claim_one.uri.rsplit("/claims/", 1)[0],
+        source_revision=1,
+        projection_revision=1,
+        projection_attempt_id=failed_attempt_id,
+        input_effect_hash=published_revision_one.input_effect_hash,
+        l0_uri=f"{failed_base}/l0.md",
+        l1_uri=f"{failed_base}/l1.md",
+        l2_uri=f"{failed_base}/l2.json",
+        relations_uri=f"{failed_base}/relations.json",
+        manifest_uri=f"{failed_base}/manifest.json",
+        current_claim_revision=1,
+    )
+    projector.record_store.fail(failed_attempt, "deliberate later failed retry")
+    assert projector.record_store.load(claim_one.uri, 1).projection_attempt_id == failed_attempt_id  # type: ignore[union-attr]
+    current_obj = source.read_object(claim_two.uri)
+    projector._reconcile_claim_catalog_projections(  # noqa: SLF001
+        current_obj,
+        dict(current_obj.metadata or {}),
+        published_revision=2,
+    )
+    # Revision 2 publishes once; both the automatic and explicit repair paths
+    # refresh revision 1 exactly once.
+    assert embedding.calls == 4
+
+    old_record = index.get_catalog("claim:claim-validity:revision:1", tenant_id="t1")
+    assert old_record is not None
+    assert old_record.valid_to == revision_two.valid_from
+    assert old_record.metadata["valid_to"] == revision_two.valid_from
+    assert old_record.metadata["validity_end_derived"] is True
+    assert old_record.metadata["projection_attempt_id"] == published_revision_one.projection_attempt_id
+    old_vector = vectors.get_vector_metadata(vector_row_id("t1", old_record.record_key))
+    assert old_vector is not None
+    assert old_vector["valid_to"] == revision_two.valid_from
+
+    committed = source.read_object(claim_two.uri)
+    source_revisions = list(committed.metadata["revisions"])
+    assert source_revisions[0]["valid_to"] is None
+
+
+def test_late_historical_claim_catalog_binds_requested_revision_without_changing_legacy_current(
+    tmp_path,
+) -> None:  # noqa: ANN001
+    class CapturingEmbedding:
+        model_name = "capturing-late-history-v1"
+        dimension = 2
+
+        def __init__(self) -> None:
+            self.inputs: list[str] = []
+
+        def embed(self, text: str) -> list[float]:
+            self.inputs.append(text)
+            return [1.0, 0.5]
+
+    artifact_root = _artifact_root(tmp_path)
+    source = FileSystemSourceStore(tmp_path, tenant_id="t1")
+    index = SQLiteIndexStore(artifact_root / "indexes" / "late-history.sqlite3")
+    vectors = InMemoryVectorStore()
+    embedding = CapturingEmbedding()
+    effective_current = MemoryRevision(
+        revision=1,
+        state="ACTIVE",
+        value_fields={"canonical_value": "current effective rule"},
+        evidence_refs=(EvidenceRef("current", None, "current-hash"),),
+        proposal_id="current",
+        relation="UNRELATED",
+        epistemic_status="EXPLICIT",
+        qualifiers={"display_fields": {"summary": "current display"}},
+        created_at="2026-07-14T00:10:00+00:00",
+        transaction_time="2026-07-14T00:10:00+00:00",
+        valid_from="2026-07-14T00:00:00+00:00",
+    )
+    late_history = MemoryRevision(
+        revision=2,
+        state="PROPOSED",
+        value_fields={"canonical_value": "older historical rule"},
+        evidence_refs=(EvidenceRef("history", None, "history-hash"),),
+        proposal_id="history",
+        relation="SUPPLEMENTS",
+        epistemic_status="EXPLICIT",
+        qualifiers={
+            "non_current_historical": True,
+            "display_fields": {"summary": "historical display"},
+        },
+        created_at="2026-07-15T08:30:00+00:00",
+        transaction_time="2026-07-15T08:30:00+00:00",
+        previous_revision=1,
+        valid_from="2026-06-01T12:00:00+00:00",
+    )
+    claim = MemoryClaim(
+        "claim-late-history",
+        "memoryos://user/u1/memories/canonical/slots/slot-late-history/claims/claim-late-history",
+        "slot-late-history",
+        "current effective rule",
+        TransitionProfile.AUTHORITATIVE_STATE,
+        (effective_current, late_history),
+    )
+    projector = CanonicalMemoryProjector(
+        source,
+        index,
+        artifact_root,
+        vector_store=vectors,
+        embedding_provider=embedding,
+    )
+    claim_one = MemoryClaim(
+        claim.claim_id,
+        claim.uri,
+        claim.slot_id,
+        claim.canonical_value,
+        claim.profile,
+        (effective_current,),
+    )
+    _persist_committed_claim(
+        source,
+        artifact_root,
+        claim_one.to_context_object(
+            tenant_id="t1",
+            owner_user_id="u1",
+            memory_type="project_rule",
+            scope=_scope(),
+        ),
+        "current effective rule",
+    )
+    assert projector.project(claim.uri, 1).status == "projected"
+    _persist_committed_claim(
+        source,
+        artifact_root,
+        claim.to_context_object(
+            tenant_id="t1",
+            owner_user_id="u1",
+            memory_type="project_rule",
+            scope=_scope(),
+        ),
+        "current effective rule",
+    )
+
+    assert projector.project(claim.uri, 2).status == "projected"
+
+    row = index.get_catalog("claim:claim-late-history:revision:2", tenant_id="t1")
+    assert row is not None
+    assert row.canonical_revision == 2
+    assert row.canonical_state == "PROPOSED"
+    assert row.metadata["revision"] == 2
+    assert row.metadata["value_fields"] == {"canonical_value": "older historical rule"}
+    assert [item["revision"] for item in row.metadata["revisions"]] == [2]
+    assert row.metadata["state"] == "PROPOSED"
+    assert row.metadata["canonical_value"] == "older historical rule"
+    assert row.event_time == late_history.valid_from
+    assert row.transaction_time == late_history.transaction_time
+    assert "older historical rule" in row.l0_text
+    assert "historical display" in row.l1_text
+    assert "current effective rule" not in row.l1_text
+    assert "older historical rule" in source.read_content(row.l2_uri)
+    vector_metadata = vectors.get_vector_metadata(vector_row_id("t1", row.record_key))
+    assert vector_metadata is not None
+    assert vector_metadata["canonical_revision"] == 2
+    assert vector_metadata["canonical_state"] == "PROPOSED"
+    assert vector_metadata["event_time"] == late_history.valid_from
+    assert vector_metadata["transaction_time"] == late_history.transaction_time
+    assert any("older historical rule" in value for value in embedding.inputs)
+
+    proof = projector.record_store.load_current(claim.uri, source_revision=2)
+    assert proof is not None
+    assert proof.current_claim_revision == 1
+    assert "current effective rule" in source.read_content(proof.l0_uri)
+    assert "older historical rule" not in source.read_content(proof.l0_uri)
+
+
+def test_claim_revision_refresh_rebinds_owner_scope_paths_acl_fts_and_vector(tmp_path) -> None:  # noqa: ANN001
+    def private_scope(
+        visible_principal: str,
+        workspace_id: str,
+        *,
+        tenant_id: str = "t1",
+    ) -> dict[str, Any]:
+        workspace: dict[str, object] = {
+            "namespace": "memoryos",
+            "kind": "workspace",
+            "id": workspace_id,
+            "parent_id": None,
+            "attributes": {},
+            "confidence": 1.0,
+            "source": "explicit",
+            "inferred": False,
+        }
+        return {
+            "canonical_subject": workspace,
+            "applicability": {"all_of": [workspace]},
+            "visibility": {
+                "tenant_id": tenant_id,
+                "allowed_principal_ids": [visible_principal],
+                "allowed_service_ids": [],
+                "private": True,
+            },
+            "authority": {
+                "principal_ids": ["u1"],
+                "service_ids": [],
+                "inferred": False,
+            },
+            "origin_refs": [],
+        }
+
+    artifact_root = _artifact_root(tmp_path)
+    source = FileSystemSourceStore(tmp_path, tenant_id="t1")
+    index = SQLiteIndexStore(artifact_root / "indexes" / "security-refresh.sqlite3")
+    vectors = InMemoryVectorStore()
+    projector = CanonicalMemoryProjector(source, index, artifact_root, vector_store=vectors)
+    revision_one = MemoryRevision(
+        revision=1,
+        state="ACTIVE",
+        value_fields={"canonical_value": "revision one searchable marker"},
+        evidence_refs=(EvidenceRef("r1", None, "r1-hash"),),
+        proposal_id="r1",
+        relation="UNRELATED",
+        epistemic_status="EXPLICIT",
+        created_at="2026-07-10T01:00:00+00:00",
+        transaction_time="2026-07-10T01:00:00+00:00",
+        valid_from="2026-07-10T00:00:00+00:00",
+    )
+    claim_one = MemoryClaim(
+        "claim-security-refresh",
+        "memoryos://user/u1/memories/canonical/slots/slot-security-refresh/claims/claim-security-refresh",
+        "slot-security-refresh",
+        "revision one searchable marker",
+        TransitionProfile.AUTHORITATIVE_STATE,
+        (revision_one,),
+    )
+    _persist_committed_claim(
+        source,
+        artifact_root,
+        claim_one.to_context_object(
+            tenant_id="t1",
+            owner_user_id="u1",
+            memory_type="project_rule",
+            scope=private_scope("old-reader", "old-workspace"),
+        ),
+        "revision one searchable marker",
+    )
+    assert projector.project(claim_one.uri, 1).status == "projected"
+    revision_one_key = "claim:claim-security-refresh:revision:1"
+    stale_owner_row = index.get_catalog(revision_one_key, tenant_id="t1")
+    assert stale_owner_row is not None
+    stale_scope = private_scope("old-reader", "old-workspace", tenant_id="legacy-tenant")
+    assert index.delete_catalog(revision_one_key, tenant_id="t1") is True
+    index.upsert_catalog(
+        replace(
+            stale_owner_row,
+            tenant_id="legacy-tenant",
+            owner_user_id="stale-owner",
+            metadata={
+                **dict(stale_owner_row.metadata),
+                "tenant_id": "legacy-tenant",
+                "owner_user_id": "stale-owner",
+                "scope": stale_scope,
+            },
+        )
+    )
+    old_vector = vectors.get_vector_metadata(vector_row_id("t1", revision_one_key))
+    assert old_vector is not None
+    vectors.delete_vector(vector_row_id("t1", revision_one_key))
+    vectors.upsert_vector(
+        vector_row_id("legacy-tenant", revision_one_key),
+        [1.0, 0.5],
+        metadata={
+            **old_vector,
+            "tenant_id": "legacy-tenant",
+            "owner_user_id": "stale-owner",
+            "workspace_id": "old-workspace",
+        },
+    )
+
+    revision_two = MemoryRevision(
+        revision=2,
+        state="ACTIVE",
+        value_fields={"canonical_value": "revision two searchable marker"},
+        evidence_refs=(EvidenceRef("r2", None, "r2-hash"),),
+        proposal_id="r2",
+        relation="CORRECTS",
+        epistemic_status="EXPLICIT",
+        created_at="2026-07-15T02:00:00+00:00",
+        transaction_time="2026-07-15T02:00:00+00:00",
+        previous_revision=1,
+        valid_from="2026-07-15T00:00:00+00:00",
+    )
+    claim_two = claim_one.with_revision(revision_two)
+    _persist_committed_claim(
+        source,
+        artifact_root,
+        claim_two.to_context_object(
+            tenant_id="t1",
+            owner_user_id="u1",
+            memory_type="project_rule",
+            scope=private_scope("new-reader", "new-workspace"),
+        ),
+        "revision two searchable marker",
+    )
+    assert projector.project(claim_two.uri, 2).status == "projected"
+
+    old_key = revision_one_key
+    refreshed = index.get_catalog(old_key, tenant_id="t1")
+    assert refreshed is not None
+    assert index.get_catalog(old_key, tenant_id="legacy-tenant") is None
+    assert refreshed.owner_user_id == "u1"
+    assert refreshed.workspace_id == "new-workspace"
+    assert refreshed.primary_tree_path.startswith("memories/rules/")
+    assert "projects/new-workspace" in refreshed.tree_paths
+    assert "projects/old-workspace" not in refreshed.tree_paths
+    assert "revision one searchable marker" in refreshed.l1_text
+    assert "revision two searchable marker" not in refreshed.l1_text
+    assert refreshed.transaction_time == revision_one.transaction_time
+    assert refreshed.valid_to == revision_two.valid_from
+    assert refreshed.metadata["scope"] == private_scope("new-reader", "new-workspace")
+
+    old_candidates = index.search_catalog(
+        "revision one searchable marker",
+        filters={
+            "tenant_id": "t1",
+            "principal_owner_id": "old-reader",
+            "workspace_access_ids": ("old-workspace",),
+            "applicability_scope_keys": ("memoryos:workspace:old-workspace",),
+            "target_paths": ("projects/old-workspace",),
+            "record_kinds": (CatalogRecordKind.CLAIM_REVISION.value,),
+            "include_inactive": True,
+        },
+        limit=10,
+    )
+    assert old_candidates == []
+    new_candidates = index.search_catalog(
+        "revision one searchable marker",
+        filters={
+            "tenant_id": "t1",
+            "principal_owner_id": "new-reader",
+            "workspace_access_ids": ("new-workspace",),
+            "applicability_scope_keys": ("memoryos:workspace:new-workspace",),
+            "target_paths": ("projects/new-workspace",),
+            "record_kinds": (CatalogRecordKind.CLAIM_REVISION.value,),
+            "include_inactive": True,
+        },
+        limit=10,
+    )
+    assert old_key in {item.metadata["catalog_record_key"] for item in new_candidates}
+    vector_metadata = vectors.get_vector_metadata(vector_row_id("t1", old_key))
+    assert vector_metadata is not None
+    assert vectors.get_vector_metadata(vector_row_id("legacy-tenant", old_key)) is None
+    assert vector_metadata["owner_user_id"] == "u1"
+    assert vector_metadata["workspace_id"] == "new-workspace"
+    assert "projects/new-workspace" in vector_metadata["tree_paths"]
+    assert "projects/old-workspace" not in vector_metadata["tree_paths"]
 
 
 def test_late_projection_cannot_overwrite_new_canonical_revision(tmp_path) -> None:  # noqa: ANN001
@@ -555,9 +1115,9 @@ def test_successful_attempt_survives_later_duplicate_failure(tmp_path: Path) -> 
     assert vectors.rows[claim.uri][1]["projection_attempt_id"] == current.projection_attempt_id
     view_currents = list((artifact_root / "views").glob("**/current.json"))
     assert view_currents
-    assert {
-        json.loads(path.read_text(encoding="utf-8"))["projection_attempt_id"] for path in view_currents
-    } == {current.projection_attempt_id}
+    assert {json.loads(path.read_text(encoding="utf-8"))["projection_attempt_id"] for path in view_currents} == {
+        current.projection_attempt_id
+    }
 
 
 def test_old_revision_failure_cannot_revoke_new_revision(tmp_path: Path) -> None:
@@ -745,10 +1305,9 @@ def test_projection_publish_stage_crash_recovers_one_consistent_attempt(
     assert vectors.rows[claim.uri][1]["projection_attempt_id"] == current.projection_attempt_id
     view_currents = list((artifact_root / "views").glob("**/current.json"))
     assert view_currents
-    assert {
-        json.loads(path.read_text(encoding="utf-8"))["projection_attempt_id"]
-        for path in view_currents
-    } == {current.projection_attempt_id}
+    assert {json.loads(path.read_text(encoding="utf-8"))["projection_attempt_id"] for path in view_currents} == {
+        current.projection_attempt_id
+    }
 
 
 def test_corrupt_projection_pointer_is_quarantined_once(tmp_path: Path) -> None:
@@ -817,7 +1376,10 @@ def test_multiprocess_duplicate_projection_has_one_current_attempt(tmp_path: Pat
     assert metadata["projection_input_effect_hash"] == current.input_effect_hash
     with sqlite3.connect(vector_path) as conn:
         vector_metadata = json.loads(
-            conn.execute("SELECT metadata_json FROM vectors WHERE uri = ?", (claim.uri,)).fetchone()[0]
+            conn.execute(
+                "SELECT metadata_json FROM vectors WHERE uri = ?",
+                (vector_row_id("t1", "claim:claim1:revision:1"),),
+            ).fetchone()[0]
         )
     assert vector_metadata["projection_attempt_id"] == current.projection_attempt_id
     views = [json.loads(path.read_text(encoding="utf-8")) for path in (artifact_root / "views").glob("**/current.json")]

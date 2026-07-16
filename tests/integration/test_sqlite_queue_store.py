@@ -253,10 +253,152 @@ def test_old_queue_schema_is_migrated_without_deleting_database(tmp_path: Path) 
     store = SQLiteQueueStore(path)
     with sqlite3.connect(path) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(queue_jobs)")}
-    assert {"lease_token", "lease_generation", "lease_owner"}.issubset(columns)
+        indexes = {row[1] for row in conn.execute("PRAGMA index_list(queue_jobs)")}
+    assert {
+        "lease_token",
+        "lease_generation",
+        "lease_owner",
+        "tenant_id",
+        "owner_user_id",
+        "workspace_id",
+    }.issubset(columns)
+    assert "queue_jobs_scope_status_idx" in indexes
+    assert store.stats_for_scope(
+        queue_name="race",
+        tenant_id="default",
+        owner_user_id="u1",
+        workspace_ids=("",),
+    ) == {"pending": 1}
     leased = store.lease("race", lease_owner="migrated", limit=1)
     assert leased[0].job_id == "legacy"
     assert leased[0].lease_generation == 1
+
+
+def test_subject_uri_projection_queue_scope_is_indexed_and_workspace_bounded(tmp_path: Path) -> None:
+    path = tmp_path / "queue.sqlite3"
+    store = SQLiteQueueStore(path)
+    store.enqueue(
+        QueueJob(
+            job_id="outbox-subject",
+            queue_name="memory_projection",
+            action="project_memory_committed",
+            target_uri="memoryos://user/subject_hash/memories/canonical/slots/slot-a",
+            payload={
+                "transaction_id": "subject",
+                "tenant_id": "tenant-a",
+                "owner_user_id": "u1",
+                "workspace_id": "workspace-a",
+            },
+        )
+    )
+
+    assert store.stats_for_scope(
+        queue_name="memory_projection",
+        tenant_id="tenant-a",
+        owner_user_id="u1",
+        workspace_ids=("", "workspace-a"),
+    ) == {"pending": 1}
+    assert store.stats_for_scope(
+        queue_name="memory_projection",
+        tenant_id="tenant-a",
+        owner_user_id="u1",
+        workspace_ids=("", "workspace-b"),
+    ) == {}
+    assert store.stats_for_scope(
+        queue_name="memory_projection",
+        tenant_id="tenant-a",
+        owner_user_id="u2",
+        workspace_ids=("", "workspace-a"),
+    ) == {}
+    with sqlite3.connect(path) as conn:
+        plan = " ".join(
+            str(row[3])
+            for row in conn.execute(
+                "EXPLAIN QUERY PLAN SELECT status, COUNT(*) FROM queue_jobs "
+                "WHERE queue_name = ? AND tenant_id = ? AND owner_user_id = ? "
+                "AND workspace_id = ? GROUP BY status",
+                ("memory_projection", "tenant-a", "u1", "workspace-a"),
+            )
+        )
+    assert "queue_jobs_scope_status_idx" in plan
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_unresolved_subject_job_blocks_only_its_own_tenant(tmp_path: Path, store_kind: str) -> None:
+    store = (
+        InMemoryQueueStore()
+        if store_kind == "memory"
+        else SQLiteQueueStore(tmp_path / "legacy-subject-queue.sqlite3")
+    )
+    store.enqueue(
+        QueueJob(
+            job_id="legacy-subject",
+            queue_name="memory_projection",
+            action="project_memory_committed",
+            target_uri="memoryos://user/subject_hash/memories/canonical/slots/slot-a",
+            payload={"transaction_id": "legacy", "tenant_id": "tenant-a"},
+        )
+    )
+
+    assert store.stats_for_scope(
+        queue_name="memory_projection",
+        tenant_id="tenant-a",
+        owner_user_id="u1",
+        workspace_ids=("", "workspace-a"),
+    ) == {"pending": 1}
+    assert store.stats_for_scope(
+        queue_name="memory_projection",
+        tenant_id="tenant-a",
+        owner_user_id="u2",
+        workspace_ids=("", "workspace-b"),
+    ) == {"pending": 1}
+    assert store.stats_for_scope(
+        queue_name="memory_projection",
+        tenant_id="tenant-b",
+        owner_user_id="u2",
+        workspace_ids=("", "workspace-b"),
+    ) == {}
+
+
+def test_scope_health_real_queries_use_scope_index(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "queue-plan.sqlite3"
+    store = SQLiteQueueStore(path)
+    store.enqueue(
+        QueueJob(
+            job_id="legacy-subject",
+            queue_name="memory_projection",
+            action="project_memory_committed",
+            target_uri="memoryos://user/subject_hash/memories/canonical/slots/slot-a",
+            payload={"transaction_id": "legacy", "tenant_id": "tenant-a"},
+        )
+    )
+    traced_sql: list[str] = []
+    original_connect = store._connect
+
+    def traced_connect() -> sqlite3.Connection:
+        conn = original_connect()
+        conn.set_trace_callback(traced_sql.append)
+        return conn
+
+    monkeypatch.setattr(store, "_connect", traced_connect)
+    assert store.stats_for_scope(
+        queue_name="memory_projection",
+        tenant_id="tenant-a",
+        owner_user_id="u1",
+        workspace_ids=("", "workspace-a"),
+    ) == {"pending": 1}
+    health_queries = [
+        sql
+        for sql in traced_sql
+        if sql.startswith("SELECT status, COUNT(*) AS count FROM queue_jobs")
+    ]
+    assert len(health_queries) == 2
+    with sqlite3.connect(path) as conn:
+        plans = [
+            " ".join(str(row[3]) for row in conn.execute(f"EXPLAIN QUERY PLAN {sql}"))
+            for sql in health_queries
+        ]
+    assert all("queue_jobs_scope_status_idx" in plan for plan in plans)
 
 
 @pytest.mark.parametrize("store_kind", ["memory", "sqlite"])

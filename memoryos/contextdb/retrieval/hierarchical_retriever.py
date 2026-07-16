@@ -1,4 +1,9 @@
-"""上下文数据库里的分层检索器。"""
+"""Legacy hierarchical retrieval reserved for offline compatibility tests.
+
+Online SDK/HTTP/MCP retrieval is owned exclusively by
+``UnifiedRetrievalOrchestrator``.  This module is intentionally not re-exported
+from :mod:`memoryos.contextdb.retrieval`.
+"""
 
 from __future__ import annotations
 
@@ -27,8 +32,18 @@ class HierarchicalRetrievalResult:
         }
 
 
-class HierarchicalRetriever:
-    def __init__(self, index_store: IndexStore, hybrid_search: HybridSearch | None = None) -> None:
+class OfflineHierarchicalRetriever:
+    """Legacy multi-pass reader that may only run in explicit offline/admin work."""
+
+    def __init__(
+        self,
+        index_store: IndexStore,
+        hybrid_search: HybridSearch | None = None,
+        *,
+        offline_admin: bool,
+    ) -> None:
+        if offline_admin is not True:
+            raise PermissionError("OfflineHierarchicalRetriever is restricted to offline admin/audit use")
         self.index_store = index_store
         self.hybrid_search = hybrid_search
         self.selector = ContextSelector()
@@ -66,3 +81,6 @@ class HierarchicalRetriever:
         l1_hits = self.selector.select(l0_hits, l1_limit)
         l2_uris = [hit.uri for hit in l1_hits[:l2_limit]]
         return HierarchicalRetrievalResult(plan=plan, l0_hits=l0_hits, l1_hits=l1_hits, l2_uris=l2_uris)
+
+
+__all__ = ["HierarchicalRetrievalResult", "OfflineHierarchicalRetriever"]

@@ -22,6 +22,57 @@ OUTBOX_TRANSITIONS = {
     "aborted": {"aborted"},
 }
 
+
+def projection_workspace_id(
+    operations: Sequence[ContextOperation | dict[str, Any]],
+) -> str:
+    """Return the single workspace that owns a canonical projection job.
+
+    Multiple or absent workspace refs intentionally collapse to the empty
+    workspace so queue health conservatively blocks every workspace-scoped
+    CURRENT read for that owner until replay completes.
+    """
+
+    workspace_ids: set[str] = set()
+    for operation in operations:
+        operation_payload = operation.payload if isinstance(operation, ContextOperation) else operation.get("payload")
+        if not isinstance(operation_payload, dict):
+            continue
+        raw_object = operation_payload.get("context_object")
+        if not isinstance(raw_object, dict):
+            continue
+        metadata = raw_object.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        scope = metadata.get("scope")
+        if not isinstance(scope, dict):
+            scope = {}
+        for value in (
+            raw_object.get("workspace_id"),
+            metadata.get("workspace_id"),
+            metadata.get("project_id"),
+            scope.get("workspace_id"),
+            scope.get("project_id"),
+        ):
+            if isinstance(value, str) and value.strip():
+                workspace_ids.add(value.strip())
+        applicability = scope.get("applicability")
+        if not isinstance(applicability, dict):
+            continue
+        refs = applicability.get("all_of")
+        if not isinstance(refs, list | tuple):
+            continue
+        for ref in refs:
+            if not isinstance(ref, dict) or str(ref.get("kind") or "") not in {
+                "workspace",
+                "project",
+            }:
+                continue
+            value = ref.get("id")
+            if isinstance(value, str) and value.strip():
+                workspace_ids.add(value.strip())
+    return next(iter(workspace_ids)) if len(workspace_ids) == 1 else ""
+
 PREPARED_INTENT_FIELDS = (
     "schema_version",
     "event_type",

@@ -106,6 +106,16 @@ class IndexStore(Protocol):
 
     def get_index_metadata(self, uri: str) -> dict | None: ...
 
+    def ordinary_relation_endpoint_state(
+        self,
+        uri: str,
+        *,
+        tenant_id: str,
+        session_id: str = "",
+    ) -> str:
+        """Return active, inactive, retired, or missing for relation gating."""
+        ...
+
 
 class RelationStore(Protocol):
     def add_relation(self, relation: ContextRelation) -> None: ...
@@ -116,9 +126,51 @@ class RelationStore(Protocol):
         *,
         tenant_id: str | None = None,
         owner_user_id: str | None = None,
+        limit: int | None = None,
     ) -> list[ContextRelation]: ...
 
-    def delete_relation(self, source_uri: str, relation_type: str, target_uri: str) -> None: ...
+    def delete_relation(
+        self,
+        source_uri: str,
+        relation_type: str,
+        target_uri: str,
+        *,
+        tenant_id: str | None = None,
+    ) -> None: ...
+
+    def delete_projection_relations(
+        self,
+        uri: str,
+        *,
+        tenant_id: str,
+        catalog_record_key: str,
+        limit: int,
+    ) -> int:
+        """Delete one bounded batch owned by a Catalog projection."""
+        ...
+
+    def delete_uri_relations(
+        self,
+        uri: str,
+        *,
+        tenant_id: str,
+        limit: int,
+    ) -> int:
+        """Delete one bounded tenant-owned batch when Catalog ownership is gone."""
+        ...
+
+    def clear_ordinary_relations(self, *, tenant_id: str, limit: int) -> int:
+        """Delete one bounded tenant batch whose Source is non-canonical."""
+        ...
+
+    def reconcile_ordinary_relations(
+        self,
+        relations: Sequence[ContextRelation],
+        *,
+        tenant_id: str,
+    ) -> dict[str, int]:
+        """Idempotently publish one bounded Source-derived ordinary batch."""
+        ...
 
     def all_relations(self) -> list[ContextRelation]: ...
 
@@ -164,6 +216,17 @@ class QueueStore(Protocol):
     def recover_expired_leases(self, *, queue_name: str | None = None) -> int: ...
 
     def stats(self, *, queue_name: str | None = None) -> dict[str, int]: ...
+
+    def stats_for_target_prefix(self, *, queue_name: str, target_uri_prefix: str) -> dict[str, int]: ...
+
+    def stats_for_scope(
+        self,
+        *,
+        queue_name: str,
+        tenant_id: str,
+        owner_user_id: str,
+        workspace_ids: Sequence[str] | None = None,
+    ) -> dict[str, int]: ...
 
 
 class LockStore(Protocol):

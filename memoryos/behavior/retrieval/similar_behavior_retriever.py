@@ -41,6 +41,7 @@ class SimilarBehaviorRetriever:
         self.hybrid_search = hybrid_search
 
     def retrieve(self, user_id: str, observation: Observation, limit: int = 8) -> dict:
+        tenant_id = self._tenant_id()
         query = " ".join([observation.raw_text, observation.location, observation.activity, *observation.signals])
         search_query = query or observation.scene_key
         namespace = f"memoryos://user/{user_id}/"
@@ -52,7 +53,12 @@ class SimilarBehaviorRetriever:
         relation_cases: list[dict] = []
         relation_uris = [item["uri"] for item in [*patterns, *clusters]]
         for uri in relation_uris:
-            related = self._relation_results(uri, user_id=user_id, trace=trace)
+            related = self._relation_results(
+                uri,
+                user_id=user_id,
+                tenant_id=tenant_id,
+                trace=trace,
+            )
             memory_anchors.extend(related["memory_anchors"])
             policy_refs.extend(related["policy_refs"])
             relation_cases.extend(related["cases"])
@@ -103,7 +109,7 @@ class SimilarBehaviorRetriever:
         if self.hybrid_search is not None:
             hybrid_hits = self.hybrid_search.search(
                 query,
-                filters={"owner_user_id": user_id},
+                filters={"tenant_id": self._tenant_id(), "owner_user_id": user_id},
                 namespace=namespace,
                 context_type=context_type,
                 limit=limit,
@@ -122,7 +128,11 @@ class SimilarBehaviorRetriever:
         else:
             index_hits = self.index_store.search(
                 query,
-                filters={"owner_user_id": user_id, "context_type": context_type.value},
+                filters={
+                    "tenant_id": self._tenant_id(),
+                    "owner_user_id": user_id,
+                    "context_type": context_type.value,
+                },
                 limit=limit,
             )
             items = [self._hit_item(hit, source="index_fallback", weight=weight) for hit in index_hits]
@@ -144,6 +154,8 @@ class SimilarBehaviorRetriever:
             return False
         if obj.context_type != context_type:
             return False
+        if str(obj.tenant_id or "default") != self._tenant_id():
+            return False
         if obj.owner_user_id != user_id:
             return False
         if obj.context_type == ContextType.MEMORY:
@@ -154,11 +166,21 @@ class SimilarBehaviorRetriever:
             LifecycleState.ARCHIVED,
         }
 
-    def _relation_results(self, uri: str, user_id: str, trace: dict[str, dict]) -> dict[str, list[dict]]:
+    def _relation_results(
+        self,
+        uri: str,
+        user_id: str,
+        tenant_id: str,
+        trace: dict[str, dict],
+    ) -> dict[str, list[dict]]:
         result: dict[str, list[dict]] = {"memory_anchors": [], "policy_refs": [], "cases": []}
         if self.relation_store is None:
             return result
-        for relation in self.relation_store.relations_of(uri, owner_user_id=user_id):
+        for relation in self.relation_store.relations_of(
+            uri,
+            tenant_id=tenant_id,
+            owner_user_id=user_id,
+        ):
             if relation.relation_type not in self.relation_types:
                 continue
             target = relation.target_uri if relation.source_uri == uri else relation.source_uri
@@ -199,6 +221,8 @@ class SimilarBehaviorRetriever:
         obj = self._read_visible_object(uri)
         if obj is None:
             return None
+        if str(obj.tenant_id or "default") != self._tenant_id():
+            return None
         if obj.owner_user_id != user_id:
             return None
         if obj.lifecycle_state in {LifecycleState.DELETED, LifecycleState.OBSOLETE, LifecycleState.ARCHIVED}:
@@ -235,6 +259,9 @@ class SimilarBehaviorRetriever:
             return obj
         except (FileNotFoundError, IsADirectoryError, NotADirectoryError, TypeError, ValueError):
             return None
+
+    def _tenant_id(self) -> str:
+        return str(getattr(self.source_store, "tenant_id", "default") or "default")
 
     def _is_active_authoritative_memory(self, obj) -> bool:  # noqa: ANN001
         if obj.lifecycle_state != LifecycleState.ACTIVE:

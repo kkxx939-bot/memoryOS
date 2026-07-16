@@ -284,7 +284,7 @@ def test_token_budget_degrades_l2_to_smaller_layer(tmp_path: Path) -> None:
         token_budget=40,
     )
     assert result["contexts"]
-    assert result["contexts"][0]["selected_layer"] in {"L0", "excerpt"}
+    assert result["contexts"][0]["selected_layer"] == "URI"
 
 
 def test_claude_installer_is_idempotent_and_uninstalls(tmp_path: Path) -> None:
