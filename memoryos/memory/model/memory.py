@@ -9,7 +9,7 @@ from typing import Any
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.model.lifecycle import LifecycleState
-from memoryos.core.time import utc_now
+from memoryos.core.clock import utc_now
 
 
 class MemoryKind(str, Enum):

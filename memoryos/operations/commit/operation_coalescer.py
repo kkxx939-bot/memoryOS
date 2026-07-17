@@ -37,13 +37,21 @@ class OperationCoalescer:
         confidence = max(first.confidence, second.confidence)
 
         if action_pair == (OperationAction.ADD, OperationAction.UPDATE):
-            return self._replace(first, action=OperationAction.ADD, payload=payload, evidence=evidence, confidence=confidence)
+            return self._replace(
+                first, action=OperationAction.ADD, payload=payload, evidence=evidence, confidence=confidence
+            )
         if action_pair == (OperationAction.ADD, OperationAction.DELETE):
-            return self._replace(second, status=OperationStatus.NOOP, payload={}, evidence=evidence, confidence=confidence)
+            return self._replace(
+                second, status=OperationStatus.NOOP, payload={}, evidence=evidence, confidence=confidence
+            )
         if action_pair == (OperationAction.UPDATE, OperationAction.DELETE):
-            return self._replace(second, action=OperationAction.DELETE, payload=second.payload, evidence=evidence, confidence=confidence)
+            return self._replace(
+                second, action=OperationAction.DELETE, payload=second.payload, evidence=evidence, confidence=confidence
+            )
         if action_pair == (OperationAction.SUPERSEDE, OperationAction.UPDATE):
-            return self._replace(first, action=OperationAction.SUPERSEDE, payload=payload, evidence=evidence, confidence=confidence)
+            return self._replace(
+                first, action=OperationAction.SUPERSEDE, payload=payload, evidence=evidence, confidence=confidence
+            )
         if {first.action, second.action} == {OperationAction.REWARD, OperationAction.PENALIZE}:
             return self._merge_reward_penalty(first, second)
         return self._replace(second, payload=payload, evidence=evidence, confidence=confidence)

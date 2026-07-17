@@ -7,11 +7,12 @@ from memoryos.behavior.model.observation import Observation
 from memoryos.behavior.model.opportunity import OpportunityStats
 from memoryos.behavior.update.opportunity_decay import OpportunityAwareDecay
 from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.store.source_store import IndexStore, SourceStore
+from memoryos.contextdb.store.index_store import IndexStore
+from memoryos.contextdb.store.source_store import SourceStore
+from memoryos.core.readiness import require_source_store_ready
 from memoryos.operations.commit.operation_committer import OperationCommitter
 from memoryos.operations.model.context_operation import ContextOperation
 from memoryos.operations.model.operation_action import OperationAction
-from memoryos.workers.readiness import require_source_store_ready
 
 
 class CoolingWorker:

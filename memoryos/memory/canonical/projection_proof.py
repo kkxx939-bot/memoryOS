@@ -17,16 +17,16 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from memoryos.core.durable_io import atomic_create_json
 from memoryos.core.file_lock import open_private_lock
 from memoryos.core.ids import require_safe_path_segment
-from memoryos.memory.canonical.event import canonical_digest
+from memoryos.core.integrity import canonical_digest
 from memoryos.memory.canonical.projection_state import (
     ProjectionIntegrityError as _ProjectionIntegrityError,
 )
 from memoryos.memory.canonical.projection_state import (
     ProjectionRecord,
 )
-from memoryos.operations.commit.effect_marker import atomic_create_json
 
 try:  # pragma: no cover - supported production POSIX platforms provide fcntl.
     import fcntl

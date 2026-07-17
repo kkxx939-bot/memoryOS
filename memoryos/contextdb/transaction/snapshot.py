@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from memoryos.core.clock import utc_now
 from memoryos.core.ids import new_id
-from memoryos.core.time import utc_now
 
 
 @dataclass(frozen=True)

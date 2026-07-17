@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
+from typing import TypeGuard, cast
+
 from memoryos.behavior.model.observation import Observation
+from memoryos.contextdb.extensions import ContextDomainOverlay, NoDomainOverlay
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.model.lifecycle import LifecycleState
 from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
-from memoryos.contextdb.store.source_store import (
-    IndexHit,
-    IndexStore,
-    RelationStore,
-    SourceStore,
-    is_canonical_memory_object,
-    is_canonical_memory_uri,
-)
-from memoryos.memory.canonical.visibility import read_committed_canonical
+from memoryos.contextdb.store.index_store import IndexHit, IndexStore
+from memoryos.contextdb.store.relation_store import RelationStore
+from memoryos.contextdb.store.source_store import SourceStore
+
+
+def _is_domain_overlay(candidate: object) -> TypeGuard[ContextDomainOverlay]:
+    return all(
+        callable(getattr(candidate, method, None))
+        for method in ("owns_uri", "owns_object", "read_object", "relations_of")
+    )
 
 
 class SimilarBehaviorRetriever:
@@ -34,11 +38,16 @@ class SimilarBehaviorRetriever:
         source_store: SourceStore | None = None,
         relation_store: RelationStore | None = None,
         hybrid_search: HybridSearch | None = None,
+        domain_overlay: ContextDomainOverlay | None = None,
     ) -> None:
         self.index_store = index_store
         self.source_store = source_store
         self.relation_store = relation_store
         self.hybrid_search = hybrid_search
+        candidate: object = domain_overlay or getattr(source_store, "domain_classifier", None)
+        self.domain_overlay: ContextDomainOverlay = (
+            candidate if _is_domain_overlay(candidate) else NoDomainOverlay()
+        )
 
     def retrieve(self, user_id: str, observation: Observation, limit: int = 8) -> dict:
         tenant_id = self._tenant_id()
@@ -243,19 +252,19 @@ class SimilarBehaviorRetriever:
         if self.source_store is None:
             return None
         try:
-            if is_canonical_memory_uri(uri):
-                return read_committed_canonical(
+            if self.domain_overlay.owns_uri(uri):
+                return self.domain_overlay.read_object(
                     self.source_store,
+                    cast(RelationStore, self.relation_store),
                     uri,
-                    self.relation_store,
-                ).object
+                )
             obj = self.source_store.read_object(uri)
-            if is_canonical_memory_object(obj):
-                return read_committed_canonical(
+            if self.domain_overlay.owns_object(obj):
+                return self.domain_overlay.read_object(
                     self.source_store,
+                    cast(RelationStore, self.relation_store),
                     uri,
-                    self.relation_store,
-                ).object
+                )
             return obj
         except (FileNotFoundError, IsADirectoryError, NotADirectoryError, TypeError, ValueError):
             return None

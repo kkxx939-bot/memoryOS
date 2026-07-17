@@ -7,8 +7,8 @@ from typing import Any
 from memoryos.api.mcp.config import MCPServerConfig
 from memoryos.api.mcp.errors import ToolValidationError
 from memoryos.api.retrieval_contract import retrieval_options_json_schema
-from memoryos.api.trusted_context import AUTHORITATIVE_FORGET, AUTHORITATIVE_REMEMBER
 from memoryos.connect import CapabilityProfile, ConnectMetadata, ConnectType, PipelineMode
+from memoryos.security.trusted_context import AUTHORITATIVE_FORGET, AUTHORITATIVE_REMEMBER
 
 ALLOWED_METADATA_FIELDS = {
     "connect_type",

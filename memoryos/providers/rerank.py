@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import Any
 
-
-class Reranker(Protocol):
-    def rerank(self, query: str, items: list[dict[str, Any]]) -> list[dict[str, Any]]: ...
+from memoryos.application.context.reranking import Reranker
 
 
 class NoopReranker:
     def rerank(self, query: str, items: list[dict[str, Any]]) -> list[dict[str, Any]]:  # noqa: ARG002
         return items
+
+
+__all__ = ["NoopReranker", "Reranker"]

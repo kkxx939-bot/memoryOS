@@ -5,14 +5,16 @@ from __future__ import annotations
 from typing import Any
 
 from memoryos.adapters.agent_hooks.base import BaseAgentHookAdapter, HookResult
+from memoryos.adapters.agent_hooks.composition import build_agent_hook_transport
 from memoryos.adapters.agent_hooks.config import AgentHookConfig
-from memoryos.adapters.agent_hooks.events import AgentHookEvent
+from memoryos.application.session.events import AgentHookEvent
 
 
 class CursorHookAdapter(BaseAgentHookAdapter):
     @classmethod
     def from_env(cls) -> CursorHookAdapter:
-        return cls(AgentHookConfig.from_env("cursor"))
+        config = AgentHookConfig.from_env("cursor")
+        return cls(config, mcp_client=build_agent_hook_transport(config))
 
     def handle(self, hook_name: str, payload: dict[str, Any] | None) -> HookResult:
         event = AgentHookEvent.from_payload(

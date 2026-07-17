@@ -7,8 +7,8 @@ from dataclasses import dataclass, field
 from memoryos.behavior.model.opportunity import OpportunityStats
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_type import ContextType
+from memoryos.core.clock import utc_now
 from memoryos.core.ids import new_id
-from memoryos.core.time import utc_now
 
 
 @dataclass

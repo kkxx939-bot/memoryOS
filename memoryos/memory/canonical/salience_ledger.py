@@ -12,16 +12,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from memoryos.core.clock import utc_now
+from memoryos.core.durable_io import atomic_create_json
 from memoryos.core.file_lock import open_private_lock
 from memoryos.core.ids import require_safe_path_segment
-from memoryos.core.time import utc_now
-from memoryos.memory.canonical.event import canonical_digest
+from memoryos.core.integrity import canonical_digest
 from memoryos.memory.canonical.salience import (
     EpisodeSalienceGate,
     SalienceDecision,
     SalienceFactor,
 )
-from memoryos.operations.commit.effect_marker import atomic_create_json
 
 SALIENCE_RESERVATION_SCHEMA_VERSION = "memory_salience_reservation_v1"
 SALIENCE_RESERVATION_ANCHOR_SCHEMA_VERSION = "memory_salience_reservation_anchor_v1"

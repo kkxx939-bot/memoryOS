@@ -7,13 +7,12 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from memoryos.adapters.agent_hooks.config import AgentHookConfig
-from memoryos.adapters.agent_hooks.events import AgentHookEvent
 from memoryos.adapters.agent_hooks.injection import MemoryOSContextRenderer
-from memoryos.adapters.agent_hooks.mcp_client import AgentHookTransportClient
 from memoryos.adapters.agent_hooks.queue import PendingItem, PendingQueue
-from memoryos.adapters.agent_hooks.sanitizer import sanitize_error_text
 from memoryos.adapters.agent_hooks.session_service import AgentSessionService
+from memoryos.application.session.events import AgentHookEvent
 from memoryos.connect import ConnectMetadata, ConnectType, PipelineMode
+from memoryos.security.sanitization import sanitize_error_text
 
 
 @dataclass
@@ -49,7 +48,9 @@ class BaseAgentHookAdapter:
         queue: PendingQueue | None = None,
     ) -> None:
         self.config = config
-        self.mcp_client = mcp_client or AgentHookTransportClient(config)
+        if mcp_client is None:
+            raise TypeError("agent hook adapters require a transport supplied by the composition root")
+        self.mcp_client = mcp_client
         if queue is not None and (queue.tenant_id != config.tenant_id or queue.user_id != config.user_id):
             raise ValueError("pending hook queue principal does not match AgentHookConfig")
         self.queue = queue or PendingQueue(

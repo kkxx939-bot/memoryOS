@@ -9,7 +9,8 @@ from memoryos.action_policy.model.action_policy import ActionPolicy, ActionPolic
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.model.lifecycle import LifecycleState
 from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
-from memoryos.contextdb.store.source_store import IndexStore, SourceStore
+from memoryos.contextdb.store.index_store import IndexStore
+from memoryos.contextdb.store.source_store import SourceStore
 
 
 class ActionPolicyRetriever:

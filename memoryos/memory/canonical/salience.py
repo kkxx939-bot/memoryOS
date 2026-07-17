@@ -9,9 +9,9 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any
 
-from memoryos.adapters.agent_hooks.sanitizer import ENV_SECRET_RE, INLINE_SECRET_RE, PRIVATE_KEY_RE
+from memoryos.core.integrity import canonical_digest
 from memoryos.memory.canonical.episode import EvidenceEpisode
-from memoryos.memory.canonical.event import canonical_digest
+from memoryos.security.sanitization import ENV_SECRET_RE, INLINE_SECRET_RE, PRIVATE_KEY_RE
 
 _REMEMBER = re.compile(r"(?i)(?:\bremember(?:\s+this|\s+that|:)|请记住|记住[：:]?)")
 _PREFERENCE = re.compile(

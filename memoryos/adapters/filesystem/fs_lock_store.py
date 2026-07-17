@@ -1,7 +1,5 @@
-"""适配器里的文件系统锁存储。"""
+"""Compatibility export for the historical filesystem lock path."""
 
-from memoryos.contextdb.store.local_stores import InMemoryLockStore
-
-FileSystemLockStore = InMemoryLockStore
+from memoryos.adapters.locks.filesystem import FileSystemLockStore
 
 __all__ = ["FileSystemLockStore"]

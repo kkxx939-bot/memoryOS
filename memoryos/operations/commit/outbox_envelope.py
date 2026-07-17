@@ -8,7 +8,7 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from memoryos.core.ids import require_safe_path_segment
-from memoryos.memory.canonical.event import canonical_digest, canonical_json
+from memoryos.core.integrity import canonical_digest, canonical_json
 from memoryos.operations.model.context_operation import ContextOperation
 
 OUTBOX_SCHEMA_VERSION = "canonical_outbox_v1"
@@ -72,6 +72,7 @@ def projection_workspace_id(
             if isinstance(value, str) and value.strip():
                 workspace_ids.add(value.strip())
     return next(iter(workspace_ids)) if len(workspace_ids) == 1 else ""
+
 
 PREPARED_INTENT_FIELDS = (
     "schema_version",

@@ -5,8 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from memoryos.core.durable_io import atomic_create_bytes
 from memoryos.core.ids import require_safe_path_segment
-from memoryos.operations.commit.effect_marker import atomic_create_bytes
 from memoryos.operations.model.context_diff import ContextDiff
 
 

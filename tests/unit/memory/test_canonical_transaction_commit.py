@@ -1,0 +1,2226 @@
+from __future__ import annotations
+
+import json
+from copy import deepcopy
+from dataclasses import replace
+from types import SimpleNamespace
+from typing import cast
+
+import pytest
+
+from memoryos.contextdb.model.context_object import ContextObject
+from memoryos.contextdb.model.context_type import ContextType
+from memoryos.contextdb.model.lifecycle import LifecycleState
+from memoryos.contextdb.session.planners.memory_commit_planner import MemoryCommitPlanner
+from memoryos.contextdb.session.planning import MemoryPlanningResult, PlanningContext, ProposalPlanningInput
+from memoryos.contextdb.session.session_archive import SessionArchiveStore
+from memoryos.contextdb.session.session_commit import SessionCommitService
+from memoryos.contextdb.session.session_model import SessionArchive
+from memoryos.contextdb.store.local_stores import (
+    FileSystemSourceStore,
+    InMemoryIndexStore,
+    InMemoryQueueStore,
+    InMemoryRelationStore,
+)
+from memoryos.contextdb.store.source_store import QueueJob
+from memoryos.contextdb.transaction.recovery import RecoveryService
+from memoryos.memory.canonical import (
+    CanonicalMemoryFormationService,
+    CanonicalMemoryProjector,
+    CanonicalMemoryRepository,
+    Commitment,
+    MemoryProjectionWorker,
+    MemoryScope,
+    ModalForce,
+    RevisionConflictError,
+    ScopeRef,
+    ScopeSelector,
+    SemanticRelation,
+    SpeechAct,
+    VisibilityPolicy,
+)
+from memoryos.operations.commit.effect_marker import atomic_write_json
+from memoryos.operations.commit.operation_committer import OperationCommitter
+from memoryos.operations.commit.outbox_envelope import OutboxIntegrityError
+from memoryos.operations.commit.redo_log import RedoIntegrityError
+from memoryos.operations.model.context_operation import ContextOperation
+from memoryos.operations.model.operation_action import OperationAction
+from tests.support.canonical_transactions import (
+    _artifact_root,
+    _entity_aliases_proposal,
+    _explicit_bindings,
+    _persisted_episode,
+    _plan,
+    _proposal,
+    _replacement_proposal,
+    _review_command_binding,
+    _reviewed_resolution_plan,
+    _setup,
+    _supplement_proposal,
+)
+
+
+class FailingSecondWriteSource(FileSystemSourceStore):
+    def __init__(self, root) -> None:  # noqa: ANN001
+        super().__init__(root, tenant_id="t1")
+        self.write_count = 0
+        self.armed = True
+
+    def write_object(self, obj, content="") -> None:  # noqa: ANN001
+        self.write_count += 1
+        if self.armed and self.write_count == 2:
+            self.armed = False
+            raise OSError("injected batch write failure")
+        super().write_object(obj, content)
+
+
+class FailOnceQueue(InMemoryQueueStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_next = True
+
+    def enqueue(self, job: QueueJob) -> QueueJob:
+        if self.fail_next:
+            self.fail_next = False
+            raise OSError("injected queue outage")
+        return super().enqueue(job)
+
+
+class CrashOnceRelationStore(InMemoryRelationStore):
+    def __init__(self, *, base_exception: bool) -> None:
+        super().__init__()
+        self.base_exception = base_exception
+        self.failed = False
+
+    def add_relation(self, relation):  # noqa: ANN001, ANN201
+        if not self.failed:
+            self.failed = True
+            if self.base_exception:
+                raise SystemExit("simulated canonical relation crash")
+            raise OSError("simulated canonical relation failure")
+        return super().add_relation(relation)
+
+
+class CrashSecondWriteSource(FileSystemSourceStore):
+    def __init__(self, root) -> None:  # noqa: ANN001
+        super().__init__(root, tenant_id="t1")
+        self.write_count = 0
+
+    def write_object(self, obj, content="") -> None:  # noqa: ANN001
+        self.write_count += 1
+        if self.write_count == 2:
+            raise SystemExit("simulated process crash")
+        super().write_object(obj, content)
+
+
+class ArmableCrashSource(FileSystemSourceStore):
+    def __init__(self, root) -> None:  # noqa: ANN001
+        super().__init__(root, tenant_id="t1")
+        self.write_count = 0
+        self.crash_at: int | None = None
+
+    def write_object(self, obj, content="") -> None:  # noqa: ANN001
+        self.write_count += 1
+        if self.crash_at == self.write_count:
+            self.crash_at = None
+            raise SystemExit("simulated switch crash")
+        super().write_object(obj, content)
+
+
+def test_append_unique_commit_preserves_old_evidence_and_accepts_new_evidence(tmp_path) -> None:  # noqa: ANN001
+    source, _index, _queue, _relations, committer, episode, scope = _setup(tmp_path)
+    initial = _entity_aliases_proposal(
+        episode,
+        "entity-aliases-initial",
+        ["sqlite"],
+    )
+    identity, _transition, first_plan = _plan(source, episode, scope, initial)
+    committer.commit(
+        "u1",
+        first_plan.to_context_operations(
+            user_id="u1",
+            tenant_id="t1",
+            episode_id=episode.episode_id,
+        ),
+    )
+    current = next(
+        claim
+        for claim in CanonicalMemoryRepository(source).load(identity)[1]
+        if claim.current.state == "ACTIVE"
+    )
+    prior_refs = current.current.field_evidence_refs["value.aliases"]
+
+    supplement_episode = _persisted_episode(
+        tmp_path,
+        SessionArchive(
+            user_id="u1",
+            session_id="append-unique-supplement",
+            archive_uri="memoryos://user/u1/sessions/history/append-unique-supplement",
+            messages=[
+                {
+                    "id": "m-append",
+                    "role": "user",
+                    "content": "Confirm SQLite is also known as SQLite3.",
+                }
+            ],
+            metadata={"tenant_id": "t1", "project_id": "memoryos"},
+        ),
+    )
+    supplement = _entity_aliases_proposal(
+        supplement_episode,
+        "entity-aliases-supplement",
+        ["sqlite3"],
+        target_claim=current,
+    )
+    supplement_plan = _reviewed_resolution_plan(
+        source,
+        committer,
+        supplement_episode,
+        supplement,
+        command_suffix="append-unique",
+    )
+    committer.commit(
+        "u1",
+        list(supplement_plan.operations),
+    )
+
+    updated = next(
+        claim
+        for claim in CanonicalMemoryRepository(source).load(identity)[1]
+        if claim.current.state == "ACTIVE"
+    )
+    refs = updated.current.field_evidence_refs["value.aliases"]
+    assert updated.current.value_fields["aliases"] == ["sqlite", "sqlite3"]
+    assert refs[: len(prior_refs)] == prior_refs
+    assert any(ref not in prior_refs for ref in refs)
+
+
+def test_expected_revision_idempotency_atomic_claim_switch_and_outbox(tmp_path) -> None:  # noqa: ANN001
+    source, index, queue, relations, committer, episode, scope = _setup(tmp_path)
+    sqlite = _proposal(episode, "p-sqlite", "SQLite", "confirmation", "confirmed")
+    identity, _, first_plan = _plan(source, episode, scope, sqlite)
+    first_ops = first_plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=episode.episode_id)
+    first_diff = committer.commit("u1", first_ops)
+    repeated = committer.commit("u1", first_ops)
+    assert repeated.diff_id == first_diff.diff_id
+    assert (_artifact_root(tmp_path) / "system" / "diffs" / f"{first_diff.diff_id}.json").exists()
+    assert [operation.operation_id for operation in repeated.operations] == [
+        operation.operation_id for operation in first_diff.operations
+    ]
+    assert len(queue.jobs) == 1
+    assert not index.indexed_uris(), "canonical projection must be outbox-driven"
+
+    stale = [deepcopy(operation) for operation in first_ops]
+    for operation in stale:
+        operation.payload["transaction_id"] += "_stale"
+        operation.payload["idempotency_key"] += "_stale"
+    with pytest.raises(RevisionConflictError):
+        committer.commit("u1", stale)
+
+    _, claims = CanonicalMemoryRepository(source).load(identity)
+    assert {claim.canonical_value: claim.current.state for claim in claims} == {"sqlite": "ACTIVE"}
+
+    sqlite_claim = next(claim for claim in claims if claim.canonical_value == "sqlite")
+    replacement_episode = _persisted_episode(
+        tmp_path,
+        SessionArchive(
+            user_id="u1",
+            session_id="s-replace",
+            archive_uri="memoryos://user/u1/sessions/history/s-replace",
+            messages=[
+                {
+                    "id": "replace-storage",
+                    "role": "user",
+                    "content": "The primary storage backend is now changed from SQLite to PostgreSQL.",
+                }
+            ],
+            metadata={"tenant_id": "t1", "project_id": "memoryos"},
+        ),
+    )
+    confirmed = _replacement_proposal(replacement_episode, "p-confirm", "PostgreSQL", sqlite_claim)
+    third_plan = _reviewed_resolution_plan(
+        source,
+        committer,
+        replacement_episode,
+        confirmed,
+        command_suffix="atomic-claim-switch",
+    )
+    canonical_operations = [
+        operation
+        for operation in third_plan.operations
+        if operation.payload.get("canonical_pending_resolution") is not True
+    ]
+    assert len(canonical_operations) == 3, "slot and both claim changes must share one transaction"
+    desired_slot_revision = next(
+        int(operation.payload["context_object"]["metadata"]["revision"])
+        for operation in canonical_operations
+        if operation.payload["context_object"]["metadata"].get("canonical_kind") == "slot"
+    )
+    committer.commit(
+        "u1",
+        list(third_plan.operations),
+    )
+    slot, claims = CanonicalMemoryRepository(source).load(identity)
+    assert slot and slot.revision == desired_slot_revision
+    assert {claim.canonical_value: claim.current.state for claim in claims} == {
+        "sqlite": "SUPERSEDED",
+        "postgresql": "ACTIVE",
+    }
+    assert len([claim for claim in claims if claim.current.state == "ACTIVE"]) == 1
+    assert len(list((_artifact_root(tmp_path) / "system" / "outbox").glob("*.json"))) == 2
+    assert relations.relations_of(identity.slot_uri, tenant_id="t1", owner_user_id="u1")
+
+
+def test_canonical_transaction_marker_rejects_same_key_with_changed_request_and_preserves_outbox(
+    tmp_path, monkeypatch
+) -> None:  # noqa: ANN001
+    source, _index, _queue, _relations, committer, episode, scope = _setup(tmp_path)
+    proposal = _proposal(episode, "marker-sqlite", "SQLite", "confirmation", "confirmed")
+    _identity, _, plan = _plan(source, episode, scope, proposal)
+    operations = plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=episode.episode_id)
+    committer.commit("u1", operations)
+    transaction_id = str(operations[0].payload["transaction_id"])
+    idempotency_key = str(operations[0].payload["idempotency_key"])
+    outbox_path = _artifact_root(tmp_path) / "system" / "outbox" / f"{transaction_id}.json"
+    marker_path = _artifact_root(tmp_path) / "system" / "transactions" / f"{idempotency_key}.json"
+    before_outbox = outbox_path.read_text(encoding="utf-8")
+    before_marker = marker_path.read_text(encoding="utf-8")
+    before_objects = {obj.uri: obj.to_dict() for obj in source.list_objects()}
+
+    def unexpected_outbox_rewrite(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        raise AssertionError("committed outbox must not be rewritten on idempotent retry")
+
+    monkeypatch.setattr(committer, "_write_outbox_event", unexpected_outbox_rewrite)
+    repeated = committer.commit("u1", operations)
+    assert {item.operation_id for item in repeated.operations} == {item.operation_id for item in operations}
+
+    forged = deepcopy(operations)
+    forged[0].payload["context_object"]["title"] = "forged same-key transaction"
+    forged[0].payload["content"] = "forged same-key transaction"
+    with pytest.raises(ValueError, match="idempotency marker conflicts"):
+        committer.commit("u1", forged)
+
+    assert outbox_path.read_text(encoding="utf-8") == before_outbox
+    assert marker_path.read_text(encoding="utf-8") == before_marker
+    assert {obj.uri: obj.to_dict() for obj in source.list_objects()} == before_objects
+
+
+def test_effect_marker_accepts_fresh_timestamps_and_rejects_legacy_schema(tmp_path) -> None:  # noqa: ANN001
+    source, _index, _queue, _relations, committer, episode, scope = _setup(tmp_path)
+    proposal = _proposal(episode, "marker-fresh-replan", "SQLite", "confirmation", "confirmed")
+    _identity, _, plan = _plan(source, episode, scope, proposal)
+    first = plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=episode.episode_id)
+    claim = next(
+        operation
+        for operation in first
+        if operation.payload["context_object"]["metadata"].get("canonical_kind") == "claim"
+    )
+    claim_uri = str(claim.payload["context_object"]["uri"])
+    slot_uri = claim_uri.rsplit("/claims/", 1)[0]
+    claim.payload["context_object"]["relations"] = [
+        {
+            "source_uri": claim_uri,
+            "type": "documents",
+            "target_uri": slot_uri,
+            "weight": 1.0,
+            "metadata": {"tenant_id": "t1", "owner_user_id": "u1"},
+            "created_at": "2026-07-12T00:00:00+00:00",
+        }
+    ]
+    committer.commit("u1", first)
+    marker_path = committer._transaction_marker(str(first[0].payload["idempotency_key"]))
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert marker["schema_version"] == "memory_transaction_receipt_v2"
+    before_audit = (_artifact_root(tmp_path) / "system" / "audit" / "u1.jsonl").read_text(encoding="utf-8")
+
+    fresh = plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=episode.episode_id)
+    for operation in fresh:
+        operation.created_at = "2030-01-01T00:00:00+00:00"
+    fresh_claim = next(
+        operation
+        for operation in fresh
+        if operation.payload["context_object"]["metadata"].get("canonical_kind") == "claim"
+    )
+    fresh_claim.payload["context_object"]["relations"] = deepcopy(
+        claim.payload["context_object"]["relations"]
+    )
+    fresh_claim.payload["context_object"]["relations"][0]["created_at"] = (
+        "2026-07-12T01:00:00+00:00"
+    )
+    assert first[0].created_at != fresh[0].created_at
+    repeated = committer.commit("u1", fresh)
+    assert {item.operation_id for item in repeated.operations} == {item.operation_id for item in first}
+    assert (_artifact_root(tmp_path) / "system" / "audit" / "u1.jsonl").read_text(encoding="utf-8") == before_audit
+
+    original_marker = deepcopy(marker)
+    marker["schema_version"] = "canonical_transaction_marker_v2"
+    atomic_write_json(marker_path, marker, artifact_root=committer.artifact_root)
+    with pytest.raises(ValueError, match="cannot prove its durable effect"):
+        committer.commit("u1", fresh)
+    atomic_write_json(
+        marker_path,
+        original_marker,
+        artifact_root=committer.artifact_root,
+    )
+
+    forged = deepcopy(fresh)
+    forged_claim = next(
+        operation
+        for operation in forged
+        if operation.payload["context_object"]["metadata"].get("canonical_kind") == "claim"
+    )
+    forged_claim.payload["context_object"]["relations"][0]["target_uri"] = (
+        "memoryos://user/u1/memories/canonical/forged"
+    )
+    with pytest.raises(ValueError, match="idempotency marker conflicts"):
+        committer.commit("u1", forged)
+
+
+def test_canonical_relation_crash_recovers_exact_implicit_edges_and_normal_failure_rolls_back(
+    tmp_path,
+) -> None:  # noqa: ANN001
+    source, index, queue, _relations, _committer, episode, scope = _setup(tmp_path)
+    proposal = _proposal(episode, "canonical-relation-crash", "SQLite", "confirmation", "confirmed")
+    _identity, _, plan = _plan(source, episode, scope, proposal)
+    operations = plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=episode.episode_id)
+    crashing_relations = CrashOnceRelationStore(base_exception=True)
+    committer = OperationCommitter(
+        source,
+        index,
+        str(tmp_path),
+        relation_store=crashing_relations,
+        queue_store=queue,
+    )
+
+    with pytest.raises(SystemExit, match="canonical relation crash"):
+        committer.commit("u1", operations)
+    recovered = RecoveryService(committer.redo, committer).recover("u1")
+    assert set(recovered.operation_ids) == {operation.operation_id for operation in operations}
+    relation_keys = {
+        (item.source_uri, item.relation_type, item.target_uri)
+        for item in crashing_relations.relations
+    }
+    claim_uri = next(
+        str(operation.payload["context_object"]["uri"])
+        for operation in operations
+        if operation.payload["context_object"]["metadata"].get("canonical_kind") == "claim"
+    )
+    slot_uri = claim_uri.rsplit("/claims/", 1)[0]
+    assert relation_keys == {
+        (claim_uri, "belongs_to_slot", slot_uri),
+        (slot_uri, "has_claim", claim_uri),
+    }
+    assert RecoveryService(committer.redo, committer).recover("u1").recovered_count == 0
+
+    rollback_identity = {"decision_topic": "secondary canonical relation rollback"}
+    rollback_proposal = replace(
+        proposal,
+        proposal_id="canonical-relation-rollback",
+        identity_fields=rollback_identity,
+        field_evidence_refs=_explicit_bindings(
+            rollback_identity,
+            dict(proposal.value_fields),
+            proposal.evidence_refs,
+        ),
+    )
+    _rollback_identity, _, rollback_plan = _plan(source, episode, scope, rollback_proposal)
+    rollback_relations = CrashOnceRelationStore(base_exception=False)
+    rollback_committer = OperationCommitter(
+        source,
+        InMemoryIndexStore(),
+        str(tmp_path),
+        relation_store=rollback_relations,
+    )
+    rollback_operations = rollback_plan.to_context_operations(
+        user_id="u1",
+        tenant_id="t1",
+        episode_id=episode.episode_id,
+    )
+    before_objects = {obj.uri: obj.to_dict() for obj in source.list_objects()}
+    before_markers = {
+        path.name for path in (_artifact_root(tmp_path) / "system" / "transactions").glob("*.json")
+    }
+    with pytest.raises(OSError, match="canonical relation failure"):
+        rollback_committer.commit("u1", rollback_operations)
+    assert {obj.uri: obj.to_dict() for obj in source.list_objects()} == before_objects
+    assert rollback_relations.relations == []
+    assert {
+        path.name for path in (_artifact_root(tmp_path) / "system" / "transactions").glob("*.json")
+    } == before_markers
+    assert rollback_committer.redo.pending_entries() == []
+
+
+def test_noncanonical_operations_cannot_mutate_canonical_slot_or_claim(tmp_path) -> None:  # noqa: ANN001
+    source, _index, _queue, _relations, committer, episode, scope = _setup(tmp_path)
+    proposal = _proposal(episode, "formal-only", "SQLite", "confirmation", "confirmed")
+    principal = ScopeRef(namespace="memoryos", kind="principal", id="u1")
+    principal_scope = MemoryScope(
+        ScopeSelector((principal,)),
+        VisibilityPolicy("t1"),
+        (principal,),
+    )
+    identity, _, plan = _plan(source, episode, principal_scope, proposal)
+    committer.commit(
+        "u1",
+        plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=episode.episode_id),
+    )
+    slot, claims = CanonicalMemoryRepository(source).load(identity)
+    assert slot is not None
+    claim = claims[0]
+    stored_claim = source.read_object(claim.uri)
+    scope_payload = dict(stored_claim.metadata["scope"])
+    forged_claim = ContextObject.from_dict(stored_claim.to_dict())
+    forged_claim.title = "forged direct claim update"
+    direct_update = ContextOperation(
+        user_id="u1",
+        context_type=ContextType.MEMORY,
+        action=OperationAction.UPDATE,
+        target_uri=claim.uri,
+        operation_id="op_direct_canonical_claim_update",
+        payload={
+            "tenant_id": "t1",
+            "memory_type": proposal.memory_type,
+            "scope": scope_payload,
+            "context_object": forged_claim.to_dict(),
+            "content": "forged",
+        },
+    )
+    with pytest.raises(ValueError, match="require a canonical transaction"):
+        committer.commit("u1", [direct_update])
+
+    relation_manifest = committer._build_regular_relation_manifest(direct_update)
+    committer.redo.begin(direct_update, relation_manifest=relation_manifest)
+    with pytest.raises(RedoIntegrityError, match="canonical.*recovery"):
+        committer.resume(
+            "u1",
+            direct_update,
+            "begin",
+            relation_manifest=relation_manifest,
+        )
+    recovery = RecoveryService(committer.redo, committer).recover("u1")
+    assert recovery.failed_count == 1
+    assert recovery.quarantine_count == 1
+    assert committer.redo.pending_entries() == []
+    assert source.read_object(claim.uri).title == stored_claim.title
+
+    stored_slot = source.read_object(identity.slot_uri)
+    direct_delete = ContextOperation(
+        user_id="u1",
+        context_type=ContextType.MEMORY,
+        action=OperationAction.DELETE,
+        target_uri=identity.slot_uri,
+        operation_id="op_direct_canonical_slot_delete",
+        payload={
+            "tenant_id": "t1",
+            "memory_type": proposal.memory_type,
+            "scope": dict(stored_slot.metadata["scope"]),
+            "reason": "bypass canonical transaction",
+        },
+    )
+    with pytest.raises(ValueError, match="require a canonical transaction"):
+        committer.commit("u1", [direct_delete])
+
+    unchanged_slot, unchanged_claims = CanonicalMemoryRepository(source).load(identity)
+    assert unchanged_slot == slot
+    assert unchanged_claims == claims
+
+
+def test_existing_canonical_metadata_at_noncanonical_uri_cannot_bypass_committer(
+    tmp_path,
+) -> None:  # noqa: ANN001
+    source, _index, _queue, _relations, committer, _episode, _scope = _setup(tmp_path)
+    uri = "memoryos://user/u1/memories/legacy-canonical-object"
+    raw = ContextObject(
+        uri=uri,
+        context_type=ContextType.MEMORY,
+        title="legacy canonical object",
+        owner_user_id="u1",
+        tenant_id="t1",
+        lifecycle_state=LifecycleState.ACTIVE,
+        schema_version="canonical_memory_v2",
+        metadata={"canonical_kind": "claim", "revision": 1, "state": "ACTIVE"},
+    )
+    source.write_object(raw, content="unproved canonical content")
+    operation = ContextOperation(
+        user_id="u1",
+        context_type=ContextType.MEMORY,
+        action=OperationAction.DELETE,
+        target_uri=uri,
+        operation_id="op_noncanonical_uri_canonical_delete",
+        payload={"tenant_id": "t1", "reason": "attempted regular deletion"},
+    )
+
+    with pytest.raises(ValueError, match="require a canonical transaction"):
+        committer.commit("u1", [operation])
+
+    assert source.read_object(uri).lifecycle_state == LifecycleState.ACTIVE
+
+    schema_only_uri = "memoryos://user/u1/memories/schema-only-canonical-add"
+    schema_only = ContextObject(
+        uri=schema_only_uri,
+        context_type=ContextType.MEMORY,
+        title="schema only canonical object",
+        owner_user_id="u1",
+        tenant_id="t1",
+        schema_version="canonical_memory_v2",
+        metadata={"revision": 1},
+    )
+    schema_only_add = ContextOperation(
+        user_id="u1",
+        context_type=ContextType.MEMORY,
+        action=OperationAction.ADD,
+        target_uri=schema_only_uri,
+        operation_id="op_noncanonical_uri_schema_only_add",
+        payload={
+            "tenant_id": "t1",
+            "context_object": schema_only.to_dict(),
+            "content": "unproved schema-only canonical content",
+        },
+    )
+
+    with pytest.raises(ValueError, match="require a canonical transaction"):
+        committer.commit("u1", [schema_only_add])
+
+    with pytest.raises(FileNotFoundError):
+        source.read_object(schema_only_uri)
+
+
+def test_all_canonical_groups_preflight_before_a_later_invalid_group_can_write(tmp_path) -> None:  # noqa: ANN001
+    source, _index, _queue, _relations, committer, episode, scope = _setup(tmp_path)
+    primary = _proposal(episode, "preflight-primary", "SQLite", "confirmation", "confirmed")
+    _identity, _, primary_plan = _plan(source, episode, scope, primary)
+    secondary_identity = {"decision_topic": "secondary storage backend"}
+    secondary = replace(
+        _proposal(episode, "preflight-secondary", "DuckDB", "confirmation", "confirmed"),
+        identity_fields=secondary_identity,
+        field_evidence_refs=_explicit_bindings(
+            secondary_identity,
+            {"canonical_value": "DuckDB"},
+            primary.evidence_refs,
+        ),
+    )
+    _secondary_identity, _, secondary_plan = _plan(source, episode, scope, secondary)
+    primary_operations = primary_plan.to_context_operations(
+        user_id="u1", tenant_id="t1", episode_id=episode.episode_id
+    )
+    invalid_operations = secondary_plan.to_context_operations(
+        user_id="u1", tenant_id="t1", episode_id=episode.episode_id
+    )
+    invalid_operations[0].payload["context_object"] = "malformed"
+
+    with pytest.raises(ValueError, match="requires context_object"):
+        committer.commit("u1", [*primary_operations, *invalid_operations])
+
+    assert not [obj for obj in source.list_objects() if dict(obj.metadata or {}).get("canonical_kind")]
+    assert not list((_artifact_root(tmp_path) / "system" / "transactions").glob("*.json"))
+    assert not list((_artifact_root(tmp_path) / "system" / "outbox").glob("*.json"))
+
+
+def test_mixed_retry_accepts_fresh_automatic_target_operation_and_returns_persisted_effect(tmp_path) -> None:  # noqa: ANN001
+    source, index, _queue, _relations, committer, episode, scope = _setup(tmp_path)
+    target = ContextObject(
+        uri="memoryos://user/u1/memories/preferences/temperature",
+        context_type=ContextType.MEMORY,
+        title="temperature preference",
+        owner_user_id="u1",
+        tenant_id="t1",
+    )
+    source.write_object(target, content="temperature preference 26 degrees")
+    index.upsert_index(target, content="temperature preference 26 degrees")
+    desired = ContextObject.from_dict(target.to_dict())
+    desired.title = "temperature preference updated"
+    raw_update = ContextOperation(
+        user_id="u1",
+        context_type=ContextType.MEMORY,
+        action=OperationAction.UPDATE,
+        operation_id="op_automatic_target_retry",
+        payload={
+            "query": "temperature preference",
+            "tenant_id": "t1",
+            "context_object": desired.to_dict(),
+            "content": "temperature preference 27 degrees",
+        },
+    )
+    fresh_retry = ContextOperation.from_dict(deepcopy(raw_update.to_dict()))
+    initial_diff = committer.commit("u1", [raw_update])
+    assert initial_diff.operations[0].target_uri == target.uri
+
+    canonical = _proposal(episode, "mixed-auto-target", "SQLite", "confirmation", "confirmed")
+    _identity, _, canonical_plan = _plan(source, episode, scope, canonical)
+    canonical_operations = canonical_plan.to_context_operations(
+        user_id="u1", tenant_id="t1", episode_id=episode.episode_id
+    )
+    mixed = committer.commit("u1", [*canonical_operations, fresh_retry])
+
+    assert {item.operation_id for item in mixed.operations} == {
+        *(item.operation_id for item in canonical_operations),
+        raw_update.operation_id,
+    }
+    persisted_retry = next(item for item in mixed.operations if item.operation_id == raw_update.operation_id)
+    assert persisted_retry.target_uri == target.uri
+    assert source.read_object(target.uri).title == "temperature preference updated"
+    assert source.read_content(f"{target.uri}/content.md") == "temperature preference 27 degrees"
+
+
+def test_all_regular_effects_preflight_before_a_later_malformed_object_can_write(tmp_path) -> None:  # noqa: ANN001
+    source, _index, _queue, _relations, committer, _episode, _scope = _setup(tmp_path)
+    first_obj = ContextObject(
+        uri="memoryos://user/u1/memories/profile/preflight-first",
+        context_type=ContextType.MEMORY,
+        title="first",
+        owner_user_id="u1",
+        tenant_id="t1",
+    )
+    first = ContextOperation(
+        user_id="u1",
+        context_type=ContextType.MEMORY,
+        action=OperationAction.ADD,
+        target_uri=first_obj.uri,
+        operation_id="op_regular_preflight_first",
+        payload={"tenant_id": "t1", "context_object": first_obj.to_dict(), "content": "first"},
+    )
+    malformed_uri = "memoryos://user/u1/memories/profile/preflight-malformed"
+    malformed = ContextOperation(
+        user_id="u1",
+        context_type=ContextType.MEMORY,
+        action=OperationAction.ADD,
+        target_uri=malformed_uri,
+        operation_id="op_regular_preflight_malformed",
+        payload={
+            "tenant_id": "t1",
+            "context_object": {
+                "uri": malformed_uri,
+                "owner_user_id": "u1",
+                "tenant_id": "t1",
+            },
+            "content": "malformed",
+        },
+    )
+
+    with pytest.raises(ValueError, match="context_object is invalid"):
+        committer.commit("u1", [first, malformed])
+
+    with pytest.raises(FileNotFoundError):
+        source.read_object(first_obj.uri)
+    assert not list((_artifact_root(tmp_path) / "system" / "diffs").glob("*.json"))
+    assert not list((_artifact_root(tmp_path) / "system" / "audit").glob("*.jsonl"))
+    assert not committer.redo.pending_entries()
+
+
+def test_canonical_batch_rolls_back_all_source_and_relations_on_mid_batch_failure(tmp_path) -> None:  # noqa: ANN001
+    _source, index, queue, relations, _committer, episode, scope = _setup(tmp_path)
+    source = FailingSecondWriteSource(tmp_path)
+    committer = OperationCommitter(
+        source,
+        index,
+        str(tmp_path),
+        relation_store=relations,
+        queue_store=queue,
+    )
+    proposal = _proposal(episode, "p-sqlite", "SQLite", "confirmation", "confirmed")
+    identity, _, plan = _plan(source, episode, scope, proposal)
+    operations = plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=episode.episode_id)
+
+    with pytest.raises(OSError, match="injected batch write failure"):
+        committer.commit("u1", operations)
+
+    assert not [obj for obj in source.list_objects() if obj.metadata.get("canonical_kind")]
+    assert relations.relations_of(identity.slot_uri, tenant_id="t1", owner_user_id="u1") == []
+    outbox = next((_artifact_root(tmp_path) / "system" / "outbox").glob("*.json"))
+    assert json.loads(outbox.read_text(encoding="utf-8"))["status"] == "aborted"
+    assert not list((_artifact_root(tmp_path) / "system" / "transactions").glob("*.json"))
+
+
+def test_canonical_preflight_rejects_evidence_archive_tampering_before_any_write(tmp_path) -> None:  # noqa: ANN001
+    source, _index, _queue, _relations, committer, episode, scope = _setup(tmp_path)
+    proposal = _proposal(episode, "p-evidence", "SQLite", "confirmation", "confirmed")
+    _identity, _, plan = _plan(source, episode, scope, proposal)
+    event_path = next(
+        (tmp_path / "tenants" / "t1" / "users" / "u1" / "sessions" / "history" / "s1" / "evidence" / "events").glob(
+            "*.json"
+        )
+    )
+    event_path.write_text('{"tampered":true}', encoding="utf-8")
+    with pytest.raises(ValueError, match="immutable event digest mismatch"):
+        committer.commit(
+            "u1",
+            plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=episode.episode_id),
+        )
+    assert not [obj for obj in source.list_objects() if obj.metadata.get("canonical_kind")]
+
+
+def test_canonical_preflight_rejects_owner_mismatch_and_outbox_prepare_failure_writes_nothing(
+    tmp_path, monkeypatch
+) -> None:  # noqa: ANN001
+    source, _index, _queue, _relations, committer, episode, scope = _setup(tmp_path)
+    proposal = _proposal(episode, "p-owner", "SQLite", "confirmation", "confirmed")
+    _identity, _, plan = _plan(source, episode, scope, proposal)
+    operations = plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=episode.episode_id)
+    forged = deepcopy(operations)
+    forged[0].payload["context_object"]["owner_user_id"] = "u2"
+    with pytest.raises(ValueError, match="tenant or owner"):
+        committer.commit("u1", forged)
+    assert not [obj for obj in source.list_objects() if obj.metadata.get("canonical_kind")]
+
+    def fail_outbox(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        raise OSError("injected outbox prepare failure")
+
+    monkeypatch.setattr(committer, "_write_outbox_event", fail_outbox)
+    with pytest.raises(OSError, match="outbox prepare"):
+        committer.commit("u1", operations)
+    assert not [obj for obj in source.list_objects() if obj.metadata.get("canonical_kind")]
+
+
+def test_canonical_commit_rejects_broken_outbox_control_symlink(tmp_path) -> None:  # noqa: ANN001
+    source, _index, _queue, _relations, committer, episode, scope = _setup(tmp_path)
+    proposal = _proposal(episode, "broken-outbox-link", "SQLite", "confirmation", "confirmed")
+    _identity, _transition, plan = _plan(source, episode, scope, proposal)
+    operations = plan.to_context_operations(
+        user_id="u1",
+        tenant_id="t1",
+        episode_id=episode.episode_id,
+    )
+    transaction_id = str(operations[0].payload["transaction_id"])
+    outbox_path = committer._outbox_path(transaction_id)
+    outbox_path.parent.mkdir(parents=True, exist_ok=True)
+    missing_target = tmp_path / "missing-outbox-control.json"
+    outbox_path.symlink_to(missing_target)
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        committer.commit("u1", operations)
+
+    assert outbox_path.is_symlink()
+    assert not missing_target.exists()
+
+
+def test_pending_commit_rejects_broken_receipt_control_symlink(tmp_path) -> None:  # noqa: ANN001
+    source, _index, _queue, _relations, committer, episode, _scope = _setup(tmp_path)
+    archive = SessionArchiveStore(tmp_path, tenant_id="t1").read_archive(
+        "memoryos://user/u1/sessions/history/s1",
+        tenant_id="t1",
+    )
+    proposal = _proposal(episode, "broken-pending-receipt", "SQLite", "confirmation", "confirmed")
+    pending = CanonicalMemoryFormationService(source).plan_pending(
+        proposal,
+        archive=archive,
+        episode=episode,
+        reason="manual_review",
+        retrieval_views=["project:memoryos:decisions"],
+        commit_group_id="broken-pending-receipt-group",
+    )
+    operation = pending.operations[0]
+    receipt_path = committer._operation_marker(operation.operation_id)
+    receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    missing_target = tmp_path / "missing-pending-receipt.json"
+    receipt_path.symlink_to(missing_target)
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        committer.commit("u1", [operation])
+
+    assert receipt_path.is_symlink()
+    assert not missing_target.exists()
+
+
+def test_final_state_rejects_forged_materialized_content_and_display_mirror(tmp_path) -> None:  # noqa: ANN001
+    source, _index, _queue, _relations, committer, episode, scope = _setup(tmp_path)
+    proposal = _proposal(episode, "p-materialized", "SQLite", "confirmation", "confirmed")
+    _identity, _, plan = _plan(source, episode, scope, proposal)
+    operations = plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=episode.episode_id)
+    claim_index = next(
+        index
+        for index, operation in enumerate(operations)
+        if operation.payload["context_object"]["metadata"]["canonical_kind"] == "claim"
+    )
+    slot_index = next(index for index in range(len(operations)) if index != claim_index)
+
+    forged_claim_content = deepcopy(operations)
+    forged_claim_content[claim_index].payload["content"] = '{"canonical_value":"forged"}'
+    with pytest.raises(ValueError, match="Claim content is not its materialized final state"):
+        committer.commit("u1", forged_claim_content)
+
+    forged_slot_content = deepcopy(operations)
+    forged_slot_content[slot_index].payload["content"] = '{"claim_ids":[]}'
+    with pytest.raises(ValueError, match="Slot content is not its materialized final state"):
+        committer.commit("u1", forged_slot_content)
+
+    forged_display = deepcopy(operations)
+    forged_display[claim_index].payload["context_object"]["metadata"]["display_fields"] = {
+        "summary": "forged display"
+    }
+    with pytest.raises(ValueError, match="Claim object mirror is inconsistent"):
+        committer.commit("u1", forged_display)
+
+    assert not [obj for obj in source.list_objects() if obj.metadata.get("canonical_kind")]
+    assert not list((_artifact_root(tmp_path) / "system" / "direct-planning-proofs").glob("*.json"))
+
+
+def test_direct_canonical_plan_rejects_a_caller_declared_planning_digest(tmp_path) -> None:  # noqa: ANN001
+    source, _index, _queue, _relations, committer, episode, scope = _setup(tmp_path)
+    proposal = _proposal(episode, "p-forged-plan", "SQLite", "confirmation", "confirmed")
+    _identity, _, plan = _plan(source, episode, scope, proposal)
+    operations = plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=episode.episode_id)
+    for operation in operations:
+        operation.payload["planning_digest"] = "f" * 64
+
+    with pytest.raises(ValueError, match="no valid immutable planning proof"):
+        committer.commit("u1", operations)
+
+    assert not list((_artifact_root(tmp_path) / "system" / "direct-planning-proofs").glob("*.json"))
+    assert not [obj for obj in source.list_objects() if obj.metadata.get("canonical_kind")]
+
+def test_canonical_envelope_validates_commit_user_target_uri_and_immutable_update_scope(tmp_path) -> None:  # noqa: ANN001
+    source, _index, _queue, _relations, committer, episode, scope = _setup(tmp_path)
+    proposal = _proposal(episode, "p-envelope", "SQLite", "confirmation", "confirmed")
+    _identity, _, initial_plan = _plan(source, episode, scope, proposal)
+    initial = initial_plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=episode.episode_id)
+
+    with pytest.raises(ValueError, match="operation user does not match commit user"):
+        committer.commit("u2", initial)
+    mismatched_target = deepcopy(initial)
+    mismatched_target[0].target_uri = f"{mismatched_target[0].target_uri}-forged"
+    with pytest.raises(ValueError, match="target_uri does not match"):
+        committer.commit("u1", mismatched_target)
+
+    committer.commit("u1", initial)
+    revised_values = {"canonical_value": "SQLite", "rationale": "verified"}
+    revised = replace(
+        proposal,
+        proposal_id="p-envelope-revision",
+        value_fields=revised_values,
+        semantic=replace(proposal.semantic, speech_act=SpeechAct.CORRECTION),
+        field_evidence_refs=_explicit_bindings(
+            dict(proposal.identity_fields),
+            revised_values,
+            proposal.evidence_refs,
+        ),
+    )
+    _identity, _, revision_plan = _plan(source, episode, scope, revised)
+    revision_ops = revision_plan.to_context_operations(
+        user_id="u1",
+        tenant_id="t1",
+        episode_id=episode.episode_id,
+    )
+    forged_scope = deepcopy(revision_ops)
+    forged_scope[0].payload["context_object"]["metadata"]["scope"]["visibility"][
+        "allowed_principal_ids"
+    ] = ["u1", "u2"]
+    with pytest.raises(ValueError, match="cannot weaken or change its scope"):
+        committer.commit("u1", forged_scope)
+
+
+def test_canonical_fresh_commit_and_resume_reject_cross_tenant_before_effects(tmp_path) -> None:  # noqa: ANN001
+    source, _index, _queue, _relations, committer, episode, scope = _setup(tmp_path)
+    proposal = _proposal(episode, "p-cross-tenant", "SQLite", "confirmation", "confirmed")
+    _identity, _, plan = _plan(source, episode, scope, proposal)
+    operations = plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=episode.episode_id)
+    forged = deepcopy(operations)
+    forged[0].payload["context_object"]["metadata"]["scope"]["visibility"]["tenant_id"] = "t2"
+
+    with pytest.raises(ValueError, match="bound tenant"):
+        committer.commit("u1", forged)
+
+    assert not [obj for obj in source.list_objects() if obj.metadata.get("canonical_kind")]
+    assert not (_artifact_root(tmp_path) / "system").exists()
+
+    cross_redo = deepcopy(operations[0])
+    cross_redo.payload["tenant_id"] = "t2"
+    cross_redo.payload["context_object"]["tenant_id"] = "t2"
+    cross_redo.payload["context_object"]["metadata"]["scope"]["visibility"]["tenant_id"] = "t2"
+    with pytest.raises(RedoIntegrityError, match="tenant boundary"):
+        committer.resume_canonical_batch(
+            "u1",
+            [SimpleNamespace(operation=cross_redo, source_effect=None, relation_manifest=None)],
+        )
+    assert not [obj for obj in source.list_objects() if obj.metadata.get("canonical_kind")]
+    assert not (_artifact_root(tmp_path) / "system").exists()
+
+
+def test_canonical_artifact_keys_reject_escape_before_redo_or_source_effects(tmp_path) -> None:  # noqa: ANN001
+    source, _index, _queue, _relations, committer, episode, scope = _setup(tmp_path)
+    proposal = _proposal(episode, "p-artifact-key", "SQLite", "confirmation", "confirmed")
+    _identity, _, plan = _plan(source, episode, scope, proposal)
+    operations = plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=episode.episode_id)
+
+    for field_name in ("transaction_id", "idempotency_key"):
+        forged = deepcopy(operations)
+        forged[0].payload[field_name] = "../../artifact-escape"
+        with pytest.raises(ValueError, match=field_name):
+            committer.commit("u1", forged)
+
+    numeric = deepcopy(operations)
+    numeric[0].payload["transaction_id"] = 123
+    with pytest.raises(ValueError, match="transaction_id"):
+        committer.commit("u1", numeric)
+
+    assert not [obj for obj in source.list_objects() if obj.metadata.get("canonical_kind")]
+    assert not (_artifact_root(tmp_path) / "system").exists()
+    assert not (tmp_path / "tenants" / "artifact-escape").exists()
+
+
+def test_cross_tenant_canonical_marker_is_not_available_for_commit_backfill(tmp_path) -> None:  # noqa: ANN001
+    source, index, _queue, relations, committer, episode, scope = _setup(tmp_path)
+    proposal = _proposal(episode, "p-marker-tenant", "SQLite", "confirmation", "confirmed")
+    _identity, _, plan = _plan(
+        source,
+        episode,
+        scope,
+        proposal,
+        commit_group_id="tenant-marker-group",
+    )
+    operations = plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=episode.episode_id)
+    committer.commit("u1", operations)
+
+    tenant_two = OperationCommitter(
+        FileSystemSourceStore(tmp_path, tenant_id="t2"),
+        index,
+        str(tmp_path),
+        relation_store=relations,
+        tenant_id="t2",
+    )
+    assert tenant_two.committed_canonical_diffs("u1", "tenant-marker-group") == []
+    assert tenant_two.committed_memory_effect_diffs("u1", "tenant-marker-group") == []
+
+
+def test_canonical_preflight_rejects_v1_identity_and_redirect_payload(tmp_path) -> None:  # noqa: ANN001
+    source, _index, _queue, _relations, committer, episode, scope = _setup(tmp_path)
+    proposal = _proposal(episode, "p-v2-only", "SQLite", "confirmation", "confirmed")
+    _identity, _, plan = _plan(source, episode, scope, proposal)
+    operations = plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=episode.episode_id)
+
+    wrong_version = deepcopy(operations)
+    wrong_version[0].payload["identity_algorithm_version"] = "identity_v1"
+    with pytest.raises(ValueError, match="requires Identity V2"):
+        committer.commit("u1", wrong_version)
+
+    redirects = deepcopy(operations)
+    for operation in redirects:
+        operation.payload["identity_alias_operations"] = []
+    with pytest.raises(ValueError, match="cannot contain redirects"):
+        committer.commit("u1", redirects)
+    assert not [obj for obj in source.list_objects() if obj.metadata.get("canonical_kind")]
+
+
+def test_committed_outbox_is_dispatched_after_initial_queue_outage(tmp_path) -> None:  # noqa: ANN001
+    source = FileSystemSourceStore(tmp_path, tenant_id="t1")
+    index = InMemoryIndexStore()
+    queue = FailOnceQueue()
+    relations = InMemoryRelationStore()
+    committer = OperationCommitter(source, index, str(tmp_path), relation_store=relations, queue_store=queue)
+    episode = _persisted_episode(
+        tmp_path,
+        SessionArchive(
+            user_id="u1",
+            session_id="s1",
+            archive_uri="memoryos://user/u1/sessions/history/s1",
+            messages=[{"id": "m1", "role": "user", "content": "The storage backend is confirmed as SQLite."}],
+            metadata={"tenant_id": "t1", "project_id": "memoryos"},
+        ),
+    )
+    assert episode.origin.primary_scope is not None
+    scope = MemoryScope(
+        ScopeSelector((episode.origin.primary_scope,)),
+        VisibilityPolicy("t1"),
+        episode.origin.scope_refs,
+    )
+    proposal = _proposal(episode, "p-sqlite", "SQLite", "confirmation", "confirmed")
+    _identity, _, plan = _plan(source, episode, scope, proposal)
+    committer.commit(
+        "u1",
+        plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=episode.episode_id),
+    )
+    assert queue.jobs == {}
+
+    worker = MemoryProjectionWorker(
+        CanonicalMemoryProjector(source, index, _artifact_root(tmp_path)),
+        queue,
+    )
+    result = worker.process_pending()
+    assert result["processed"]
+    assert index.indexed_uris()
+
+
+def test_source_committed_transaction_recovers_when_final_outbox_write_fails(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    source, _index, queue, _relations, committer, episode, scope = _setup(tmp_path)
+    proposal = _proposal(episode, "p-final-outbox", "SQLite", "confirmation", "confirmed")
+    identity, _, plan = _plan(source, episode, scope, proposal)
+    operations = plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=episode.episode_id)
+    original_finalize = committer._finalize_canonical_outbox
+    calls = 0
+
+    def fail_once(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("injected final outbox failure")
+        return original_finalize(*args, **kwargs)
+
+    monkeypatch.setattr(committer, "_finalize_canonical_outbox", fail_once)
+    with pytest.raises(OSError, match="final outbox"):
+        committer.commit("u1", operations)
+    outbox = next((_artifact_root(tmp_path) / "system" / "outbox").glob("*.json"))
+    assert json.loads(outbox.read_text(encoding="utf-8"))["status"] == "source_committed"
+    assert CanonicalMemoryRepository(source).load(identity)[0] is not None
+
+    monkeypatch.setattr(committer, "_finalize_canonical_outbox", original_finalize)
+    assert set(committer.recover_pending_canonical("u1")) == {operation.operation_id for operation in operations}
+    assert json.loads(outbox.read_text(encoding="utf-8"))["status"] == "committed"
+    assert queue.jobs
+
+
+def test_prepared_outbox_and_redo_recover_complete_transaction_after_crash(tmp_path) -> None:  # noqa: ANN001
+    source = CrashSecondWriteSource(tmp_path)
+    index = InMemoryIndexStore()
+    queue = InMemoryQueueStore()
+    relations = InMemoryRelationStore()
+    committer = OperationCommitter(source, index, str(tmp_path), relation_store=relations, queue_store=queue)
+    episode = _persisted_episode(
+        tmp_path,
+        SessionArchive(
+            user_id="u1",
+            session_id="s1",
+            archive_uri="memoryos://user/u1/sessions/history/s1",
+            messages=[{"id": "m1", "role": "user", "content": "The primary storage backend is SQLite."}],
+            metadata={"tenant_id": "t1", "project_id": "memoryos"},
+        ),
+    )
+    assert episode.origin.primary_scope is not None
+    scope = MemoryScope(
+        ScopeSelector((episode.origin.primary_scope,)),
+        VisibilityPolicy("t1"),
+        episode.origin.scope_refs,
+    )
+    proposal = _proposal(episode, "p-sqlite", "SQLite", "confirmation", "confirmed")
+    identity, _, plan = _plan(source, episode, scope, proposal)
+    operations = plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=episode.episode_id)
+    with pytest.raises(SystemExit, match="simulated process crash"):
+        committer.commit("u1", operations)
+
+    recovery = RecoveryService(committer.redo, committer).recover("u1")
+    assert set(recovery.operation_ids) == {operation.operation_id for operation in operations}
+    slot, claims = CanonicalMemoryRepository(source).load(identity)
+    assert slot is not None and {claim.canonical_value: claim.current.state for claim in claims} == {"sqlite": "ACTIVE"}
+    outbox = next((_artifact_root(tmp_path) / "system" / "outbox").glob("*.json"))
+    assert json.loads(outbox.read_text(encoding="utf-8"))["status"] == "committed"
+
+
+def test_canonical_recovery_rejects_same_revision_with_divergent_source_effect(tmp_path) -> None:  # noqa: ANN001
+    source, _index, _queue, _relations, committer, episode, scope = _setup(tmp_path)
+    proposal = _proposal(episode, "recovery-integrity", "SQLite", "confirmation", "confirmed")
+    _identity, _, plan = _plan(source, episode, scope, proposal)
+    operations = plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=episode.episode_id)
+    transaction_id = str(operations[0].payload["transaction_id"])
+    idempotency_key = str(operations[0].payload["idempotency_key"])
+    before_images = committer._capture_canonical_state(operations)
+    before_by_uri = {
+        str(snapshot["uri"]): snapshot["object"]
+        for snapshot in before_images
+    }
+    relation_manifests = {
+        operation.operation_id: committer._build_canonical_relation_manifest(
+            operation,
+            before_by_uri.get(str(operation.target_uri or "")),
+        )
+        for operation in operations
+    }
+    committer._write_outbox_event(
+        transaction_id,
+        idempotency_key,
+        operations,
+        status="prepared",
+        before_images=before_images,
+        relation_manifests=relation_manifests,
+    )
+    for operation in operations:
+        committer.redo.begin(
+            operation,
+            phase="started",
+            relation_manifest=relation_manifests[operation.operation_id],
+        )
+    first = operations[0]
+    committer._apply_canonical_source(first)
+    first_manifest = relation_manifests[first.operation_id]
+    committer._apply_canonical_relation_manifest(first, first_manifest)
+    committer.redo.advance(
+        first,
+        phase="source_written",
+        source_effect=committer._capture_canonical_source_effect(first, first_manifest),
+        relation_manifest=first_manifest,
+    )
+    first_payload = first.payload["context_object"]
+    tampered = source.read_object(str(first_payload["uri"]))
+    tampered.title = "tampered at the same revision"
+    source.write_object(tampered, content=str(first.payload.get("content", "")))
+
+    recovery = RecoveryService(committer.redo, committer).recover("u1")
+
+    assert not (_artifact_root(tmp_path) / "system" / "transactions" / f"{idempotency_key}.json").exists()
+    assert recovery.recovered_count == 0
+    assert recovery.quarantine_count >= 1
+    assert committer.redo.pending_entries() == []
+
+
+def test_session_commit_revision_conflict_rereads_and_reconciles_same_proposal(tmp_path) -> None:  # noqa: ANN001
+    source, index, queue, relations, committer, sqlite_episode, scope = _setup(tmp_path)
+    postgres_archive = SessionArchive(
+        user_id="u1",
+        session_id="s2",
+        archive_uri="memoryos://user/u1/sessions/history/s2",
+        messages=[{"id": "m1", "role": "user", "content": "PostgreSQL is a future primary storage backend option."}],
+        metadata={"tenant_id": "t1", "project_id": "memoryos"},
+    )
+    postgres_episode = _persisted_episode(tmp_path, postgres_archive)
+    postgres = _proposal(postgres_episode, "p-postgres", "PostgreSQL", "confirmation", "confirmed")
+    _identity, _, stale_plan = _plan(source, postgres_episode, scope, postgres)
+    stale_operations = stale_plan.to_context_operations(
+        user_id="u1",
+        tenant_id="t1",
+        episode_id=postgres_episode.episode_id,
+    )
+
+    sqlite = _proposal(sqlite_episode, "p-sqlite", "SQLite", "confirmation", "confirmed")
+    identity, _, sqlite_plan = _plan(source, sqlite_episode, scope, sqlite)
+    committer.commit(
+        "u1",
+        sqlite_plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=sqlite_episode.episode_id),
+    )
+
+    planner = MemoryCommitPlanner(source_store=source, index_store=index, relation_store=relations)
+    planning_context = PlanningContext(
+        planning_id="postgres-stale-plan",
+        task_id=postgres_archive.task_id,
+        archive_digest=postgres_archive.archive_digest,
+        manifest_digest=postgres_archive.manifest_digest,
+        episode_id=postgres_episode.episode_id,
+        session_id=postgres_archive.session_id,
+        tenant_id="t1",
+        user_id="u1",
+        proposal_inputs=(ProposalPlanningInput(postgres),),
+        prefetch_snapshot=(),
+        planned_against_revisions=tuple(sorted(stale_plan.expected_revisions.items())),
+        staged_objects=(),
+        scope_candidates=tuple(scope_ref.key for scope_ref in postgres_episode.legal_scope_candidates()),
+        evidence_references=postgres.evidence_refs,
+        operation_group_identity=f"commit_group_{postgres_archive.task_id}",
+        extractor_version="test-planner",
+    )
+    service = SessionCommitService(
+        SessionArchiveStore(tmp_path),
+        queue,
+        committer=committer,
+        memory_planner=planner,
+    )
+    service._commit_memory_with_reconcile_retry(postgres_archive, stale_operations, planning_context)
+    _slot, claims = CanonicalMemoryRepository(source).load(identity)
+    assert {claim.canonical_value: claim.current.state for claim in claims} == {"sqlite": "ACTIVE"}
+    pending = [obj for obj in source.list_objects() if obj.metadata.get("canonical_kind") == "pending_proposal"]
+    assert len(pending) == 1
+    assert pending[0].metadata["proposal"]["value_fields"]["canonical_value"] == "PostgreSQL"
+
+
+def test_uncommitted_partial_switch_is_invisible_until_transaction_recovery(tmp_path) -> None:  # noqa: ANN001
+    source = ArmableCrashSource(tmp_path)
+    index = InMemoryIndexStore()
+    queue = InMemoryQueueStore()
+    relations = InMemoryRelationStore()
+    committer = OperationCommitter(source, index, str(tmp_path), relation_store=relations, queue_store=queue)
+    episode = _persisted_episode(
+        tmp_path,
+        SessionArchive(
+            user_id="u1",
+            session_id="s1",
+            archive_uri="memoryos://user/u1/sessions/history/s1",
+            messages=[
+                {
+                    "id": "m1",
+                    "role": "user",
+                    "content": "SQLite is confirmed. PostgreSQL is a future primary storage backend option.",
+                }
+            ],
+            metadata={"tenant_id": "t1", "project_id": "memoryos"},
+        ),
+    )
+    assert episode.origin.primary_scope is not None
+    scope = MemoryScope(
+        ScopeSelector((episode.origin.primary_scope,)),
+        VisibilityPolicy("t1"),
+        episode.origin.scope_refs,
+    )
+    sqlite = _proposal(episode, "sqlite-initial", "SQLite", "confirmation", "confirmed")
+    identity, _, sqlite_plan = _plan(source, episode, scope, sqlite)
+    committer.commit(
+        "u1",
+        sqlite_plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=episode.episode_id),
+    )
+    sqlite_claim = next(
+        claim
+        for claim in CanonicalMemoryRepository(source).load(identity)[1]
+        if claim.canonical_value == "sqlite"
+    )
+    replacement_episode = _persisted_episode(
+        tmp_path,
+        SessionArchive(
+            user_id="u1",
+            session_id="s-replace",
+            archive_uri="memoryos://user/u1/sessions/history/s-replace",
+            messages=[
+                {
+                    "id": "replace-storage",
+                    "role": "user",
+                    "content": "The primary storage backend is now changed from SQLite to PostgreSQL.",
+                }
+            ],
+            metadata={"tenant_id": "t1", "project_id": "memoryos"},
+        ),
+    )
+    confirmed = _replacement_proposal(replacement_episode, "postgres-confirm", "PostgreSQL", sqlite_claim)
+    switch_plan = _reviewed_resolution_plan(
+        source,
+        committer,
+        replacement_episode,
+        confirmed,
+        command_suffix="switch-crash",
+    )
+    switch_operations = list(switch_plan.operations)
+    source.crash_at = source.write_count + 2
+    with pytest.raises(SystemExit, match="simulated switch crash"):
+        committer.commit("u1", switch_operations)
+
+    before_recovery = CanonicalMemoryRepository(source).load(identity)[1]
+    assert {claim.canonical_value: claim.current.state for claim in before_recovery} == {"sqlite": "ACTIVE"}
+    RecoveryService(committer.redo, committer).recover("u1")
+    after_recovery = CanonicalMemoryRepository(source).load(identity)[1]
+    assert {claim.canonical_value: claim.current.state for claim in after_recovery} == {
+        "sqlite": "SUPERSEDED",
+        "postgresql": "ACTIVE",
+    }
+
+
+def test_mixed_pending_is_not_written_when_canonical_preflight_conflicts(tmp_path) -> None:  # noqa: ANN001
+    source, index, _queue, relations, committer, episode, scope = _setup(tmp_path)
+    archive = SessionArchiveStore(tmp_path, tenant_id="t1").read_archive(
+        "memoryos://user/u1/sessions/history/s1",
+        tenant_id="t1",
+    )
+    sqlite = _proposal(episode, "mixed-sqlite", "SQLite", "confirmation", "confirmed")
+    _identity, _, initial_plan = _plan(source, episode, scope, sqlite)
+    initial = initial_plan.to_context_operations(user_id="u1", tenant_id="t1", episode_id=episode.episode_id)
+    committer.commit("u1", initial)
+    stale = [deepcopy(operation) for operation in initial]
+    for operation in stale:
+        operation.payload["transaction_id"] += "_stale"
+        operation.payload["idempotency_key"] += "_stale"
+
+    pending = CanonicalMemoryFormationService(source).plan_pending(
+        sqlite,
+        archive=archive,
+        episode=episode,
+        reason="manual_review",
+        retrieval_views=["project:memoryos:decisions"],
+        commit_group_id=f"commit_group_{archive.task_id}",
+    )
+    pending_uri = str(pending.operations[0].target_uri)
+
+    with pytest.raises(RevisionConflictError) as raised:
+        committer.commit("u1", [*stale, *pending.operations])
+
+    assert raised.value.committed_diff is None
+    with pytest.raises(FileNotFoundError):
+        source.read_object(pending_uri)
+    assert pending_uri not in index.indexed_uris()
+    assert not any(
+        pending.operations[0].operation_id in path.read_text(encoding="utf-8")
+        for path in (_artifact_root(tmp_path) / "system" / "diffs").glob("*.json")
+    )
+    assert relations.relations_of(pending_uri, tenant_id="t1", owner_user_id="u1") == []
+
+
+def test_partial_canonical_conflict_replan_merges_diff_then_commits_pending_once(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    source, index, queue, relations, committer, episode, scope = _setup(tmp_path)
+    archive_store = SessionArchiveStore(tmp_path, tenant_id="t1")
+    archive = archive_store.read_archive(
+        "memoryos://user/u1/sessions/history/s1",
+        tenant_id="t1",
+    )
+    group_id = f"commit_group_{archive.task_id}"
+    primary = _proposal(episode, "primary-sqlite", "SQLite", "confirmation", "confirmed")
+    secondary_identity = {"decision_topic": "secondary storage backend"}
+    secondary = _proposal(episode, "secondary-duckdb", "DuckDB", "confirmation", "confirmed")
+    secondary = replace(
+        secondary,
+        identity_fields=secondary_identity,
+        field_evidence_refs=_explicit_bindings(
+            secondary_identity,
+            dict(secondary.value_fields),
+            secondary.evidence_refs,
+        ),
+    )
+    _primary_identity, _, primary_plan = _plan(
+        source, episode, scope, primary, commit_group_id=group_id
+    )
+    _secondary_identity, _, secondary_plan = _plan(
+        source, episode, scope, secondary, commit_group_id=group_id
+    )
+    primary_ops = primary_plan.to_context_operations(
+        user_id="u1", tenant_id="t1", episode_id=episode.episode_id
+    )
+    secondary_ops = secondary_plan.to_context_operations(
+        user_id="u1", tenant_id="t1", episode_id=episode.episode_id
+    )
+    pending = CanonicalMemoryFormationService(source).plan_pending(
+        primary,
+        archive=archive,
+        episode=episode,
+        reason="manual_review",
+        retrieval_views=["project:memoryos:decisions"],
+        commit_group_id=f"commit_group_{archive.task_id}",
+    )
+
+    original_batch = committer._commit_canonical_batch
+    batch_calls = 0
+
+    def conflict_second_batch(user_id, operations):  # noqa: ANN001, ANN202
+        nonlocal batch_calls
+        batch_calls += 1
+        if batch_calls == 2:
+            raise RevisionConflictError("injected concurrent revision change")
+        return original_batch(user_id, operations)
+
+    monkeypatch.setattr(committer, "_commit_canonical_batch", conflict_second_batch)
+    planning_context = PlanningContext(
+        planning_id="mixed-replan",
+        task_id=archive.task_id,
+        archive_digest=archive.archive_digest,
+        manifest_digest=archive.manifest_digest,
+        episode_id=episode.episode_id,
+        session_id=archive.session_id,
+        tenant_id="t1",
+        user_id="u1",
+        proposal_inputs=(),
+        prefetch_snapshot=(),
+        planned_against_revisions=(),
+        staged_objects=(),
+        scope_candidates=tuple(item.key for item in episode.legal_scope_candidates()),
+        evidence_references=primary.evidence_refs,
+        operation_group_identity=f"commit_group_{archive.task_id}",
+        extractor_version="test-planner",
+    )
+
+    class StaticReplanner:
+        def replan(self, context, requested_archive):  # noqa: ANN001, ANN201, ARG002
+            return MemoryPlanningResult(tuple([*secondary_ops, *pending.operations]), context)
+
+    service = SessionCommitService(
+        archive_store,
+        queue,
+        committer=committer,
+        memory_planner=cast(MemoryCommitPlanner, StaticReplanner()),
+    )
+    result = service._commit_memory_with_reconcile_retry(
+        archive,
+        [*primary_ops, *secondary_ops, *pending.operations],
+        planning_context,
+    )
+
+    expected_ids = {
+        *(operation.operation_id for operation in primary_ops),
+        *(operation.operation_id for operation in secondary_ops),
+        pending.operations[0].operation_id,
+    }
+    assert {item["operation_id"] for item in result["operations"]} == expected_ids
+    assert result["operation_count"] == len(expected_ids)
+    assert result["canonical_active_operation_count"] == 2
+    assert result["pending_count"] == 1
+    assert result["pending_persisted"] is True
+    assert source.read_object(str(pending.operations[0].target_uri)).metadata["canonical_kind"] == "pending_proposal"
+
+    before_audit = (_artifact_root(tmp_path) / "system" / "audit" / "u1.jsonl").read_text(encoding="utf-8")
+    before_diffs = {path.name: path.read_text(encoding="utf-8") for path in (_artifact_root(tmp_path) / "system" / "diffs").glob("*.json")}
+    before_objects = {obj.uri: obj.to_dict() for obj in source.list_objects()}
+    repeated = service._commit_memory_with_reconcile_retry(
+        archive,
+        [*primary_ops, *secondary_ops, *pending.operations],
+        planning_context,
+    )
+    assert {item["operation_id"] for item in repeated["operations"]} == expected_ids
+    assert (_artifact_root(tmp_path) / "system" / "audit" / "u1.jsonl").read_text(encoding="utf-8") == before_audit
+    assert {
+        path.name: path.read_text(encoding="utf-8") for path in (_artifact_root(tmp_path) / "system" / "diffs").glob("*.json")
+    } == before_diffs
+    assert {obj.uri: obj.to_dict() for obj in source.list_objects()} == before_objects
+
+
+def test_non_revision_partial_commit_backfills_canonical_and_pending_effects_for_final_projection(
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    source, index, queue, relations, committer, episode, scope = _setup(tmp_path)
+    archive_store = SessionArchiveStore(tmp_path, tenant_id="t1")
+    archive = archive_store.read_archive(
+        "memoryos://user/u1/sessions/history/s1",
+        tenant_id="t1",
+    )
+    group_id = f"commit_group_{archive.task_id}"
+    primary = _proposal(episode, "non-revision-primary", "SQLite", "confirmation", "confirmed")
+    secondary_identity = {"decision_topic": "secondary storage backend"}
+    secondary = _proposal(episode, "non-revision-secondary", "DuckDB", "confirmation", "confirmed")
+    secondary = replace(
+        secondary,
+        identity_fields=secondary_identity,
+        field_evidence_refs=_explicit_bindings(
+            secondary_identity,
+            dict(secondary.value_fields),
+            secondary.evidence_refs,
+        ),
+    )
+    _primary_identity, _, primary_plan = _plan(
+        source, episode, scope, primary, commit_group_id=group_id
+    )
+    _secondary_identity, _, secondary_plan = _plan(
+        source, episode, scope, secondary, commit_group_id=group_id
+    )
+    primary_ops = primary_plan.to_context_operations(
+        user_id="u1", tenant_id="t1", episode_id=episode.episode_id
+    )
+    secondary_ops = secondary_plan.to_context_operations(
+        user_id="u1", tenant_id="t1", episode_id=episode.episode_id
+    )
+    pending = CanonicalMemoryFormationService(source).plan_pending(
+        primary,
+        archive=archive,
+        episode=episode,
+        reason="manual_review",
+        retrieval_views=["project:memoryos:decisions"],
+        commit_group_id=group_id,
+    )
+    projection_worker = MemoryProjectionWorker(
+        CanonicalMemoryProjector(source, index, _artifact_root(tmp_path)),
+        queue,
+    )
+    service = SessionCommitService(
+        archive_store,
+        queue,
+        committer=committer,
+        projection_worker=projection_worker,
+    )
+    service.commit_group_store.create(
+        group_id,
+        task_id=archive.task_id,
+        archive_uri=archive.archive_uri,
+        user_id=archive.user_id,
+        tenant_id="t1",
+        archive_digest=archive.archive_digest,
+        manifest_digest=archive.manifest_digest,
+    )
+    original_batch = committer._commit_canonical_batch
+    calls = 0
+
+    def fail_second_group(user_id, operations):  # noqa: ANN001, ANN202
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected non-revision failure")
+        return original_batch(user_id, operations)
+
+    monkeypatch.setattr(committer, "_commit_canonical_batch", fail_second_group)
+    with pytest.raises(OSError, match="non-revision failure"):
+        service._commit_memory_with_reconcile_retry(
+            archive,
+            [*primary_ops, *secondary_ops, *pending.operations],
+            commit_group_id=group_id,
+        )
+
+    partial = service.commit_group_store.load(group_id)
+    assert partial is not None
+    partial_ids = {
+        operation["operation_id"]
+        for diff in partial.canonical_effects.values()
+        for operation in diff.get("operations", [])
+    }
+    assert partial_ids == {operation.operation_id for operation in primary_ops}
+
+    monkeypatch.setattr(committer, "_commit_canonical_batch", original_batch)
+    final = service._commit_memory_with_reconcile_retry(
+        archive,
+        [*secondary_ops, *pending.operations],
+        commit_group_id=group_id,
+    )
+
+    expected_ids = {
+        *(operation.operation_id for operation in primary_ops),
+        *(operation.operation_id for operation in secondary_ops),
+        pending.operations[0].operation_id,
+    }
+    assert {operation["operation_id"] for operation in final["operations"]} == expected_ids
+    assert final["pending_count"] == 1
+    assert final["pending_persisted"] is True
+    projected = service._project_commit_group(group_id, final)
+    assert set(projected["processed"]) == {
+        f"outbox_{primary_ops[0].payload['transaction_id']}",
+        f"outbox_{secondary_ops[0].payload['transaction_id']}",
+    }
+
+
+def test_restart_backfills_marker_before_replanning_without_repeating_source_or_audit(tmp_path) -> None:  # noqa: ANN001
+    source, index, queue, relations, committer, episode, scope = _setup(tmp_path)
+    archive_store = SessionArchiveStore(tmp_path, tenant_id="t1")
+    archive = archive_store.read_archive(
+        "memoryos://user/u1/sessions/history/s1",
+        tenant_id="t1",
+    )
+    group_id = f"commit_group_{archive.task_id}"
+    proposal = _proposal(episode, "marker-restart", "SQLite", "confirmation", "confirmed")
+    _identity, _, plan = _plan(source, episode, scope, proposal, commit_group_id=group_id)
+    operations = plan.to_context_operations(
+        user_id="u1",
+        tenant_id="t1",
+        episode_id=episode.episode_id,
+    )
+    initial_service = SessionCommitService(archive_store, queue, committer=committer)
+    initial_service.commit_group_store.create(
+        group_id,
+        task_id=archive.task_id,
+        archive_uri=archive.archive_uri,
+        user_id=archive.user_id,
+        tenant_id="t1",
+        archive_digest=archive.archive_digest,
+        manifest_digest=archive.manifest_digest,
+    )
+    committer.commit("u1", operations)
+    before_status = initial_service.commit_group_store.load(group_id)
+    assert before_status is not None and before_status.canonical_effects == {}
+    before_audit = (_artifact_root(tmp_path) / "system" / "audit" / "u1.jsonl").read_text(encoding="utf-8")
+    before_objects = {obj.uri: obj.to_dict() for obj in source.list_objects()}
+    context = PlanningContext(
+        planning_id="marker-restart-plan",
+        task_id=archive.task_id,
+        archive_digest=archive.archive_digest,
+        manifest_digest=archive.manifest_digest,
+        episode_id=episode.episode_id,
+        session_id=archive.session_id,
+        tenant_id="t1",
+        user_id="u1",
+        proposal_inputs=(),
+        prefetch_snapshot=(),
+        planned_against_revisions=(),
+        staged_objects=(),
+        scope_candidates=tuple(item.key for item in episode.legal_scope_candidates()),
+        evidence_references=proposal.evidence_refs,
+        operation_group_identity=group_id,
+        extractor_version="test-planner",
+    )
+    holder: dict[str, SessionCommitService] = {}
+
+    class MarkerAwarePlanner:
+        def plan(self, requested_archive):  # noqa: ANN001, ANN201, ARG002
+            status = holder["service"].commit_group_store.load(group_id)
+            assert status is not None and status.canonical_effects
+            return MemoryPlanningResult(tuple(operations), context)
+
+    restarted = SessionCommitService(
+        archive_store,
+        queue,
+        committer=committer,
+        memory_planner=cast(MemoryCommitPlanner, MarkerAwarePlanner()),
+    )
+    holder["service"] = restarted
+
+    result = restarted.async_commit(archive)
+
+    assert result.canonical_committed is True
+    after = restarted.commit_group_store.load(group_id)
+    assert after is not None and after.canonical_effects
+    assert {obj.uri: obj.to_dict() for obj in source.list_objects()} == before_objects
+    assert (_artifact_root(tmp_path) / "system" / "audit" / "u1.jsonl").read_text(encoding="utf-8") == before_audit
+
+
+def test_regular_pending_redo_is_recovered_and_backfilled_when_retry_omits_operation(
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    source, index, queue, relations, committer, episode, scope = _setup(tmp_path)
+    archive_store = SessionArchiveStore(tmp_path, tenant_id="t1")
+    archive = archive_store.read_archive(
+        "memoryos://user/u1/sessions/history/s1",
+        tenant_id="t1",
+    )
+    group_id = f"commit_group_{archive.task_id}"
+    proposal = _proposal(episode, "regular-redo-backfill", "SQLite", "confirmation", "confirmed")
+    _identity, _, plan = _plan(source, episode, scope, proposal, commit_group_id=group_id)
+    canonical_operations = plan.to_context_operations(
+        user_id="u1",
+        tenant_id="t1",
+        episode_id=episode.episode_id,
+    )
+    pending = CanonicalMemoryFormationService(source).plan_pending(
+        proposal,
+        archive=archive,
+        episode=episode,
+        reason="manual_review",
+        retrieval_views=["project:memoryos:decisions"],
+        commit_group_id=group_id,
+    )
+    service = SessionCommitService(archive_store, queue, committer=committer)
+    service.commit_group_store.create(
+        group_id,
+        task_id=archive.task_id,
+        archive_uri=archive.archive_uri,
+        user_id=archive.user_id,
+        tenant_id="t1",
+        archive_digest=archive.archive_digest,
+        manifest_digest=archive.manifest_digest,
+    )
+    original_upsert = index.upsert_index
+    fail_pending_once = True
+
+    def upsert_with_pending_failure(obj, content=""):  # noqa: ANN001, ANN202
+        nonlocal fail_pending_once
+        if fail_pending_once and dict(obj.metadata or {}).get("canonical_kind") == "pending_proposal":
+            fail_pending_once = False
+            raise OSError("injected pending index failure")
+        return original_upsert(obj, content)
+
+    monkeypatch.setattr(index, "upsert_index", upsert_with_pending_failure)
+    with pytest.raises(OSError, match="pending index failure"):
+        service._commit_memory_with_reconcile_retry(
+            archive,
+            [*canonical_operations, *pending.operations],
+            commit_group_id=group_id,
+        )
+
+    assert not committer.redo.pending_entries()
+    assert committer._operation_marker(pending.operations[0].operation_id).exists()
+    recovered_status = service.commit_group_store.load(group_id)
+    assert recovered_status is not None
+    recovered_ids = {
+        operation["operation_id"]
+        for diff in recovered_status.canonical_effects.values()
+        for operation in diff.get("operations", [])
+    }
+    expected_ids = {
+        *(operation.operation_id for operation in canonical_operations),
+        pending.operations[0].operation_id,
+    }
+    assert recovered_ids == expected_ids
+    before_audit = (_artifact_root(tmp_path) / "system" / "audit" / "u1.jsonl").read_text(encoding="utf-8")
+
+    final = service._commit_memory_with_reconcile_retry(
+        archive,
+        [],
+        commit_group_id=group_id,
+    )
+
+    assert {operation["operation_id"] for operation in final["operations"]} == expected_ids
+    assert final["pending_count"] == 1
+    assert final["pending_persisted"] is True
+    assert (_artifact_root(tmp_path) / "system" / "audit" / "u1.jsonl").read_text(encoding="utf-8") == before_audit
+
+
+def test_regular_recovery_integrity_failure_is_not_swallowed_by_original_error(
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    source, _index, queue, _relations, committer, episode, _scope = _setup(tmp_path)
+    archive_store = SessionArchiveStore(tmp_path, tenant_id="t1")
+    archive = archive_store.read_archive(
+        "memoryos://user/u1/sessions/history/s1",
+        tenant_id="t1",
+    )
+    group_id = f"commit_group_{archive.task_id}"
+    proposal = _proposal(episode, "recovery-integrity", "SQLite", "future_option", "exploratory")
+    pending = CanonicalMemoryFormationService(source).plan_pending(
+        proposal,
+        archive=archive,
+        episode=episode,
+        reason="manual_review",
+        retrieval_views=["project:memoryos:decisions"],
+        commit_group_id=group_id,
+    )
+    operation = pending.operations[0]
+    committer.redo.begin(operation, phase="started")
+    committer._apply_source(operation)
+    committer.redo.advance(
+        operation,
+        phase="source_written",
+        source_effect=committer._capture_regular_source_effect(operation),
+    )
+    tampered = source.read_object(str(operation.target_uri))
+    tampered.title = "tampered after source phase"
+    source.write_object(tampered, content="tampered")
+    service = SessionCommitService(archive_store, queue, committer=committer)
+    service.commit_group_store.create(
+        group_id,
+        task_id=archive.task_id,
+        archive_uri=archive.archive_uri,
+        user_id=archive.user_id,
+        tenant_id="t1",
+        archive_digest=archive.archive_digest,
+        manifest_digest=archive.manifest_digest,
+    )
+
+    def fail_original(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        raise OSError("original commit failure")
+
+    monkeypatch.setattr(service, "_commit_or_describe", fail_original)
+    with pytest.raises(RedoIntegrityError, match="SourceStore effect does not match") as raised:
+        service._commit_memory_with_reconcile_retry(
+            archive,
+            [],
+            commit_group_id=group_id,
+        )
+
+    assert isinstance(raised.value.__cause__, OSError)
+    assert committer.redo.pending_entries()
+    status = service.commit_group_store.load(group_id)
+    assert status is not None and status.canonical_effects == {}
+
+
+def test_regular_lifecycle_conflict_preflights_all_groups_then_replan_commits_every_unwritten_effect(tmp_path) -> None:  # noqa: ANN001
+    source, index, queue, relations, committer, episode, scope = _setup(tmp_path)
+    archive_store = SessionArchiveStore(tmp_path, tenant_id="t1")
+    archive = archive_store.read_archive(
+        "memoryos://user/u1/sessions/history/s1",
+        tenant_id="t1",
+    )
+    proposal = _proposal(episode, "canonical-before-regular-conflict", "SQLite", "confirmation", "confirmed")
+    identity, _, canonical_plan = _plan(source, episode, scope, proposal)
+    canonical_operations = canonical_plan.to_context_operations(
+        user_id="u1",
+        tenant_id="t1",
+        episode_id=episode.episode_id,
+    )
+    formation = CanonicalMemoryFormationService(source)
+    pending = formation.plan_pending(
+        proposal,
+        archive=archive,
+        episode=episode,
+        reason="manual_review",
+        retrieval_views=["project:memoryos:decisions"],
+        commit_group_id="regular-conflict-create",
+    )
+    committer.commit("u1", list(pending.operations))
+    pending_uri = str(pending.operations[0].target_uri)
+    current_pending = CanonicalMemoryRepository(source).load_pending(
+        pending_uri,
+        tenant_id="t1",
+        owner_user_id="u1",
+    )
+    stale_binding = _review_command_binding(
+        committer,
+        current_pending,
+        decision="REJECT",
+        suffix="stale-reviewer",
+    )
+    winning_binding = _review_command_binding(
+        committer,
+        current_pending,
+        decision="CONFIRM",
+        suffix="winning-reviewer",
+    )
+    stale_rejection = formation.plan_pending_lifecycle_transition(
+        pending_uri,
+        LifecycleState.REJECTED,
+        tenant_id="t1",
+        owner_user_id="u1",
+        commit_group_id="stale-reviewer",
+        **stale_binding,
+    )
+    confirmed = formation.plan_pending_lifecycle_transition(
+        pending_uri,
+        LifecycleState.CONFIRMED,
+        tenant_id="t1",
+        owner_user_id="u1",
+        commit_group_id="winning-reviewer",
+        **winning_binding,
+    )
+    committer.commit("u1", [confirmed])
+    secondary_proposal = _proposal(
+        episode,
+        "regular-success-before-conflict",
+        "PostgreSQL",
+        "future_option",
+        "exploratory",
+    )
+    secondary_pending = formation.plan_pending(
+        secondary_proposal,
+        archive=archive,
+        episode=episode,
+        reason="secondary_manual_review",
+        retrieval_views=["project:memoryos:decisions"],
+        commit_group_id="regular-success-create",
+    )
+    secondary_pending_uri = str(secondary_pending.operations[0].target_uri)
+    before_objects = {obj.uri: obj.to_dict() for obj in source.list_objects()}
+    before_audit = (_artifact_root(tmp_path) / "system" / "audit" / "u1.jsonl").read_text(encoding="utf-8")
+    before_diffs = {
+        path.name: path.read_text(encoding="utf-8")
+        for path in (_artifact_root(tmp_path) / "system" / "diffs").glob("*.json")
+    }
+
+    with pytest.raises(RevisionConflictError) as raised:
+        committer.commit(
+            "u1",
+            [*canonical_operations, *secondary_pending.operations, stale_rejection],
+        )
+
+    assert raised.value.committed_diff is None
+    canonical_ids = {operation.operation_id for operation in canonical_operations}
+    secondary_add_id = secondary_pending.operations[0].operation_id
+    slot, claims = CanonicalMemoryRepository(source).load(identity)
+    assert slot is None
+    assert not claims
+    assert CanonicalMemoryRepository(source).load_pending(
+        pending_uri,
+        tenant_id="t1",
+        owner_user_id="u1",
+    ).lifecycle_state == LifecycleState.CONFIRMED
+    with pytest.raises(FileNotFoundError):
+        source.read_object(secondary_pending_uri)
+    assert secondary_pending_uri not in index.indexed_uris()
+    assert {obj.uri: obj.to_dict() for obj in source.list_objects()} == before_objects
+    assert (_artifact_root(tmp_path) / "system" / "audit" / "u1.jsonl").read_text(encoding="utf-8") == before_audit
+    assert {
+        path.name: path.read_text(encoding="utf-8")
+        for path in (_artifact_root(tmp_path) / "system" / "diffs").glob("*.json")
+    } == before_diffs
+    assert not any(
+        (_artifact_root(tmp_path) / "system" / "transactions" / f"{operation.payload['idempotency_key']}.json").exists()
+        for operation in canonical_operations
+    )
+    assert not committer.redo.pending_entries()
+
+    planning_context = PlanningContext(
+        planning_id="regular-conflict-replan",
+        task_id=archive.task_id,
+        archive_digest=archive.archive_digest,
+        manifest_digest=archive.manifest_digest,
+        episode_id=episode.episode_id,
+        session_id=archive.session_id,
+        tenant_id="t1",
+        user_id="u1",
+        proposal_inputs=(),
+        prefetch_snapshot=(),
+        planned_against_revisions=(),
+        staged_objects=(),
+        scope_candidates=tuple(item.key for item in episode.legal_scope_candidates()),
+        evidence_references=proposal.evidence_refs,
+        operation_group_identity=f"commit_group_{archive.task_id}",
+        extractor_version="test-planner",
+    )
+    current_for_replan = CanonicalMemoryRepository(source).load_pending(
+        pending_uri,
+        tenant_id="t1",
+        owner_user_id="u1",
+    )
+    fresh_binding = _review_command_binding(
+        committer,
+        current_for_replan,
+        decision="REJECT",
+        suffix="fresh-reviewer",
+    )
+
+    class LifecycleReplanner:
+        operations = ()
+
+        def replan(self, context, requested_archive):  # noqa: ANN001, ANN201, ARG002
+            reject_primary = formation.plan_pending_lifecycle_transition(
+                pending_uri,
+                LifecycleState.REJECTED,
+                tenant_id="t1",
+                owner_user_id="u1",
+                    commit_group_id="fresh-reviewer",
+                    reason="review_reconciled_after_cas_conflict",
+                    **fresh_binding,
+                )
+            self.operations = (*canonical_operations, *secondary_pending.operations, reject_primary)
+            return MemoryPlanningResult(self.operations, context)
+
+    replanner = LifecycleReplanner()
+    service = SessionCommitService(
+        archive_store,
+        queue,
+        committer=committer,
+        memory_planner=cast(MemoryCommitPlanner, replanner),
+    )
+    result = service._commit_memory_with_reconcile_retry(
+        archive,
+        [*canonical_operations, *secondary_pending.operations, stale_rejection],
+        planning_context,
+    )
+
+    assert replanner.operations
+    assert {item["operation_id"] for item in result["operations"]} == {
+        *canonical_ids,
+        secondary_add_id,
+        replanner.operations[-1].operation_id,
+    }
+    assert result["pending_count"] == 1
+    assert result["pending_persisted"] is True
+    assert CanonicalMemoryRepository(source).load_pending(
+        pending_uri,
+        tenant_id="t1",
+        owner_user_id="u1",
+    ).lifecycle_state == LifecycleState.REJECTED
+    assert CanonicalMemoryRepository(source).load_pending(
+        secondary_pending_uri,
+        tenant_id="t1",
+        owner_user_id="u1",
+    ).lifecycle_state == LifecycleState.PENDING
+    slot, claims = CanonicalMemoryRepository(source).load(identity)
+    assert slot is not None
+    assert {claim.canonical_value: claim.current.state for claim in claims} == {"sqlite": "ACTIVE"}
+    audit_rows = [
+        json.loads(line)
+        for line in (_artifact_root(tmp_path) / "system" / "audit" / "u1.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    audited_operation_ids = [str(row.get("payload", {}).get("operation_id") or "") for row in audit_rows]
+    actual_operation_ids = {
+        *canonical_ids,
+        secondary_add_id,
+        replanner.operations[-1].operation_id,
+    }
+    assert all(audited_operation_ids.count(operation_id) == 1 for operation_id in actual_operation_ids)
+
+
+def test_confirmed_pending_supplement_commits_revision_before_linked_resolution(
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    source, index, _queue, relations, committer, initial_episode, scope = _setup(tmp_path)
+    initial = _proposal(initial_episode, "supplement-base", "SQLite", "confirmation", "confirmed")
+    identity, _, initial_plan = _plan(source, initial_episode, scope, initial)
+    committer.commit(
+        "u1",
+        initial_plan.to_context_operations(
+            user_id="u1",
+            tenant_id="t1",
+            episode_id=initial_episode.episode_id,
+        ),
+    )
+    active = next(
+        claim for claim in CanonicalMemoryRepository(source).load(identity)[1] if claim.current.state == "ACTIVE"
+    )
+    weak_archive = SessionArchive(
+        user_id="u1",
+        session_id="supplement-weak",
+        archive_uri="memoryos://user/u1/sessions/history/supplement-weak",
+        messages=[
+            {
+                "id": "weak-detail",
+                "role": "user",
+                "content": (
+                    "For the primary storage backend SQLite, perhaps supplement the rationale: stable under load."
+                ),
+            }
+        ],
+        metadata={"tenant_id": "t1", "project_id": "memoryos"},
+        task_id="supplement-weak-task",
+    )
+    weak_episode = _persisted_episode(tmp_path, weak_archive)
+    weak = _supplement_proposal(
+        weak_episode,
+        "supplement-weak",
+        active,
+        speech_act=SpeechAct.PROPOSAL,
+        commitment=Commitment.WEAK,
+    )
+    formation = CanonicalMemoryFormationService(source)
+    # This test exercises the legal reviewable supplement path.  The ordinary
+    # weak/non-final semantic admission result is NEEDS_SCHEMA_REPAIR and must
+    # not be upgraded by CONFIRM; correction-policy tests cover that branch.
+    pending = formation.plan_pending(
+        weak,
+        archive=weak_archive,
+        episode=weak_episode,
+        reason="low_confidence_review",
+        retrieval_views=["project:memoryos:decisions"],
+        commit_group_id="supplement-weak-group",
+    )
+    assert pending.decision.value == "PENDING"
+    assert pending.operations[0].payload["canonical_pending_proposal"] is True
+    committer.commit("u1", list(pending.operations))
+    pending_uri = str(pending.operations[0].target_uri)
+    pending_record = CanonicalMemoryRepository(source).load_pending(
+        pending_uri,
+        tenant_id="t1",
+        owner_user_id="u1",
+    )
+    review_binding = _review_command_binding(
+        committer,
+        pending_record,
+        decision="CONFIRM_AND_APPLY",
+        suffix="supplement-human-review",
+    )
+    confirm_review = formation.plan_pending_lifecycle_transition(
+        pending_uri,
+        LifecycleState.CONFIRMED,
+        tenant_id="t1",
+        owner_user_id="u1",
+        commit_group_id="supplement-human-review",
+        reason="human_confirmed_with_followup_evidence",
+        **review_binding,
+    )
+    committer.commit("u1", [confirm_review])
+
+    confirmed_archive = SessionArchive(
+        user_id="u1",
+        session_id="supplement-confirmed",
+        archive_uri="memoryos://user/u1/sessions/history/supplement-confirmed",
+        messages=[
+            {
+                "id": "confirmed-detail",
+                "role": "user",
+                "content": (
+                    "I confirm an additional supplement for the primary storage backend SQLite: "
+                    "the rationale is stable under load."
+                ),
+            }
+        ],
+        metadata={"tenant_id": "t1", "project_id": "memoryos"},
+        task_id="supplement-confirmed-task",
+    )
+    confirmed_episode = _persisted_episode(tmp_path, confirmed_archive)
+    confirmed = _supplement_proposal(
+        confirmed_episode,
+        "supplement-confirmed",
+        active,
+        speech_act=SpeechAct.CONFIRMATION,
+        commitment=Commitment.CONFIRMED,
+    )
+    rewritten = replace(
+        confirmed,
+        value_fields={"canonical_value": "SQLite", "rationale": "different reviewed content"},
+    )
+    with pytest.raises(ValueError, match="cannot rewrite pending identity or value fields"):
+        formation.plan_confirmed_pending_resolution(
+            pending_uri,
+            rewritten,
+            archive=confirmed_archive,
+            episode=confirmed_episode,
+            tenant_id="t1",
+            owner_user_id="u1",
+            commit_group_id="supplement-rewrite-attempt",
+            retrieval_views=["project:memoryos:decisions"],
+            **review_binding,
+        )
+    changed_relation = replace(
+        confirmed,
+        semantic=replace(confirmed.semantic, relation_to_existing=SemanticRelation.DUPLICATE),
+    )
+    with pytest.raises(ValueError, match="cannot change pending semantic relation"):
+        formation.plan_confirmed_pending_resolution(
+            pending_uri,
+            changed_relation,
+            archive=confirmed_archive,
+            episode=confirmed_episode,
+            tenant_id="t1",
+            owner_user_id="u1",
+            commit_group_id="supplement-relation-attempt",
+            retrieval_views=["project:memoryos:decisions"],
+            **review_binding,
+        )
+    changed_modal = replace(
+        confirmed,
+        semantic=replace(confirmed.semantic, modal_force=ModalForce.PREFER),
+    )
+    with pytest.raises(ValueError, match="cannot change pending proposition semantics"):
+        formation.plan_confirmed_pending_resolution(
+            pending_uri,
+            changed_modal,
+            archive=confirmed_archive,
+            episode=confirmed_episode,
+            tenant_id="t1",
+            owner_user_id="u1",
+            commit_group_id="supplement-modal-attempt",
+            retrieval_views=["project:memoryos:decisions"],
+            **review_binding,
+        )
+    resolved_plan = formation.plan_confirmed_pending_resolution(
+        pending_uri,
+        confirmed,
+        archive=confirmed_archive,
+        episode=confirmed_episode,
+        tenant_id="t1",
+        owner_user_id="u1",
+        commit_group_id="supplement-resolution-group",
+        retrieval_views=["project:memoryos:decisions"],
+        **review_binding,
+    )
+    resolution_operation = resolved_plan.operations[-1]
+    assert resolution_operation.payload["pending_lifecycle_resolution"] is True
+    assert resolution_operation.payload["canonical_pending_resolution"] is True
+    assert resolution_operation.payload["canonical_memory"] is True
+    assert resolution_operation.payload["transaction_id"] == resolved_plan.operations[0].payload["transaction_id"]
+    assert resolution_operation.payload["resolved_claim_uris"] == [active.uri]
+    original_write = source.write_object
+    fail_resolution = True
+
+    def write_with_resolution_failure(obj, content=""):  # noqa: ANN001, ANN202
+        nonlocal fail_resolution
+        if (
+            fail_resolution
+            and dict(obj.metadata or {}).get("canonical_kind") == "pending_proposal"
+            and obj.lifecycle_state == LifecycleState.RESOLVED
+        ):
+            fail_resolution = False
+            raise OSError("injected pending resolution write failure")
+        return original_write(obj, content)
+
+    monkeypatch.setattr(source, "write_object", write_with_resolution_failure)
+    with pytest.raises(OSError, match="pending resolution write failure"):
+        committer.commit("u1", list(resolved_plan.operations))
+    rolled_back = CanonicalMemoryRepository(source).load(identity)[1]
+    assert len(next(claim for claim in rolled_back if claim.claim_id == active.claim_id).revisions) == 1
+    assert CanonicalMemoryRepository(source).load_pending(
+        pending_uri,
+        tenant_id="t1",
+        owner_user_id="u1",
+    ).lifecycle_state == LifecycleState.CONFIRMED
+
+    monkeypatch.setattr(source, "write_object", original_write)
+    with pytest.raises(OutboxIntegrityError, match="terminal state"):
+        committer.commit("u1", list(resolved_plan.operations))
+    retry_plan = formation.plan_confirmed_pending_resolution(
+        pending_uri,
+        confirmed,
+        archive=confirmed_archive,
+        episode=confirmed_episode,
+        tenant_id="t1",
+        owner_user_id="u1",
+        commit_group_id="supplement-resolution-retry",
+        retrieval_views=["project:memoryos:decisions"],
+        **review_binding,
+    )
+    resolution_operation = retry_plan.operations[-1]
+    committed = committer.commit("u1", list(retry_plan.operations))
+    assert {operation.operation_id for operation in committed.operations} == {
+        operation.operation_id for operation in retry_plan.operations
+    }
+    repeated = committer.commit("u1", list(retry_plan.operations))
+    assert {operation.operation_id for operation in repeated.operations} == {
+        operation.operation_id for operation in retry_plan.operations
+    }
+
+    updated = next(
+        claim for claim in CanonicalMemoryRepository(source).load(identity)[1] if claim.claim_id == active.claim_id
+    )
+    assert len(updated.revisions) == 2
+    assert updated.current.state == "ACTIVE"
+    assert updated.current.qualifiers["display_fields"]["rationale"] == "stable under load"
+    pending_record = CanonicalMemoryRepository(source).load_pending(
+        pending_uri,
+        tenant_id="t1",
+        owner_user_id="u1",
+    )
+    assert pending_record.lifecycle_state == LifecycleState.RESOLVED
+    assert pending_record.lifecycle_revision == 3
+    assert pending_uri in index.indexed_uris()
+    assert source.read_object(pending_uri).metadata["admission"]["decision"] == "pending"
+    assert index.search(
+        "stable under load",
+        filters={"owner_user_id": "u1", "tenant_id": "t1"},
+    ) == []
+    assert resolution_operation.payload["resolution_idempotency_keys"]
+    assert all(
+        (_artifact_root(tmp_path) / "system" / "transactions" / f"{key}.json").exists()
+        for key in resolution_operation.payload["resolution_idempotency_keys"]
+    )

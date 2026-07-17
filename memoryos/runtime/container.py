@@ -4,39 +4,50 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, cast
 
+from memoryos.action_policy.integration.commit_registration import build_action_policy_commit_handlers
+from memoryos.adapters.agent_hooks.session_service import AgentSessionService
+from memoryos.adapters.persistence.filesystem import FileSystemSourceStore
+from memoryos.adapters.persistence.filesystem.session_archive import SessionArchiveStore
+from memoryos.adapters.persistence.sqlite import (
+    SQLiteIndexStore,
+    SQLiteLockStore,
+    SQLiteQueueStore,
+    SQLiteRelationStore,
+)
+from memoryos.application.context.maintenance import DerivedServingMaintenanceService
+from memoryos.application.context.reranking import Reranker
+from memoryos.application.session.commit_service import SessionCommitService
+from memoryos.application.session.context_projector import SessionContextProjector
+from memoryos.application.session.planners import ActionPolicyCommitPlanner, BehaviorCommitPlanner, MemoryCommitPlanner
 from memoryos.contextdb.context_db import ContextDB
 from memoryos.contextdb.retention import CatalogRetentionManager, RetentionPolicy
+from memoryos.contextdb.retrieval.embedding import EmbeddingProvider
 from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
-from memoryos.contextdb.session.commit_group import CommitGroupStore
-from memoryos.contextdb.session.context_projector import SessionContextProjector
-from memoryos.contextdb.session.planners import ActionPolicyCommitPlanner, BehaviorCommitPlanner, MemoryCommitPlanner
-from memoryos.contextdb.session.planning_envelope import PlanningEnvelopeStore
-from memoryos.contextdb.session.session_archive import SessionArchiveStore
-from memoryos.contextdb.session.session_commit import SessionCommitService
-from memoryos.contextdb.store import FileSystemSourceStore, IndexStore, RelationStore, SourceStore
-from memoryos.contextdb.store.source_store import LockStore, QueueStore
-from memoryos.contextdb.store.sqlite_index_store import SQLiteIndexStore
-from memoryos.contextdb.store.sqlite_lock_store import SQLiteLockStore
-from memoryos.contextdb.store.sqlite_queue_store import SQLiteQueueStore
-from memoryos.contextdb.store.sqlite_relation_store import SQLiteRelationStore
-from memoryos.contextdb.store.vector_store import (
+from memoryos.contextdb.session.evidence_encoder import register_session_evidence_encoder
+from memoryos.contextdb.store.index_store import IndexStore
+from memoryos.contextdb.store.lock_store import LockStore
+from memoryos.contextdb.store.queue_store import QueueStore
+from memoryos.contextdb.store.relation_store import RelationStore
+from memoryos.contextdb.store.source_store import SourceStore
+from memoryos.contextdb.store.vector import (
     VectorStore,
     require_production_vector_capabilities,
     vector_capabilities,
 )
 from memoryos.contextdb.tombstone import ProjectionTombstoneService
-from memoryos.contextdb.transaction.recovery import RecoveryService
 from memoryos.contextdb.unified_migration import (
-    CurrentSlotMigrationBackfill,
     RuntimeMigrationCoordinator,
     UnifiedContextMigration,
     has_existing_session_archive_evidence,
 )
+from memoryos.core.integrity import canonical_digest
 from memoryos.core.path_safety import validate_authoritative_tree
-from memoryos.memory.canonical.event import canonical_digest
+from memoryos.core.readiness import RuntimeReadiness, RuntimeReadinessState
+from memoryos.execution.action_executor import ActionExecutor
+from memoryos.execution.tool_registry import ToolRegistry
 from memoryos.memory.canonical.history import validate_canonical_receipt_history
 from memoryos.memory.canonical.identity import AliasRegistry
 from memoryos.memory.canonical.migration import MemoryClosureMigration
@@ -47,16 +58,28 @@ from memoryos.memory.canonical.review_command import validate_pending_review_com
 from memoryos.memory.canonical.salience_ledger import DurableSalienceLedger
 from memoryos.memory.canonical.slot_projection import CurrentSlotProjection
 from memoryos.memory.canonical.visibility import reconcile_committed_relation_store
+from memoryos.memory.integration.archive_reader import (
+    register_session_evidence_archive_reader_factory,
+)
+from memoryos.memory.integration.commit_registration import build_memory_commit_handlers
+from memoryos.memory.integration.context_overlay import CanonicalMemoryContextOverlay
+from memoryos.memory.integration.current_slot_backfill import CurrentSlotMigrationBackfill
+from memoryos.memory.integration.index_policy import CanonicalMemoryIndexPolicy
+from memoryos.memory.integration.planning_envelope import PlanningEnvelopeStore
+from memoryos.memory.integration.relation_policy import CanonicalMemoryRelationPolicy
+from memoryos.memory.integration.retrieval_policy import CanonicalMemoryRetrievalPolicy
+from memoryos.memory.integration.session_evidence import CanonicalSessionEvidenceEncoder
+from memoryos.operations.commit.commit_group import CommitGroupStore
+from memoryos.operations.commit.domain_registry import (
+    register_action_policy_commit_handlers,
+    register_memory_commit_handlers,
+)
 from memoryos.operations.commit.operation_committer import OperationCommitter
 from memoryos.operations.commit.planning_proof import ImmutablePlanningProofStore
+from memoryos.operations.commit.recovery import RecoveryService
 from memoryos.prediction.model.prediction_ledger import PredictionLedger
-from memoryos.prediction.pipeline.executor import ActionExecutor
 from memoryos.prediction.pipeline.prediction_engine import PredictionEngine
-from memoryos.providers.embedding import EmbeddingProvider
-from memoryos.providers.rerank import Reranker
 from memoryos.runtime.config import RuntimeConfig
-from memoryos.runtime.readiness import RuntimeReadiness, RuntimeReadinessState
-from memoryos.skill.tool_registry import ToolRegistry
 from memoryos.workers.recovery_worker import RecoveryWorker
 
 
@@ -83,6 +106,7 @@ class RuntimeContainer:
     recovery_service: RecoveryService
     recovery_worker: RecoveryWorker
     readiness: RuntimeReadiness
+    agent_session_service: AgentSessionService = field(init=False)
     tombstone_service: ProjectionTombstoneService | None = None
     retention_manager: CatalogRetentionManager | None = None
     migration_gate: RuntimeMigrationCoordinator | None = None
@@ -127,9 +151,17 @@ def build_runtime_container(
         raise TypeError("memory_extractor must be an LLM MemorySemanticProposal backend")
     root_path = config.root_path
     readiness = RuntimeReadiness()
+    domain_overlay = CanonicalMemoryContextOverlay()
+    index_policy = CanonicalMemoryIndexPolicy()
+    retrieval_policy = CanonicalMemoryRetrievalPolicy()
+    relation_domain_policy = CanonicalMemoryRelationPolicy()
     root_path.mkdir(parents=True, exist_ok=True, mode=0o700)
     root_path.chmod(0o700)
-    source = source_store or FileSystemSourceStore(root_path, tenant_id=config.tenant_id)
+    source = source_store or FileSystemSourceStore(
+        root_path,
+        tenant_id=config.tenant_id,
+        domain_classifier=domain_overlay,
+    )
     if hasattr(source, "__dict__"):
         vars(source)["readiness"] = readiness
     source_tenant = getattr(source, "tenant_id", config.tenant_id)
@@ -138,11 +170,16 @@ def build_runtime_container(
     tenant_root = root_path if config.tenant_id == "default" else root_path / "tenants" / config.tenant_id
     tenant_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     tenant_root.chmod(0o700)
+    agent_session_service = AgentSessionService(str(root_path), tenant_id=config.tenant_id)
     index_root = tenant_root / "indexes"
     index = index_store or SQLiteIndexStore(index_root / "context.sqlite3")
     relation = relation_store or SQLiteRelationStore(index_root / "relations.sqlite3")
+    for domain_aware_store in (source, index, relation):
+        if hasattr(domain_aware_store, "domain_classifier"):
+            cast(Any, domain_aware_store).domain_classifier = domain_overlay
     queue = queue_store or SQLiteQueueStore(tenant_root / "queues" / "jobs.sqlite3")
     lock = lock_store or SQLiteLockStore(root_path / "system" / "locks.sqlite3")
+    register_session_evidence_encoder(CanonicalSessionEvidenceEncoder())
     session_archive_store = SessionArchiveStore(root_path, tenant_id=config.tenant_id)
     has_preexisting_session_evidence = has_existing_session_archive_evidence(
         session_archive_store,
@@ -175,7 +212,11 @@ def build_runtime_container(
         configured_vector_capabilities = require_production_vector_capabilities(configured_vector_store)
     search = hybrid_search or (
         HybridSearch(
-            index, vector_store=configured_vector_store, embedding_provider=configured_embedding, source_store=source
+            index,
+            vector_store=configured_vector_store,
+            embedding_provider=configured_embedding,
+            source_store=source,
+            domain_policy=retrieval_policy,
         )
         if configured_vector_store is not None and configured_embedding is not None
         else None
@@ -191,6 +232,11 @@ def build_runtime_container(
         else None
     )
     aliases = AliasRegistry(config.memory_aliases)
+    register_session_evidence_archive_reader_factory(SessionArchiveStore)
+    register_memory_commit_handlers(
+        build_memory_commit_handlers(session_evidence_reader_factory=SessionArchiveStore)
+    )
+    register_action_policy_commit_handlers(build_action_policy_commit_handlers())
     committer = OperationCommitter(
         source,
         index,
@@ -273,6 +319,7 @@ def build_runtime_container(
             extractor=config.memory_extractor,
             egress_policy=config.memory_egress_policy,
             alias_registry=aliases,
+            archive_store=session_archive_store,
         ),
         behavior_planner=BehaviorCommitPlanner(index_store=index, source_store=source),
         action_policy_planner=ActionPolicyCommitPlanner(index_store=index, source_store=source),
@@ -315,6 +362,28 @@ def build_runtime_container(
         migration_gate=migration_gate,
         unified_context_migration=unified_context_migration,
         readiness=readiness,
+    )
+    context_db._configure_extensions(
+        domain_overlay=domain_overlay,
+        index_policy=index_policy,
+        relation_domain_policy=relation_domain_policy,
+        administration_service=DerivedServingMaintenanceService(
+            source,
+            index,
+            relation,
+            queue_store=queue,
+            projection_store=projection_store,
+            canonical_projector=canonical_projector,
+            current_slot_projector=current_slot_projector,
+            retention_manager=retention_manager,
+            migration_gate=migration_gate,
+            unified_context_migration=unified_context_migration,
+            readiness=readiness,
+            domain_overlay=domain_overlay,
+            index_policy=index_policy,
+            serving_lock=context_db.serving_lock,
+            relation_domain_policy=relation_domain_policy,
+        ),
     )
     engine = PredictionEngine(
         index,
@@ -579,7 +648,7 @@ def build_runtime_container(
         )
     else:
         readiness.transition(RuntimeReadinessState.READY, details=startup_details)
-    return RuntimeContainer(
+    container = RuntimeContainer(
         source_store=source,
         index_store=index,
         relation_store=relation,
@@ -604,6 +673,8 @@ def build_runtime_container(
         migration_gate=migration_gate,
         unified_context_migration=unified_context_migration,
     )
+    container.agent_session_service = agent_session_service
+    return container
 
 
 def _replay_startup_projection_tombstones(

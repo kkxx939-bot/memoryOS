@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from memoryos.contextdb.store.source_store import IndexHit
+from memoryos.contextdb.store.index_store import IndexHit
 
 
 class ContextReranker:

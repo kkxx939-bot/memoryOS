@@ -6,14 +6,14 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from memoryos.api.trusted_context import (
+from memoryos.connect import ConnectMetadata, ConnectType, PipelineMode
+from memoryos.security.trusted_context import (
     DEFAULT_AGENT_CAPABILITIES,
     TrustedRequestContext,
     capabilities_from_csv,
     scope_keys_from_csv,
     workspace_ids_from_csv,
 )
-from memoryos.connect import ConnectMetadata, ConnectType, PipelineMode
 
 DEFAULT_AGENT_ADAPTERS = ("codex", "claude_code", "cursor", "windsurf", "cline", "continue", "generic_agent")
 

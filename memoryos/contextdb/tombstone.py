@@ -9,8 +9,9 @@ from typing import Any
 
 from memoryos.contextdb.catalog import CatalogRecord
 from memoryos.contextdb.model.lifecycle import LifecycleState
-from memoryos.contextdb.store.source_store import RelationStore, SourceStore
-from memoryos.contextdb.store.vector_store import VectorStore, vector_capabilities, vector_row_id
+from memoryos.contextdb.store.relation_store import RelationStore
+from memoryos.contextdb.store.source_store import SourceStore
+from memoryos.contextdb.store.vector import VectorStore, vector_capabilities, vector_row_id
 
 
 @dataclass(frozen=True)

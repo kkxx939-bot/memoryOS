@@ -7,14 +7,14 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from memoryos.contextdb.session.planning_envelope import (
+from memoryos.core.ids import require_safe_path_segment
+from memoryos.core.integrity import canonical_digest
+from memoryos.core.path_safety import DurablePathIntegrityError, require_safe_artifact_path
+from memoryos.memory.canonical.current_head import iter_current_head_uris, load_current_head
+from memoryos.memory.integration.planning_envelope import (
     PlanningEnvelopeIntegrityError,
     PlanningEnvelopeStore,
 )
-from memoryos.core.ids import require_safe_path_segment
-from memoryos.core.path_safety import DurablePathIntegrityError, require_safe_artifact_path
-from memoryos.memory.canonical.current_head import iter_current_head_uris, load_current_head
-from memoryos.memory.canonical.event import canonical_digest
 from memoryos.operations.commit.outbox_envelope import (
     OutboxIntegrityError,
     prepared_intent_digest,

@@ -3,225 +3,28 @@
 from __future__ import annotations
 
 import json
-import os
-import stat
-import uuid
+import os as os
 from pathlib import Path
 from typing import Any
 
 from memoryos.contextdb.model.context_relation import ContextRelation
 from memoryos.contextdb.model.lifecycle import LifecycleState
-from memoryos.contextdb.store.source_store import RelationStore, SourceStore
-from memoryos.core.path_safety import DurablePathIntegrityError
-from memoryos.core.time import utc_now
-from memoryos.memory.canonical.event import canonical_digest, canonical_json
+from memoryos.contextdb.store.relation_store import RelationStore
+from memoryos.contextdb.store.source_store import SourceStore
+from memoryos.core.clock import utc_now
+from memoryos.core.durable_io.atomic_file import (
+    ImmutableArtifactConflictError as ImmutableArtifactConflictError,
+)
+from memoryos.core.durable_io.atomic_file import atomic_create_bytes as atomic_create_bytes
+from memoryos.core.durable_io.atomic_json import atomic_create_json as atomic_create_json
+from memoryos.core.durable_io.atomic_json import atomic_write_json as atomic_write_json
+from memoryos.core.integrity import canonical_digest, canonical_json
 
 EFFECT_MARKER_SCHEMA_VERSION = "effect_marker_v1"
 
 
 class EffectProofError(RuntimeError):
     """A durable marker cannot prove the SourceStore effects it claims."""
-
-
-class ImmutableArtifactConflictError(ValueError):
-    """A create-only artifact identity is already bound to different bytes."""
-
-
-def _open_control_parent(path: Path, artifact_root: str | Path) -> int:
-    """Open the destination parent with an openat/O_NOFOLLOW directory walk."""
-
-    candidate = Path(path).expanduser().absolute()
-    boundary = Path(artifact_root).expanduser().absolute()
-    if boundary.is_symlink():
-        raise DurablePathIntegrityError("artifact root cannot be a symbolic link")
-    resolved_boundary = boundary.resolve()
-    try:
-        relative_parent = candidate.parent.relative_to(boundary)
-    except ValueError:
-        try:
-            relative_parent = candidate.parent.relative_to(resolved_boundary)
-            boundary = resolved_boundary
-        except ValueError as exc:
-            raise DurablePathIntegrityError("artifact path is outside its artifact root") from exc
-    if any(part in {"", ".", ".."} for part in relative_parent.parts):
-        raise DurablePathIntegrityError("artifact path contains an unsafe directory segment")
-    boundary.mkdir(parents=True, exist_ok=True, mode=0o700)
-    try:
-        boundary.chmod(0o700)
-    except OSError:
-        pass
-    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        directory_descriptor = os.open(boundary, directory_flags)
-    except OSError as exc:
-        raise DurablePathIntegrityError("artifact root is not a safe directory") from exc
-    try:
-        for part in relative_parent.parts:
-            try:
-                os.mkdir(part, 0o700, dir_fd=directory_descriptor)
-            except FileExistsError:
-                pass
-            # A durable file is not sufficient if one of its newly-created
-            # parent directory entries can disappear after a power loss.
-            # Sync each parent before descending so the final artifact has a
-            # fully durable path, not merely durable bytes.
-            os.fsync(directory_descriptor)
-            try:
-                child = os.open(part, directory_flags, dir_fd=directory_descriptor)
-            except OSError as exc:
-                raise DurablePathIntegrityError(
-                    "artifact path cannot traverse a symbolic link or non-directory"
-                ) from exc
-            os.close(directory_descriptor)
-            directory_descriptor = child
-            try:
-                os.fchmod(directory_descriptor, 0o700)
-            except OSError:
-                pass
-        return directory_descriptor
-    except BaseException:
-        os.close(directory_descriptor)
-        raise
-
-
-def _read_regular_file_at(directory_descriptor: int, name: str) -> bytes:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(name, flags, dir_fd=directory_descriptor)
-    except OSError as exc:
-        raise ImmutableArtifactConflictError(
-            "immutable artifact collision is unreadable or not a regular file"
-        ) from exc
-    try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise ImmutableArtifactConflictError("immutable artifact collision is not a regular file")
-        chunks: list[bytes] = []
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
-            if not chunk:
-                return b"".join(chunks)
-            chunks.append(chunk)
-    finally:
-        os.close(descriptor)
-
-
-def atomic_create_bytes(
-    path: Path,
-    encoded: bytes,
-    *,
-    artifact_root: str | Path,
-) -> bool:
-    """Create an immutable file exactly once without a check/replace race.
-
-    A hard-link publication is used because it is an atomic no-overwrite
-    operation on the destination directory.  Replaying identical bytes is a
-    no-op; a different payload for the same identity fails closed.
-    """
-
-    try:
-        parent_descriptor = _open_control_parent(path, artifact_root)
-    except DurablePathIntegrityError as exc:
-        raise ImmutableArtifactConflictError(str(exc)) from exc
-    temporary_name = f".{path.name}.{uuid.uuid4().hex}.tmp"
-    try:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(temporary_name, flags, 0o600, dir_fd=parent_descriptor)
-        try:
-            view = memoryview(encoded)
-            while view:
-                written = os.write(descriptor, view)
-                if written <= 0:  # pragma: no cover - defensive OS contract.
-                    raise OSError("immutable artifact write made no progress")
-                view = view[written:]
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        try:
-            os.link(
-                temporary_name,
-                path.name,
-                src_dir_fd=parent_descriptor,
-                dst_dir_fd=parent_descriptor,
-                follow_symlinks=False,
-            )
-        except FileExistsError:
-            if _read_regular_file_at(parent_descriptor, path.name) != encoded:
-                raise ImmutableArtifactConflictError(
-                    "immutable artifact identity conflicts with different content"
-                ) from None
-            return False
-        os.fsync(parent_descriptor)
-        return True
-    finally:
-        try:
-            os.unlink(temporary_name, dir_fd=parent_descriptor)
-        except FileNotFoundError:
-            pass
-        os.close(parent_descriptor)
-
-
-def atomic_create_json(
-    path: Path,
-    payload: dict[str, Any],
-    *,
-    artifact_root: str | Path,
-) -> bool:
-    """Create one canonical JSON artifact without ever replacing it."""
-
-    return atomic_create_bytes(
-        path,
-        canonical_json(payload).encode("utf-8"),
-        artifact_root=artifact_root,
-    )
-
-
-def atomic_write_json(
-    path: Path,
-    payload: dict[str, Any],
-    *,
-    artifact_root: str | Path,
-) -> None:
-    """Publish one JSON file without exposing a partial control record."""
-
-    try:
-        parent_descriptor = _open_control_parent(path, artifact_root)
-    except DurablePathIntegrityError as exc:
-        raise ValueError(str(exc)) from exc
-    temporary_name = f".{path.name}.{uuid.uuid4().hex}.tmp"
-    encoded = canonical_json(payload).encode("utf-8")
-    try:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(temporary_name, flags, 0o600, dir_fd=parent_descriptor)
-        try:
-            view = memoryview(encoded)
-            while view:
-                written = os.write(descriptor, view)
-                if written <= 0:  # pragma: no cover - defensive OS contract.
-                    raise OSError("JSON artifact write made no progress")
-                view = view[written:]
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        try:
-            existing = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
-        except FileNotFoundError:
-            existing = None
-        if existing is not None and not stat.S_ISREG(existing.st_mode):
-            raise ValueError("JSON control path cannot be a symbolic link or non-regular file")
-        os.replace(
-            temporary_name,
-            path.name,
-            src_dir_fd=parent_descriptor,
-            dst_dir_fd=parent_descriptor,
-        )
-        os.fsync(parent_descriptor)
-    finally:
-        try:
-            os.unlink(temporary_name, dir_fd=parent_descriptor)
-        except FileNotFoundError:
-            pass
-        os.close(parent_descriptor)
 
 
 def relation_identity(spec: dict[str, Any]) -> dict[str, str]:

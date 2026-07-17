@@ -7,11 +7,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-from memoryos.api.sdk.client import MemoryOSClient
-from memoryos.core.time import utc_now
-from memoryos.operations.commit.effect_marker import atomic_write_json
-from memoryos.operations.commit.quarantine import list_quarantine_records
-from memoryos.runtime.readiness import RuntimeNotReadyError
+from memoryos.core.clock import utc_now
+from memoryos.core.durable_io import atomic_write_json
+from memoryos.core.durable_io.quarantine import list_quarantine_records
+from memoryos.core.readiness import RuntimeNotReadyError
+from memoryos.workers.contracts import WorkerRuntime
 from memoryos.workers.embedding_worker import EmbeddingWorker
 from memoryos.workers.memory_proposal_worker import MemoryProposalWorker
 from memoryos.workers.semantic_worker import SemanticWorker
@@ -23,7 +23,7 @@ class WorkerRunner:
 
     def __init__(
         self,
-        client: MemoryOSClient,
+        client: WorkerRuntime,
         *,
         poll_interval: float = 1.0,
         batch_size: int = 10,

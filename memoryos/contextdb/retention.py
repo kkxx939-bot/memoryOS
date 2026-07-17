@@ -15,7 +15,7 @@ from memoryos.contextdb.catalog import (
     normalize_tree_path,
 )
 from memoryos.contextdb.layers.layer_generator import l0_abstract, l1_overview
-from memoryos.contextdb.store.vector_store import vector_row_id
+from memoryos.contextdb.store.vector import vector_row_id
 from memoryos.security.context_projection import ContextProjectionSanitizer
 
 

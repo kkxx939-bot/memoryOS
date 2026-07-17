@@ -8,7 +8,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum
 
-from memoryos.adapters.agent_hooks.sanitizer import ENV_SECRET_RE, INLINE_SECRET_RE, PRIVATE_KEY_RE, SECRET_KEY_RE
 from memoryos.memory.canonical.episode import EvidenceEpisode
 from memoryos.memory.canonical.evidence import ProposalValidationResult
 from memoryos.memory.canonical.proposal import (
@@ -25,6 +24,7 @@ from memoryos.memory.canonical.semantic import (
     MemoryTypeEligibilityPolicy,
 )
 from memoryos.memory.schema import MemoryType, MemoryTypeRegistry
+from memoryos.security.sanitization import ENV_SECRET_RE, INLINE_SECRET_RE, PRIVATE_KEY_RE, SECRET_KEY_RE
 
 _PRIVATE_PROCESS_RE = re.compile(
     r"(?i)\b(chain of thought|scratchpad|internal reasoning|agent private|内部推理|草稿)\b"

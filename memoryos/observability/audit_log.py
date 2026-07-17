@@ -6,7 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from memoryos.core.time import utc_now
+from memoryos.core.clock import utc_now
 from memoryos.security.path_safety import validate_identifier
 
 

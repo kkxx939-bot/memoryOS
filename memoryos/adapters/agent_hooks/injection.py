@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from memoryos.adapters.agent_hooks.sanitizer import sanitize_text
+from memoryos.security.sanitization import sanitize_text
 
 
 class MemoryOSContextRenderer:

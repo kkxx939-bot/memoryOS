@@ -6,8 +6,8 @@ import json
 import os
 from pathlib import Path
 
+from memoryos.core.clock import utc_now
 from memoryos.core.ids import require_safe_path_segment
-from memoryos.core.time import utc_now
 
 
 class AuditWriter:

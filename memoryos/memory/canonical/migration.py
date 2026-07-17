@@ -9,31 +9,32 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 from memoryos.contextdb.model.context_object import ContextObject
-from memoryos.contextdb.session.planning_envelope import (
-    PLANNING_ENVELOPE_ANCHOR_SCHEMA_VERSION,
-    PLANNING_ENVELOPE_SCHEMA_VERSION,
-    PlanningEnvelopeIntegrityError,
-    PlanningEnvelopeStore,
-    validate_planning_envelope_payload,
-)
-from memoryos.contextdb.store.source_store import RelationStore, SourceStore
+from memoryos.contextdb.store.relation_store import RelationStore
+from memoryos.contextdb.store.source_store import SourceStore
+from memoryos.core.durable_io import atomic_create_json, atomic_write_json
+from memoryos.core.durable_io.quarantine import quarantine_control_file
+from memoryos.core.integrity import canonical_digest
 from memoryos.memory.canonical.current_head import (
     iter_current_head_uris,
     load_current_head,
     publish_current_head_sets,
     receipt_history_contains_uri,
 )
-from memoryos.memory.canonical.event import canonical_digest
 from memoryos.memory.canonical.projection_state import (
     ProjectionIntegrityError,
     ProjectionRecord,
     ProjectionRecordStore,
 )
 from memoryos.memory.canonical.visibility import read_committed_canonical
+from memoryos.memory.integration.planning_envelope import (
+    PLANNING_ENVELOPE_ANCHOR_SCHEMA_VERSION,
+    PLANNING_ENVELOPE_SCHEMA_VERSION,
+    PlanningEnvelopeIntegrityError,
+    PlanningEnvelopeStore,
+    validate_planning_envelope_payload,
+)
 from memoryos.operations.commit.effect_marker import (
     EFFECT_MARKER_SCHEMA_VERSION,
-    atomic_create_json,
-    atomic_write_json,
 )
 from memoryos.operations.commit.outbox_envelope import (
     OutboxIntegrityError,
@@ -44,7 +45,6 @@ from memoryos.operations.commit.planning_proof import (
     ImmutablePlanningProofStore,
     PlanningProofIntegrityError,
 )
-from memoryos.operations.commit.quarantine import quarantine_control_file
 from memoryos.operations.commit.receipt import (
     TRANSACTION_RECEIPT_SCHEMA_VERSION,
     build_transaction_receipt,

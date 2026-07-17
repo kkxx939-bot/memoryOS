@@ -7,10 +7,10 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from memoryos.core.durable_io import atomic_write_json
+from memoryos.core.durable_io.quarantine import QuarantineRecord, quarantine_control_file
 from memoryos.core.ids import require_safe_path_segment
-from memoryos.memory.canonical.event import canonical_digest
-from memoryos.operations.commit.effect_marker import atomic_write_json
-from memoryos.operations.commit.quarantine import QuarantineRecord, quarantine_control_file
+from memoryos.core.integrity import canonical_digest
 from memoryos.operations.model.context_operation import ContextOperation
 
 

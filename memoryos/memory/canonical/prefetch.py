@@ -8,7 +8,9 @@ from typing import Any
 
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
-from memoryos.contextdb.store.source_store import IndexStore, RelationStore, SourceStore
+from memoryos.contextdb.store.index_store import IndexStore
+from memoryos.contextdb.store.relation_store import RelationStore
+from memoryos.contextdb.store.source_store import SourceStore
 from memoryos.memory.canonical.episode import EvidenceEpisode
 from memoryos.memory.canonical.scope import MemoryScope
 from memoryos.memory.canonical.state import materialized_current_revision_payload

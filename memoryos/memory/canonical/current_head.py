@@ -8,10 +8,10 @@ from pathlib import Path
 from typing import Any
 
 from memoryos.contextdb.model.context_object import ContextObject
+from memoryos.core.durable_io import atomic_write_json
 from memoryos.core.ids import require_safe_path_segment
+from memoryos.core.integrity import canonical_digest
 from memoryos.core.path_safety import DurablePathIntegrityError, require_safe_artifact_path
-from memoryos.memory.canonical.event import canonical_digest
-from memoryos.operations.commit.effect_marker import atomic_write_json
 from memoryos.operations.commit.receipt import (
     TRANSACTION_RECEIPT_SCHEMA_VERSION,
     ReceiptIntegrityError,

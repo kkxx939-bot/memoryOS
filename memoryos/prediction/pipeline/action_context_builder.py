@@ -8,15 +8,14 @@ from memoryos.action_policy.model.action_policy import ActionCandidate, ActionPo
 from memoryos.contextdb.layers.context_packer import ContextPacker
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.model.lifecycle import LifecycleState
-from memoryos.contextdb.store.source_store import (
-    IndexHit,
-    IndexStore,
-    RelationStore,
-    SourceStore,
+from memoryos.contextdb.store.index_store import IndexHit, IndexStore
+from memoryos.contextdb.store.relation_store import RelationStore
+from memoryos.contextdb.store.source_store import SourceStore
+from memoryos.memory.canonical.visibility import committed_content, read_committed_canonical
+from memoryos.memory.integration.classification import (
     is_canonical_memory_object,
     is_canonical_memory_uri,
 )
-from memoryos.memory.canonical.visibility import committed_content, read_committed_canonical
 from memoryos.prediction.model.action_context import ActionContext
 
 

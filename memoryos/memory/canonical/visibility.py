@@ -10,12 +10,9 @@ from typing import Any, NoReturn
 
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_relation import ContextRelation
-from memoryos.contextdb.store.source_store import (
-    RelationStore,
-    SourceStore,
-    is_canonical_memory_object,
-    is_canonical_memory_uri,
-)
+from memoryos.contextdb.store.relation_store import RelationStore
+from memoryos.contextdb.store.source_store import SourceStore
+from memoryos.core.integrity import canonical_digest, canonical_json
 from memoryos.memory.canonical.current_head import (
     CurrentHeadIntegrityError,
     artifact_root_for,
@@ -27,7 +24,10 @@ from memoryos.memory.canonical.current_head import (
     validate_current_head_set,
     validate_current_head_set_path,
 )
-from memoryos.memory.canonical.event import canonical_digest, canonical_json
+from memoryos.memory.integration.classification import (
+    is_canonical_memory_object,
+    is_canonical_memory_uri,
+)
 from memoryos.operations.commit.effect_marker import marker_proves_relation, normalized_relation
 from memoryos.operations.commit.receipt import ReceiptIntegrityError, receipt_snapshot
 from memoryos.operations.commit.redo_log import RedoControlFileError, RedoLog

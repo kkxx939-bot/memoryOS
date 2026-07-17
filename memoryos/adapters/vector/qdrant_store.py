@@ -1,7 +1,5 @@
-"""适配器里的Qdrant存储。"""
+"""Compatibility export for the historical Qdrant adapter path."""
 
-from memoryos.contextdb.store.vector_store import InMemoryVectorStore
-
-QdrantStore = InMemoryVectorStore
+from memoryos.adapters.vector.qdrant import QdrantStore
 
 __all__ = ["QdrantStore"]

@@ -6,7 +6,7 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-from memoryos.contextdb.store.source_store import LockStore, LockToken
+from memoryos.contextdb.store.lock_store import LockStore, LockToken
 
 
 @dataclass(frozen=True)

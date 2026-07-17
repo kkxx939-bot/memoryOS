@@ -1,9 +1,5 @@
-"""核心工具里的时间。"""
+"""Compatibility import for the historical clock path."""
 
-from __future__ import annotations
+from memoryos.core.clock import utc_now
 
-from datetime import datetime, timezone
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+__all__ = ["utc_now"]

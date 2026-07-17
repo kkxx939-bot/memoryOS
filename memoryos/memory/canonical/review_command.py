@@ -11,10 +11,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from memoryos.core.clock import utc_now
+from memoryos.core.durable_io import atomic_write_json
 from memoryos.core.file_lock import open_private_lock
-from memoryos.core.time import utc_now
-from memoryos.memory.canonical.event import canonical_digest
-from memoryos.operations.commit.effect_marker import atomic_write_json
+from memoryos.core.integrity import canonical_digest
 
 PENDING_REVIEW_COMMAND_SCHEMA_VERSION = "pending_review_command_v1"
 

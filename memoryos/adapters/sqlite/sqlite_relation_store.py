@@ -1,5 +1,8 @@
-"""适配器里的SQLite关系存储。"""
+"""Compatibility exports for the canonical SQLite relation adapter path."""
 
-from memoryos.contextdb.store.sqlite_relation_store import SQLiteRelationStore as SqliteRelationStore
+from memoryos.adapters.persistence.sqlite.relation_store import (
+    SQLiteRelationStore,
+    SqliteRelationStore,
+)
 
-__all__ = ["SqliteRelationStore"]
+__all__ = ["SQLiteRelationStore", "SqliteRelationStore"]

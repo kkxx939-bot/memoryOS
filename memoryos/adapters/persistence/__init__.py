@@ -1,0 +1,1 @@
+"""Persistent infrastructure adapters."""

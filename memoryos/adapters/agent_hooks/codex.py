@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from memoryos.adapters.agent_hooks.base import BaseAgentHookAdapter, HookResult
+from memoryos.adapters.agent_hooks.composition import build_agent_hook_transport
 from memoryos.adapters.agent_hooks.config import AgentHookConfig
 from memoryos.adapters.agent_hooks.contracts import CodexPayloadParser
 
@@ -12,7 +13,8 @@ from memoryos.adapters.agent_hooks.contracts import CodexPayloadParser
 class CodexHookAdapter(BaseAgentHookAdapter):
     @classmethod
     def from_env(cls) -> CodexHookAdapter:
-        return cls(AgentHookConfig.from_env("codex"))
+        config = AgentHookConfig.from_env("codex")
+        return cls(config, mcp_client=build_agent_hook_transport(config))
 
     def handle(self, hook_name: str, payload: dict[str, Any] | None) -> HookResult:
         event = CodexPayloadParser().parse(payload, hook_name=hook_name, user_id=self.config.user_id)

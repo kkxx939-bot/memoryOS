@@ -4,14 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from memoryos.contextdb.model.lifecycle import LifecycleState
-from memoryos.contextdb.store.source_store import (
-    IndexStore,
-    RelationStore,
-    SourceStore,
-    is_canonical_memory_object,
-    is_canonical_memory_uri,
+from memoryos.contextdb.extensions import (
+    ContextDomainClassifier,
+    ContextIndexPolicy,
+    NoContextIndexPolicy,
+    NoDomainOverlay,
 )
+from memoryos.contextdb.model.lifecycle import LifecycleState
+from memoryos.contextdb.store.index_store import IndexStore
+from memoryos.contextdb.store.relation_store import RelationStore
+from memoryos.contextdb.store.source_store import SourceStore
 
 
 @dataclass(frozen=True)
@@ -27,17 +29,27 @@ class ConsistencyReport:
 
 
 class ConsistencyVerifier:
-    def __init__(self, source_store: SourceStore, index_store: IndexStore, relation_store: RelationStore | None = None) -> None:
+    def __init__(
+        self,
+        source_store: SourceStore,
+        index_store: IndexStore,
+        relation_store: RelationStore | None = None,
+        *,
+        domain_classifier: ContextDomainClassifier | None = None,
+        index_policy: ContextIndexPolicy | None = None,
+    ) -> None:
         self.source_store = source_store
         self.index_store = index_store
         self.relation_store = relation_store
+        self.domain_classifier = domain_classifier or NoDomainOverlay()
+        self.index_policy = index_policy or NoContextIndexPolicy()
 
     def verify(self) -> ConsistencyReport:
         tenant_id = str(getattr(self.source_store, "tenant_id", "default") or "default")
         objects = [
             obj
             for obj in self.source_store.list_objects()
-            if not is_canonical_memory_object(obj)
+            if not self.domain_classifier.owns_object(obj)
         ]
         source_uris = {obj.uri for obj in objects}
         missing_index = []
@@ -61,7 +73,11 @@ class ConsistencyVerifier:
         indexed_uris = {
             uri
             for uri in getattr(self.index_store, "indexed_uris", lambda: [])()
-            if not self._canonical_uri(uri)
+            if not self.index_policy.owns_index_entry(
+                self.source_store,
+                uri,
+                self.index_store.get_index_metadata(uri),
+            )
         }
         orphan_index = sorted(uri for uri in indexed_uris if uri not in source_uris)
         broken_relations = self._broken_relations(source_uris, tenant_id=tenant_id)
@@ -80,7 +96,9 @@ class ConsistencyVerifier:
             for relation in self.relation_store.relations_of(uri, tenant_id=tenant_id):
                 if self._global_uri(relation.source_uri) or self._global_uri(relation.target_uri):
                     continue
-                if self._canonical_uri(relation.source_uri) or self._canonical_uri(relation.target_uri):
+                if self.domain_classifier.owns_uri(
+                    relation.source_uri
+                ) or self.domain_classifier.owns_uri(relation.target_uri):
                     continue
                 if relation.source_uri not in source_uris or relation.target_uri not in source_uris:
                     broken.append(relation.to_dict())
@@ -88,7 +106,3 @@ class ConsistencyVerifier:
 
     def _global_uri(self, uri: str) -> bool:
         return uri.startswith(("memoryos://resources/", "memoryos://skills/"))
-
-    @staticmethod
-    def _canonical_uri(uri: str) -> bool:
-        return is_canonical_memory_uri(uri)

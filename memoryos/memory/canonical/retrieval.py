@@ -22,9 +22,11 @@ from typing import Any
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.model.lifecycle import LifecycleState
 from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
-from memoryos.contextdb.store.source_store import IndexStore, RelationStore, SourceStore
-from memoryos.contextdb.store.sqlite_index_store import lexical_match_count, lexical_terms
-from memoryos.memory.canonical.event import canonical_digest, canonical_json
+from memoryos.contextdb.retrieval.lexical import lexical_match_count, lexical_terms
+from memoryos.contextdb.store.index_store import IndexStore
+from memoryos.contextdb.store.relation_store import RelationStore
+from memoryos.contextdb.store.source_store import SourceStore
+from memoryos.core.integrity import canonical_digest, canonical_json
 from memoryos.memory.canonical.identity import IDENTITY_ALGORITHM_V2
 from memoryos.memory.canonical.projection_state import (
     ProjectionIntegrityError,

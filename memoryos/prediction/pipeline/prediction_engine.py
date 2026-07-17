@@ -6,16 +6,18 @@ from memoryos.action_policy.model.action_policy import ActionPolicy
 from memoryos.action_policy.ranking.action_policy_ranker import ActionPolicyRanker
 from memoryos.action_policy.retrieval import ActionPolicyRetriever
 from memoryos.behavior.retrieval.similar_behavior_retriever import SimilarBehaviorRetriever
+from memoryos.contextdb.retrieval.embedding import EmbeddingProvider
 from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
-from memoryos.contextdb.store.source_store import IndexStore, RelationStore, SourceStore
-from memoryos.contextdb.store.vector_store import VectorStore
+from memoryos.contextdb.store.index_store import IndexStore
+from memoryos.contextdb.store.relation_store import RelationStore
+from memoryos.contextdb.store.source_store import SourceStore
+from memoryos.contextdb.store.vector import VectorStore
 from memoryos.prediction.model.prediction_ledger import PredictionLedger
 from memoryos.prediction.model.prediction_request import PredictionRequest
 from memoryos.prediction.model.prediction_result import PredictionResult
 from memoryos.prediction.pipeline.action_context_builder import ActionContextBuilder
 from memoryos.prediction.pipeline.observation_normalizer import ObservationNormalizer
 from memoryos.prediction.pipeline.policy_gate import PolicyGate
-from memoryos.providers.embedding import EmbeddingProvider
 
 
 class PredictionEngine:

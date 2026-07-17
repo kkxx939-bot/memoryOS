@@ -1,15 +1,8 @@
-"""向量服务的基础接口。"""
+"""Built-in no-op embedding provider and historical protocol export."""
 
 from __future__ import annotations
 
-from typing import Protocol
-
-
-class EmbeddingProvider(Protocol):
-    model_name: str
-    dimension: int
-
-    def embed(self, text: str) -> list[float]: ...
+from memoryos.contextdb.retrieval.embedding import EmbeddingProvider
 
 
 class NoopEmbeddingProvider:
@@ -18,3 +11,6 @@ class NoopEmbeddingProvider:
 
     def embed(self, text: str) -> list[float]:  # noqa: ARG002
         return []
+
+
+__all__ = ["EmbeddingProvider", "NoopEmbeddingProvider"]

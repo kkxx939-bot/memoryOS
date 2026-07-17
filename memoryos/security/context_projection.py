@@ -11,7 +11,7 @@ from pathlib import PurePath
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
-from memoryos.adapters.agent_hooks.sanitizer import sanitize_text
+from memoryos.security.sanitization import sanitize_text
 
 _SECRET_KEY = re.compile(
     r"(?i)(?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|cookie|set-cookie|"

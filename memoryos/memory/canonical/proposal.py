@@ -14,9 +14,9 @@ from memoryos.contextdb.model.context_layer import ContextLayers
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.model.lifecycle import LifecycleState
+from memoryos.core.clock import utc_now
 from memoryos.core.ids import stable_hash
-from memoryos.core.time import utc_now
-from memoryos.memory.canonical.event import canonicalize, immutable_snapshot
+from memoryos.core.integrity import canonicalize, immutable_snapshot
 from memoryos.memory.canonical.scope import MemoryScope, ScopeRef
 
 if TYPE_CHECKING:

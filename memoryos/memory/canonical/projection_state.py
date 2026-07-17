@@ -13,9 +13,9 @@ from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from pathlib import Path
 
+from memoryos.core.clock import utc_now
+from memoryos.core.durable_io.quarantine import quarantine_control_file
 from memoryos.core.file_lock import open_private_lock
-from memoryos.core.time import utc_now
-from memoryos.operations.commit.quarantine import quarantine_control_file
 
 try:  # pragma: no cover - all supported production POSIX platforms provide fcntl.
     import fcntl

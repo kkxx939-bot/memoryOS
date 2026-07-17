@@ -1,5 +1,5 @@
-"""适配器里的SQLite索引存储。"""
+"""Compatibility exports for the canonical SQLite catalog adapter path."""
 
-from memoryos.contextdb.store.sqlite_index_store import SQLiteIndexStore as SqliteIndexStore
+from memoryos.adapters.persistence.sqlite.index_store import SQLiteIndexStore, SqliteIndexStore
 
-__all__ = ["SqliteIndexStore"]
+__all__ = ["SQLiteIndexStore", "SqliteIndexStore"]

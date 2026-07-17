@@ -5,7 +5,6 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from memoryos.adapters.agent_hooks.sanitizer import ENV_SECRET_RE, INLINE_SECRET_RE, PRIVATE_KEY_RE, SECRET_KEY_RE
 from memoryos.memory.schema import (
     AdmissionDecision,
     MemoryAdmissionResult,
@@ -15,6 +14,7 @@ from memoryos.memory.schema import (
     MemoryTypeSchema,
 )
 from memoryos.memory.view import MemoryViewRouter
+from memoryos.security.sanitization import ENV_SECRET_RE, INLINE_SECRET_RE, PRIVATE_KEY_RE, SECRET_KEY_RE
 
 RAW_OUTPUT_RE = re.compile(
     r"(?im)(^diff --git\b|^@@\s|^traceback \(most recent call last\)|^pytest\s+.*(?:={3,}|failed)|^failed tests?:|^error:|"

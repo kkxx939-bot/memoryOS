@@ -12,8 +12,8 @@ from typing import Any
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.model.lifecycle import LifecycleState
-from memoryos.core.time import utc_now
-from memoryos.memory.canonical.event import canonicalize
+from memoryos.core.clock import utc_now
+from memoryos.core.integrity import canonicalize
 from memoryos.memory.canonical.evidence import EvidenceRef
 from memoryos.memory.canonical.identity import IDENTITY_ALGORITHM_V2
 from memoryos.memory.canonical.scope import ScopeRef

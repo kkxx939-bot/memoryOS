@@ -10,6 +10,7 @@ from enum import Enum
 from typing import Any
 
 from memoryos.contextdb.model.context_object import ContextObject
+from memoryos.core.types import scope_keys_from_payloads
 from memoryos.security.context_projection import ContextProjectionSanitizer
 from memoryos.security.workspace_identity import normalize_workspace_id
 
@@ -394,8 +395,6 @@ def _catalog_scope_keys(metadata: Mapping[str, Any]) -> tuple[str, ...]:
     applicability = scope.get("applicability")
     if not isinstance(applicability, Mapping):
         raise ValueError("Catalog vector applicability must be an object")
-    from memoryos.memory.canonical.scope import scope_keys_from_payloads
-
     return scope_keys_from_payloads(applicability.get("all_of"))
 
 

@@ -16,15 +16,14 @@ from typing import Any
 from memoryos.contextdb.catalog import CatalogRecord
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.model.lifecycle import LifecycleState
-from memoryos.contextdb.store.source_store import (
-    IndexHit,
-    IndexStore,
-    SourceStore,
-    is_canonical_memory_object,
-    is_canonical_memory_uri,
+from memoryos.contextdb.retrieval.domain_policy import (
+    ContextRetrievalDomainPolicy,
+    NoRetrievalDomainPolicy,
 )
-from memoryos.contextdb.store.vector_store import VectorStore, vector_row_id
-from memoryos.providers.embedding import EmbeddingProvider
+from memoryos.contextdb.retrieval.embedding import EmbeddingProvider
+from memoryos.contextdb.store.index_store import IndexHit, IndexStore
+from memoryos.contextdb.store.source_store import SourceStore
+from memoryos.contextdb.store.vector import VectorStore, vector_row_id
 
 logger = logging.getLogger(__name__)
 
@@ -55,11 +54,13 @@ class HybridSearch:
         embedding_provider: EmbeddingProvider | None = None,
         source_store: SourceStore | None = None,
         min_vector_similarity: float = DEFAULT_MIN_VECTOR_SIMILARITY,
+        domain_policy: ContextRetrievalDomainPolicy | None = None,
     ) -> None:
         self.index_store = index_store
         self.vector_store = vector_store
         self.embedding_provider = embedding_provider
         self.source_store = source_store
+        self.domain_policy = domain_policy or NoRetrievalDomainPolicy()
         self.min_vector_similarity = self._validated_threshold(
             min_vector_similarity,
             "min_vector_similarity",
@@ -169,16 +170,7 @@ class HybridSearch:
                     existing["vector_score"] = normalized_vector_score
                     existing["source"] = "hybrid" if existing.get("index_score") is not None else "vector"
             except Exception as exc:
-                # Import lazily: HybridSearch participates in session planner
-                # initialization, while the canonical visibility package also
-                # imports retrieval components.  The runtime type check keeps
-                # the module graph acyclic without weakening fail-closed
-                # handling.
-                from memoryos.memory.canonical.visibility import (
-                    CommittedStateIntegrityError,
-                )
-
-                if isinstance(exc, CommittedStateIntegrityError):
+                if self.domain_policy.is_authoritative_integrity_error(exc):
                     # A vector outage may fall back to lexical search; a
                     # broken committed-state proof may never become an empty
                     # successful result.
@@ -299,16 +291,11 @@ class HybridSearch:
                     obj = source_snapshot.get(source_validation_uri)
                     if obj is None:
                         return None
-                elif is_canonical_memory_uri(source_validation_uri):
-                    from memoryos.memory.canonical.visibility import read_committed_canonical
-
-                    obj = read_committed_canonical(self.source_store, source_validation_uri).object
                 else:
-                    obj = self.source_store.read_object(source_validation_uri)
-                    if is_canonical_memory_object(obj):
-                        from memoryos.memory.canonical.visibility import read_committed_canonical
-
-                        obj = read_committed_canonical(self.source_store, source_validation_uri).object
+                    obj = self.domain_policy.read_serving_object(
+                        self.source_store,
+                        source_validation_uri,
+                    )
             except (FileNotFoundError, IsADirectoryError, NotADirectoryError, TypeError, ValueError):
                 return None
             if obj.lifecycle_state != LifecycleState.ACTIVE:
@@ -359,45 +346,14 @@ class HybridSearch:
         fields = self._mapping(metadata.get("fields", {}))
         connect = self._mapping(metadata.get("connect", {}))
         admission = self._mapping(metadata.get("admission", {}))
-        if metadata.get("canonical_kind") in {"claim", "slot", "pending_proposal"}:
-            try:
-                from memoryos.memory.canonical.scope import MemoryScope
-
-                canonical_scope = MemoryScope.from_dict(scope)
-            except (KeyError, TypeError, ValueError):
-                return None
-            if canonical_scope.canonical_subject is None:
-                return None
-            if canonical_scope.visibility.tenant_id != str(tenant_id or "default"):
-                return None
-            if canonical_scope.authority.inferred:
-                return None
-            asserted_by = str(
-                metadata.get("asserted_by")
-                or (owner_user_id if metadata.get("canonical_kind") == "pending_proposal" else "")
-                or ""
-            )
-            asserted_by_service = str(metadata.get("asserted_by_service") or "")
-            if (canonical_scope.authority.principal_ids or canonical_scope.authority.service_ids) and not (
-                asserted_by in set(canonical_scope.authority.principal_ids)
-                or asserted_by_service in set(canonical_scope.authority.service_ids)
-            ):
-                return None
-            actual_scopes = {item.key for item in canonical_scope.applicability.all_of}
-        else:
-            raw_applicability = scope.get("applicability", {})
-            if raw_applicability is not None and not isinstance(raw_applicability, Mapping):
-                return None
-            applicability = self._mapping(raw_applicability or {})
-            raw_scope_items = applicability.get("all_of", [])
-            if not isinstance(raw_scope_items, list | tuple):
-                return None
-            try:
-                from memoryos.memory.canonical.scope import scope_keys_from_payloads
-
-                actual_scopes = set(scope_keys_from_payloads(raw_scope_items))
-            except (KeyError, TypeError, ValueError):
-                return None
+        scope_keys = self.domain_policy.applicability_scope_keys(
+            metadata,
+            tenant_id=str(tenant_id or "default"),
+            owner_user_id=str(owner_user_id or ""),
+        )
+        if scope_keys is None:
+            return None
+        actual_scopes = set(scope_keys)
         for filter_name, actual in (
             ("claim_state", metadata.get("state") or metadata.get("claim_state")),
             ("slot_id", metadata.get("slot_id")),

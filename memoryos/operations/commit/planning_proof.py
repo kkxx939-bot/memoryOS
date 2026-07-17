@@ -14,10 +14,10 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from memoryos.core.durable_io import atomic_create_json
 from memoryos.core.file_lock import open_private_lock
 from memoryos.core.ids import require_safe_path_segment
-from memoryos.memory.canonical.event import canonical_digest
-from memoryos.operations.commit.effect_marker import atomic_create_json
+from memoryos.core.integrity import canonical_digest
 from memoryos.operations.model.context_operation import ContextOperation
 
 try:  # pragma: no cover - production Unix platforms provide fcntl.

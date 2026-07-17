@@ -31,7 +31,7 @@ from memoryos.memory.canonical.state import (
     TransitionProfile,
 )
 from memoryos.operations.model.operation_action import OperationAction
-from tests.unit.test_canonical_transaction_commit import (
+from tests.support.canonical_transactions import (
     _plan,
     _proposal,
     _supplement_proposal,
@@ -759,7 +759,7 @@ def test_late_historical_revision_uses_public_unified_history_as_of_and_two_time
 def test_late_non_current_revision_keeps_requested_value_across_sdk_http_and_mcp(
     tmp_path,
 ) -> None:  # noqa: ANN001
-    from tests.unit.test_canonical_retrieval import _scope, _write_committed_canonical_fixture
+    from tests.support.canonical_retrieval import _scope, _write_committed_canonical_fixture
 
     client = MemoryOSClient(str(tmp_path), tenant_id="t1")
     assert isinstance(client.source_store, FileSystemSourceStore)

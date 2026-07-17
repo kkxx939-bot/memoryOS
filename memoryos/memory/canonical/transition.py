@@ -10,7 +10,7 @@ from types import MappingProxyType
 from typing import Any, NoReturn
 
 from memoryos.contextdb.model.lifecycle import LifecycleState
-from memoryos.core.time import utc_now
+from memoryos.core.clock import utc_now
 from memoryos.memory.canonical.field_merge import FieldMergeError, FieldMerger
 from memoryos.memory.canonical.identity import ResolvedMemoryIdentity, canonical_identity_value
 from memoryos.memory.canonical.proposal import (

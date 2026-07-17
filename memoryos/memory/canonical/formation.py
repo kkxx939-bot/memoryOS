@@ -10,14 +10,15 @@ from typing import Any
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.lifecycle import LifecycleState
 from memoryos.contextdb.session.session_model import SessionArchive
-from memoryos.contextdb.store.source_store import RelationStore, SourceStore
+from memoryos.contextdb.store.relation_store import RelationStore
+from memoryos.contextdb.store.source_store import SourceStore
 from memoryos.core.ids import stable_hash
+from memoryos.core.integrity import canonicalize
 from memoryos.memory.canonical.admission import (
     ProposalAdmissionDecision,
     ProposalAdmissionGate,
 )
 from memoryos.memory.canonical.episode import EvidenceEpisode
-from memoryos.memory.canonical.event import canonicalize
 from memoryos.memory.canonical.evidence import EvidenceRef, ProposalEvidenceValidator, bind_field_evidence
 from memoryos.memory.canonical.identity import (
     IDENTITY_ALGORITHM_V2,

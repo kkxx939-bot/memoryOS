@@ -12,13 +12,15 @@ from typing import Any
 from urllib.parse import parse_qs
 
 from memoryos.action_policy.model.action_policy import ActionPolicy
-from memoryos.adapters.agent_hooks.events import AgentEventType, AgentHookEvent, NormalizedAgentEvent
-from memoryos.adapters.agent_hooks.sanitizer import sanitize_error_text
-from memoryos.adapters.agent_hooks.session_service import AgentSessionService
-from memoryos.api.limits import MAX_RETRIEVAL_LIMIT, MAX_TOKEN_BUDGET, bounded_int
 from memoryos.api.retrieval_contract import parse_retrieval_options
 from memoryos.api.sdk.client import MemoryOSClient
-from memoryos.api.trusted_context import (
+from memoryos.application.context.orchestrator import RetrievalUnavailableError
+from memoryos.application.session.events import AgentEventType, AgentHookEvent, NormalizedAgentEvent
+from memoryos.contextdb.retrieval.limits import MAX_RETRIEVAL_LIMIT, MAX_TOKEN_BUDGET, bounded_int
+from memoryos.core.readiness import RuntimeNotReadyError
+from memoryos.prediction.model.prediction_request import PredictionRequest
+from memoryos.security.sanitization import sanitize_error_text
+from memoryos.security.trusted_context import (
     AUTHORITATIVE_FORGET,
     AUTHORITATIVE_REMEMBER,
     COMMIT_SESSION,
@@ -30,9 +32,6 @@ from memoryos.api.trusted_context import (
     scope_keys_from_csv,
     workspace_ids_from_csv,
 )
-from memoryos.contextdb.retrieval.orchestrator import RetrievalUnavailableError
-from memoryos.prediction.model.prediction_request import PredictionRequest
-from memoryos.runtime.readiness import RuntimeNotReadyError
 
 
 def handle(
@@ -138,7 +137,7 @@ class MemoryOSASGI:
         if str(getattr(client, "tenant_id", "default")) != self.trusted_context.tenant_id:
             raise ValueError("HTTP client tenant does not match trusted caller tenant")
         self.max_body_bytes = max_body_bytes
-        self.sessions = AgentSessionService(client.root, tenant_id=self.trusted_context.tenant_id)
+        self.sessions = client.agent_session_service
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope.get("type") != "http":

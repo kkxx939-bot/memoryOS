@@ -12,8 +12,8 @@ from typing import Any
 import memoryos
 from memoryos.api.sdk.client import MemoryOSClient
 from memoryos.connect import ConnectMetadata, ConnectType, PipelineMode
+from memoryos.core.readiness import RuntimeNotReadyError
 from memoryos.prediction.model.prediction_request import PredictionRequest
-from memoryos.runtime.readiness import RuntimeNotReadyError
 
 
 def main(argv: list[str] | None = None) -> int:

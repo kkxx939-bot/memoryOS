@@ -11,13 +11,9 @@ from typing import Any
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_uri import ContextURI
 from memoryos.contextdb.model.lifecycle import LifecycleState
-from memoryos.contextdb.store.source_store import (
-    IndexHit,
-    IndexStore,
-    SourceStore,
-    is_canonical_memory_object,
-)
-from memoryos.memory.canonical.scope import MemoryScope, scope_key_from_payload
+from memoryos.contextdb.store.index_store import IndexHit, IndexStore
+from memoryos.contextdb.store.source_store import SourceStore
+from memoryos.operations.commit.domain_registry import memory_commit_handlers
 from memoryos.operations.model.context_operation import ContextOperation
 from memoryos.operations.model.operation_action import OperationAction
 from memoryos.operations.model.operation_status import OperationStatus
@@ -57,6 +53,12 @@ class TargetResolver:
         self.source_store = source_store
         self.absolute_threshold = self._validated_threshold(absolute_threshold, "absolute_threshold")
         self.margin_threshold = self._validated_threshold(margin_threshold, "margin_threshold")
+        handlers = memory_commit_handlers()
+        self._domain_classifier = (
+            handlers.domain_classifier_binder(source_store)
+            if handlers is not None
+            else getattr(source_store, "domain_classifier", None)
+        )
 
     def resolve(self, operation: ContextOperation, user_id: str | None = None, limit: int = 5) -> ResolveResult:
         commit_user_id = str(user_id or operation.user_id)
@@ -491,9 +493,13 @@ class TargetResolver:
         if metadata.get("fields") is not None and not isinstance(metadata.get("fields"), dict):
             return "target_scope_invalid"
         target_scope = dict(raw_target_scope or {})
-        if is_canonical_memory_object(target):
+        owns_object = getattr(self._domain_classifier, "owns_object", None)
+        if callable(owns_object) and bool(owns_object(target)):
             try:
-                canonical_scope = MemoryScope.from_dict(target_scope)
+                handlers = memory_commit_handlers()
+                if handlers is None:
+                    return "target_scope_invalid"
+                canonical_scope = handlers.memory_scope_from_dict(target_scope)
             except (KeyError, TypeError, ValueError):
                 return "target_scope_invalid"
             if canonical_scope.canonical_subject is None:
@@ -573,7 +579,7 @@ class TargetResolver:
             if item.get("namespace") is not None and not self._nonempty_string(item.get("namespace")):
                 return False
             try:
-                scope_key_from_payload(item)
+                self._scope_key_from_payload(item)
             except (KeyError, TypeError, ValueError):
                 return False
         return True
@@ -589,7 +595,7 @@ class TargetResolver:
             return ()
         applicability = dict(raw_applicability)
         keys = [
-            scope_key_from_payload(item)
+            self._scope_key_from_payload(item)
             for item in applicability.get("all_of", []) or []
             if isinstance(item, dict) and item.get("kind") and item.get("id")
         ]
@@ -632,6 +638,12 @@ class TargetResolver:
             return False
         parts = value.split(":")
         return len(parts) >= 3 and all(parts[:3])
+
+    def _scope_key_from_payload(self, payload: dict[str, Any]) -> str:
+        handlers = memory_commit_handlers()
+        if handlers is None:
+            raise ValueError("Memory scope handlers are not registered")
+        return handlers.scope_key_from_payload(payload)
 
     def _workspace_from_scope_key(self, scope_key: str) -> str:
         parts = scope_key.split(":", 3)

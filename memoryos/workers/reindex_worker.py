@@ -6,12 +6,19 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
+from memoryos.contextdb.extensions import (
+    ContextDomainClassifier,
+    ContextIndexPolicy,
+    NoContextIndexPolicy,
+    NoDomainOverlay,
+)
 from memoryos.contextdb.store.index_consistency import (
     _checkpoint_projection_fence,
     _prepare_generic_index_rebuild_unfenced,
 )
-from memoryos.contextdb.store.source_store import IndexStore, SourceStore, is_canonical_memory_object
-from memoryos.workers.readiness import require_source_store_ready
+from memoryos.contextdb.store.index_store import IndexStore
+from memoryos.contextdb.store.source_store import SourceStore
+from memoryos.core.readiness import require_source_store_ready
 
 
 class ReindexWorker:
@@ -21,10 +28,18 @@ class ReindexWorker:
         index_store: IndexStore,
         *,
         migration_gate: Any | None = None,
+        domain_classifier: ContextDomainClassifier | None = None,
+        index_policy: ContextIndexPolicy | None = None,
     ) -> None:
         self.source_store = source_store
         self.index_store = index_store
         self.migration_gate = migration_gate or getattr(source_store, "migration_gate", None)
+        self.domain_classifier = (
+            domain_classifier
+            or getattr(source_store, "domain_classifier", None)
+            or NoDomainOverlay()
+        )
+        self.index_policy = index_policy or NoContextIndexPolicy()
 
     @contextmanager
     def _projection_fence(self, *, projection_fence_held: bool) -> Iterator[Any | None]:
@@ -50,12 +65,13 @@ class ReindexWorker:
             self.source_store,
             self.index_store,
             fence=fence,
+            index_policy=self.index_policy,
         )
         count = 0
         for offset, obj in enumerate(self.source_store.list_objects()):
             if offset % 256 == 0:
                 _checkpoint_projection_fence(fence)
-            if is_canonical_memory_object(obj):
+            if self.domain_classifier.owns_object(obj):
                 continue
             try:
                 content = self.source_store.read_content(obj.uri)

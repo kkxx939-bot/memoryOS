@@ -6,7 +6,7 @@ import math
 from dataclasses import dataclass, field
 
 from memoryos.contextdb.model.context_uri import ContextURI
-from memoryos.core.time import utc_now
+from memoryos.core.clock import utc_now
 
 
 @dataclass(frozen=True)

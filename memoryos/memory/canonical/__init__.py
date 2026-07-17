@@ -1,212 +1,158 @@
-"""这个包的公开接口都从这里导出。"""
+"""Stable, lazily resolved Canonical Memory exports."""
 
-from memoryos.memory.canonical.admission import (
-    ProposalAdmissionDecision,
-    ProposalAdmissionGate,
-    ProposalAdmissionResult,
-)
-from memoryos.memory.canonical.episode import EvidenceEpisode, SessionArchiveEpisodeAdapter
-from memoryos.memory.canonical.event import ActorRef, EventEnvelope, OriginContext, SubjectRef
-from memoryos.memory.canonical.evidence import (
-    EVIDENCE_SIGNAL_PHRASES,
-    EvidenceRef,
-    EvidenceSignalKind,
-    EvidenceSignalMatch,
-    EvidenceSignalMatcher,
-    ProposalEvidenceValidator,
-    ProposalValidationResult,
-    bind_field_evidence,
-)
-from memoryos.memory.canonical.formation import (
-    CandidateProposalAdapter,
-    CanonicalFormationResult,
-    CanonicalMemoryFormationService,
-)
-from memoryos.memory.canonical.identity import (
-    IDENTITY_ALGORITHM_V2,
-    AliasRegistry,
-    ResolvedMemoryIdentity,
-    StableMemoryIdentityResolver,
-    canonical_identity_json,
-    canonical_identity_value,
-)
-from memoryos.memory.canonical.prefetch import ExistingMemoryPrefetcher, PrefetchedMemory
-from memoryos.memory.canonical.projection import (
-    CanonicalMemoryProjector,
-    MemoryProjectionWorker,
-    ProjectionResult,
-)
-from memoryos.memory.canonical.projection_state import (
-    ProjectionIntegrityError,
-    ProjectionRecord,
-    ProjectionRecordStore,
-    ProjectionStatus,
-    ProjectionStepStatus,
-)
-from memoryos.memory.canonical.promotion_policy import (
-    CANONICAL_PIPELINE_GATES,
-    CanonicalPromotionDecision,
-    CanonicalPromotionFacts,
-    CanonicalPromotionPolicy,
-    CanonicalPromotionResult,
-)
-from memoryos.memory.canonical.proposal import (
-    Atomicity,
-    Attribution,
-    Commitment,
-    Durability,
-    EpistemicStatus,
-    MemorySemanticProposal,
-    ModalForce,
-    NormalizedSemanticAssessment,
-    PendingMemoryProposal,
-    PendingReason,
-    PendingReasonPolicy,
-    SemanticAssessment,
-    SemanticRelation,
-    SpeechAct,
-    TemporalScope,
-    UtteranceMode,
-)
-from memoryos.memory.canonical.reconcile import AmbiguousSemanticReconciler, MemorySemanticReconciler
-from memoryos.memory.canonical.repository import CanonicalMemoryRepository
-from memoryos.memory.canonical.retrieval import (
-    CanonicalInvariantViolation,
-    CanonicalMemoryQuery,
-    CanonicalQueryIntent,
-    OfflineCanonicalMemoryRetriever,
-)
-from memoryos.memory.canonical.salience import EpisodeSalienceGate, SalienceDecision
-from memoryos.memory.canonical.scope import (
-    CORE_SCOPE_KINDS,
-    HIERARCHICAL_SCOPE_KINDS,
-    AuthorityPolicy,
-    MemoryScope,
-    ScopeRef,
-    ScopeResolutionSource,
-    ScopeSelector,
-    VisibilityPolicy,
-    scope_from_external,
-    scope_key_candidates_from_payload,
-    scope_key_from_payload,
-)
-from memoryos.memory.canonical.semantic import MemorySemanticNormalizer
-from memoryos.memory.canonical.state import (
-    ActiveClaimInvariantError,
-    CanonicalMemoryInvariantError,
-    ClaimState,
-    MemoryClaim,
-    MemoryRevision,
-    MemorySlot,
-    MissingClaimInvariantError,
-    RevisionSequenceError,
-    TransitionProfile,
-)
-from memoryos.memory.canonical.transaction import (
-    MemoryTransactionPlan,
-    MemoryTransactionPlanner,
-    PlannedMemoryOperation,
-    RevisionConflictError,
-)
-from memoryos.memory.canonical.transition import (
-    MemoryStateTransition,
-    MemoryTransitionPolicy,
-    PendingSemanticReconciliation,
-)
+from __future__ import annotations
 
-__all__ = [
-    "CORE_SCOPE_KINDS",
-    "HIERARCHICAL_SCOPE_KINDS",
-    "ActorRef",
-    "EventEnvelope",
-    "EvidenceEpisode",
-    "MemoryScope",
-    "MemorySemanticNormalizer",
-    "MemorySemanticProposal",
-    "PendingMemoryProposal",
-    "PendingReason",
-    "PendingReasonPolicy",
+from importlib import import_module
+from typing import Any
+
+_PUBLIC_ATTRS: dict[str, tuple[str, str]] = {}
+
+
+def _exports(module: str, *names: str) -> None:
+    _PUBLIC_ATTRS.update({name: (module, name) for name in names})
+
+
+_exports(
+    "memoryos.memory.canonical.admission",
+    "ProposalAdmissionDecision",
+    "ProposalAdmissionGate",
+    "ProposalAdmissionResult",
+)
+_exports("memoryos.memory.canonical.episode", "EvidenceEpisode", "SessionArchiveEpisodeAdapter")
+_exports("memoryos.memory.canonical.event", "ActorRef", "EventEnvelope", "OriginContext", "SubjectRef")
+_exports(
+    "memoryos.memory.canonical.evidence",
+    "EVIDENCE_SIGNAL_PHRASES",
     "EvidenceRef",
     "EvidenceSignalKind",
     "EvidenceSignalMatch",
     "EvidenceSignalMatcher",
-    "EVIDENCE_SIGNAL_PHRASES",
     "ProposalEvidenceValidator",
     "ProposalValidationResult",
     "bind_field_evidence",
-    "ProposalAdmissionDecision",
-    "ProposalAdmissionGate",
-    "ProposalAdmissionResult",
-    "EpisodeSalienceGate",
-    "SalienceDecision",
-    "EpistemicStatus",
-    "SpeechAct",
-    "Commitment",
-    "TemporalScope",
-    "SemanticRelation",
-    "UtteranceMode",
-    "Attribution",
-    "Durability",
-    "ModalForce",
-    "Atomicity",
-    "SemanticAssessment",
-    "NormalizedSemanticAssessment",
-    "AliasRegistry",
+)
+_exports(
+    "memoryos.memory.canonical.formation",
+    "CandidateProposalAdapter",
+    "CanonicalFormationResult",
+    "CanonicalMemoryFormationService",
+)
+_exports(
+    "memoryos.memory.canonical.identity",
     "IDENTITY_ALGORITHM_V2",
+    "AliasRegistry",
     "ResolvedMemoryIdentity",
     "StableMemoryIdentityResolver",
     "canonical_identity_json",
     "canonical_identity_value",
-    "MemorySlot",
-    "MemoryClaim",
-    "MemoryRevision",
-    "ClaimState",
-    "TransitionProfile",
-    "CanonicalMemoryInvariantError",
-    "ActiveClaimInvariantError",
-    "MissingClaimInvariantError",
-    "RevisionSequenceError",
-    "MemoryStateTransition",
-    "MemoryTransitionPolicy",
-    "PendingSemanticReconciliation",
-    "CanonicalMemoryRepository",
-    "AmbiguousSemanticReconciler",
-    "MemorySemanticReconciler",
-    "MemoryTransactionPlan",
-    "MemoryTransactionPlanner",
-    "PlannedMemoryOperation",
-    "RevisionConflictError",
+)
+_exports("memoryos.memory.canonical.prefetch", "ExistingMemoryPrefetcher", "PrefetchedMemory")
+_exports(
+    "memoryos.memory.canonical.projection",
     "CanonicalMemoryProjector",
     "MemoryProjectionWorker",
     "ProjectionResult",
+)
+_exports(
+    "memoryos.memory.canonical.projection_state",
     "ProjectionIntegrityError",
     "ProjectionRecord",
     "ProjectionRecordStore",
     "ProjectionStatus",
     "ProjectionStepStatus",
-    "CanonicalMemoryQuery",
-    "CanonicalQueryIntent",
-    "CanonicalInvariantViolation",
-    "OfflineCanonicalMemoryRetriever",
-    "CanonicalFormationResult",
-    "CanonicalMemoryFormationService",
-    "CandidateProposalAdapter",
-    "ExistingMemoryPrefetcher",
-    "PrefetchedMemory",
+)
+_exports(
+    "memoryos.memory.canonical.promotion_policy",
     "CANONICAL_PIPELINE_GATES",
     "CanonicalPromotionDecision",
     "CanonicalPromotionFacts",
     "CanonicalPromotionPolicy",
     "CanonicalPromotionResult",
-    "OriginContext",
+)
+_exports(
+    "memoryos.memory.canonical.proposal",
+    "Atomicity",
+    "Attribution",
+    "Commitment",
+    "Durability",
+    "EpistemicStatus",
+    "MemorySemanticProposal",
+    "ModalForce",
+    "NormalizedSemanticAssessment",
+    "PendingMemoryProposal",
+    "PendingReason",
+    "PendingReasonPolicy",
+    "SemanticAssessment",
+    "SemanticRelation",
+    "SpeechAct",
+    "TemporalScope",
+    "UtteranceMode",
+)
+_exports("memoryos.memory.canonical.reconcile", "AmbiguousSemanticReconciler", "MemorySemanticReconciler")
+_exports("memoryos.memory.canonical.repository", "CanonicalMemoryRepository")
+_exports(
+    "memoryos.memory.canonical.retrieval",
+    "CanonicalInvariantViolation",
+    "CanonicalMemoryQuery",
+    "CanonicalQueryIntent",
+    "OfflineCanonicalMemoryRetriever",
+)
+_exports("memoryos.memory.canonical.salience", "EpisodeSalienceGate", "SalienceDecision")
+_exports(
+    "memoryos.memory.canonical.scope",
+    "CORE_SCOPE_KINDS",
+    "HIERARCHICAL_SCOPE_KINDS",
+    "AuthorityPolicy",
+    "MemoryScope",
     "ScopeRef",
     "ScopeResolutionSource",
     "ScopeSelector",
-    "SessionArchiveEpisodeAdapter",
-    "SubjectRef",
     "VisibilityPolicy",
-    "AuthorityPolicy",
-    "scope_key_from_payload",
-    "scope_key_candidates_from_payload",
     "scope_from_external",
-]
+    "scope_key_candidates_from_payload",
+    "scope_key_from_payload",
+)
+_exports("memoryos.memory.canonical.semantic", "MemorySemanticNormalizer")
+_exports(
+    "memoryos.memory.canonical.state",
+    "ActiveClaimInvariantError",
+    "CanonicalMemoryInvariantError",
+    "ClaimState",
+    "MemoryClaim",
+    "MemoryRevision",
+    "MemorySlot",
+    "MissingClaimInvariantError",
+    "RevisionSequenceError",
+    "TransitionProfile",
+)
+_exports(
+    "memoryos.memory.canonical.transaction",
+    "MemoryTransactionPlan",
+    "MemoryTransactionPlanner",
+    "PlannedMemoryOperation",
+    "RevisionConflictError",
+)
+_exports(
+    "memoryos.memory.canonical.transition",
+    "MemoryStateTransition",
+    "MemoryTransitionPolicy",
+    "PendingSemanticReconciliation",
+)
+
+del _exports
+
+
+def __getattr__(name: str) -> Any:
+    target = _PUBLIC_ATTRS.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(target[0]), target[1])
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted({*globals(), *__all__})
+
+
+__all__ = list(_PUBLIC_ATTRS)

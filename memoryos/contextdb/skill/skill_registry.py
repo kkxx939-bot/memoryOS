@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from memoryos.contextdb.skill.skill_model import Skill
-from memoryos.contextdb.store.source_store import IndexStore, SourceStore
+from memoryos.contextdb.store.index_store import IndexStore
+from memoryos.contextdb.store.source_store import SourceStore
 
 
 class SkillRegistry:

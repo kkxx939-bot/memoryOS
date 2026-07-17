@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from memoryos.contextdb.transaction.recovery import RecoveryService
+from memoryos.operations.commit.recovery import RecoveryService
 from memoryos.operations.commit.redo_log import RedoControlFileError
 
 

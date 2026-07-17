@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from memoryos.adapters.agent_hooks.base import HookResult
-from memoryos.adapters.agent_hooks.events import AgentHookEvent
+from memoryos.application.session.events import AgentHookEvent
 
 
 class ClaudeCodePayloadParser:

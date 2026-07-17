@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-import hashlib
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any
 
+from memoryos.core.integrity import canonical_json, text_digest
 from memoryos.memory.canonical.episode import EvidenceEpisode
-from memoryos.memory.canonical.event import EventEnvelope, canonical_json
+from memoryos.memory.canonical.event import EventEnvelope
 from memoryos.memory.canonical.literal_grounding import literal_value_supported
 from memoryos.memory.canonical.proposal import EpistemicStatus, MemorySemanticProposal
 
@@ -117,7 +117,7 @@ def has_explicit_replacement_cue(text: str) -> bool:
 def evidence_hash(text: str) -> str:
     """计算证据文本的 SHA-256，用来发现内容被改动。"""
 
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return text_digest(text)
 
 
 class EvidenceSignalKind(str, Enum):

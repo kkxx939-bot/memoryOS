@@ -1,30 +1,17 @@
-"""这个包的公开接口都从这里导出。"""
+"""Lazy public exports for ContextDB retrieval contracts."""
 
-from memoryos.contextdb.retrieval.context_selector import ContextSelector
-from memoryos.contextdb.retrieval.query_plan import (
-    CanonicalResolutionMode,
-    QueryPlan,
-    RetrievalOptions,
-    RetrievalQueryIntent,
-    RetrievalQueryPlan,
-)
-from memoryos.contextdb.retrieval.query_planner import (
-    QueryPlanner,
-    RetrievalScopeViolation,
-    TrustedRetrievalScope,
-    bind_trusted_scope,
-    merge_retrieval_options,
-    retrieval_options_from_legacy,
-)
-from memoryos.contextdb.retrieval.reranker import ContextReranker
-from memoryos.contextdb.retrieval.token_budget import TokenBudgetController
+from __future__ import annotations
+
+from importlib import import_module
+from typing import Any
 
 __all__ = [
+    "CanonicalResolutionMode",
     "ContextReranker",
     "ContextSelector",
-    "CanonicalResolutionMode",
-    "QueryPlanner",
+    "EmbeddingProvider",
     "QueryPlan",
+    "QueryPlanner",
     "RetrievalOptions",
     "RetrievalQueryIntent",
     "RetrievalQueryPlan",
@@ -35,3 +22,32 @@ __all__ = [
     "merge_retrieval_options",
     "retrieval_options_from_legacy",
 ]
+
+_PLAN = "memoryos.contextdb.retrieval.query_plan"
+_PLANNER = "memoryos.application.context.query_planner"
+_EXPORTS = {
+    "CanonicalResolutionMode": (_PLAN, "CanonicalResolutionMode"),
+    "ContextReranker": ("memoryos.contextdb.retrieval.reranker", "ContextReranker"),
+    "ContextSelector": ("memoryos.contextdb.retrieval.context_selector", "ContextSelector"),
+    "EmbeddingProvider": ("memoryos.contextdb.retrieval.embedding", "EmbeddingProvider"),
+    "QueryPlan": (_PLAN, "QueryPlan"),
+    "QueryPlanner": (_PLANNER, "QueryPlanner"),
+    "RetrievalOptions": (_PLAN, "RetrievalOptions"),
+    "RetrievalQueryIntent": (_PLAN, "RetrievalQueryIntent"),
+    "RetrievalQueryPlan": (_PLAN, "RetrievalQueryPlan"),
+    "RetrievalScopeViolation": (_PLANNER, "RetrievalScopeViolation"),
+    "TokenBudgetController": ("memoryos.contextdb.retrieval.token_budget", "TokenBudgetController"),
+    "TrustedRetrievalScope": (_PLANNER, "TrustedRetrievalScope"),
+    "bind_trusted_scope": (_PLANNER, "bind_trusted_scope"),
+    "merge_retrieval_options": (_PLANNER, "merge_retrieval_options"),
+    "retrieval_options_from_legacy": (_PLANNER, "retrieval_options_from_legacy"),
+}
+
+
+def __getattr__(name: str) -> Any:
+    target = _EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(name)
+    value = getattr(import_module(target[0]), target[1])
+    globals()[name] = value
+    return value

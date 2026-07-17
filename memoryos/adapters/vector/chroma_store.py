@@ -1,7 +1,5 @@
-"""适配器里的Chroma存储。"""
+"""Compatibility export for the historical Chroma adapter path."""
 
-from memoryos.contextdb.store.vector_store import InMemoryVectorStore
-
-ChromaStore = InMemoryVectorStore
+from memoryos.adapters.vector.chroma import ChromaStore
 
 __all__ = ["ChromaStore"]

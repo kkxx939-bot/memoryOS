@@ -7,8 +7,7 @@ from enum import Enum
 from typing import Any
 
 from memoryos.contextdb.model.context_type import ContextType
-from memoryos.memory.canonical.scope import scope_keys_from_payloads
-from memoryos.memory.canonical.state import materialized_current_revision_payload
+from memoryos.operations.commit.domain_registry import memory_commit_handlers
 from memoryos.operations.model.context_operation import ContextOperation
 from memoryos.operations.model.operation_action import OperationAction
 from memoryos.operations.model.operation_status import OperationStatus
@@ -54,8 +53,9 @@ def operation_memory_metadata(operation: ContextOperation) -> MemoryOperationMet
     context_object = operation.payload.get("context_object")
     metadata = dict(context_object.get("metadata", {}) or {}) if isinstance(context_object, dict) else {}
     revisions = metadata.get("revisions", []) or []
-    if metadata.get("canonical_kind") == "claim":
-        current = materialized_current_revision_payload(metadata)
+    handlers = memory_commit_handlers()
+    if metadata.get("canonical_kind") == "claim" and handlers is not None:
+        current = handlers.materialized_current_revision_payload(metadata)
     else:
         current = dict(revisions[-1]) if revisions and isinstance(revisions[-1], dict) else {}
     values = dict(current.get("value_fields", {}) or {})
@@ -104,7 +104,10 @@ def _operation_scope_keys(operation: ContextOperation) -> set[str] | None:
     if not isinstance(raw_applicability, dict):
         return None
     try:
-        keys = set(scope_keys_from_payloads(raw_applicability.get("all_of", [])))
+        handlers = memory_commit_handlers()
+        if handlers is None:
+            return None
+        keys = set(handlers.scope_keys_from_payloads(raw_applicability.get("all_of", [])))
     except (KeyError, TypeError, ValueError):
         return None
     return keys or None

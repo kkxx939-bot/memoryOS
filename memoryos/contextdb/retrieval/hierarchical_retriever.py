@@ -13,7 +13,7 @@ from memoryos.contextdb.retrieval.context_selector import ContextSelector
 from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
 from memoryos.contextdb.retrieval.query_plan import QueryPlan
 from memoryos.contextdb.retrieval.reranker import ContextReranker
-from memoryos.contextdb.store.source_store import IndexHit, IndexStore
+from memoryos.contextdb.store.index_store import IndexHit, IndexStore
 
 
 @dataclass(frozen=True)

@@ -1,7 +1,5 @@
-"""适配器里的Milvus存储。"""
+"""Compatibility export for the historical Milvus adapter path."""
 
-from memoryos.contextdb.store.vector_store import InMemoryVectorStore
-
-MilvusStore = InMemoryVectorStore
+from memoryos.adapters.vector.milvus import MilvusStore
 
 __all__ = ["MilvusStore"]

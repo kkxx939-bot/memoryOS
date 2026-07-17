@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from memoryos.contextdb.extensions import ContextDomainClassifier, NoDomainOverlay
 from memoryos.contextdb.layers.layer_generator import (
     generate_l0_for_object,
     generate_l1_for_object,
@@ -12,7 +13,7 @@ from memoryos.contextdb.layers.layer_generator import (
 )
 from memoryos.contextdb.model.context_layer import ContextLayers
 from memoryos.contextdb.model.context_object import ContextObject
-from memoryos.contextdb.store.source_store import SourceStore, is_canonical_memory_object
+from memoryos.contextdb.store.source_store import SourceStore
 from memoryos.security.context_projection import ContextProjectionSanitizer
 
 
@@ -25,9 +26,20 @@ class LayerRefreshResult:
 
 
 class LayerRefresher:
-    def __init__(self, source_store: SourceStore, *, migration_gate=None) -> None:  # noqa: ANN001
+    def __init__(
+        self,
+        source_store: SourceStore,
+        *,
+        migration_gate=None,  # noqa: ANN001
+        domain_classifier: ContextDomainClassifier | None = None,
+    ) -> None:
         self.source_store = source_store
         self.migration_gate = migration_gate or getattr(source_store, "migration_gate", None)
+        self.domain_classifier = (
+            domain_classifier
+            or getattr(source_store, "domain_classifier", None)
+            or NoDomainOverlay()
+        )
         self.sanitizer = ContextProjectionSanitizer()
 
     def refresh(self, obj: ContextObject, content: str, bullets: list[str] | None = None) -> LayerRefreshResult:
@@ -46,8 +58,8 @@ class LayerRefresher:
         content: str,
         bullets: list[str] | None = None,
     ) -> LayerRefreshResult:
-        if is_canonical_memory_object(obj):
-            raise ValueError("canonical memory layers require the receipt-bound projector")
+        if self.domain_classifier.owns_object(obj):
+            raise ValueError("domain-owned layers require their authoritative projector")
         base = obj.uri
         l0_uri = f"{base}/.abstract.md"
         l1_uri = f"{base}/.overview.md"

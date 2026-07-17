@@ -1,7 +1,5 @@
-"""适配器里的本地向量存储。"""
+"""Compatibility export for the historical local-vector adapter path."""
 
-from memoryos.contextdb.store.vector_store import InMemoryVectorStore
-
-LocalVectorStore = InMemoryVectorStore
+from memoryos.adapters.vector.in_memory.local import LocalVectorStore
 
 __all__ = ["LocalVectorStore"]

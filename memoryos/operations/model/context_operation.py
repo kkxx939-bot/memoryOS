@@ -7,8 +7,8 @@ from dataclasses import dataclass, field
 
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.model.context_uri import ContextURI
+from memoryos.core.clock import utc_now
 from memoryos.core.ids import new_id, require_safe_path_segment
-from memoryos.core.time import utc_now
 from memoryos.operations.model.operation_action import OperationAction
 from memoryos.operations.model.operation_status import OperationStatus
 

@@ -24,13 +24,14 @@ from memoryos.contextdb.catalog import (
     normalize_timestamp,
     validate_tree_paths,
 )
-from memoryos.contextdb.store.source_store import RelationStore, SourceStore
-from memoryos.contextdb.store.vector_store import VectorStore, vector_row_id
-from memoryos.memory.canonical.event import canonical_digest, canonicalize
+from memoryos.contextdb.retrieval.embedding import EmbeddingProvider
+from memoryos.contextdb.store.relation_store import RelationStore
+from memoryos.contextdb.store.source_store import SourceStore
+from memoryos.contextdb.store.vector import VectorStore, vector_row_id
+from memoryos.core.integrity import canonical_digest, canonicalize
 from memoryos.memory.canonical.repository import CanonicalMemoryRepository
 from memoryos.memory.canonical.state import ClaimState, MemoryClaim, MemorySlot, profile_for
 from memoryos.memory.canonical.visibility import CommittedCanonicalRead, read_committed_canonical
-from memoryos.providers.embedding import EmbeddingProvider
 from memoryos.security.context_projection import (
     ContextProjectionSanitizationError,
     ContextProjectionSanitizer,

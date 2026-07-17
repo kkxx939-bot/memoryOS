@@ -6,16 +6,14 @@ import os
 import uuid
 from collections.abc import Callable
 
-from memoryos.contextdb.store.source_store import (
-    QueueStore,
-    SourceStore,
-    is_canonical_memory_object,
-    is_canonical_memory_uri,
-)
-from memoryos.contextdb.store.vector_store import VectorStore, vector_row_id
-from memoryos.providers.embedding import EmbeddingProvider, HashingEmbeddingProvider
+from memoryos.contextdb.extensions import NoDomainOverlay
+from memoryos.contextdb.retrieval.embedding import EmbeddingProvider
+from memoryos.contextdb.store.queue_store import QueueStore
+from memoryos.contextdb.store.source_store import SourceStore
+from memoryos.contextdb.store.vector import VectorStore, vector_row_id
+from memoryos.core.readiness import require_source_store_ready
+from memoryos.providers.embedding import HashingEmbeddingProvider
 from memoryos.security.context_projection import ContextProjectionSanitizer
-from memoryos.workers.readiness import require_source_store_ready
 
 
 class EmbeddingWorker:
@@ -36,6 +34,7 @@ class EmbeddingWorker:
         self.namespace_builder = namespace_builder
         self.worker_id = worker_id or f"embedding:{os.getpid()}:{uuid.uuid4().hex}"
         self.migration_gate = migration_gate or getattr(source_store, "migration_gate", None)
+        self.domain_classifier = getattr(source_store, "domain_classifier", None) or NoDomainOverlay()
         self.sanitizer = ContextProjectionSanitizer()
 
     def process_pending(
@@ -78,13 +77,13 @@ class EmbeddingWorker:
         )
         for job in jobs:
             try:
-                if is_canonical_memory_uri(job.target_uri):
+                if self.domain_classifier.owns_uri(job.target_uri):
                     self.queue_store.quarantine(job, "canonical_requires_projector")
                     failed.append(job.job_id)
                     quarantine.append(job.job_id)
                     continue
                 obj = self.source_store.read_object(job.target_uri)
-                if is_canonical_memory_object(obj):
+                if self.domain_classifier.owns_object(obj):
                     self.queue_store.quarantine(job, "canonical_requires_projector")
                     failed.append(job.job_id)
                     quarantine.append(job.job_id)

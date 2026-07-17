@@ -12,8 +12,8 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from memoryos.core.time import utc_now
-from memoryos.memory.canonical.event import canonical_digest, canonical_json
+from memoryos.core.clock import utc_now
+from memoryos.core.integrity import canonical_digest, canonical_json
 
 TRANSACTION_RECEIPT_SCHEMA_VERSION = "memory_transaction_receipt_v2"
 

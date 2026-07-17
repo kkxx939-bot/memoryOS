@@ -9,9 +9,18 @@ if TYPE_CHECKING:
     from memoryos.operations.commit.diff_writer import DiffWriter
     from memoryos.operations.commit.operation_coalescer import OperationCoalescer
     from memoryos.operations.commit.operation_committer import OperationCommitter
+    from memoryos.operations.commit.recovery import RecoveryResult, RecoveryService
     from memoryos.operations.commit.redo_log import RedoLog
 
-__all__ = ["AuditWriter", "DiffWriter", "OperationCoalescer", "OperationCommitter", "RedoLog"]
+__all__ = [
+    "AuditWriter",
+    "DiffWriter",
+    "OperationCoalescer",
+    "OperationCommitter",
+    "RecoveryResult",
+    "RecoveryService",
+    "RedoLog",
+]
 
 
 def __getattr__(name: str) -> Any:
@@ -27,6 +36,8 @@ def __getattr__(name: str) -> Any:
             "OperationCommitter",
         ),
         "RedoLog": ("memoryos.operations.commit.redo_log", "RedoLog"),
+        "RecoveryResult": ("memoryos.operations.commit.recovery", "RecoveryResult"),
+        "RecoveryService": ("memoryos.operations.commit.recovery", "RecoveryService"),
     }
     if name not in modules:
         raise AttributeError(name)

@@ -10,8 +10,9 @@ from types import MappingProxyType
 
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_relation import ContextRelation
+from memoryos.core.errors import RevisionConflictError as RevisionConflictError
 from memoryos.core.ids import stable_hash
-from memoryos.memory.canonical.event import canonicalize, immutable_snapshot
+from memoryos.core.integrity import canonicalize, immutable_snapshot
 from memoryos.memory.canonical.evidence import EvidenceRef
 from memoryos.memory.canonical.identity import IDENTITY_ALGORITHM_V2
 from memoryos.memory.canonical.proposal import MemorySemanticProposal
@@ -19,14 +20,6 @@ from memoryos.memory.canonical.scope import MemoryScope
 from memoryos.memory.canonical.transition import MemoryStateTransition, MemoryTransitionPolicy
 from memoryos.operations.model.context_operation import ContextOperation
 from memoryos.operations.model.operation_action import OperationAction
-
-
-class RevisionConflictError(RuntimeError):
-    """Raised when a planned revision no longer matches canonical state."""
-
-    def __init__(self, message: str, *, committed_diff=None) -> None:  # noqa: ANN001
-        self.committed_diff = committed_diff
-        super().__init__(message)
 
 
 @dataclass(frozen=True)

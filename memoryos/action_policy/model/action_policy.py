@@ -7,8 +7,8 @@ from enum import Enum
 
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_type import ContextType
+from memoryos.core.clock import utc_now
 from memoryos.core.ids import stable_hash
-from memoryos.core.time import utc_now
 from memoryos.security.action_risk import canonical_action
 
 

@@ -7,7 +7,8 @@ from typing import Any
 
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.lifecycle import LifecycleState
-from memoryos.contextdb.store.source_store import RelationStore, SourceStore
+from memoryos.contextdb.store.relation_store import RelationStore
+from memoryos.contextdb.store.source_store import SourceStore
 from memoryos.memory.canonical.identity import IDENTITY_ALGORITHM_V2, ResolvedMemoryIdentity
 from memoryos.memory.canonical.proposal import PendingMemoryProposal
 from memoryos.memory.canonical.scope import MemoryScope

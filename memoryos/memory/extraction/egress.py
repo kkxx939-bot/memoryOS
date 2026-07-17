@@ -8,14 +8,14 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol, cast
 
-from memoryos.adapters.agent_hooks.sanitizer import (
+from memoryos.contextdb.session.session_model import SessionArchive
+from memoryos.memory.canonical.episode import EvidenceEpisode
+from memoryos.security.sanitization import (
     ENV_SECRET_RE,
     INLINE_SECRET_RE,
     PRIVATE_KEY_RE,
     SECRET_KEY_RE,
 )
-from memoryos.contextdb.session.session_model import SessionArchive
-from memoryos.memory.canonical.episode import EvidenceEpisode
 
 
 class EgressDecision(str, Enum):

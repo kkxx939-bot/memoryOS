@@ -8,13 +8,13 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
-from memoryos.contextdb.session.commit_group import CommitGroupIntegrityError
-from memoryos.contextdb.session.planning_envelope import PlanningEnvelopeIntegrityError
-from memoryos.contextdb.session.session_commit import SessionCommitService
+from memoryos.application.session.commit_service import SessionCommitService
 from memoryos.contextdb.session.session_model import SessionArchive
-from memoryos.contextdb.store.source_store import QueueJob
+from memoryos.contextdb.store.queue_store import QueueJob
+from memoryos.core.readiness import require_session_service_ready, session_service_is_ready
 from memoryos.memory.canonical.salience_ledger import SalienceLedgerIntegrityError
-from memoryos.workers.readiness import require_session_service_ready, session_service_is_ready
+from memoryos.memory.integration.planning_envelope import PlanningEnvelopeIntegrityError
+from memoryos.operations.commit.commit_group import CommitGroupIntegrityError
 from memoryos.workers.tenant_boundary import require_bound_job_tenant
 
 

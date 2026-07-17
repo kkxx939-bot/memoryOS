@@ -5,10 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from memoryos.adapters.agent_hooks.sanitizer import sanitize_error_text
 from memoryos.api.sdk.http_client import RemoteMemoryOSError
-from memoryos.contextdb.retrieval.orchestrator import RetrievalUnavailableError
-from memoryos.runtime.readiness import RuntimeNotReadyError
+from memoryos.application.context.orchestrator import RetrievalUnavailableError
+from memoryos.core.readiness import RuntimeNotReadyError
+from memoryos.security.sanitization import sanitize_error_text
 
 
 class MCPErrorCode:

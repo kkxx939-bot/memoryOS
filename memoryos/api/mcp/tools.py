@@ -7,7 +7,6 @@ from typing import Any
 
 import memoryos
 from memoryos.action_policy.model.action_policy import ActionPolicy
-from memoryos.api.limits import MAX_RETRIEVAL_LIMIT, MAX_TOKEN_BUDGET
 from memoryos.api.mcp.config import MCPServerConfig
 from memoryos.api.mcp.errors import MCPErrorCode, ToolPermissionError, exception_payload, ok_payload
 from memoryos.api.mcp.schemas import (
@@ -22,22 +21,23 @@ from memoryos.api.mcp.schemas import (
     required_str,
 )
 from memoryos.api.retrieval_contract import parse_retrieval_options
-from memoryos.api.trusted_context import (
-    AUTHORITATIVE_FORGET,
-    AUTHORITATIVE_REMEMBER,
-    COMMIT_SESSION,
-    READ_CONTEXT,
-    TrustedRequestContext,
-)
+from memoryos.application.context.query_planner import merge_retrieval_options, retrieval_options_from_legacy
 from memoryos.contextdb.model.context_uri import ContextURI
+from memoryos.contextdb.retrieval.limits import MAX_RETRIEVAL_LIMIT, MAX_TOKEN_BUDGET
 from memoryos.contextdb.retrieval.query_plan import (
     DEFAULT_CANDIDATE_LIMIT,
     DEFAULT_TOKEN_BUDGET,
     RetrievalOptions,
     RetrievalQueryIntent,
 )
-from memoryos.contextdb.retrieval.query_planner import merge_retrieval_options, retrieval_options_from_legacy
 from memoryos.prediction.model.prediction_request import PredictionRequest
+from memoryos.security.trusted_context import (
+    AUTHORITATIVE_FORGET,
+    AUTHORITATIVE_REMEMBER,
+    COMMIT_SESSION,
+    READ_CONTEXT,
+    TrustedRequestContext,
+)
 
 
 class MCPToolRouter:

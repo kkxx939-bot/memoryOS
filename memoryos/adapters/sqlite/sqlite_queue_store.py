@@ -1,5 +1,5 @@
-"""适配器里的SQLite队列存储。"""
+"""Compatibility exports for the canonical SQLite queue adapter path."""
 
-from memoryos.contextdb.store.sqlite_queue_store import SQLiteQueueStore as SqliteQueueStore
+from memoryos.adapters.persistence.sqlite.queue_store import SQLiteQueueStore, SqliteQueueStore
 
-__all__ = ["SqliteQueueStore"]
+__all__ = ["SQLiteQueueStore", "SqliteQueueStore"]

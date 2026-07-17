@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from memoryos.memory.canonical.event import canonical_digest, canonical_json
+from memoryos.core.integrity import canonical_digest, canonical_json
 from memoryos.memory.schema import FieldMergeMode, MemoryTypeSchema
 
 

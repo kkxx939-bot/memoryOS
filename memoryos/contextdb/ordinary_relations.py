@@ -5,18 +5,14 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.model.context_uri import ContextURI
 from memoryos.contextdb.model.lifecycle import LifecycleState
-from memoryos.contextdb.store.source_store import (
-    IndexStore,
-    SourceStore,
-    is_canonical_memory_object,
-    is_canonical_memory_uri,
-)
+from memoryos.contextdb.store.index_store import IndexStore
+from memoryos.contextdb.store.source_store import SourceStore
 
 _AUDIT_RELATION_TYPES = frozenset({"supersedes", "superseded_by"})
 
@@ -25,6 +21,46 @@ _AUDIT_RELATION_TYPES = frozenset({"supersedes", "superseded_by"})
 class OrdinaryRelationEligibility:
     allowed: bool
     reason: str = ""
+
+
+class RelationDomainPolicy(Protocol):
+    """Validate endpoints owned by an optional domain extension."""
+
+    def owns_uri(self, uri: str) -> bool: ...
+
+    def owns_object(self, obj: ContextObject) -> bool: ...
+
+    def validate_target(
+        self,
+        obj: ContextObject,
+        *,
+        role: str,
+        source_store: SourceStore,
+        tenant_id: str,
+        domain_reader: Callable[[str], ContextObject] | None,
+    ) -> OrdinaryRelationEligibility: ...
+
+
+class NoRelationDomainPolicy:
+    def owns_uri(self, uri: str) -> bool:
+        del uri
+        return False
+
+    def owns_object(self, obj: ContextObject) -> bool:
+        del obj
+        return False
+
+    def validate_target(
+        self,
+        obj: ContextObject,
+        *,
+        role: str,
+        source_store: SourceStore,
+        tenant_id: str,
+        domain_reader: Callable[[str], ContextObject] | None,
+    ) -> OrdinaryRelationEligibility:
+        del obj, role, source_store, tenant_id, domain_reader
+        return OrdinaryRelationEligibility(False, "domain endpoint policy is unavailable")
 
 
 def _stable_json(value: object) -> str:
@@ -130,7 +166,8 @@ def ordinary_relation_serving_eligibility(
     source_store: SourceStore,
     index_store: IndexStore,
     authority_object: ContextObject | None = None,
-    canonical_reader: Callable[[str], ContextObject] | None = None,
+    domain_policy: RelationDomainPolicy | None = None,
+    domain_reader: Callable[[str], ContextObject] | None = None,
     allow_virtual_targets: bool = False,
 ) -> OrdinaryRelationEligibility:
     """Bound one ordinary edge to live Source/Catalog authority.
@@ -149,8 +186,9 @@ def ordinary_relation_serving_eligibility(
     declared_tenant = str(metadata.get("tenant_id") or tenant_id)
     if declared_tenant != tenant_id:
         return OrdinaryRelationEligibility(False, "relation metadata crosses its Source tenant")
-    if is_canonical_memory_uri(source_uri):
-        return OrdinaryRelationEligibility(False, "canonical Source requires an immutable receipt")
+    policy = domain_policy or NoRelationDomainPolicy()
+    if policy.owns_uri(source_uri):
+        return OrdinaryRelationEligibility(False, "domain-owned Source requires its authoritative publisher")
 
     audit_edge = relation_type in _AUDIT_RELATION_TYPES
     for endpoint_uri, role in ((source_uri, "source"), (target_uri, "target")):
@@ -163,7 +201,8 @@ def ordinary_relation_serving_eligibility(
             source_store=source_store,
             index_store=index_store,
             authority_object=authority_object,
-            canonical_reader=canonical_reader,
+            domain_policy=policy,
+            domain_reader=domain_reader,
             allow_virtual_targets=allow_virtual_targets,
         )
         if not result.allowed:
@@ -181,7 +220,8 @@ def _ordinary_endpoint_eligibility(
     source_store: SourceStore,
     index_store: IndexStore,
     authority_object: ContextObject | None,
-    canonical_reader: Callable[[str], ContextObject] | None,
+    domain_policy: RelationDomainPolicy,
+    domain_reader: Callable[[str], ContextObject] | None,
     allow_virtual_targets: bool,
 ) -> OrdinaryRelationEligibility:
     if not uri.startswith("memoryos://"):
@@ -193,21 +233,18 @@ def _ordinary_endpoint_eligibility(
     except (TypeError, ValueError):
         return OrdinaryRelationEligibility(False, f"{role} URI is invalid")
 
-    if is_canonical_memory_uri(uri):
+    if domain_policy.owns_uri(uri):
         if role == "source":
-            return OrdinaryRelationEligibility(False, "canonical Source requires an immutable receipt")
-        if canonical_reader is None:
-            return OrdinaryRelationEligibility(False, "canonical committed-state reader is unavailable")
-        # The callback proves Source bundle + receipt + Current Head.  Its
-        # integrity errors deliberately propagate so rebuild cannot disguise
-        # canonical corruption as an absent ordinary edge.
-        committed = canonical_reader(uri)
-        return _canonical_target_eligibility(
+            return OrdinaryRelationEligibility(False, "domain-owned Source requires its authoritative publisher")
+        if domain_reader is None:
+            return OrdinaryRelationEligibility(False, "domain committed-state reader is unavailable")
+        committed = domain_reader(uri)
+        return domain_policy.validate_target(
             committed,
             role=role,
             source_store=source_store,
             tenant_id=tenant_id,
-            canonical_reader=canonical_reader,
+            domain_reader=domain_reader,
         )
 
     try:
@@ -241,20 +278,20 @@ def _ordinary_endpoint_eligibility(
             allowed_lifecycle.add(LifecycleState.OBSOLETE)
         if obj.lifecycle_state not in allowed_lifecycle:
             return OrdinaryRelationEligibility(False, f"{role} endpoint is not serving")
-        if is_canonical_memory_object(obj):
-            if not is_canonical_memory_uri(uri):
-                return OrdinaryRelationEligibility(False, "canonical endpoint URI is invalid")
-            return _canonical_target_eligibility(
+        if domain_policy.owns_object(obj):
+            if not domain_policy.owns_uri(uri):
+                return OrdinaryRelationEligibility(False, "domain endpoint URI is invalid")
+            return domain_policy.validate_target(
                 obj,
                 role=role,
                 source_store=source_store,
                 tenant_id=tenant_id,
-                canonical_reader=canonical_reader,
+                domain_reader=domain_reader,
             )
         return OrdinaryRelationEligibility(True)
 
-    if is_canonical_memory_uri(uri):
-        return OrdinaryRelationEligibility(False, f"{role} canonical endpoint is missing")
+    if domain_policy.owns_uri(uri):
+        return OrdinaryRelationEligibility(False, f"{role} domain endpoint is missing")
     if session_id:
         if state != "active":
             return OrdinaryRelationEligibility(False, f"{role} Session endpoint has no active Catalog row")
@@ -273,51 +310,6 @@ def _ordinary_endpoint_eligibility(
     return OrdinaryRelationEligibility(False, "ordinary target Source is missing")
 
 
-def _canonical_target_eligibility(
-    obj: ContextObject,
-    *,
-    role: str,
-    source_store: SourceStore,
-    tenant_id: str,
-    canonical_reader: Callable[[str], ContextObject] | None,
-) -> OrdinaryRelationEligibility:
-    if role == "source":
-        return OrdinaryRelationEligibility(False, "canonical Source requires an immutable receipt")
-    metadata = dict(obj.metadata or {})
-    kind = str(metadata.get("canonical_kind") or "")
-    if kind == "claim":
-        try:
-            current_revision = int(metadata.get("current_revision", metadata.get("revision", 0)) or 0)
-        except (TypeError, ValueError):
-            return OrdinaryRelationEligibility(False, "canonical Claim current revision is invalid")
-        revisions = [
-            dict(item)
-            for item in metadata.get("revisions", []) or []
-            if isinstance(item, dict) and int(item.get("revision", 0) or 0) == current_revision
-        ]
-        if len(revisions) != 1 or str(revisions[0].get("state") or "").upper() != "ACTIVE":
-            return OrdinaryRelationEligibility(False, "canonical Claim is not ACTIVE")
-        if str(metadata.get("state") or "").upper() != "ACTIVE":
-            return OrdinaryRelationEligibility(False, "canonical Claim materialized state is inconsistent")
-        slot_uri = obj.uri.rsplit("/claims/", 1)[0]
-        try:
-            slot = canonical_reader(slot_uri) if canonical_reader is not None else source_store.read_object(slot_uri)
-        except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
-            return OrdinaryRelationEligibility(False, "canonical Claim Slot is missing")
-        slot_metadata = dict(slot.metadata or {})
-        if (
-            str(slot.tenant_id or "default") != tenant_id
-            or str(slot_metadata.get("canonical_kind") or "") != "slot"
-            or str(slot_metadata.get("active_claim_id") or "") != str(metadata.get("claim_id") or "")
-        ):
-            return OrdinaryRelationEligibility(False, "canonical Claim is not its Slot current state")
-        return OrdinaryRelationEligibility(True)
-    if kind == "slot":
-        if not str(metadata.get("active_claim_id") or ""):
-            return OrdinaryRelationEligibility(False, "canonical Slot has no ACTIVE Claim")
-        return OrdinaryRelationEligibility(True)
-    return OrdinaryRelationEligibility(False, "canonical endpoint is not a serving Slot or Claim")
-
 
 def _session_id(uri: ContextURI) -> str:
     segments = uri.segments
@@ -328,7 +320,9 @@ def _session_id(uri: ContextURI) -> str:
 
 
 __all__ = [
+    "NoRelationDomainPolicy",
     "OrdinaryRelationEligibility",
+    "RelationDomainPolicy",
     "ordinary_relation_serving_eligibility",
     "ordinary_relation_specs_for_object",
 ]

@@ -6,8 +6,9 @@ import json
 from dataclasses import dataclass, replace
 
 from memoryos.contextdb.model.context_object import ContextObject
-from memoryos.contextdb.store.source_store import RelationStore, SourceStore
-from memoryos.memory.canonical.event import canonical_json
+from memoryos.contextdb.store.relation_store import RelationStore
+from memoryos.contextdb.store.source_store import SourceStore
+from memoryos.core.integrity import canonical_json
 from memoryos.memory.canonical.identity import (
     IDENTITY_ALGORITHM_V2,
     AliasRegistry,

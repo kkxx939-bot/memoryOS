@@ -10,8 +10,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, NoReturn
 
-from memoryos.adapters.agent_hooks.sanitizer import sanitize_error_text
-from memoryos.core.time import utc_now
+from memoryos.core.clock import utc_now
+from memoryos.security.sanitization import sanitize_error_text
 
 _fcntl: Any
 try:
@@ -214,7 +214,7 @@ class PendingQueue:
     def _quarantine_corrupt_queue(self, error: BaseException) -> NoReturn:
         # Local import keeps the lightweight hook package out of the canonical
         # commit module's import cycle.
-        from memoryos.operations.commit.quarantine import quarantine_control_file
+        from memoryos.core.durable_io.quarantine import quarantine_control_file
 
         if self.path.exists():
             quarantine_control_file(

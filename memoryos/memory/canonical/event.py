@@ -2,84 +2,20 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
-import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
-from enum import Enum
-from types import MappingProxyType
+from datetime import datetime, timezone
 from typing import Any
 
+from memoryos.core.integrity.canonical_json import (
+    canonical_json,
+    canonicalize,
+    immutable_snapshot,
+)
+from memoryos.core.integrity.digest import canonical_digest
 from memoryos.memory.canonical.scope import ScopeRef
 
 EVENT_ENVELOPE_SCHEMA_VERSION = "event_envelope_v2"
-
-
-class CanonicalSerializationError(ValueError):
-    """Raised when evidence cannot be represented deterministically."""
-
-
-def canonicalize(value: Any) -> Any:
-    """Return a JSON-safe deterministic snapshot of an evidence value."""
-
-    if value is None or isinstance(value, str | bool | int):
-        return value
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise CanonicalSerializationError("non-finite floats are not valid evidence values")
-        return value
-    if isinstance(value, Enum):
-        return canonicalize(value.value)
-    if isinstance(value, datetime):
-        resolved = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
-        return resolved.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
-    if isinstance(value, date):
-        return value.isoformat()
-    if isinstance(value, Mapping):
-        result: dict[str, Any] = {}
-        for raw_key, raw_value in value.items():
-            key = str(raw_key)
-            if key in result:
-                raise CanonicalSerializationError(f"mapping keys collide after string normalization: {key!r}")
-            result[key] = canonicalize(raw_value)
-        return {key: result[key] for key in sorted(result)}
-    if isinstance(value, list | tuple):
-        return [canonicalize(item) for item in value]
-    if isinstance(value, set | frozenset):
-        items = [canonicalize(item) for item in value]
-        return sorted(items, key=lambda item: canonical_json(item))
-    raise CanonicalSerializationError(f"unsupported evidence value type: {type(value).__name__}")
-
-
-def canonical_json(value: Any) -> str:
-    return json.dumps(
-        canonicalize(value),
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
-
-
-def canonical_digest(value: Any) -> str:
-    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
-
-
-def immutable_snapshot(value: Any) -> Any:
-    """Deeply snapshot mutable caller data without retaining shared references."""
-
-    normalized = canonicalize(value)
-    return _freeze_normalized(normalized)
-
-
-def _freeze_normalized(value: Any) -> Any:
-    if isinstance(value, dict):
-        return MappingProxyType({key: _freeze_normalized(item) for key, item in value.items()})
-    if isinstance(value, list):
-        return tuple(_freeze_normalized(item) for item in value)
-    return value
 
 
 def _utc(value: datetime) -> datetime:

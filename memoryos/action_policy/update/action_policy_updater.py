@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from memoryos.action_policy.model.action_policy import ActionPolicy, ActionPolicyStatus
 from memoryos.action_policy.model.reward_signal import PenaltySignal, RewardSignal
-from memoryos.core.time import utc_now
+from memoryos.core.clock import utc_now
 
 
 class ActionPolicyUpdater:

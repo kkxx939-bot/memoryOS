@@ -1,6 +1,6 @@
-"""适配器里的SQLite元数据存储。"""
+"""Compatibility alias for the SQLite catalog adapter."""
 
-from memoryos.adapters.sqlite.sqlite_index_store import SqliteIndexStore
+from memoryos.adapters.persistence.sqlite.index_store import SqliteIndexStore
 
 SqliteMetadataStore = SqliteIndexStore
 

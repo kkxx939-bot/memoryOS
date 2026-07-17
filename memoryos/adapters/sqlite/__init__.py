@@ -1,8 +1,22 @@
-"""这个包的公开接口都从这里导出。"""
+"""Compatibility exports for the canonical persistence adapter package."""
 
-from memoryos.adapters.sqlite.sqlite_index_store import SqliteIndexStore
-from memoryos.adapters.sqlite.sqlite_metadata_store import SqliteMetadataStore
-from memoryos.adapters.sqlite.sqlite_queue_store import SqliteQueueStore
-from memoryos.adapters.sqlite.sqlite_relation_store import SqliteRelationStore
+from memoryos.adapters.persistence.sqlite import (
+    SQLiteIndexStore,
+    SqliteIndexStore,
+    SQLiteQueueStore,
+    SqliteQueueStore,
+    SQLiteRelationStore,
+    SqliteRelationStore,
+)
 
-__all__ = ["SqliteIndexStore", "SqliteMetadataStore", "SqliteQueueStore", "SqliteRelationStore"]
+SqliteMetadataStore = SqliteIndexStore
+
+__all__ = [
+    "SQLiteIndexStore",
+    "SQLiteQueueStore",
+    "SQLiteRelationStore",
+    "SqliteIndexStore",
+    "SqliteMetadataStore",
+    "SqliteQueueStore",
+    "SqliteRelationStore",
+]
