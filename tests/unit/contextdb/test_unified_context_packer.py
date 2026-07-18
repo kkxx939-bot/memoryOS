@@ -40,73 +40,81 @@ def test_layer_degrades_l2_l1_l0_uri_and_reports_required_fields() -> None:
         assert {
             "source_uri",
             "token_estimate",
-            "canonical_validation_status",
+            "source_validation_status",
             "projection_lag",
             "degraded_mode",
         }.issubset(item)
 
 
-def test_packer_enforces_slot_session_and_resource_quotas() -> None:
+def test_packer_enforces_document_and_session_quotas() -> None:
     candidates = [
         _candidate(
-            f"slot-{index}",
+            f"document-{index}",
             context_type="memory",
-            record_kind="current_slot",
-            canonical_slot_id="same-slot",
+            record_kind="memory_document",
+            tenant_id="tenant-a",
+            owner_user_id="u1",
+            document_id="same-document",
+            document_kind="preferences",
+            projection_generation=1,
             l0_text="memory",
         )
-        for index in range(2)
+        for index in range(4)
     ] + [_candidate(f"session-{index}", session_id="s1", l0_text="session") for index in range(7)]
 
     packed = ContextPacker().pack(candidates, plan=_plan(token_budget=1_000, final_limit=20))
 
     selected = packed["contexts"]
-    assert sum(item["metadata"].get("source_digest", "").startswith("digest-slot") for item in selected) == 1
+    assert sum(item["record_key"].startswith("document-") for item in selected) == 3
     assert sum(item["record_key"].startswith("session-") for item in selected) <= 5
-    assert {item["drop_reason"] for item in packed["dropped_contexts"]} >= {"slot_quota", "session_quota"}
+    assert {item["drop_reason"] for item in packed["dropped_contexts"]} >= {
+        "document_quota",
+        "session_quota",
+    }
 
 
-def test_history_deduplicates_claim_revision_without_collapsing_slot_history() -> None:
+def test_history_applies_block_quota_per_document_without_collapsing_other_documents() -> None:
     candidates = [
         _candidate(
-            "claim-a-rev-1",
+            f"first-document-block-{index}",
             context_type="memory",
-            record_kind="claim_revision",
-            canonical_slot_id="same-slot",
-            canonical_claim_id="claim-a",
-            canonical_revision=1,
-            l0_text="first state",
-        ),
+            record_kind="memory_block",
+            tenant_id="tenant-a",
+            owner_user_id="u1",
+            document_id="document-a",
+            block_id=f"block-{index}",
+            document_kind="topic",
+            projection_generation=2,
+            l0_text=f"first document block {index}",
+        )
+        for index in range(4)
+    ] + [
         _candidate(
-            "claim-b-rev-1",
+            "second-document-block",
             context_type="memory",
-            record_kind="claim_revision",
-            canonical_slot_id="same-slot",
-            canonical_claim_id="claim-b",
-            canonical_revision=1,
-            l0_text="second state",
-        ),
-        _candidate(
-            "claim-b-rev-1-duplicate",
-            context_type="memory",
-            record_kind="claim_revision",
-            canonical_slot_id="same-slot",
-            canonical_claim_id="claim-b",
-            canonical_revision=1,
-            l0_text="duplicate projection path",
-        ),
+            record_kind="memory_block",
+            tenant_id="tenant-a",
+            owner_user_id="u1",
+            document_id="document-b",
+            block_id="block-0",
+            document_kind="topic",
+            projection_generation=1,
+            l0_text="second document block",
+        )
     ]
 
     packed = ContextPacker().pack(
         candidates,
-        plan=_plan(query_intent=RetrievalQueryIntent.HISTORY, token_budget=1_000, final_limit=10),
+        plan=_plan(query_intent=RetrievalQueryIntent.HISTORY, token_budget=1_000, final_limit=20),
     )
 
     assert [item["record_key"] for item in packed["contexts"]] == [
-        "claim-a-rev-1",
-        "claim-b-rev-1",
+        "first-document-block-0",
+        "first-document-block-1",
+        "first-document-block-2",
+        "second-document-block",
     ]
-    assert [item["drop_reason"] for item in packed["dropped_contexts"]] == ["claim_revision_quota"]
+    assert [item["drop_reason"] for item in packed["dropped_contexts"]] == ["document_quota"]
 
 
 def test_coding_agent_priority_uses_record_and_source_kinds() -> None:
@@ -118,12 +126,12 @@ def test_coding_agent_priority_uses_record_and_source_kinds() -> None:
             l0_text="older related session",
         ),
         _candidate(
-            "experience",
+            "preference",
             context_type="memory",
-            record_kind="current_slot",
-            canonical_slot_id="experience-slot",
-            metadata={"memory_type": "agent_experience"},
-            l0_text="reusable experience",
+            record_kind="memory_document",
+            document_id="preference-document",
+            document_kind="preferences",
+            l0_text="user preferences",
         ),
         _candidate(
             "current-session",
@@ -138,20 +146,21 @@ def test_coding_agent_priority_uses_record_and_source_kinds() -> None:
             l0_text="repository source",
         ),
         _candidate(
-            "decision",
+            "topic",
             context_type="memory",
-            record_kind="current_slot",
-            canonical_slot_id="decision-slot",
-            metadata={"memory_type": "project_decision"},
-            l0_text="project decision",
+            record_kind="memory_block",
+            document_id="topic-document",
+            block_id="topic-block",
+            document_kind="topic",
+            l0_text="project knowledge",
         ),
         _candidate(
-            "rule",
+            "experience",
             context_type="memory",
-            record_kind="current_slot",
-            canonical_slot_id="rule-slot",
-            metadata={"memory_type": "project_rule"},
-            l0_text="project rule",
+            record_kind="memory_document",
+            document_id="experience-document",
+            document_kind="experience",
+            l0_text="reusable experience",
         ),
     ]
 
@@ -166,8 +175,8 @@ def test_coding_agent_priority_uses_record_and_source_kinds() -> None:
     )
 
     assert [item["record_key"] for item in packed["contexts"]] == [
-        "rule",
-        "decision",
+        "preference",
+        "topic",
         "resource",
         "current-session",
         "experience",

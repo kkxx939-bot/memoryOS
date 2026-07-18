@@ -18,6 +18,27 @@ from memoryos.contextdb.store.queue_store import (
 )
 from memoryos.core.clock import utc_now
 
+_QUEUE_TABLE_LAYOUT = (
+    ("job_id", "TEXT", 0, None, 1),
+    ("queue_name", "TEXT", 1, None, 0),
+    ("action", "TEXT", 1, None, 0),
+    ("target_uri", "TEXT", 1, None, 0),
+    ("payload_json", "TEXT", 1, None, 0),
+    ("tenant_id", "TEXT", 1, "''", 0),
+    ("owner_user_id", "TEXT", 1, "''", 0),
+    ("workspace_id", "TEXT", 1, "''", 0),
+    ("status", "TEXT", 1, None, 0),
+    ("leased_until", "TEXT", 0, None, 0),
+    ("lease_token", "TEXT", 1, "''", 0),
+    ("lease_generation", "INTEGER", 1, "0", 0),
+    ("lease_owner", "TEXT", 1, "''", 0),
+    ("retry_count", "INTEGER", 1, "0", 0),
+    ("created_at", "TEXT", 1, None, 0),
+    ("updated_at", "TEXT", 1, None, 0),
+    ("last_error", "TEXT", 1, "''", 0),
+)
+_QUEUE_STATUSES = ("pending", "leased", "done", "dead_letter", "quarantine")
+
 
 class SQLiteQueueStore:
     def __init__(self, path: str | Path) -> None:
@@ -80,6 +101,50 @@ class SQLiteQueueStore:
             conn.commit()
         assert row is not None
         return self._row_to_job(row)
+
+    def purge_target_jobs(
+        self,
+        *,
+        queue_name: str,
+        target_uri: str,
+        tenant_id: str,
+        owner_user_id: str,
+    ) -> int:
+        """Physically retire all stale jobs for one hard-erased document target."""
+
+        values = tuple(str(value or "").strip() for value in (queue_name, target_uri, tenant_id, owner_user_id))
+        if not all(values):
+            raise ValueError("queue target purge requires exact queue, URI, tenant and owner")
+        queue, target, tenant, owner = values
+        with self._connect() as conn:
+            conn.execute("PRAGMA secure_delete = ON")
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT tenant_id, owner_user_id, payload_json FROM queue_jobs "
+                "WHERE queue_name = ? AND target_uri = ?",
+                (queue, target),
+            ).fetchall()
+            for row in rows:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+                if (
+                    str(row["tenant_id"] or "") != tenant
+                    or str(row["owner_user_id"] or "") != owner
+                    or str(payload.get("tenant_id") or "") != tenant
+                    or str(payload.get("owner_user_id") or "") != owner
+                ):
+                    conn.rollback()
+                    raise QueueLeaseIdentityError("queue target purge encountered a cross-scope job")
+            cursor = conn.execute(
+                "DELETE FROM queue_jobs WHERE queue_name = ? AND target_uri = ? "
+                "AND tenant_id = ? AND owner_user_id = ?",
+                (queue, target, tenant, owner),
+            )
+            conn.commit()
+            removed = max(0, int(cursor.rowcount))
+        with self._connect() as conn:
+            conn.execute("PRAGMA secure_delete = ON")
+            conn.execute("VACUUM")
+        return removed
 
     def lease(
         self,
@@ -433,39 +498,16 @@ class SQLiteQueueStore:
     def _init_db(self) -> None:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS queue_jobs (
-                  job_id TEXT PRIMARY KEY,
-                  queue_name TEXT NOT NULL,
-                  action TEXT NOT NULL,
-                  target_uri TEXT NOT NULL,
-                  payload_json TEXT NOT NULL,
-                  tenant_id TEXT NOT NULL DEFAULT '',
-                  owner_user_id TEXT NOT NULL DEFAULT '',
-                  workspace_id TEXT NOT NULL DEFAULT '',
-                  status TEXT NOT NULL,
-                  leased_until TEXT,
-                  retry_count INTEGER NOT NULL DEFAULT 0,
-                  created_at TEXT NOT NULL,
-                  updated_at TEXT NOT NULL,
-                  last_error TEXT NOT NULL DEFAULT ''
+            existing = conn.execute(
+                "SELECT type FROM sqlite_master WHERE name = 'queue_jobs'"
+            ).fetchone()
+            if existing is None:
+                self._create_queue_table(conn)
+            elif str(existing["type"]) != "table":
+                raise RuntimeError(
+                    "unsupported QueueStore layout; reset the greenfield runtime"
                 )
-                """
-            )
-            columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(queue_jobs)")}
-            migrations = {
-                "lease_token": "TEXT NOT NULL DEFAULT ''",
-                "lease_generation": "INTEGER NOT NULL DEFAULT 0",
-                "lease_owner": "TEXT NOT NULL DEFAULT ''",
-                "tenant_id": "TEXT NOT NULL DEFAULT ''",
-                "owner_user_id": "TEXT NOT NULL DEFAULT ''",
-                "workspace_id": "TEXT NOT NULL DEFAULT ''",
-            }
-            for column, declaration in migrations.items():
-                if column not in columns:
-                    conn.execute(f"ALTER TABLE queue_jobs ADD COLUMN {column} {declaration}")
-            conn.execute("UPDATE queue_jobs SET status = 'dead_letter' WHERE status = 'failed'")
+            self._require_exact_queue_layout(conn)
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS queue_jobs_claim_idx "
                 "ON queue_jobs(queue_name, status, leased_until, created_at)"
@@ -477,16 +519,62 @@ class SQLiteQueueStore:
                 "CREATE INDEX IF NOT EXISTS queue_jobs_scope_status_idx "
                 "ON queue_jobs(queue_name, tenant_id, owner_user_id, workspace_id, status)"
             )
-            rows = conn.execute("SELECT * FROM queue_jobs WHERE tenant_id = '' OR owner_user_id = ''").fetchall()
-            for row in rows:
-                job = self._row_to_job(row)
-                tenant_id, owner_user_id, workspace_id = self._job_scope(job)
-                conn.execute(
-                    "UPDATE queue_jobs SET tenant_id = ?, owner_user_id = ?, workspace_id = ? WHERE job_id = ?",
-                    (tenant_id, owner_user_id, workspace_id, job.job_id),
-                )
             conn.commit()
         os.chmod(self.path, 0o600)
+
+    @staticmethod
+    def _create_queue_table(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE queue_jobs (
+              job_id TEXT PRIMARY KEY,
+              queue_name TEXT NOT NULL,
+              action TEXT NOT NULL,
+              target_uri TEXT NOT NULL,
+              payload_json TEXT NOT NULL,
+              tenant_id TEXT NOT NULL DEFAULT '',
+              owner_user_id TEXT NOT NULL DEFAULT '',
+              workspace_id TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL,
+              leased_until TEXT,
+              lease_token TEXT NOT NULL DEFAULT '',
+              lease_generation INTEGER NOT NULL DEFAULT 0,
+              lease_owner TEXT NOT NULL DEFAULT '',
+              retry_count INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              last_error TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+
+    @staticmethod
+    def _require_exact_queue_layout(conn: sqlite3.Connection) -> None:
+        rows = conn.execute("PRAGMA table_info(queue_jobs)").fetchall()
+        layout = tuple(
+            (
+                str(row["name"]),
+                str(row["type"]).upper(),
+                int(row["notnull"]),
+                row["dflt_value"],
+                int(row["pk"]),
+            )
+            for row in rows
+        )
+        if layout != _QUEUE_TABLE_LAYOUT:
+            raise RuntimeError(
+                "unsupported QueueStore layout; reset the greenfield runtime"
+            )
+        placeholders = ",".join("?" for _ in _QUEUE_STATUSES)
+        invalid = conn.execute(
+            f"SELECT job_id FROM queue_jobs "
+            f"WHERE tenant_id = '' OR status NOT IN ({placeholders}) LIMIT 1",
+            _QUEUE_STATUSES,
+        ).fetchone()
+        if invalid is not None:
+            raise RuntimeError(
+                "unsupported QueueStore data; reset the greenfield runtime"
+            )
 
     def _validate_lease(self, job: QueueJob) -> None:
         if (

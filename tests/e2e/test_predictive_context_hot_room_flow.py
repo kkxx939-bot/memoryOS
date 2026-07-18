@@ -34,19 +34,18 @@ def test_predictive_context_hot_room_flow_uses_production_entrypoint(tmp_path) -
         signals=["user_present"],
         environment={"temperature": 30},
     )
-    anchor_uri = "memoryos://user/u1/memories/anchors/home_comfort"
+    anchor_uri = "memoryos://user/u1/support/behavior/home_comfort"
     resource_uri = "memoryos://resources/devices/living-room-ac"
     skill_uri = "memoryos://skills/smart_home/ac-control"
 
     anchor = ContextObject(
         uri=anchor_uri,
-        context_type=ContextType.MEMORY,
+        context_type=ContextType.BEHAVIOR_SUPPORT,
         title="home comfort",
         owner_user_id="u1",
         metadata={
-            "memory_kind": "anchor_memory",
-            "admission": {"decision": "accept"},
-            "summary": "User comfort memory anchor for hot room behavior.",
+            "support_anchor_kind": "behavior",
+            "summary": "User comfort support anchor for hot room behavior.",
         },
     )
     client.context_db.seed_object(anchor, content="User comfort memory anchor for hot room behavior.")
@@ -55,7 +54,7 @@ def test_predictive_context_hot_room_flow_uses_production_entrypoint(tmp_path) -
         user_id="u1",
         scene_key=observation.scene_key,
         trigger_conditions={"scene_key": observation.scene_key, "context_tags": ["home", "hot_environment"]},
-        memory_anchor_uri=anchor_uri,
+        support_anchor_uri=anchor_uri,
         case_refs=["case-1", "case-2", "case-3"],
         action_distribution=[{"action": "turn_on_ac", "count": 3}],
         hotness=0.95,
@@ -93,7 +92,7 @@ def test_predictive_context_hot_room_flow_uses_production_entrypoint(tmp_path) -
         user_id="u1",
         scene_key=observation.scene_key,
         action="turn_on_ac",
-        memory_anchor_uri=anchor_uri,
+        support_anchor_uri=anchor_uri,
         q_value=0.95,
         confidence=0.95,
         reward_score=10.0,
@@ -129,6 +128,7 @@ def test_predictive_context_hot_room_flow_uses_production_entrypoint(tmp_path) -
     result = client.process_observation(request, archive_session=True, async_commit=True)
     prediction = result.prediction_result
 
+    assert result.archive_error is None, result.archive_error
     assert prediction.candidates[0].action == "turn_on_ac"
     assert prediction.decision.mode == "execute"
     assert prediction.memory_operations == []

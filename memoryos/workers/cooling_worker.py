@@ -50,7 +50,12 @@ class CoolingWorker:
         )
         hits = self.index_store.search(
             query or "behavior",
-            filters={"owner_user_id": user_id, "context_type": ContextType.BEHAVIOR_PATTERN.value},
+            tenant_id=self._tenant_id(),
+            filters={
+                "tenant_id": self._tenant_id(),
+                "owner_user_id": user_id,
+                "context_type": ContextType.BEHAVIOR_PATTERN.value,
+            },
             limit=limit,
         )
         operations: list[ContextOperation] = []
@@ -172,7 +177,7 @@ class CoolingWorker:
             user_id=str(obj.owner_user_id or metadata.get("user_id", "")),
             scene_key=str(metadata.get("scene_key", "")),
             trigger_conditions=dict(metadata.get("trigger_conditions", {})),
-            memory_anchor_uri=str(metadata.get("memory_anchor_uri", "")),
+            support_anchor_uri=str(metadata.get("support_anchor_uri", "")),
             case_refs=list(metadata.get("case_refs", [])),
             action_distribution=list(metadata.get("action_distribution", [])),
             pattern_id=uri.rsplit("/", 1)[-1],
@@ -205,3 +210,6 @@ class CoolingWorker:
     def _target_policy_uris(self, pattern: BehaviorPattern) -> list[str]:
         values = pattern.trigger_conditions.get("related_policy_uris", [])
         return [str(value) for value in values if value]
+
+    def _tenant_id(self) -> str:
+        return str(getattr(self.source_store, "tenant_id", "default") or "default")

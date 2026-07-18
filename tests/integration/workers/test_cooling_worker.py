@@ -20,7 +20,11 @@ def _stores(tmp_path):
 
 def _seed_policy_and_pattern(source, index, policy: ActionPolicy, stats: OpportunityStats) -> BehaviorPattern:
     source.write_object(policy.to_context_object(), content=json.dumps(policy.to_dict()))
-    index.upsert_index(policy.to_context_object(), content=f"{policy.scene_key} {policy.action}")
+    index.upsert_index(
+        policy.to_context_object(),
+        content=f"{policy.scene_key} {policy.action}",
+        tenant_id="default",
+    )
     pattern = BehaviorPattern(
         user_id=policy.user_id,
         scene_key=policy.scene_key,
@@ -28,7 +32,7 @@ def _seed_policy_and_pattern(source, index, policy: ActionPolicy, stats: Opportu
             "context_tags": ["home", "hot_environment"],
             "related_policy_uris": [policy.uri],
         },
-        memory_anchor_uri=policy.memory_anchor_uri,
+        support_anchor_uri=policy.support_anchor_uri,
         case_refs=["c1", "c2", "c3"],
         action_distribution=[{"action": policy.action, "count": 3}],
         opportunity=stats,
@@ -36,13 +40,21 @@ def _seed_policy_and_pattern(source, index, policy: ActionPolicy, stats: Opportu
         confidence=0.8,
     )
     source.write_object(pattern.to_context_object(), content="hot room behavior pattern")
-    index.upsert_index(pattern.to_context_object(), content="hot room behavior pattern home")
+    index.upsert_index(
+        pattern.to_context_object(),
+        content="hot room behavior pattern home",
+        tenant_id="default",
+    )
     return pattern
 
 
 def _seed_custom_pattern(source, index, policy: ActionPolicy, stats: OpportunityStats, context_tags: list[str], content: str) -> BehaviorPattern:
     source.write_object(policy.to_context_object(), content=json.dumps(policy.to_dict()))
-    index.upsert_index(policy.to_context_object(), content=f"{policy.scene_key} {policy.action}")
+    index.upsert_index(
+        policy.to_context_object(),
+        content=f"{policy.scene_key} {policy.action}",
+        tenant_id="default",
+    )
     pattern = BehaviorPattern(
         user_id=policy.user_id,
         scene_key=policy.scene_key,
@@ -50,7 +62,7 @@ def _seed_custom_pattern(source, index, policy: ActionPolicy, stats: Opportunity
             "context_tags": context_tags,
             "related_policy_uris": [policy.uri],
         },
-        memory_anchor_uri=policy.memory_anchor_uri,
+        support_anchor_uri=policy.support_anchor_uri,
         case_refs=["c1", "c2", "c3"],
         action_distribution=[{"action": policy.action, "count": 3}],
         opportunity=stats,
@@ -58,13 +70,13 @@ def _seed_custom_pattern(source, index, policy: ActionPolicy, stats: Opportunity
         confidence=0.8,
     )
     source.write_object(pattern.to_context_object(), content=content)
-    index.upsert_index(pattern.to_context_object(), content=content)
+    index.upsert_index(pattern.to_context_object(), content=content, tenant_id="default")
     return pattern
 
 
 def test_cooling_worker_no_opportunity_does_not_penalize_action_policy(tmp_path) -> None:
     source, index, committer = _stores(tmp_path)
-    policy = ActionPolicy(user_id="u1", scene_key="hot_room", action="turn_on_ac", memory_anchor_uri="memoryos://user/u1/memories/anchors/hot")
+    policy = ActionPolicy(user_id="u1", scene_key="hot_room", action="turn_on_ac", support_anchor_uri="memoryos://user/u1/support/behavior/hot")
     pattern = _seed_policy_and_pattern(source, index, policy, OpportunityStats())
 
     result = CoolingWorker(source, index, committer).process_behavior_patterns("u1", [Observation(user_id="u1", raw_text="hot room", location="office")])
@@ -76,7 +88,7 @@ def test_cooling_worker_no_opportunity_does_not_penalize_action_policy(tmp_path)
 
 def test_cooling_worker_activated_opportunity_refreshes_pattern(tmp_path) -> None:
     source, index, committer = _stores(tmp_path)
-    policy = ActionPolicy(user_id="u1", scene_key="hot_room", action="turn_on_ac", memory_anchor_uri="memoryos://user/u1/memories/anchors/hot")
+    policy = ActionPolicy(user_id="u1", scene_key="hot_room", action="turn_on_ac", support_anchor_uri="memoryos://user/u1/support/behavior/hot")
     pattern = _seed_policy_and_pattern(source, index, policy, OpportunityStats(activation_count=2, missed_opportunity_count=1))
 
     result = CoolingWorker(source, index, committer).process_behavior_patterns(
@@ -89,7 +101,7 @@ def test_cooling_worker_activated_opportunity_refreshes_pattern(tmp_path) -> Non
 
 def test_cooling_worker_missed_opportunity_penalizes_policy_once(tmp_path) -> None:
     source, index, committer = _stores(tmp_path)
-    policy = ActionPolicy(user_id="u1", scene_key="hot_room", action="turn_on_ac", memory_anchor_uri="memoryos://user/u1/memories/anchors/hot")
+    policy = ActionPolicy(user_id="u1", scene_key="hot_room", action="turn_on_ac", support_anchor_uri="memoryos://user/u1/support/behavior/hot")
     _seed_policy_and_pattern(source, index, policy, OpportunityStats(activation_count=0, missed_opportunity_count=2))
 
     result = CoolingWorker(source, index, committer).process_behavior_patterns("u1", [Observation(user_id="u1", raw_text="hot room", location="home", environment={"temperature": 30})])
@@ -102,7 +114,7 @@ def test_cooling_worker_missed_opportunity_penalizes_policy_once(tmp_path) -> No
 
 def test_cooling_worker_negative_feedback_penalizes_or_disables(tmp_path) -> None:
     source, index, committer = _stores(tmp_path)
-    policy = ActionPolicy(user_id="u1", scene_key="hot_room", action="turn_on_ac", memory_anchor_uri="memoryos://user/u1/memories/anchors/hot", auto_execute_allowed=True)
+    policy = ActionPolicy(user_id="u1", scene_key="hot_room", action="turn_on_ac", support_anchor_uri="memoryos://user/u1/support/behavior/hot", auto_execute_allowed=True)
     _seed_policy_and_pattern(source, index, policy, OpportunityStats())
 
     result = CoolingWorker(source, index, committer).process_behavior_patterns("u1", [Observation(user_id="u1", raw_text="hot room", location="home", signals=["negative_feedback"], environment={"temperature": 30})])
@@ -117,8 +129,8 @@ def test_cooling_worker_negative_feedback_penalizes_or_disables(tmp_path) -> Non
 
 def test_cooling_worker_negative_feedback_only_applies_to_matching_pattern(tmp_path) -> None:
     source, index, committer = _stores(tmp_path)
-    ac_policy = ActionPolicy(user_id="u1", scene_key="hot_weather_ac", action="turn_on_ac", memory_anchor_uri="memoryos://user/u1/memories/anchors/hot")
-    light_policy = ActionPolicy(user_id="u1", scene_key="light_control", action="turn_on_light", memory_anchor_uri="memoryos://user/u1/memories/anchors/light")
+    ac_policy = ActionPolicy(user_id="u1", scene_key="hot_weather_ac", action="turn_on_ac", support_anchor_uri="memoryos://user/u1/support/behavior/hot")
+    light_policy = ActionPolicy(user_id="u1", scene_key="light_control", action="turn_on_light", support_anchor_uri="memoryos://user/u1/support/behavior/light")
     _seed_custom_pattern(source, index, ac_policy, OpportunityStats(), ["home", "hot_environment"], "hot room home ac")
     _seed_custom_pattern(source, index, light_policy, OpportunityStats(), ["home", "light_control"], "home light control")
 

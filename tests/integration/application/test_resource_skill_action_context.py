@@ -10,7 +10,6 @@ from memoryos.contextdb.resource.resource_importer import ResourceImporter
 from memoryos.contextdb.skill.skill_model import Skill
 from memoryos.contextdb.skill.skill_registry import SkillRegistry
 from memoryos.contextdb.store.local_stores import FileSystemSourceStore, InMemoryIndexStore, InMemoryRelationStore
-from memoryos.memory.model.memory import MemoryAnchor
 from memoryos.operations.commit.operation_committer import OperationCommitter
 from memoryos.operations.model.context_operation import ContextOperation
 from memoryos.operations.model.operation_action import OperationAction
@@ -18,6 +17,7 @@ from memoryos.prediction.model.prediction_request import PredictionRequest
 from memoryos.prediction.pipeline.action_context_builder import ActionContextBuilder
 from memoryos.prediction.pipeline.policy_gate import PolicyGate
 from memoryos.skill.tool_registry import ToolRegistry
+from memoryos.support import SupportAnchor
 
 
 def test_resource_and_skill_required_by_action_policy_gate_execution(tmp_path) -> None:
@@ -36,7 +36,7 @@ def test_resource_and_skill_required_by_action_policy_gate_execution(tmp_path) -
         user_id="u1",
         scene_key="hot",
         action="turn_on_ac",
-        memory_anchor_uri="memoryos://user/u1/memories/anchors/hot",
+        support_anchor_uri="memoryos://user/u1/support/behavior/hot",
         auto_execute_allowed=True,
         q_value=0.9,
         confidence=0.9,
@@ -44,8 +44,8 @@ def test_resource_and_skill_required_by_action_policy_gate_execution(tmp_path) -
         required_skill_uris=[skill_uri],
     )
     source.write_object(
-        MemoryAnchor(
-            uri=policy.memory_anchor_uri,
+        SupportAnchor(
+            uri=policy.support_anchor_uri,
             user_id="u1",
             title="hot anchor",
             content="verified hot-room behavior anchor",
@@ -94,18 +94,18 @@ def test_direct_request_resource_and_skill_are_archived_and_learned_by_action_po
     scene_key = "hot_room"
     resource_uri = "memoryos://resources/ac"
     skill_uri = "memoryos://skills/ac"
-    anchor_uri = f"memoryos://user/u1/memories/anchors/{scene_key}"
+    anchor_uri = f"memoryos://user/u1/support/behavior/{scene_key}"
     pattern = BehaviorPattern(
         user_id="u1",
         scene_key=scene_key,
         trigger_conditions={"scene_key": scene_key},
-        memory_anchor_uri=anchor_uri,
+        support_anchor_uri=anchor_uri,
         case_refs=["case-1"],
         action_distribution=[{"action": "turn_on_ac", "count": 1}],
     )
     client.context_db.seed_object(pattern.to_context_object(), content="hot_room turn_on_ac behavior")
     client.context_db.seed_object(
-        MemoryAnchor(
+        SupportAnchor(
             uri=anchor_uri,
             user_id="u1",
             title="hot room anchor",
@@ -118,10 +118,11 @@ def test_direct_request_resource_and_skill_are_archived_and_learned_by_action_po
         user_id="u1",
         scene_key=scene_key,
         action="turn_on_ac",
-        memory_anchor_uri=anchor_uri,
+        support_anchor_uri=anchor_uri,
         auto_execute_allowed=True,
         q_value=0.95,
         confidence=0.95,
+        reward_score=10.0,
     )
     client.context_db.seed_object(policy.to_context_object(), content=json.dumps(policy.to_dict()))
     request = PredictionRequest(
@@ -202,16 +203,17 @@ def test_registered_persistent_skill_is_executable_by_default(tmp_path) -> None:
         user_id="u1",
         scene_key="hot",
         action="turn_on_ac",
-        memory_anchor_uri="memoryos://user/u1/memories/anchors/hot",
+        support_anchor_uri="memoryos://user/u1/support/behavior/hot",
         auto_execute_allowed=True,
         q_value=0.95,
         confidence=0.95,
+        reward_score=10.0,
         required_resource_uris=[resource_uri],
         required_skill_uris=[skill_uri],
     )
     client.context_db.seed_object(
-        MemoryAnchor(
-            uri=policy.memory_anchor_uri,
+        SupportAnchor(
+            uri=policy.support_anchor_uri,
             user_id="u1",
             title="hot anchor",
             content="verified hot-room behavior anchor",

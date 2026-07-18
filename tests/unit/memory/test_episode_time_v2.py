@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from memoryos.contextdb.session.session_model import SessionArchive
-from memoryos.memory.canonical import SessionArchiveEpisodeAdapter
+from memoryos.memory.evidence import SessionArchiveEpisodeAdapter
 
 
 def test_cross_category_events_are_sorted_by_valid_ingest_sequence_and_id() -> None:
@@ -133,8 +133,9 @@ def test_missing_and_invalid_fields_are_deterministically_defaulted_and_marked()
     assert first.actor.id_inferred and first.actor.role_inferred
     assert first.subjects[0].inferred
     assert first.occurred_at_inferred and first.ingested_at_inferred and first.sequence_inferred
+    assert first.sequence == 0
     assert set(first.metadata["invalid_fields"]) == {"occurred_at", "sequence"}
-    assert set(first.metadata["inferred_fields"]) >= {
+    assert set(first.metadata["inferred_fields"]) == {
         "actor.id",
         "actor.role",
         "subjects",

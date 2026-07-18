@@ -29,7 +29,6 @@ class ContextCommitter(Protocol):
     relation_store: RelationStore | None
     tenant_id: str
     tombstone_service: Any
-    migration_gate: Any
 
     def commit(self, user_id: str, operations: list[Any]) -> Any: ...
 

@@ -11,7 +11,8 @@ from memoryos.application.session.planners import (
     BehaviorCommitPlanner,
     ContextCommitPlanner,
     MemoryCommitPlanner,
-    RuleMemoryCommitPlanner,
+    MemoryDocumentPlanningResult,
+    PlannedMemoryEdit,
 )
 from memoryos.application.session.service import SessionApplicationService
 
@@ -20,7 +21,8 @@ __all__ = [
     "BehaviorCommitPlanner",
     "ContextCommitPlanner",
     "MemoryCommitPlanner",
-    "RuleMemoryCommitPlanner",
+    "MemoryDocumentPlanningResult",
+    "PlannedMemoryEdit",
     "SessionCommitService",
     "SessionApplicationService",
     "SessionContextProjector",

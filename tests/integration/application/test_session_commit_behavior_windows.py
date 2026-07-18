@@ -5,7 +5,6 @@ from datetime import datetime, timedelta, timezone
 from memoryos.behavior.model.behavior_case import BehaviorCase
 from memoryos.behavior.update.behavior_case_writer import BehaviorCaseWriter
 from memoryos.contextdb.session.planners.behavior_commit_planner import BehaviorCommitPlanner
-from memoryos.contextdb.session.planners.memory_commit_planner import MemoryCommitPlanner
 from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.contextdb.store.local_stores import FileSystemSourceStore, InMemoryIndexStore
 from memoryos.operations.commit.operation_committer import OperationCommitter
@@ -75,7 +74,7 @@ def test_two_similar_cases_within_three_days_generate_cluster_and_anchor(tmp_pat
     operations = BehaviorCommitPlanner(index, source).plan(_archive())
 
     assert any(operation.context_type.value == "behavior_cluster" for operation in operations)
-    assert any(operation.context_type.value == "memory" for operation in operations)
+    assert any(operation.context_type.value == "behavior_support" for operation in operations)
     assert all(operation.context_type.value != "behavior_pattern" for operation in operations)
 
 
@@ -90,7 +89,7 @@ def test_three_similar_cases_within_seven_days_generate_pattern(tmp_path) -> Non
     pattern_ops = [operation for operation in operations if operation.context_type.value == "behavior_pattern"]
     assert pattern_ops
     payload = pattern_ops[0].payload["context_object"]["metadata"]
-    assert payload["memory_anchor_uri"]
+    assert payload["support_anchor_uri"]
 
 
 def test_missing_created_at_history_can_archive_but_not_upgrade_to_cluster_or_pattern(tmp_path) -> None:
@@ -212,19 +211,3 @@ def test_stale_single_short_behavior_archives_instead_of_pattern(tmp_path) -> No
 
     assert any(operation.action == OperationAction.ARCHIVE for operation in operations)
     assert all(operation.context_type.value != "behavior_pattern" for operation in operations)
-
-
-def test_memory_commit_planner_does_not_anchor_same_scene_with_different_context_tags() -> None:
-    archive = SessionArchive(
-        user_id="u1",
-        session_id="s",
-        archive_uri="memoryos://user/u1/sessions/history/s",
-        observations=[
-            {"scene_key": "hot_room", "location": "home", "environment": {"temperature": 30}},
-            {"scene_key": "hot_room", "location": "office", "environment": {"temperature": 30}},
-        ],
-    )
-
-    operations = MemoryCommitPlanner().plan(archive).operations
-
-    assert operations == ()

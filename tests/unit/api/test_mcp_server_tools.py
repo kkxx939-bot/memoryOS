@@ -7,10 +7,29 @@ from memoryos.api.mcp import stdio
 from memoryos.api.mcp.config import MCPServerConfig
 from memoryos.api.mcp.server import MemoryOSMCPServer
 from memoryos.api.sdk.client import MemoryOSClient
-from memoryos.api.trusted_context import AUTHORITATIVE_REMEMBER, DEFAULT_AGENT_CAPABILITIES
+from memoryos.api.trusted_context import (
+    AUTHORITATIVE_FORGET,
+    AUTHORITATIVE_REMEMBER,
+    DEFAULT_AGENT_CAPABILITIES,
+    HARD_ERASE_MEMORY,
+)
 from memoryos.connect import ConnectMetadata
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.runtime.readiness import RuntimeNotReadyError, RuntimeReadinessState
+
+
+def _document_result(*, edit_summary: str = "explicit remember") -> dict[str, Any]:
+    return {
+        "document_uri": "memoryos://user/u1/memory/documents/01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "document_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "document_kind": "topic",
+        "relative_path": "topics/distributed-systems.md",
+        "document_revision": 1,
+        "source_digest": "a" * 64,
+        "changed": True,
+        "edit_summary": edit_summary,
+        "projection_status": "ENQUEUED",
+    }
 
 
 class FakeMCPClient:
@@ -22,8 +41,15 @@ class FakeMCPClient:
         self.process_calls = 0
         self.fail_search = False
         self.tenant_id = "default"
+        self.adopt_calls: list[dict[str, Any]] = []
         self.remember_calls: list[dict[str, Any]] = []
-        self.pending_calls: list[dict[str, Any]] = []
+        self.edit_calls: list[dict[str, Any]] = []
+        self.rename_calls: list[dict[str, Any]] = []
+        self.merge_calls: list[dict[str, Any]] = []
+        self.consolidation_proposal_calls: list[dict[str, Any]] = []
+        self.forget_calls: list[dict[str, Any]] = []
+        self.history_calls: list[dict[str, Any]] = []
+        self.restore_calls: list[dict[str, Any]] = []
         self.review_calls: list[dict[str, Any]] = []
         self.health_payload: dict[str, Any] = {
             "status": "ready",
@@ -78,15 +104,87 @@ class FakeMCPClient:
 
     def remember(self, **kwargs: Any) -> dict[str, Any]:
         self.remember_calls.append(kwargs)
-        return {"status": "COMMITTED", "uri": "memoryos://memory/c1"}
+        return _document_result()
 
-    def list_pending(self, **kwargs: Any) -> list[dict[str, Any]]:
-        self.pending_calls.append(kwargs)
-        return [{"uri": "memoryos://user/u1/memories/pending/p1", "lifecycle_revision": 1}]
+    def adopt_memory_document(self, **kwargs: Any) -> dict[str, Any]:
+        self.adopt_calls.append(kwargs)
+        return _document_result(edit_summary="adopt unmanaged Markdown document")
 
-    def review_pending(self, **kwargs: Any) -> dict[str, Any]:
+    def edit_memory_document(self, **kwargs: Any) -> dict[str, Any]:
+        self.edit_calls.append(kwargs)
+        return _document_result(edit_summary="explicit full-document edit")
+
+    def rename_memory_document(self, **kwargs: Any) -> dict[str, Any]:
+        self.rename_calls.append(kwargs)
+        return _document_result(edit_summary="rename and edit memory document")
+
+    def merge_memory_documents(self, **kwargs: Any) -> dict[str, Any]:
+        self.merge_calls.append(kwargs)
+        return {
+            "saga_id": "memsaga_" + "a" * 64,
+            "status": "AWAITING_TARGET_PROJECTION",
+            "target_document_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "target_projection_generation": 2,
+            "target_projection_confirmed": False,
+            "soft_forgotten_document_ids": [],
+            "pending_document_ids": ["source-1"],
+        }
+
+    def propose_memory_consolidation(self, **kwargs: Any) -> dict[str, Any]:
+        self.consolidation_proposal_calls.append(kwargs)
+        document = _document_result(edit_summary="consolidation preview")
+        source = kwargs["source_documents"][0]
+        return {
+            "proposal_id": "proposal-consolidation",
+            "status": "PENDING",
+            "document_uri": document["document_uri"],
+            "document_id": document["document_id"],
+            "document_kind": document["document_kind"],
+            "relative_path": document["relative_path"],
+            "source_digest": document["source_digest"],
+            "proposed_source_digest": "b" * 64,
+            "proposed_diff_digest": "c" * 64,
+            "proposed_diff": "-target\n+target plus source",
+            "edit_summary": "consolidation preview",
+            "workflow_kind": "CONSOLIDATION",
+            "consolidation_sources": [
+                {
+                    "document_uri": source["document_uri"],
+                    "document_id": "source-1",
+                    "relative_path": "knowledge/topics/source.md",
+                    "source_digest": source["expected_digest"],
+                    "size": 10,
+                }
+            ],
+        }
+
+    def forget(self, **kwargs: Any) -> dict[str, Any]:
+        self.forget_calls.append(kwargs)
+        return {**_document_result(edit_summary="soft forget"), "mode": "SOFT_FORGET", "recoverable": True}
+
+    def list_memory_history(self, **kwargs: Any) -> dict[str, Any]:
+        self.history_calls.append(kwargs)
+        return {
+            "document_uri": kwargs["document_uri"],
+            "document_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "document_kind": "topic",
+            "relative_path": "topics/distributed-systems.md",
+            "revisions": [],
+        }
+
+    def restore_memory_revision(self, **kwargs: Any) -> dict[str, Any]:
+        self.restore_calls.append(kwargs)
+        return _document_result(edit_summary="restore retained document revision 1")
+
+    def review_memory_edit(self, **kwargs: Any) -> dict[str, Any]:
         self.review_calls.append(kwargs)
-        return {"status": "resolved", "uri": kwargs["pending_uri"]}
+        return {
+            **_document_result(edit_summary="reviewed update"),
+            "proposal_id": kwargs["proposal_id"],
+            "status": "APPROVED",
+            "proposed_source_digest": "b" * 64,
+            "proposed_diff_digest": "c" * 64,
+        }
 
     def health(self) -> dict[str, Any]:
         return self.health_payload
@@ -106,7 +204,14 @@ def _server(
         actor_kind="user" if authoritative else "agent",
         actor_id="u1" if authoritative else "codex",
         capabilities=(
-            frozenset({*DEFAULT_AGENT_CAPABILITIES, AUTHORITATIVE_REMEMBER})
+            frozenset(
+                {
+                    *DEFAULT_AGENT_CAPABILITIES,
+                    AUTHORITATIVE_REMEMBER,
+                    AUTHORITATIVE_FORGET,
+                    HARD_ERASE_MEMORY,
+                }
+            )
             if authoritative
             else DEFAULT_AGENT_CAPABILITIES
         ),
@@ -117,13 +222,13 @@ def _server(
     return MemoryOSMCPServer(cast(MemoryOSClient, client), config=config), client
 
 
-def test_mcp_memory_identity_pending_list_and_review_are_strictly_bound() -> None:
+def test_mcp_markdown_memory_commands_share_the_document_contract() -> None:
     server, client = _server(authoritative=True)
     invalid = server.call_tool(
         "memoryos_remember",
         {
             "content": "PostgreSQL",
-            "identity_fields": ["primary storage backend"],
+            "title": "unsupported field",
         },
     )
     assert invalid["error"]["code"] == "VALIDATION_ERROR"
@@ -133,28 +238,95 @@ def test_mcp_memory_identity_pending_list_and_review_are_strictly_bound() -> Non
         "memoryos_remember",
         {
             "content": "PostgreSQL",
-            "memory_type": "project_decision",
-            "identity_fields": {"decision_topic": "primary storage backend"},
+            "target_hint": "topic:primary storage backend",
         },
     )
     assert remembered["error"] is None
-    assert client.remember_calls[0]["identity_fields"] == {"decision_topic": "primary storage backend"}
-    listed = server.call_tool("memoryos_list_pending", {"lifecycle_states": ["PENDING"]})
-    assert listed["error"] is None
-    assert listed["results"][0]["lifecycle_revision"] == 1
-    reviewed = server.call_tool(
-        "memoryos_review_pending",
+    assert remembered["document_uri"].startswith("memoryos://user/u1/memory/documents/")
+    assert client.remember_calls[0]["target_hint"] == "topic:primary storage backend"
+    adopted = server.call_tool(
+        "memoryos_adopt_memory_document",
         {
-            "pending_uri": "memoryos://user/u1/memories/pending/p1",
-            "decision": "CONFIRM_AND_APPLY",
-            "expected_lifecycle_revision": 1,
-            "expected_proposal_fingerprint": "fingerprint",
-            "command_id": "review-command",
+            "relative_path": "knowledge/topics/external.md",
+            "expected_raw_sha256": "a" * 64,
+        },
+    )
+    assert adopted["error"] is None
+    assert client.adopt_calls == [
+        {
+            "relative_path": "knowledge/topics/external.md",
+            "expected_raw_sha256": "a" * 64,
+        }
+    ]
+    reviewed = server.call_tool(
+        "memoryos_review_memory_edit",
+        {
+            "proposal_id": "proposal-1",
+            "decision": "APPROVE",
         },
     )
     assert reviewed["error"] is None
-    assert reviewed["status"] == "resolved"
-    assert client.review_calls[0]["tenant_id"] == "default"
+    assert reviewed["status"] == "APPROVED"
+    assert client.review_calls[0] == {"proposal_id": "proposal-1", "decision": "APPROVE"}
+    rename_request = {
+        "document_uri": remembered["document_uri"],
+        "new_relative_path": "knowledge/topics/postgresql-renamed.md",
+        "expected_digest": "a" * 64,
+        "edit": "PostgreSQL renamed and edited",
+    }
+    renamed = server.call_tool("memoryos_rename_memory_document", rename_request)
+    assert renamed["error"] is None
+    assert renamed["edit_summary"] == "rename and edit memory document"
+    assert client.rename_calls == [rename_request]
+    proposal_request = {
+        "target_document_uri": remembered["document_uri"],
+        "merged_edit": "PostgreSQL plus exact source",
+        "expected_target_digest": "a" * 64,
+        "source_documents": [
+            {
+                "document_uri": remembered["document_uri"] + "-source",
+                "expected_digest": "a" * 64,
+            }
+        ],
+    }
+    merged = server.call_tool("memoryos_merge_memory_documents", proposal_request)
+    assert merged["error"] is None
+    assert merged["status"] == "AWAITING_TARGET_PROJECTION"
+    assert client.merge_calls == [proposal_request]
+    proposed = server.call_tool(
+        "memoryos_propose_memory_consolidation",
+        proposal_request,
+    )
+    assert proposed["error"] is None
+    assert proposed["status"] == "PENDING"
+    assert proposed["workflow_kind"] == "CONSOLIDATION"
+    assert client.consolidation_proposal_calls == [proposal_request]
+
+
+def test_mcp_hard_erase_requires_its_independent_capability() -> None:
+    server, client = _server(authoritative=False)
+    server.config = MCPServerConfig(
+        root="/tmp/memory",
+        user_id="u1",
+        adapter_id="codex",
+        actor_kind="user",
+        actor_id="u1",
+        capabilities=frozenset({*DEFAULT_AGENT_CAPABILITIES, AUTHORITATIVE_FORGET}),
+    )
+    server.router.config = server.config
+    server.router.caller = server.config.trusted_context()
+
+    result = server.call_tool(
+        "memoryos_forget",
+        {
+            "document_uri": "memoryos://user/u1/memory/documents/01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "mode": "HARD_ERASE",
+            "expected_digest": "a" * 64,
+        },
+    )
+
+    assert result["error"]["code"] == "PERMISSION_DENIED"
+    assert client.forget_calls == []
 
 
 def _request(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -214,24 +386,24 @@ def test_mcp_search_context_supports_multiple_context_types() -> None:
     assert client.search_calls[0]["options"].context_types == (ContextType.MEMORY, ContextType.SESSION)
 
 
-def test_mcp_search_context_passes_memory_scope_arguments() -> None:
+def test_mcp_search_context_passes_generic_workspace_scope_arguments() -> None:
     server, client = _server()
 
     result = server.call_tool(
         "memoryos_search_context",
         {
-            "query": "rules",
-            "search_scope": "project_rules",
+            "query": "shared context",
+            "search_scope": "workspace_shared",
             "project_id": "memoryOS",
-            "retrieval_views": ["project:memoryOS:rules"],
+            "retrieval_views": ["project:memoryOS:shared"],
         },
     )
 
     assert result["error"] is None
     call = client.search_calls[0]
-    assert call["search_scope"] == "project_rules"
+    assert call["search_scope"] == "workspace_shared"
     assert call["project_id"] == "memoryOS"
-    assert call["retrieval_views"] == ["project:memoryOS:rules"]
+    assert call["retrieval_views"] == ["project:memoryOS:shared"]
 
 
 def test_mcp_search_context_rejects_unknown_adapter_id() -> None:

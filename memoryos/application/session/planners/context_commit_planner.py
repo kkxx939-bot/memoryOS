@@ -19,7 +19,13 @@ class ContextCommitPlanner:
             if item.get("refresh_layers") is False:
                 continue
             seen.add(uri)
-            context_type = ContextType(str(item.get("context_type", self._infer_type(uri))))
+            declared_type = item.get("context_type")
+            inferred_type = self._infer_type(uri)
+            if declared_type in (None, "") and inferred_type is None:
+                # An untyped URI is still retained in immutable Session evidence,
+                # but it cannot authorize an ordinary Source mutation.
+                continue
+            context_type = ContextType(str(declared_type or inferred_type))
             operations.append(
                 ContextOperation(
                     user_id=archive.user_id,
@@ -47,15 +53,21 @@ class ContextCommitPlanner:
                 )
         return operations
 
-    def _infer_type(self, uri: str) -> str:
+    def _infer_type(self, uri: str) -> str | None:
         if "/action_policies/" in uri:
             return ContextType.ACTION_POLICY.value
+        if "/support/behavior/" in uri:
+            return ContextType.BEHAVIOR_SUPPORT.value
+        if "/support/action_policy/" in uri:
+            return ContextType.ACTION_POLICY_SUPPORT.value
         if "/behavior/patterns/" in uri:
             return ContextType.BEHAVIOR_PATTERN.value
+        if "/behavior/clusters/" in uri:
+            return ContextType.BEHAVIOR_CLUSTER.value
         if "/behavior/cases/" in uri:
             return ContextType.BEHAVIOR_CASE.value
-        if uri.startswith("memoryos://resources/"):
+        if uri.startswith("memoryos://resources/") or "/resources/" in uri:
             return ContextType.RESOURCE.value
-        if uri.startswith("memoryos://skills/"):
+        if uri.startswith("memoryos://skills/") or "/skills/" in uri:
             return ContextType.SKILL.value
-        return ContextType.MEMORY.value
+        return None

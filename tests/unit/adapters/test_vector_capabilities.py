@@ -13,11 +13,7 @@ from memoryos.adapters.vector.qdrant_store import QdrantStore
 from memoryos.contextdb.catalog import CatalogRecord, CatalogRecordKind, catalog_vector_metadata
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.retrieval.candidate_generator import CandidateGenerator
-from memoryos.contextdb.retrieval.query_plan import (
-    CanonicalResolutionMode,
-    RetrievalQueryIntent,
-    RetrievalQueryPlan,
-)
+from memoryos.contextdb.retrieval.query_plan import RetrievalQueryIntent, RetrievalQueryPlan
 from memoryos.contextdb.store.sqlite_index_store import SQLiteIndexStore
 from memoryos.contextdb.store.vector_store import (
     InMemoryVectorStore,
@@ -25,6 +21,7 @@ from memoryos.contextdb.store.vector_store import (
     VectorHit,
     require_production_vector_capabilities,
     vector_capabilities,
+    vector_row_id,
 )
 
 
@@ -147,11 +144,6 @@ def test_native_filtered_vector_branch_can_recall_without_lexical_seed(tmp_path)
                         break
                 if rejected_by_time:
                     continue
-                valid_at = str(filters.get("valid_at") or "")
-                valid_from = str(metadata.get("valid_from") or "")
-                valid_to = str(metadata.get("valid_to") or "")
-                if valid_at and ((valid_from and valid_from > valid_at) or (valid_to and valid_to <= valid_at)):
-                    continue
                 allowed.append(uri)
             self.filtered_before_top_k = tuple(allowed)
             return self.search_vector_candidates(embedding, tuple(allowed), limit=limit)
@@ -191,8 +183,6 @@ def test_native_filtered_vector_branch_can_recall_without_lexical_seed(tmp_path)
         event_time="2026-07-14T01:00:00+00:00",
         ingested_at="2026-07-14T01:00:00+00:00",
         transaction_time="2026-07-14T01:00:00+00:00",
-        valid_from="2026-07-14T00:00:00+00:00",
-        valid_to="2026-07-15T00:00:00+00:00",
         title="no lexical overlap",
         l0_text="unrelated words",
         l1_text="catalog phrase without matching terms",
@@ -241,20 +231,18 @@ def test_native_filtered_vector_branch_can_recall_without_lexical_seed(tmp_path)
             uri=f"{uri}-wrong-transaction-time",
             transaction_time="2026-07-16T00:00:00+00:00",
         ),
-        replace(
-            valid,
-            record_key="wrong-valid-time",
-            uri=f"{uri}-wrong-valid-time",
-            valid_from="2026-07-15T00:00:00+00:00",
-            valid_to="2026-07-16T00:00:00+00:00",
-        ),
     )
     for record in records:
-        index.upsert_catalog(record)
+        index.upsert_catalog(record, tenant_id=record.tenant_id)
     vectors = FilteredStore()
-    vectors.upsert_vector(uri, [0.8, 0.2], catalog_vector_metadata(valid))
+    valid_row_id = vector_row_id(valid.tenant_id, valid.record_key)
+    vectors.upsert_vector(valid_row_id, [0.8, 0.2], catalog_vector_metadata(valid))
     for record in records[1:]:
-        vectors.upsert_vector(record.uri, [1.0, 0.0], catalog_vector_metadata(record))
+        vectors.upsert_vector(
+            vector_row_id(record.tenant_id, record.record_key),
+            [1.0, 0.0],
+            catalog_vector_metadata(record),
+        )
     plan = RetrievalQueryPlan(
         semantic_query="zzvectorconcept",
         target_paths=("projects/project-a",),
@@ -266,9 +254,7 @@ def test_native_filtered_vector_branch_can_recall_without_lexical_seed(tmp_path)
         event_time_to="2026-07-15T00:00:00+00:00",
         transaction_time_from="2026-07-14T00:00:00+00:00",
         transaction_time_to="2026-07-15T00:00:00+00:00",
-        valid_at="2026-07-14T12:00:00+00:00",
         query_intent=RetrievalQueryIntent.OPEN_RECALL,
-        canonical_resolution_mode=CanonicalResolutionMode.DISABLED,
         candidate_limit=1,
         final_limit=1,
         metadata_filters={
@@ -290,9 +276,8 @@ def test_native_filtered_vector_branch_can_recall_without_lexical_seed(tmp_path)
     assert vectors.seen_filters["target_paths"] == ("projects/project-a",)
     assert vectors.seen_filters["event_time_from"] == "2026-07-14T00:00:00+00:00"
     assert vectors.seen_filters["transaction_time_to"] == "2026-07-15T00:00:00+00:00"
-    assert vectors.seen_filters["valid_at"] == "2026-07-14T12:00:00+00:00"
     assert vectors.seen_filters["applicability_scope_keys"] == ("memoryos:workspace:project-a",)
-    assert vectors.filtered_before_top_k == (uri,)
+    assert vectors.filtered_before_top_k == (valid_row_id,)
 
 
 def test_candidate_generation_reports_fts_unavailable(tmp_path) -> None:  # noqa: ANN001
@@ -304,7 +289,6 @@ def test_candidate_generation_reports_fts_unavailable(tmp_path) -> None:  # noqa
             tenant_id="tenant-a",
             owner_user_id="u1",
             query_intent=RetrievalQueryIntent.OPEN_RECALL,
-            canonical_resolution_mode=CanonicalResolutionMode.DISABLED,
             candidate_limit=10,
             final_limit=5,
         )

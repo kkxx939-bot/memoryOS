@@ -1,9 +1,4 @@
-"""Stable in-process SDK facade.
-
-Business orchestration lives in :mod:`memoryos.application`; this module keeps
-the public constructor, method signatures, tenant routing, and compatibility
-hooks.
-"""
+"""Stable in-process SDK facade for Context, Session and Markdown memory."""
 
 from __future__ import annotations
 
@@ -12,6 +7,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from memoryos.action_policy.model.action_policy import ActionPolicy
+from memoryos.api.memory_contract import validate_memory_request, validate_memory_response
 from memoryos.api.retrieval_contract import parse_retrieval_options
 from memoryos.application.context.assembler import ContextAssembler
 from memoryos.application.context.orchestrator import UnifiedRetrievalOrchestrator
@@ -25,7 +21,7 @@ from memoryos.application.context.query_support import (
 )
 from memoryos.application.context.reranking import Reranker
 from memoryos.application.memory.command_service import MemoryCommandService
-from memoryos.application.memory.pending_review_service import PendingReviewService
+from memoryos.application.memory.pending_review_service import MemoryEditReviewService
 from memoryos.application.prediction.result import ProcessObservationResult
 from memoryos.application.prediction.service import PredictionApplicationService
 from memoryos.application.session.service import SessionApplicationService
@@ -36,7 +32,6 @@ from memoryos.contextdb.model.lifecycle import LifecycleState
 from memoryos.contextdb.retrieval.embedding import EmbeddingProvider
 from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
 from memoryos.contextdb.retrieval.query_plan import RetrievalOptions
-from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.contextdb.store.index_store import IndexStore
 from memoryos.contextdb.store.lock_store import LockStore
 from memoryos.contextdb.store.queue_store import QueueStore
@@ -44,7 +39,6 @@ from memoryos.contextdb.store.relation_store import RelationStore
 from memoryos.contextdb.store.source_store import SourceStore
 from memoryos.contextdb.store.vector import VectorStore
 from memoryos.execution.tool_registry import ToolRegistry
-from memoryos.memory.canonical import MemorySemanticProposal
 from memoryos.memory.extraction import MemoryEgressPolicy, MemoryExtractorBackend
 from memoryos.prediction.model.prediction_request import PredictionRequest
 from memoryos.prediction.model.prediction_result import PredictionResult
@@ -74,7 +68,6 @@ class MemoryOSClient:
         reranker: Reranker | None = None,
         memory_extractor: MemoryExtractorBackend | None = None,
         memory_egress_policy: MemoryEgressPolicy | None = None,
-        memory_aliases: dict[str, dict[str, str]] | None = None,
         mode: str = "local",
         tenant_id: str = "default",
     ) -> None:
@@ -88,7 +81,6 @@ class MemoryOSClient:
                 tenant_id=tenant_id,
                 memory_extractor=memory_extractor,
                 memory_egress_policy=memory_egress_policy,
-                memory_aliases=memory_aliases,
                 reranker=reranker,
             ),
             index_store=index_store,
@@ -118,24 +110,33 @@ class MemoryOSClient:
         self.engine = container.engine
         self.executor = container.executor
         self.memory_projection_worker = container.memory_projection_worker
+        self.memory_command_service = container.memory_command_service
+        self.memory_review_service = container.memory_review_service
+        self.memory_document_store = container.memory_document_store
+        self.memory_document_control_store = container.memory_document_control_store
+        self.memory_document_revision_store = container.memory_document_revision_store
+        self.memory_document_planner = container.memory_document_planner
+        self.memory_document_committer = container.memory_document_committer
+        self.memory_document_consolidation_store = container.memory_document_consolidation_store
+        self.memory_document_consolidator = container.memory_document_consolidator
+        self.memory_document_projector = container.memory_document_projector
+        self.memory_document_scanner = container.memory_document_scanner
+        self.memory_document_edit_worker = container.memory_document_edit_worker
+        self.memory_document_scan_worker = container.memory_document_scan_worker
+        self.memory_document_eraser = container.memory_document_eraser
         self.recovery_service = container.recovery_service
         self.recovery_worker = container.recovery_worker
         self.readiness = container.readiness
-        self.migration_gate = container.migration_gate
-        self.unified_context_migration = container.unified_context_migration
         self._tenant_clients: dict[str, MemoryOSClient] = {}
         self._tenant_clients_lock = threading.RLock()
         self._tenant_mode = mode
         self._tenant_memory_extractor = memory_extractor
         self._tenant_memory_egress_policy = memory_egress_policy
-        self._tenant_memory_aliases = memory_aliases
         self._tenant_reranker = reranker
         self._tenant_embedding_provider = embedding_provider
         self.last_recall_trace_id = ""
         self._context_queries = ContextQueryService(self)
         self._prediction_application = PredictionApplicationService(self)
-        self._memory_commands = MemoryCommandService(self)
-        self._pending_reviews = PendingReviewService(self)
         self._session_application = SessionApplicationService(self, self._context_queries)
 
     def _get_context_queries(self) -> ContextQueryService:
@@ -153,18 +154,10 @@ class MemoryOSClient:
         return service
 
     def _get_memory_commands(self) -> MemoryCommandService:
-        service = getattr(self, "_memory_commands", None)
-        if service is None:
-            service = MemoryCommandService(self)
-            self._memory_commands = service
-        return service
+        return self.memory_command_service
 
-    def _get_pending_reviews(self) -> PendingReviewService:
-        service = getattr(self, "_pending_reviews", None)
-        if service is None:
-            service = PendingReviewService(self)
-            self._pending_reviews = service
-        return service
+    def _get_memory_reviews(self) -> MemoryEditReviewService:
+        return self.memory_review_service
 
     def _get_session_application(self) -> SessionApplicationService:
         service = getattr(self, "_session_application", None)
@@ -209,10 +202,9 @@ class MemoryOSClient:
         project_id: str = "",
         tenant_id: str | None = None,
         applicability_scopes: list[dict[str, Any]] | None = None,
-        memory_states: list[str] | None = None,
-        memory_types: list[str] | None = None,
-        claim_uris: list[str] | None = None,
-        slot_uris: list[str] | None = None,
+        record_kinds: list[str] | None = None,
+        document_ids: list[str] | None = None,
+        document_kinds: list[str] | None = None,
         query_intent: str | None = None,
         caller: TrustedRequestContext | None = None,
     ) -> list[dict[str, Any]]:
@@ -235,10 +227,9 @@ class MemoryOSClient:
                 project_id=project_id,
                 tenant_id=effective_tenant,
                 applicability_scopes=applicability_scopes,
-                memory_states=memory_states,
-                memory_types=memory_types,
-                claim_uris=claim_uris,
-                slot_uris=slot_uris,
+                record_kinds=record_kinds,
+                document_ids=document_ids,
+                document_kinds=document_kinds,
                 query_intent=query_intent,
                 caller=caller,
             )
@@ -254,10 +245,9 @@ class MemoryOSClient:
             project_id=project_id,
             tenant_id=effective_tenant,
             applicability_scopes=applicability_scopes,
-            memory_states=memory_states,
-            memory_types=memory_types,
-            claim_uris=claim_uris,
-            slot_uris=slot_uris,
+            record_kinds=record_kinds,
+            document_ids=document_ids,
+            document_kinds=document_kinds,
             query_intent=query_intent,
             caller=caller,
         )
@@ -277,10 +267,9 @@ class MemoryOSClient:
         project_id: str = "",
         tenant_id: str | None = None,
         applicability_scopes: list[dict[str, Any]] | None = None,
-        memory_states: list[str] | None = None,
-        memory_types: list[str] | None = None,
-        claim_uris: list[str] | None = None,
-        slot_uris: list[str] | None = None,
+        record_kinds: list[str] | None = None,
+        document_ids: list[str] | None = None,
+        document_kinds: list[str] | None = None,
         query_intent: str | None = None,
         caller: TrustedRequestContext | None = None,
     ) -> dict[str, Any]:
@@ -304,10 +293,9 @@ class MemoryOSClient:
                 project_id=project_id,
                 tenant_id=effective_tenant,
                 applicability_scopes=applicability_scopes,
-                memory_states=memory_states,
-                memory_types=memory_types,
-                claim_uris=claim_uris,
-                slot_uris=slot_uris,
+                record_kinds=record_kinds,
+                document_ids=document_ids,
+                document_kinds=document_kinds,
                 query_intent=query_intent,
                 caller=caller,
             )
@@ -324,10 +312,9 @@ class MemoryOSClient:
             project_id=project_id,
             tenant_id=effective_tenant,
             applicability_scopes=applicability_scopes,
-            memory_states=memory_states,
-            memory_types=memory_types,
-            claim_uris=claim_uris,
-            slot_uris=slot_uris,
+            record_kinds=record_kinds,
+            document_ids=document_ids,
+            document_kinds=document_kinds,
             query_intent=query_intent,
             caller=caller,
         )
@@ -356,185 +343,308 @@ class MemoryOSClient:
 
     def remember(
         self,
-        *,
-        user_id: str,
         content: str,
-        title: str = "",
-        memory_type: str = "project_decision",
-        project_id: str = "",
-        constraint_polarity: str = "",
-        condition: str = "",
-        exception: str = "",
-        identity_fields: dict[str, Any] | None = None,
-        connect_metadata: dict[str, Any] | None = None,
+        occurred_at: str | None = None,
+        target_hint: str | None = None,
+        expected_document_digest: str | None = None,
+        *,
         tenant_id: str | None = None,
-        caller: TrustedRequestContext | None = None,
+        caller: TrustedRequestContext,
     ) -> dict[str, Any]:
+        request = validate_memory_request(
+            "remember",
+            {
+                "content": content,
+                "occurred_at": occurred_at,
+                "target_hint": target_hint,
+                "expected_document_digest": expected_document_digest,
+            },
+        )
         effective_tenant = self._effective_tenant(caller, tenant_id)
         scoped = self._client_for_tenant(effective_tenant)
         if scoped is not self:
             return scoped.remember(
-                user_id=user_id,
-                content=content,
-                title=title,
-                memory_type=memory_type,
-                project_id=project_id,
-                constraint_polarity=constraint_polarity,
-                condition=condition,
-                exception=exception,
-                identity_fields=identity_fields,
-                connect_metadata=connect_metadata,
+                **request,
                 tenant_id=effective_tenant,
                 caller=caller,
             )
-        return self._get_memory_commands().remember(
-            user_id=user_id,
-            content=content,
-            title=title,
-            memory_type=memory_type,
-            project_id=project_id,
-            constraint_polarity=constraint_polarity,
-            condition=condition,
-            exception=exception,
-            identity_fields=identity_fields,
-            connect_metadata=connect_metadata,
-            tenant_id=effective_tenant,
-            caller=caller,
+        self._require_ready()
+        return validate_memory_response("remember",
+            self._get_memory_commands().remember(**request, caller=caller)
+        )
+
+    def adopt_memory_document(
+        self,
+        relative_path: str,
+        expected_raw_sha256: str,
+        *,
+        tenant_id: str | None = None,
+        caller: TrustedRequestContext,
+    ) -> dict[str, Any]:
+        request = validate_memory_request(
+            "adopt",
+            {
+                "relative_path": relative_path,
+                "expected_raw_sha256": expected_raw_sha256,
+            },
+        )
+        effective_tenant = self._effective_tenant(caller, tenant_id)
+        scoped = self._client_for_tenant(effective_tenant)
+        if scoped is not self:
+            return scoped.adopt_memory_document(
+                **request,
+                tenant_id=effective_tenant,
+                caller=caller,
+            )
+        self._require_ready()
+        return validate_memory_response("adopt",
+            self._get_memory_commands().adopt_memory_document(**request, caller=caller)
+        )
+
+    def edit_memory_document(
+        self,
+        document_uri: str,
+        edit: str,
+        expected_digest: str,
+        *,
+        tenant_id: str | None = None,
+        caller: TrustedRequestContext,
+    ) -> dict[str, Any]:
+        request = validate_memory_request(
+            "edit",
+            {"document_uri": document_uri, "edit": edit, "expected_digest": expected_digest},
+        )
+        effective_tenant = self._effective_tenant(caller, tenant_id)
+        scoped = self._client_for_tenant(effective_tenant)
+        if scoped is not self:
+            return scoped.edit_memory_document(**request, tenant_id=effective_tenant, caller=caller)
+        self._require_ready()
+        return validate_memory_response("edit",
+            self._get_memory_commands().edit_memory_document(**request, caller=caller)
+        )
+
+    def rename_memory_document(
+        self,
+        document_uri: str,
+        new_relative_path: str,
+        expected_digest: str,
+        edit: str | None = None,
+        *,
+        tenant_id: str | None = None,
+        caller: TrustedRequestContext,
+    ) -> dict[str, Any]:
+        request = validate_memory_request(
+            "rename",
+            {
+                "document_uri": document_uri,
+                "new_relative_path": new_relative_path,
+                "expected_digest": expected_digest,
+                "edit": edit,
+            },
+        )
+        effective_tenant = self._effective_tenant(caller, tenant_id)
+        scoped = self._client_for_tenant(effective_tenant)
+        if scoped is not self:
+            return scoped.rename_memory_document(**request, tenant_id=effective_tenant, caller=caller)
+        self._require_ready()
+        return validate_memory_response(
+            "rename",
+            self._get_memory_commands().rename_memory_document(**request, caller=caller),
+        )
+
+    def merge_memory_documents(
+        self,
+        target_document_uri: str,
+        merged_edit: str,
+        expected_target_digest: str,
+        source_documents: list[dict[str, str]],
+        *,
+        tenant_id: str | None = None,
+        caller: TrustedRequestContext,
+    ) -> dict[str, Any]:
+        request = validate_memory_request(
+            "merge",
+            {
+                "target_document_uri": target_document_uri,
+                "merged_edit": merged_edit,
+                "expected_target_digest": expected_target_digest,
+                "source_documents": source_documents,
+            },
+        )
+        effective_tenant = self._effective_tenant(caller, tenant_id)
+        scoped = self._client_for_tenant(effective_tenant)
+        if scoped is not self:
+            return scoped.merge_memory_documents(**request, tenant_id=effective_tenant, caller=caller)
+        self._require_ready()
+        return validate_memory_response(
+            "merge",
+            self._get_memory_commands().merge_memory_documents(**request, caller=caller),
+        )
+
+    def propose_memory_consolidation(
+        self,
+        target_document_uri: str,
+        merged_edit: str,
+        expected_target_digest: str,
+        source_documents: list[dict[str, str]],
+        *,
+        tenant_id: str | None = None,
+        caller: TrustedRequestContext,
+    ) -> dict[str, Any]:
+        request = validate_memory_request(
+            "merge_propose",
+            {
+                "target_document_uri": target_document_uri,
+                "merged_edit": merged_edit,
+                "expected_target_digest": expected_target_digest,
+                "source_documents": source_documents,
+            },
+        )
+        effective_tenant = self._effective_tenant(caller, tenant_id)
+        scoped = self._client_for_tenant(effective_tenant)
+        if scoped is not self:
+            return scoped.propose_memory_consolidation(
+                **request,
+                tenant_id=effective_tenant,
+                caller=caller,
+            )
+        self._require_ready()
+        return validate_memory_response(
+            "merge_propose",
+            self._get_memory_commands().propose_memory_consolidation(
+                **request,
+                caller=caller,
+            ),
+        )
+
+    def resume_memory_consolidation(
+        self,
+        saga_id: str,
+        *,
+        tenant_id: str | None = None,
+        caller: TrustedRequestContext,
+    ) -> dict[str, Any]:
+        request = validate_memory_request("merge_resume", {"saga_id": saga_id})
+        effective_tenant = self._effective_tenant(caller, tenant_id)
+        scoped = self._client_for_tenant(effective_tenant)
+        if scoped is not self:
+            return scoped.resume_memory_consolidation(**request, tenant_id=effective_tenant, caller=caller)
+        self._require_ready()
+        return validate_memory_response(
+            "merge_resume",
+            self._get_memory_commands().resume_memory_consolidation(**request, caller=caller),
         )
 
     def forget(
         self,
+        document_uri: str,
+        section_anchor: str | None = None,
+        mode: str = "SOFT_FORGET",
+        expected_digest: str | None = None,
         *,
-        user_id: str,
-        uri: str,
         tenant_id: str | None = None,
-        caller: TrustedRequestContext | None = None,
+        caller: TrustedRequestContext,
     ) -> dict[str, Any]:
+        request = validate_memory_request(
+            "forget",
+            {
+                "document_uri": document_uri,
+                "section_anchor": section_anchor,
+                "mode": mode,
+                "expected_digest": expected_digest,
+            },
+        )
         effective_tenant = self._effective_tenant(caller, tenant_id)
         scoped = self._client_for_tenant(effective_tenant)
         if scoped is not self:
-            return scoped.forget(user_id=user_id, uri=uri, tenant_id=effective_tenant, caller=caller)
-        return self._get_memory_commands().forget(
-            user_id=user_id,
-            uri=uri,
-            tenant_id=effective_tenant,
-            caller=caller,
+            return scoped.forget(**request, tenant_id=effective_tenant, caller=caller)
+        self._require_ready()
+        return validate_memory_response("forget",
+            self._get_memory_commands().forget(**request, caller=caller)
         )
 
-    def list_pending(
+    def list_memory_history(
         self,
+        document_uri: str,
         *,
-        user_id: str,
         tenant_id: str | None = None,
-        lifecycle_states: list[str] | None = None,
-        project_id: str = "",
-        caller: TrustedRequestContext | None = None,
-    ) -> list[dict[str, Any]]:
+        caller: TrustedRequestContext,
+    ) -> dict[str, Any]:
+        request = validate_memory_request("history", {"document_uri": document_uri})
         effective_tenant = self._effective_tenant(caller, tenant_id)
         scoped = self._client_for_tenant(effective_tenant)
         if scoped is not self:
-            return scoped.list_pending(
-                user_id=user_id,
-                tenant_id=effective_tenant,
-                lifecycle_states=lifecycle_states,
-                project_id=project_id,
-                caller=caller,
-            )
-        return self._get_memory_commands().list_pending(
-            user_id=user_id,
-            tenant_id=effective_tenant,
-            lifecycle_states=lifecycle_states,
-            project_id=project_id,
-            caller=caller,
+            return scoped.list_memory_history(**request, tenant_id=effective_tenant, caller=caller)
+        self._require_ready()
+        return validate_memory_response("history",
+            self._get_memory_commands().list_memory_history(**request, caller=caller)
         )
 
-    def review_pending(
+    def restore_memory_revision(
         self,
+        document_uri: str,
+        revision: int,
+        expected_digest: str,
         *,
-        user_id: str,
-        pending_uri: str,
+        tenant_id: str | None = None,
+        caller: TrustedRequestContext,
+    ) -> dict[str, Any]:
+        request = validate_memory_request(
+            "restore",
+            {
+                "document_uri": document_uri,
+                "revision": revision,
+                "expected_digest": expected_digest,
+            },
+        )
+        effective_tenant = self._effective_tenant(caller, tenant_id)
+        scoped = self._client_for_tenant(effective_tenant)
+        if scoped is not self:
+            return scoped.restore_memory_revision(**request, tenant_id=effective_tenant, caller=caller)
+        self._require_ready()
+        return validate_memory_response("restore",
+            self._get_memory_commands().restore_memory_revision(**request, caller=caller)
+        )
+
+    def review_memory_edit(
+        self,
+        proposal_id: str,
         decision: str,
-        expected_lifecycle_revision: int,
-        expected_proposal_fingerprint: str,
-        command_id: str,
+        corrected_edit: str | None = None,
+        *,
         tenant_id: str | None = None,
-        reason: str = "",
-        corrected_proposal: MemorySemanticProposal | dict[str, Any] | None = None,
-        caller: TrustedRequestContext | None = None,
+        caller: TrustedRequestContext,
     ) -> dict[str, Any]:
+        request = validate_memory_request(
+            "review",
+            {"proposal_id": proposal_id, "decision": decision, "corrected_edit": corrected_edit},
+        )
         effective_tenant = self._effective_tenant(caller, tenant_id)
         scoped = self._client_for_tenant(effective_tenant)
         if scoped is not self:
-            return scoped.review_pending(
-                user_id=user_id,
-                pending_uri=pending_uri,
-                decision=decision,
-                expected_lifecycle_revision=expected_lifecycle_revision,
-                expected_proposal_fingerprint=expected_proposal_fingerprint,
-                command_id=command_id,
-                tenant_id=effective_tenant,
-                reason=reason,
-                corrected_proposal=corrected_proposal,
-                caller=caller,
-            )
-        return self._get_pending_reviews().review_pending(
-            user_id=user_id,
-            pending_uri=pending_uri,
-            decision=decision,
-            expected_lifecycle_revision=expected_lifecycle_revision,
-            expected_proposal_fingerprint=expected_proposal_fingerprint,
-            command_id=command_id,
-            tenant_id=effective_tenant,
-            reason=reason,
-            corrected_proposal=corrected_proposal,
-            caller=caller,
-            review_locked=self._review_pending_locked,
+            return scoped.review_memory_edit(**request, tenant_id=effective_tenant, caller=caller)
+        self._require_ready()
+        return validate_memory_response("review",
+            self._get_memory_reviews().review_edit(**request, caller=caller)
         )
 
-    def _review_pending_locked(
+    def preview_memory_edit(
         self,
+        proposal_id: str,
         *,
-        user_id: str,
-        pending_uri: str,
-        normalized_decision: str,
-        expected_lifecycle_revision: int,
-        expected_proposal_fingerprint: str,
-        command_id: str,
-        tenant_id: str,
-        reason: str,
-        corrected_proposal: MemorySemanticProposal | None,
-        caller: TrustedRequestContext | None,
-        review_request_digest: str,
-        command_proof_preexisting: bool,
+        tenant_id: str | None = None,
+        caller: TrustedRequestContext,
     ) -> dict[str, Any]:
-        return self._get_pending_reviews()._review_pending_locked(
-            user_id=user_id,
-            pending_uri=pending_uri,
-            normalized_decision=normalized_decision,
-            expected_lifecycle_revision=expected_lifecycle_revision,
-            expected_proposal_fingerprint=expected_proposal_fingerprint,
-            command_id=command_id,
-            tenant_id=tenant_id,
-            reason=reason,
-            corrected_proposal=corrected_proposal,
-            caller=caller,
-            review_request_digest=review_request_digest,
-            command_proof_preexisting=command_proof_preexisting,
+        request = validate_memory_request("review_preview", {"proposal_id": proposal_id})
+        effective_tenant = self._effective_tenant(caller, tenant_id)
+        scoped = self._client_for_tenant(effective_tenant)
+        if scoped is not self:
+            return scoped.preview_memory_edit(**request, tenant_id=effective_tenant, caller=caller)
+        self._require_ready()
+        return validate_memory_response(
+            "review_preview",
+            self._get_memory_reviews().preview_edit(**request, caller=caller),
         )
-
-    def _pending_review_recovered_result(
-        self,
-        pending_uri: str,
-        pending: Any,
-        claim_uris: tuple[str, ...],
-    ) -> dict[str, Any]:
-        return self._get_pending_reviews()._pending_review_recovered_result(pending_uri, pending, claim_uris)
-
-    def _forget_canonical_claim(self, user_id: str, obj) -> dict[str, Any]:  # noqa: ANN001
-        return self._get_memory_commands()._forget_canonical_claim(user_id, obj)
-
-    def _persist_structured_command_archive(self, archive: SessionArchive) -> SessionArchive:
-        return self._get_memory_commands()._persist_structured_command_archive(archive)
 
     def archive_read(
         self,
@@ -562,6 +672,7 @@ class MemoryOSClient:
         tenant_id: str | None = None,
         caller: TrustedRequestContext | None = None,
         project_id: str = "",
+        timezone_name: str = "UTC",
     ) -> list[dict[str, Any]]:
         effective_tenant = self._effective_tenant(caller, tenant_id)
         scoped = self._client_for_tenant(effective_tenant)
@@ -573,6 +684,7 @@ class MemoryOSClient:
                 tenant_id=effective_tenant,
                 caller=caller,
                 project_id=project_id,
+                timezone_name=timezone_name,
             )
         return self._get_session_application().archive_search(
             query,
@@ -581,6 +693,7 @@ class MemoryOSClient:
             tenant_id=effective_tenant,
             caller=caller,
             project_id=project_id,
+            timezone_name=timezone_name,
             search_context=self.search_context,
             archive_read=self.archive_read,
         )
@@ -653,20 +766,12 @@ class MemoryOSClient:
         if obj.owner_user_id != caller.user_id:
             raise FileNotFoundError(uri)
         parsed = ContextURI.parse(uri)
-        if parsed.authority == "user":
-            canonical_kind = str(dict(obj.metadata or {}).get("canonical_kind") or "")
-            path_is_bound = parsed.user_id == caller.user_id or canonical_kind in {"claim", "slot"}
-            if not path_is_bound:
-                raise FileNotFoundError(uri)
+        if parsed.authority == "user" and parsed.user_id != caller.user_id:
+            raise FileNotFoundError(uri)
         if obj.lifecycle_state != LifecycleState.ACTIVE:
             raise FileNotFoundError(uri)
         metadata = dict(obj.metadata or {})
         self._require_exact_workspace(metadata, caller, uri)
-        admission = dict(metadata.get("admission", {}) or {})
-        if admission.get("decision") in {"pending", "restricted", "archive_only", "reject"}:
-            raise FileNotFoundError(uri)
-        if metadata.get("canonical_kind") == "claim" and metadata.get("state") != "ACTIVE":
-            raise FileNotFoundError(uri)
         visibility = dict(dict(metadata.get("scope", {}) or {}).get("visibility", {}) or {})
         if visibility:
             if str(visibility.get("tenant_id") or "default") != caller.tenant_id:
@@ -709,7 +814,6 @@ class MemoryOSClient:
                 tenant_id=tenant_id,
                 memory_extractor=self._tenant_memory_extractor,
                 memory_egress_policy=self._tenant_memory_egress_policy,
-                memory_aliases=self._tenant_memory_aliases,
                 reranker=self._tenant_reranker,
                 embedding_provider=self._tenant_embedding_provider,
             )
@@ -722,33 +826,26 @@ class MemoryOSClient:
             readiness.require_ready()
 
     def _process_memory_projections_or_raise(self) -> dict[str, list[str]]:
-        """A committed canonical write must never report a false serving success."""
+        """Boundedly assist durable document projection without hiding failure."""
 
-        combined: dict[str, list[str]] = {
-            key: []
-            for key in ("processed", "stale", "failed", "dead_letter", "quarantine", "released")
-        }
-        # Bound synchronous assistance. A larger backlog remains durable and
-        # explicitly unavailable instead of making this request wait without
-        # limit or falsely claiming that its CurrentSlot row is serving.
+        combined: dict[str, list[str]] = {key: [] for key in ("processed", "stale", "failed")}
+        # A larger backlog remains durable and explicitly pending.
         for _ in range(10):
-            result = self.memory_projection_worker.process_pending(limit=10)
+            run = self.memory_projection_worker.process_pending(limit=10)
             for key in combined:
-                combined[key].extend(str(item) for item in result.get(key, ()))
-            terminal = tuple(result.get("dead_letter", ())) + tuple(result.get("quarantine", ()))
-            failed = tuple(result.get("failed", ()))
-            if failed or terminal:
+                combined[key].extend(str(item) for item in getattr(run, key))
+            if run.failed:
                 raise RuntimeError(
-                    "canonical transaction committed but its serving projection is unavailable; "
-                    f"failed={len(failed)}, terminal={len(terminal)}"
+                    "memory document committed but its serving projection is unavailable; "
+                    f"failed={len(run.failed)}"
                 )
             stats = self.queue_store.stats(queue_name="memory_projection")
             if not any(int(stats.get(status, 0) or 0) for status in ("pending", "leased")):
                 return combined
-            if not result.get("processed"):
+            if not run.processed and not run.stale:
                 break
         raise RuntimeError(
-            "canonical transaction committed but its serving projection remains pending after bounded replay"
+            "memory document committed but its serving projection remains pending after bounded replay"
         )
 
     def _require_exact_workspace(
@@ -841,7 +938,6 @@ class MemoryOSClient:
             vector_store=getattr(self, "vector_store", None),
             embedding_provider=getattr(self, "embedding_provider", None),
             reranker=getattr(self, "reranker", None),
-            projection_store=getattr(self.context_db, "projection_store", None),
         )
 
     def _project_id_from_metadata(self, connect_metadata: dict[str, Any] | None) -> str:

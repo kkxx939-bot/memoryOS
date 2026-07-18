@@ -11,9 +11,10 @@ class WorkerRuntime(Protocol):
     recovery_worker: Any
     session_commit_service: Any
     memory_projection_worker: Any
+    memory_document_edit_worker: Any
+    memory_document_scan_worker: Any
     source_store: Any
     queue_store: Any
-    migration_gate: Any
     vector_store: Any
     embedding_provider: Any
     context_db: Any

@@ -10,6 +10,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+from memoryos.api.memory_contract import validate_memory_request, validate_memory_response
 from memoryos.api.retrieval_contract import serialize_retrieval_options
 from memoryos.contextdb.retrieval.query_plan import RetrievalOptions
 
@@ -160,41 +161,186 @@ class HTTPMemoryOSClient:
         _raise_remote_error(response)
         return response
 
-    def remember(self, **kwargs: Any) -> dict[str, Any]:
-        response = self.request("POST", "/v1/memories/remember", kwargs)
-        _raise_remote_error(response)
-        return response
-
-    def forget(self, **kwargs: Any) -> dict[str, Any]:
-        response = self.request("POST", "/v1/memories/forget", kwargs)
-        _raise_remote_error(response)
-        return response
-
-    def list_pending(
+    def remember(
         self,
-        *,
-        user_id: str,
-        tenant_id: str | None = None,
-        lifecycle_states: list[str] | None = None,
-        project_id: str = "",
-    ) -> list[dict[str, Any]]:
-        effective_tenant = tenant_id or self.tenant_id
-        query = urllib.parse.urlencode(
+        content: str,
+        occurred_at: str | None = None,
+        target_hint: str | None = None,
+        expected_document_digest: str | None = None,
+    ) -> dict[str, Any]:
+        payload = validate_memory_request(
+            "remember",
             {
-                "user_id": user_id,
-                "lifecycle_state": ",".join(lifecycle_states or []),
-                **({"tenant_id": effective_tenant} if effective_tenant else {}),
-                **({"project_id": project_id} if project_id else {}),
-            }
+                "content": content,
+                "occurred_at": occurred_at,
+                "target_hint": target_hint,
+                "expected_document_digest": expected_document_digest,
+            },
         )
-        response = self.request("GET", f"/v1/memories/pending?{query}")
+        response = self.request("POST", "/v1/memories/remember", payload)
         _raise_remote_error(response)
-        return list(response.get("results", []))
+        return validate_memory_response("remember", _without_request_id(response))
 
-    def review_pending(self, **kwargs: Any) -> dict[str, Any]:
-        response = self.request("POST", "/v1/memories/pending/review", kwargs)
+    def adopt_memory_document(
+        self,
+        relative_path: str,
+        expected_raw_sha256: str,
+    ) -> dict[str, Any]:
+        payload = validate_memory_request(
+            "adopt",
+            {
+                "relative_path": relative_path,
+                "expected_raw_sha256": expected_raw_sha256,
+            },
+        )
+        response = self.request("POST", "/v1/memories/adopt", payload)
         _raise_remote_error(response)
-        return response
+        return validate_memory_response("adopt", _without_request_id(response))
+
+    def edit_memory_document(
+        self,
+        document_uri: str,
+        edit: str,
+        expected_digest: str,
+    ) -> dict[str, Any]:
+        payload = validate_memory_request(
+            "edit",
+            {"document_uri": document_uri, "edit": edit, "expected_digest": expected_digest},
+        )
+        response = self.request("POST", "/v1/memories/edit", payload)
+        _raise_remote_error(response)
+        return validate_memory_response("edit", _without_request_id(response))
+
+    def rename_memory_document(
+        self,
+        document_uri: str,
+        new_relative_path: str,
+        expected_digest: str,
+        edit: str | None = None,
+    ) -> dict[str, Any]:
+        payload = validate_memory_request(
+            "rename",
+            {
+                "document_uri": document_uri,
+                "new_relative_path": new_relative_path,
+                "expected_digest": expected_digest,
+                "edit": edit,
+            },
+        )
+        response = self.request("POST", "/v1/memories/rename", payload)
+        _raise_remote_error(response)
+        return validate_memory_response("rename", _without_request_id(response))
+
+    def merge_memory_documents(
+        self,
+        target_document_uri: str,
+        merged_edit: str,
+        expected_target_digest: str,
+        source_documents: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        payload = validate_memory_request(
+            "merge",
+            {
+                "target_document_uri": target_document_uri,
+                "merged_edit": merged_edit,
+                "expected_target_digest": expected_target_digest,
+                "source_documents": source_documents,
+            },
+        )
+        response = self.request("POST", "/v1/memories/merge", payload)
+        _raise_remote_error(response)
+        return validate_memory_response("merge", _without_request_id(response))
+
+    def propose_memory_consolidation(
+        self,
+        target_document_uri: str,
+        merged_edit: str,
+        expected_target_digest: str,
+        source_documents: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        payload = validate_memory_request(
+            "merge_propose",
+            {
+                "target_document_uri": target_document_uri,
+                "merged_edit": merged_edit,
+                "expected_target_digest": expected_target_digest,
+                "source_documents": source_documents,
+            },
+        )
+        response = self.request("POST", "/v1/memories/merge/propose", payload)
+        _raise_remote_error(response)
+        return validate_memory_response("merge_propose", _without_request_id(response))
+
+    def resume_memory_consolidation(self, saga_id: str) -> dict[str, Any]:
+        payload = validate_memory_request("merge_resume", {"saga_id": saga_id})
+        response = self.request("POST", "/v1/memories/merge/resume", payload)
+        _raise_remote_error(response)
+        return validate_memory_response("merge_resume", _without_request_id(response))
+
+    def forget(
+        self,
+        document_uri: str,
+        section_anchor: str | None = None,
+        mode: str = "SOFT_FORGET",
+        expected_digest: str | None = None,
+    ) -> dict[str, Any]:
+        payload = validate_memory_request(
+            "forget",
+            {
+                "document_uri": document_uri,
+                "section_anchor": section_anchor,
+                "mode": mode,
+                "expected_digest": expected_digest,
+            },
+        )
+        response = self.request("POST", "/v1/memories/forget", payload)
+        _raise_remote_error(response)
+        return validate_memory_response("forget", _without_request_id(response))
+
+    def list_memory_history(self, document_uri: str) -> dict[str, Any]:
+        payload = validate_memory_request("history", {"document_uri": document_uri})
+        query = urllib.parse.urlencode(payload)
+        response = self.request("GET", f"/v1/memories/history?{query}")
+        _raise_remote_error(response)
+        return validate_memory_response("history", _without_request_id(response))
+
+    def restore_memory_revision(
+        self,
+        document_uri: str,
+        revision: int,
+        expected_digest: str,
+    ) -> dict[str, Any]:
+        payload = validate_memory_request(
+            "restore",
+            {
+                "document_uri": document_uri,
+                "revision": revision,
+                "expected_digest": expected_digest,
+            },
+        )
+        response = self.request("POST", "/v1/memories/restore", payload)
+        _raise_remote_error(response)
+        return validate_memory_response("restore", _without_request_id(response))
+
+    def review_memory_edit(
+        self,
+        proposal_id: str,
+        decision: str,
+        corrected_edit: str | None = None,
+    ) -> dict[str, Any]:
+        payload = validate_memory_request(
+            "review",
+            {"proposal_id": proposal_id, "decision": decision, "corrected_edit": corrected_edit},
+        )
+        response = self.request("POST", "/v1/memories/review", payload)
+        _raise_remote_error(response)
+        return validate_memory_response("review", _without_request_id(response))
+
+    def preview_memory_edit(self, proposal_id: str) -> dict[str, Any]:
+        payload = validate_memory_request("review_preview", {"proposal_id": proposal_id})
+        response = self.request("POST", "/v1/memories/review/preview", payload)
+        _raise_remote_error(response)
+        return validate_memory_response("review_preview", _without_request_id(response))
 
     def read(self, uri: str, *, layer: str = "L2") -> dict[str, Any]:
         query = urllib.parse.urlencode({"uri": uri, "layer": layer})
@@ -316,3 +462,11 @@ def _raise_remote_error(response: dict[str, Any]) -> None:
         operation=str(raw.get("operation") or ""),
         status_code=int(status_code) if isinstance(status_code, int) else None,
     )
+
+
+def _without_request_id(response: dict[str, Any]) -> dict[str, Any]:
+    """The ASGI request id is transport metadata, not command result data."""
+
+    payload = dict(response)
+    payload.pop("request_id", None)
+    return payload

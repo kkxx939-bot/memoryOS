@@ -1,18 +1,35 @@
-"""上下文数据库里的SQLite关系存储。"""
+"""Greenfield tenant-qualified SQLite relation serving store."""
 
 from __future__ import annotations
 
 import json
 import os
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from memoryos.contextdb.extensions import ContextDomainClassifier, NoDomainOverlay
 from memoryos.contextdb.model.context_relation import ContextRelation
 
+_RELATION_COLUMNS = frozenset(
+    {
+        "tenant_id",
+        "source_uri",
+        "relation_type",
+        "target_uri",
+        "owner_user_id",
+        "catalog_record_key",
+        "weight",
+        "metadata_json",
+        "created_at",
+    }
+)
+_RELATION_PRIMARY_KEY = ("tenant_id", "source_uri", "relation_type", "target_uri")
+
 
 class SQLiteRelationStore:
+    """Store rebuildable relation edges without any tenant-free identity."""
+
     def __init__(
         self,
         path: str | Path,
@@ -26,33 +43,39 @@ class SQLiteRelationStore:
         self._init_db()
         os.chmod(self.path, 0o600)
 
-    def add_relation(self, relation: ContextRelation) -> None:
-        tenant_id = str(relation.metadata.get("tenant_id", "default"))
-        owner_user_id = str(relation.metadata.get("owner_user_id", ""))
-        catalog_record_key = str(relation.metadata.get("catalog_record_key", ""))
+    @staticmethod
+    def _require_tenant(tenant_id: str) -> str:
+        resolved = str(tenant_id or "").strip()
+        if not resolved:
+            raise ValueError("tenant_id is required")
+        return resolved
+
+    def add_relation(self, relation: ContextRelation, *, tenant_id: str) -> None:
+        resolved_tenant = self._require_tenant(tenant_id)
+        metadata = self._metadata_for_tenant(relation.metadata, resolved_tenant)
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO relations(
-                  source_uri, relation_type, target_uri, tenant_id, owner_user_id,
+                  tenant_id, source_uri, relation_type, target_uri, owner_user_id,
                   catalog_record_key, weight, metadata_json, created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(tenant_id, source_uri, relation_type, target_uri) DO UPDATE SET
                   owner_user_id=excluded.owner_user_id,
                   catalog_record_key=excluded.catalog_record_key,
                   weight=excluded.weight,
-                  metadata_json=excluded.metadata_json
+                  metadata_json=excluded.metadata_json,
+                  created_at=excluded.created_at
                 """,
                 (
+                    resolved_tenant,
                     relation.source_uri,
                     relation.relation_type,
                     relation.target_uri,
-                    tenant_id,
-                    owner_user_id,
-                    catalog_record_key,
+                    str(metadata.get("owner_user_id") or ""),
+                    str(metadata.get("catalog_record_key") or ""),
                     relation.weight,
-                    json.dumps(relation.metadata, ensure_ascii=False),
+                    self._json_dump(metadata),
                     relation.created_at,
                 ),
             )
@@ -61,35 +84,26 @@ class SQLiteRelationStore:
         self,
         uri: str,
         *,
-        tenant_id: str | None = None,
+        tenant_id: str,
         owner_user_id: str | None = None,
         limit: int | None = None,
     ) -> list[ContextRelation]:
-        sql = "SELECT * FROM relations WHERE (source_uri = ? OR target_uri = ?)"
-        params: list[str] = [uri, uri]
-        if tenant_id is not None:
-            sql += " AND tenant_id = ?"
-            params.append(tenant_id)
+        resolved_tenant = self._require_tenant(tenant_id)
+        sql = (
+            "SELECT * FROM relations WHERE tenant_id = ? "
+            "AND (source_uri = ? OR target_uri = ?)"
+        )
+        params: list[object] = [resolved_tenant, str(uri), str(uri)]
         if owner_user_id is not None:
             sql += " AND (owner_user_id = ? OR owner_user_id = '')"
-            params.append(owner_user_id)
-        sql += " ORDER BY weight DESC, created_at DESC, source_uri, target_uri"
+            params.append(str(owner_user_id))
+        sql += " ORDER BY weight DESC, created_at DESC, source_uri, relation_type, target_uri"
         if limit is not None:
             sql += " LIMIT ?"
-            params.append(str(max(0, int(limit))))
+            params.append(max(0, min(int(limit), 1_000)))
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
-        return [
-            ContextRelation(
-                source_uri=row["source_uri"],
-                relation_type=row["relation_type"],
-                target_uri=row["target_uri"],
-                weight=float(row["weight"]),
-                metadata=json.loads(row["metadata_json"] or "{}"),
-                created_at=row["created_at"],
-            )
-            for row in rows
-        ]
+        return [self._relation_from_row(row) for row in rows]
 
     def delete_relation(
         self,
@@ -97,23 +111,14 @@ class SQLiteRelationStore:
         relation_type: str,
         target_uri: str,
         *,
-        tenant_id: str | None = None,
+        tenant_id: str,
     ) -> None:
+        resolved_tenant = self._require_tenant(tenant_id)
         with self._connect() as conn:
-            if tenant_id is None:
-                tenants = conn.execute(
-                    "SELECT DISTINCT tenant_id FROM relations WHERE source_uri = ? "
-                    "AND relation_type = ? AND target_uri = ? LIMIT 2",
-                    (source_uri, relation_type, target_uri),
-                ).fetchall()
-                if len(tenants) > 1:
-                    raise ValueError("tenant_id is required for an ambiguous relation identity")
-                tenant_id = str(tenants[0]["tenant_id"]) if tenants else None
-            if tenant_id is None:
-                return
             conn.execute(
-                "DELETE FROM relations WHERE tenant_id = ? AND source_uri = ? AND relation_type = ? AND target_uri = ?",
-                (tenant_id, source_uri, relation_type, target_uri),
+                "DELETE FROM relations WHERE tenant_id = ? AND source_uri = ? "
+                "AND relation_type = ? AND target_uri = ?",
+                (resolved_tenant, str(source_uri), str(relation_type), str(target_uri)),
             )
 
     def delete_projection_relations(
@@ -124,35 +129,58 @@ class SQLiteRelationStore:
         catalog_record_key: str,
         limit: int,
     ) -> int:
-        """Delete a bounded, ownership-filtered batch without relation overfetch.
+        """Delete a bounded batch owned by one exact Catalog projection."""
 
-        Legacy relations with no Catalog owner remain eligible so upgrades keep
-        the previous cleanup behavior. Relations explicitly owned by another
-        Catalog record are excluded in SQL before LIMIT, preventing a large
-        unrelated prefix from hiding the projection's own edges.
-        """
-
+        resolved_tenant = self._require_tenant(tenant_id)
+        resolved_record_key = str(catalog_record_key or "").strip()
+        if not resolved_record_key:
+            raise ValueError("catalog_record_key is required")
         maximum = max(1, min(int(limit), 1_000))
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
                 """
                 SELECT source_uri, relation_type, target_uri
                 FROM relations
-                WHERE tenant_id = ?
-                  AND (catalog_record_key = '' OR catalog_record_key = ?)
+                WHERE tenant_id = ? AND catalog_record_key = ?
                   AND (source_uri = ? OR target_uri = ?)
                 ORDER BY source_uri, relation_type, target_uri
                 LIMIT ?
                 """,
-                (tenant_id, catalog_record_key, uri, uri, maximum),
+                (resolved_tenant, resolved_record_key, str(uri), str(uri), maximum),
             ).fetchall()
-            conn.executemany(
-                "DELETE FROM relations WHERE tenant_id = ? AND source_uri = ? AND relation_type = ? AND target_uri = ?",
-                (
-                    (tenant_id, str(row["source_uri"]), str(row["relation_type"]), str(row["target_uri"]))
-                    for row in rows
-                ),
-            )
+            self._delete_rows(conn, resolved_tenant, rows)
+        return len(rows)
+
+    def delete_memory_document_relations(
+        self,
+        uri: str,
+        *,
+        tenant_id: str,
+        owner_user_id: str,
+        limit: int,
+    ) -> int:
+        """Delete one bounded exact-owner batch touching a memory document URI."""
+
+        resolved_tenant = self._require_tenant(tenant_id)
+        resolved_owner = str(owner_user_id or "").strip()
+        if not resolved_owner:
+            raise ValueError("owner_user_id is required")
+        maximum = max(1, min(int(limit), 1_000))
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT source_uri, relation_type, target_uri
+                FROM relations
+                WHERE tenant_id = ? AND owner_user_id = ?
+                  AND (source_uri = ? OR target_uri = ?)
+                ORDER BY source_uri, relation_type, target_uri
+                LIMIT ?
+                """,
+                (resolved_tenant, resolved_owner, str(uri), str(uri), maximum),
+            ).fetchall()
+            self._delete_rows(conn, resolved_tenant, rows)
         return len(rows)
 
     def delete_uri_relations(
@@ -162,39 +190,32 @@ class SQLiteRelationStore:
         tenant_id: str,
         limit: int,
     ) -> int:
-        """Delete a bounded tenant+URI batch after Catalog ownership is lost."""
+        """Delete a bounded tenant-local URI batch after ownership is gone."""
 
+        resolved_tenant = self._require_tenant(tenant_id)
         maximum = max(1, min(int(limit), 1_000))
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
                 """
                 SELECT source_uri, relation_type, target_uri
                 FROM relations
-                WHERE tenant_id = ?
-                  AND (source_uri = ? OR target_uri = ?)
+                WHERE tenant_id = ? AND (source_uri = ? OR target_uri = ?)
                 ORDER BY source_uri, relation_type, target_uri
                 LIMIT ?
                 """,
-                (tenant_id, uri, uri, maximum),
+                (resolved_tenant, str(uri), str(uri), maximum),
             ).fetchall()
-            conn.executemany(
-                """
-                DELETE FROM relations
-                WHERE tenant_id = ? AND source_uri = ?
-                  AND relation_type = ? AND target_uri = ?
-                """,
-                (
-                    (tenant_id, str(row["source_uri"]), str(row["relation_type"]), str(row["target_uri"]))
-                    for row in rows
-                ),
-            )
+            self._delete_rows(conn, resolved_tenant, rows)
         return len(rows)
 
     def clear_ordinary_relations(self, *, tenant_id: str, limit: int) -> int:
         """Delete one bounded tenant batch while preserving domain-owned edges."""
 
+        resolved_tenant = self._require_tenant(tenant_id)
         maximum = max(1, min(int(limit), 1_000))
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             selected: list[sqlite3.Row] = []
             after = ("", "", "")
             page_size = max(64, maximum)
@@ -208,7 +229,7 @@ class SQLiteRelationStore:
                     ORDER BY source_uri, relation_type, target_uri
                     LIMIT ?
                     """,
-                    (tenant_id, *after, page_size),
+                    (resolved_tenant, *after, page_size),
                 ).fetchall()
                 if not rows:
                     break
@@ -223,13 +244,7 @@ class SQLiteRelationStore:
                     selected.append(row)
                     if len(selected) >= maximum:
                         break
-            conn.executemany(
-                "DELETE FROM relations WHERE tenant_id = ? AND source_uri = ? AND relation_type = ? AND target_uri = ?",
-                (
-                    (tenant_id, str(row["source_uri"]), str(row["relation_type"]), str(row["target_uri"]))
-                    for row in selected
-                ),
-            )
+            self._delete_rows(conn, resolved_tenant, selected)
         return len(selected)
 
     def reconcile_ordinary_relations(
@@ -238,100 +253,157 @@ class SQLiteRelationStore:
         *,
         tenant_id: str,
     ) -> dict[str, int]:
-        """Idempotently upsert one bounded, tenant-owned ordinary batch."""
+        """Idempotently upsert one bounded tenant-owned ordinary batch."""
 
+        resolved_tenant = self._require_tenant(tenant_id)
         values = tuple(relations)
         if len(values) > 1_000:
             raise ValueError("ordinary relation reconcile batch exceeds 1000")
-        prepared: dict[tuple[str, str, str], ContextRelation] = {}
+        prepared: dict[tuple[str, str, str], tuple[ContextRelation, dict[str, object]]] = {}
         for relation in values:
-            relation_tenant = str(relation.metadata.get("tenant_id") or "default")
-            if relation_tenant != tenant_id:
-                raise ValueError("ordinary relation tenant differs from reconcile tenant")
+            metadata = self._metadata_for_tenant(relation.metadata, resolved_tenant)
             if self.domain_classifier.owns_uri(relation.source_uri):
-                raise ValueError("ordinary relation reconcile cannot mutate a canonical Source")
-            if str(relation.metadata.get("catalog_record_key") or ""):
+                raise ValueError("ordinary relation reconcile cannot mutate a domain-owned Source")
+            if str(metadata.get("catalog_record_key") or ""):
                 raise ValueError("ordinary Source relation cannot claim Catalog projection ownership")
             identity = (relation.source_uri, relation.relation_type, relation.target_uri)
-            existing = prepared.get(identity)
-            if existing is not None and not self._ordinary_projection_equal(existing, relation):
+            prior = prepared.get(identity)
+            if prior is not None and not self._ordinary_projection_equal(
+                prior[0],
+                relation,
+                left_metadata=prior[1],
+                right_metadata=metadata,
+            ):
                 raise ValueError("ordinary relation batch contains a conflicting identity")
-            prepared[identity] = relation
+            prepared[identity] = (relation, metadata)
 
         written = 0
         skipped = 0
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             for identity in sorted(prepared):
-                relation = prepared[identity]
+                relation, metadata = prepared[identity]
                 existing = conn.execute(
-                    "SELECT owner_user_id, catalog_record_key, weight, metadata_json "
+                    "SELECT owner_user_id, catalog_record_key, weight, metadata_json, created_at "
                     "FROM relations WHERE tenant_id = ? AND source_uri = ? "
                     "AND relation_type = ? AND target_uri = ?",
-                    (tenant_id, *identity),
+                    (resolved_tenant, *identity),
                 ).fetchone()
                 if existing is not None:
-                    try:
-                        existing_metadata = json.loads(str(existing["metadata_json"] or "{}"))
-                    except (TypeError, ValueError) as exc:
-                        raise ValueError("ordinary RelationStore metadata is invalid") from exc
+                    existing_metadata = self._json_mapping(existing["metadata_json"])
                     if (
-                        str(existing["owner_user_id"] or "") == str(relation.metadata.get("owner_user_id") or "")
+                        str(existing["owner_user_id"] or "") == str(metadata.get("owner_user_id") or "")
                         and not str(existing["catalog_record_key"] or "")
                         and float(existing["weight"]) == relation.weight
-                        and existing_metadata == dict(relation.metadata or {})
+                        and existing_metadata == metadata
+                        and str(existing["created_at"]) == relation.created_at
                     ):
                         skipped += 1
                         continue
                 conn.execute(
                     """
                     INSERT INTO relations(
-                      source_uri, relation_type, target_uri, tenant_id, owner_user_id,
+                      tenant_id, source_uri, relation_type, target_uri, owner_user_id,
                       catalog_record_key, weight, metadata_json, created_at
                     ) VALUES (?, ?, ?, ?, ?, '', ?, ?, ?)
                     ON CONFLICT(tenant_id, source_uri, relation_type, target_uri) DO UPDATE SET
                       owner_user_id=excluded.owner_user_id,
                       catalog_record_key='',
                       weight=excluded.weight,
-                      metadata_json=excluded.metadata_json
+                      metadata_json=excluded.metadata_json,
+                      created_at=excluded.created_at
                     """,
                     (
-                        relation.source_uri,
-                        relation.relation_type,
-                        relation.target_uri,
-                        tenant_id,
-                        str(relation.metadata.get("owner_user_id") or ""),
+                        resolved_tenant,
+                        *identity,
+                        str(metadata.get("owner_user_id") or ""),
                         relation.weight,
-                        json.dumps(relation.metadata, ensure_ascii=False, sort_keys=True),
+                        self._json_dump(metadata),
                         relation.created_at,
                     ),
                 )
                 written += 1
         return {"processed": len(prepared), "written": written, "skipped": skipped}
 
+    def all_relations(self, *, tenant_id: str) -> list[ContextRelation]:
+        resolved_tenant = self._require_tenant(tenant_id)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM relations WHERE tenant_id = ? "
+                "ORDER BY source_uri, relation_type, target_uri",
+                (resolved_tenant,),
+            ).fetchall()
+        return [self._relation_from_row(row) for row in rows]
+
     @staticmethod
-    def _ordinary_projection_equal(left: ContextRelation, right: ContextRelation) -> bool:
+    def _ordinary_projection_equal(
+        left: ContextRelation,
+        right: ContextRelation,
+        *,
+        left_metadata: Mapping[str, object] | None = None,
+        right_metadata: Mapping[str, object] | None = None,
+    ) -> bool:
         return (
             left.source_uri == right.source_uri
             and left.relation_type == right.relation_type
             and left.target_uri == right.target_uri
             and left.weight == right.weight
-            and dict(left.metadata or {}) == dict(right.metadata or {})
+            and dict(left_metadata or left.metadata or {}) == dict(right_metadata or right.metadata or {})
+            and left.created_at == right.created_at
         )
 
-    def all_relations(self) -> list[ContextRelation]:
-        with self._connect() as conn:
-            rows = conn.execute("SELECT * FROM relations").fetchall()
-        return [
-            ContextRelation(
-                source_uri=row["source_uri"],
-                relation_type=row["relation_type"],
-                target_uri=row["target_uri"],
-                weight=float(row["weight"]),
-                metadata=json.loads(row["metadata_json"] or "{}"),
-                created_at=row["created_at"],
-            )
-            for row in rows
-        ]
+    @staticmethod
+    def _metadata_for_tenant(metadata: Mapping[str, object], tenant_id: str) -> dict[str, object]:
+        result = dict(metadata or {})
+        supplied = str(result.get("tenant_id") or "")
+        if supplied and supplied != tenant_id:
+            raise ValueError("relation tenant differs from explicit tenant_id")
+        result["tenant_id"] = tenant_id
+        return result
+
+    @staticmethod
+    def _delete_rows(
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        rows: Sequence[sqlite3.Row],
+    ) -> None:
+        conn.executemany(
+            "DELETE FROM relations WHERE tenant_id = ? AND source_uri = ? "
+            "AND relation_type = ? AND target_uri = ?",
+            (
+                (
+                    tenant_id,
+                    str(row["source_uri"]),
+                    str(row["relation_type"]),
+                    str(row["target_uri"]),
+                )
+                for row in rows
+            ),
+        )
+
+    def _relation_from_row(self, row: sqlite3.Row) -> ContextRelation:
+        return ContextRelation(
+            source_uri=str(row["source_uri"]),
+            relation_type=str(row["relation_type"]),
+            target_uri=str(row["target_uri"]),
+            weight=float(row["weight"]),
+            metadata=self._json_mapping(row["metadata_json"]),
+            created_at=str(row["created_at"]),
+        )
+
+    @staticmethod
+    def _json_dump(value: Mapping[str, object]) -> str:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+    @staticmethod
+    def _json_mapping(value: object) -> dict[str, object]:
+        try:
+            decoded = json.loads(str(value or "{}"))
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise ValueError("RelationStore metadata is invalid") from exc
+        if not isinstance(decoded, dict):
+            raise ValueError("RelationStore metadata is invalid")
+        return decoded
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)
@@ -340,103 +412,51 @@ class SQLiteRelationStore:
 
     def _init_db(self) -> None:
         with self._connect() as conn:
-            self._create_relations_table(conn)
-            columns = {row["name"] for row in conn.execute("PRAGMA table_info(relations)").fetchall()}
-            if "tenant_id" not in columns:
-                conn.execute("ALTER TABLE relations ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'")
-            if "owner_user_id" not in columns:
-                conn.execute("ALTER TABLE relations ADD COLUMN owner_user_id TEXT NOT NULL DEFAULT ''")
-            if "catalog_record_key" not in columns:
-                conn.execute("ALTER TABLE relations ADD COLUMN catalog_record_key TEXT NOT NULL DEFAULT ''")
-            primary_key = tuple(
-                str(row["name"])
-                for row in sorted(
-                    (row for row in conn.execute("PRAGMA table_info(relations)").fetchall() if int(row["pk"]) > 0),
-                    key=lambda row: int(row["pk"]),
-                )
-            )
-            expected_primary_key = ("tenant_id", "source_uri", "relation_type", "target_uri")
-            if primary_key != expected_primary_key:
-                conn.execute("ALTER TABLE relations RENAME TO relations_legacy_identity")
+            row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'relations'"
+            ).fetchone()
+            if row is None:
                 self._create_relations_table(conn)
-                conn.execute(
-                    "INSERT OR REPLACE INTO relations(tenant_id, source_uri, relation_type, target_uri, "
-                    "owner_user_id, catalog_record_key, weight, metadata_json, created_at) "
-                    "SELECT tenant_id, source_uri, relation_type, target_uri, owner_user_id, "
-                    "catalog_record_key, weight, metadata_json, created_at FROM relations_legacy_identity"
+            else:
+                info = conn.execute("PRAGMA table_info(relations)").fetchall()
+                columns = {str(item["name"]) for item in info}
+                primary_key = tuple(
+                    str(item["name"])
+                    for item in sorted(info, key=lambda candidate: int(candidate["pk"]))
+                    if int(item["pk"]) > 0
                 )
-                conn.execute("DROP TABLE relations_legacy_identity")
-            self._migrate_catalog_record_keys(conn)
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_relations_source_scope "
-                "ON relations(source_uri, tenant_id, owner_user_id, weight DESC)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_relations_target_scope "
-                "ON relations(target_uri, tenant_id, owner_user_id, weight DESC)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_relations_source_projection "
-                "ON relations(source_uri, tenant_id, catalog_record_key)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_relations_target_projection "
-                "ON relations(target_uri, tenant_id, catalog_record_key)"
-            )
+                if columns != _RELATION_COLUMNS or primary_key != _RELATION_PRIMARY_KEY:
+                    raise RuntimeError("unsupported RelationStore layout; reset the greenfield runtime")
+            for statement in (
+                "CREATE INDEX IF NOT EXISTS idx_relations_tenant_source "
+                "ON relations(tenant_id, source_uri, owner_user_id, weight DESC, target_uri)",
+                "CREATE INDEX IF NOT EXISTS idx_relations_tenant_target "
+                "ON relations(tenant_id, target_uri, owner_user_id, weight DESC, source_uri)",
+                "CREATE INDEX IF NOT EXISTS idx_relations_tenant_source_projection "
+                "ON relations(tenant_id, source_uri, catalog_record_key)",
+                "CREATE INDEX IF NOT EXISTS idx_relations_tenant_target_projection "
+                "ON relations(tenant_id, target_uri, catalog_record_key)",
+            ):
+                conn.execute(statement)
 
     @staticmethod
     def _create_relations_table(conn: sqlite3.Connection) -> None:
         conn.execute(
             """
-                CREATE TABLE IF NOT EXISTS relations (
-                  source_uri TEXT NOT NULL,
-                  relation_type TEXT NOT NULL,
-                  target_uri TEXT NOT NULL,
-                  tenant_id TEXT NOT NULL DEFAULT 'default',
-                  owner_user_id TEXT NOT NULL DEFAULT '',
-                  catalog_record_key TEXT NOT NULL DEFAULT '',
-                  weight REAL NOT NULL,
-                  metadata_json TEXT NOT NULL,
-                  created_at TEXT NOT NULL,
-                  PRIMARY KEY(tenant_id, source_uri, relation_type, target_uri)
-                )
+            CREATE TABLE relations (
+              tenant_id TEXT NOT NULL,
+              source_uri TEXT NOT NULL,
+              relation_type TEXT NOT NULL,
+              target_uri TEXT NOT NULL,
+              owner_user_id TEXT NOT NULL DEFAULT '',
+              catalog_record_key TEXT NOT NULL DEFAULT '',
+              weight REAL NOT NULL,
+              metadata_json TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              PRIMARY KEY (tenant_id, source_uri, relation_type, target_uri)
+            )
             """
         )
-
-    @staticmethod
-    def _migrate_catalog_record_keys(conn: sqlite3.Connection) -> None:
-        """Backfill the normalized owner from legacy metadata in bounded batches."""
-
-        after_rowid = 0
-        while True:
-            rows = conn.execute(
-                """
-                SELECT rowid, metadata_json
-                FROM relations
-                WHERE rowid > ? AND catalog_record_key = ''
-                ORDER BY rowid
-                LIMIT 1000
-                """,
-                (after_rowid,),
-            ).fetchall()
-            if not rows:
-                return
-            updates: list[tuple[str, int]] = []
-            for row in rows:
-                after_rowid = int(row["rowid"])
-                try:
-                    metadata = json.loads(str(row["metadata_json"] or "{}"))
-                except (TypeError, ValueError):
-                    continue
-                if not isinstance(metadata, dict):
-                    continue
-                catalog_record_key = str(metadata.get("catalog_record_key") or "")
-                if catalog_record_key:
-                    updates.append((catalog_record_key, after_rowid))
-            conn.executemany(
-                "UPDATE relations SET catalog_record_key = ? WHERE rowid = ? AND catalog_record_key = ''",
-                updates,
-            )
 
 
 SqliteRelationStore = SQLiteRelationStore

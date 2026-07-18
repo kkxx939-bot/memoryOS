@@ -3,26 +3,27 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 
 from memoryos.action_policy.model.action_policy import ActionPolicy
 from memoryos.action_policy.update.action_policy_factory import ActionPolicyEvidence, ActionPolicyFactory
 from memoryos.contextdb.model.context_type import ContextType
+from memoryos.contextdb.model.lifecycle import LifecycleState
 from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.contextdb.store.index_store import IndexStore
 from memoryos.contextdb.store.source_store import SourceStore
 from memoryos.core.ids import stable_hash
-from memoryos.memory.model.memory import Memory, MemoryAnchor, MemoryKind
-from memoryos.memory.service.memory_updater import MemoryUpdater
 from memoryos.operations.model.context_operation import ContextOperation
 from memoryos.operations.model.operation_action import OperationAction
 from memoryos.security.action_risk import canonical_action
+from memoryos.support import SupportAnchor, SupportAnchorKind, SupportAnchorUpdater
 
 
 class ActionPolicyCommitPlanner:
     def __init__(self, index_store: IndexStore | None = None, source_store: SourceStore | None = None) -> None:
         self.index_store = index_store
         self.source_store = source_store
-        self.memory_updater = MemoryUpdater()
+        self.support_updater = SupportAnchorUpdater()
         self.factory = ActionPolicyFactory()
 
     def plan(self, archive: SessionArchive) -> list[ContextOperation]:
@@ -61,7 +62,12 @@ class ActionPolicyCommitPlanner:
                     )
                 )
             if explicit_rule:
-                operations.append(self.memory_updater.policy_rule(self._policy_memory(archive.user_id, explicit_rule, policy_uri), evidence=[{"source": "explicit_negative_feedback"}]))
+                operations.append(
+                    self.support_updater.add(
+                        self._policy_support(archive.user_id, explicit_rule, policy_uri),
+                        evidence=[{"source": "explicit_negative_feedback"}],
+                    )
+                )
                 operations.append(
                     ContextOperation(
                         user_id=archive.user_id,
@@ -79,15 +85,15 @@ class ActionPolicyCommitPlanner:
         evidence_by_key = self._collect_evidence(archive)
         operations: list[ContextOperation] = []
         for evidence in evidence_by_key.values():
-            if not evidence.memory_anchor_uri:
+            if not evidence.support_anchor_uri:
                 continue
             if not self._stable_enough(evidence):
                 continue
-            if not self._anchor_exists(evidence.memory_anchor_uri):
+            if not self._anchor_exists(evidence.support_anchor_uri, archive.user_id):
                 operations.append(
-                    self.memory_updater.add_memory(
-                        MemoryAnchor(
-                            uri=evidence.memory_anchor_uri,
+                    self.support_updater.add(
+                        SupportAnchor(
+                            uri=evidence.support_anchor_uri,
                             user_id=archive.user_id,
                             title=f"{evidence.scene_key} behavior anchor",
                             content=f"Recurring behavior theme for {evidence.scene_key}.",
@@ -112,7 +118,7 @@ class ActionPolicyCommitPlanner:
                             "source": "action_policy_auto_generation",
                             "scene_key": evidence.scene_key,
                             "action": evidence.action,
-                            "memory_anchor_uri": evidence.memory_anchor_uri,
+                            "support_anchor_uri": evidence.support_anchor_uri,
                         }
                     ],
                     source_session_id=archive.session_id,
@@ -154,22 +160,25 @@ class ActionPolicyCommitPlanner:
             evidence.evidence_refs.append(f"feedback:{archive.session_id}")
         for scene_key in scenes:
             for metadata, uri in self._behavior_metadata(archive.user_id, scene_key):
-                anchor_uri = str(metadata.get("memory_anchor_uri", "")) or self._default_anchor_uri(archive.user_id, scene_key)
+                anchor_uri = str(metadata.get("support_anchor_uri", "")) or self._default_anchor_uri(
+                    archive.user_id,
+                    scene_key,
+                )
                 for item in metadata.get("action_distribution", []) or []:
                     action = str(item.get("action", ""))
                     if not action:
                         continue
                     count = int(item.get("count", 0) or 0)
                     evidence = self._ensure_evidence(evidence_by_key, archive.user_id, scene_key, action)
-                    evidence.memory_anchor_uri = evidence.memory_anchor_uri or anchor_uri
+                    evidence.support_anchor_uri = evidence.support_anchor_uri or anchor_uri
                     evidence.opportunity_count += count
                     evidence.positive_count += count
                     evidence.activation_count += count
                     evidence.supported_behavior_pattern_uris.append(uri)
                     evidence.evidence_refs.append(uri)
         for evidence in evidence_by_key.values():
-            if not evidence.memory_anchor_uri:
-                evidence.memory_anchor_uri = self._default_anchor_uri(archive.user_id, evidence.scene_key)
+            if not evidence.support_anchor_uri:
+                evidence.support_anchor_uri = self._default_anchor_uri(archive.user_id, evidence.scene_key)
             evidence.evidence_refs = list(dict.fromkeys(evidence.evidence_refs))
             evidence.supported_behavior_pattern_uris = list(dict.fromkeys(evidence.supported_behavior_pattern_uris))
             evidence.required_resource_uris = list(dict.fromkeys(evidence.required_resource_uris))
@@ -190,7 +199,7 @@ class ActionPolicyCommitPlanner:
                 user_id=user_id,
                 scene_key=scene_key,
                 action=canonical,
-                memory_anchor_uri=self._default_anchor_uri(user_id, scene_key),
+                support_anchor_uri=self._default_anchor_uri(user_id, scene_key),
             )
         return evidence_by_key[key]
 
@@ -232,7 +241,16 @@ class ActionPolicyCommitPlanner:
             return []
         records: list[tuple[dict, str]] = []
         for context_type in (ContextType.BEHAVIOR_PATTERN, ContextType.BEHAVIOR_CLUSTER):
-            for hit in self.index_store.search(scene_key, filters={"owner_user_id": user_id, "context_type": context_type.value}, limit=20):
+            for hit in self.index_store.search(
+                scene_key,
+                tenant_id=self._tenant_id(),
+                filters={
+                    "tenant_id": self._tenant_id(),
+                    "owner_user_id": user_id,
+                    "context_type": context_type.value,
+                },
+                limit=20,
+            ):
                 metadata = dict(hit.metadata)
                 if self.source_store is not None:
                     try:
@@ -259,17 +277,26 @@ class ActionPolicyCommitPlanner:
             except (FileNotFoundError, IsADirectoryError, NotADirectoryError, json.JSONDecodeError, TypeError, ValueError, KeyError):
                 return None
 
-    def _anchor_exists(self, uri: str) -> bool:
+    def _anchor_exists(self, uri: str, user_id: str) -> bool:
         if self.source_store is None:
             return False
         try:
-            self.source_store.read_object(uri)
-            return True
+            obj = self.source_store.read_object(uri)
         except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
             return False
+        return bool(
+            obj.context_type == ContextType.BEHAVIOR_SUPPORT
+            and obj.owner_user_id == user_id
+            and obj.lifecycle_state == LifecycleState.ACTIVE
+            and isinstance(obj.metadata, Mapping)
+            and str(obj.metadata.get("support_anchor_kind") or "") == "behavior"
+        )
+
+    def _tenant_id(self) -> str:
+        return str(getattr(self.source_store, "tenant_id", "default") or "default")
 
     def _default_anchor_uri(self, user_id: str, scene_key: str) -> str:
-        return f"memoryos://user/{user_id}/memories/anchors/{scene_key}_anchor"
+        return f"memoryos://user/{user_id}/support/behavior/{scene_key}_anchor"
 
     def _used_uris(self, archive: SessionArchive, segment: str) -> list[str]:
         prefix = f"memoryos://{segment}/"
@@ -281,14 +308,18 @@ class ActionPolicyCommitPlanner:
         action = canonical_action(str(feedback.get("action", feedback.get("selected_action", "unknown"))))
         return f"memoryos://user/{user_id}/action_policies/{scene_key}/{action}"
 
-    def _policy_memory(self, user_id: str, rule: str, policy_uri: str) -> Memory:
+    def _policy_support(self, user_id: str, rule: str, policy_uri: str) -> SupportAnchor:
         digest = stable_hash([user_id, rule, policy_uri], length=16)
-        return Memory(
-            uri=f"memoryos://user/{user_id}/memories/policies/{digest}",
+        return SupportAnchor(
+            uri=f"memoryos://user/{user_id}/support/action-policy/{digest}",
             user_id=user_id,
-            title=rule[:48] or "policy memory",
+            title=rule[:48] or "policy support",
             content=rule,
-            kind=MemoryKind.POLICY,
+            anchor_key=digest,
+            kind=SupportAnchorKind.ACTION_POLICY,
             confidence=1.0,
             constrains_policy_uris=[policy_uri],
+            policy_rule_type="action_auto_execute",
+            policy_rule_value="forbidden",
+            related_action=policy_uri.rsplit("/", 1)[-1],
         )

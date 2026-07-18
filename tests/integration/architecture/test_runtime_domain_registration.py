@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from inspect import getsource
 
 
 def test_domain_package_imports_do_not_register_commit_or_evidence_handlers() -> None:
@@ -12,7 +13,6 @@ import json
 from memoryos.contextdb.session.evidence_encoder import session_evidence_encoder
 from memoryos.operations.commit.domain_registry import (
     action_policy_commit_handlers,
-    memory_commit_handlers,
 )
 
 import memoryos.action_policy
@@ -28,7 +28,6 @@ else:
 print(json.dumps({
     "action_policy_handlers": action_policy_commit_handlers() is not None,
     "encoder_error": encoder_error,
-    "memory_handlers": memory_commit_handlers() is not None,
 }))
 """
     result = subprocess.run(
@@ -41,7 +40,6 @@ print(json.dumps({
     assert json.loads(result.stdout) == {
         "action_policy_handlers": False,
         "encoder_error": "Session evidence encoder is not registered",
-        "memory_handlers": False,
     }
 
 
@@ -53,14 +51,12 @@ import tempfile
 from memoryos.contextdb.session.evidence_encoder import session_evidence_encoder
 from memoryos.operations.commit.domain_registry import (
     action_policy_commit_handlers,
-    memory_commit_handlers,
 )
 from memoryos.runtime.config import RuntimeConfig
 from memoryos.runtime.container import build_runtime_container
 
 before = {
     "action_policy_handlers": action_policy_commit_handlers() is not None,
-    "memory_handlers": memory_commit_handlers() is not None,
 }
 try:
     session_evidence_encoder()
@@ -75,7 +71,6 @@ with tempfile.TemporaryDirectory() as root:
 after = {
     "action_policy_handlers": action_policy_commit_handlers() is not None,
     "encoder": session_evidence_encoder() is not None,
-    "memory_handlers": memory_commit_handlers() is not None,
 }
 print(json.dumps({"after": after, "before": before}))
 """
@@ -90,11 +85,24 @@ print(json.dumps({"after": after, "before": before}))
         "after": {
             "action_policy_handlers": True,
             "encoder": True,
-            "memory_handlers": True,
         },
         "before": {
             "action_policy_handlers": False,
             "encoder": False,
-            "memory_handlers": False,
         },
     }
+
+
+def test_runtime_calls_consolidation_recovery_before_projection_drain(tmp_path) -> None:  # noqa: ANN001
+    from memoryos.runtime.config import RuntimeConfig
+    from memoryos.runtime.container import _recover_runtime, build_runtime_container
+
+    container = build_runtime_container(RuntimeConfig(root=str(tmp_path)))
+
+    assert container.memory_command_service.consolidator is container.memory_document_consolidator
+    assert container.memory_document_consolidator.saga_store is container.memory_document_consolidation_store
+    recovery_source = getsource(_recover_runtime)
+    intent_recovery = recovery_source.index('details["document_intents"]')
+    saga_recovery = recovery_source.index('details["memory_consolidations_pre_projection"]')
+    projection_drain = recovery_source.index('details["memory_projection_queue"]')
+    assert intent_recovery < saga_recovery < projection_drain

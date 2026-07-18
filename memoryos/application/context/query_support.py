@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import uuid
 from collections.abc import Mapping, Sequence
@@ -13,7 +14,7 @@ from memoryos.application.context.query_planner import TrustedRetrievalScope, me
 from memoryos.contextdb.retrieval.query_plan import RetrievalOptions, RetrievalQueryIntent
 from memoryos.core.clock import utc_now
 from memoryos.core.durable_io import atomic_write_json
-from memoryos.memory.canonical import AliasRegistry, ScopeRef, scope_key_from_payload
+from memoryos.core.types import scope_key_from_payload
 from memoryos.security.context_projection import ContextProjectionSanitizer
 from memoryos.security.trusted_context import TrustedRequestContext
 
@@ -117,11 +118,14 @@ def _record_unified_recall(client: Any, result: UnifiedRetrievalResult) -> str:
     trace_id = str(uuid.uuid4())
     plan = result.plan
     metrics = result.metrics.to_dict()
+    query_plan = plan.to_dict()
+    query_plan.pop("semantic_query", None)
     trace = {
         "trace_id": trace_id,
         "created_at": utc_now(),
-        "query": plan.semantic_query,
-        "query_plan": plan.to_dict(),
+        "query_digest": hashlib.sha256(plan.semantic_query.encode("utf-8")).hexdigest(),
+        "query_utf8_bytes": len(plan.semantic_query.encode("utf-8")),
+        "query_plan": query_plan,
         "scope": {
             "tenant_id": plan.tenant_id,
             "user_id": plan.owner_user_id,
@@ -141,7 +145,7 @@ def _record_unified_recall(client: Any, result: UnifiedRetrievalResult) -> str:
                 "source_uri": item.get("source_uri"),
                 "score": item.get("score"),
                 "layer": item.get("selected_layer") or item.get("layer"),
-                "canonical_validation_status": item.get("canonical_validation_status"),
+                "source_validation_status": item.get("source_validation_status"),
                 "projection_lag": item.get("projection_lag"),
                 "degraded_mode": item.get("degraded_mode"),
             }
@@ -173,16 +177,12 @@ def _trace_root(client: Any) -> Path:
 
 def _scope_keys(
     scopes: list[dict[str, Any]] | None,
-    *,
-    aliases: Mapping[str, Mapping[str, str]] | None = None,
 ) -> list[str]:
     keys = []
-    registry = AliasRegistry(aliases)
     for scope in scopes or []:
         if not isinstance(scope, dict) or not scope.get("kind") or not scope.get("id"):
             raise ValueError("applicability_scopes must contain scope objects with kind and id")
         keys.append(scope_key_from_payload(scope))
-        keys.append(registry.canonical_scope(ScopeRef.from_dict(scope)).key)
     return list(dict.fromkeys(keys))
 
 

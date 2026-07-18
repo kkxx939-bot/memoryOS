@@ -51,6 +51,7 @@ class FileSystemSourceStore:
         return self._operation_lock_store
 
     def read_object(self, uri: str) -> ContextObject:
+        self._reject_memory_document_uri(uri)
         directory = self._object_dir(uri)
         pointer = directory / ".bundle-current.json"
         if pointer.exists() or pointer.is_symlink():
@@ -65,6 +66,7 @@ class FileSystemSourceStore:
         return obj
 
     def write_object(self, obj: ContextObject, content: str | bytes = "") -> None:
+        self._reject_memory_document_uri(obj.uri)
         if ContextURI.parse(obj.uri).authority == "user" and str(obj.tenant_id or "default") != self.tenant_id:
             raise PermissionError("ContextObject tenant does not match SourceStore tenant")
         if self._requires_versioned_bundle(obj):
@@ -79,6 +81,7 @@ class FileSystemSourceStore:
             self.write_content(obj.layers.l2_uri or obj.uri, content)
 
     def read_content(self, uri: str) -> str:
+        self._reject_memory_document_uri(uri)
         bundle = self._bundle_for_content_uri(uri)
         if bundle is not None:
             _obj, content = self._read_bundle(bundle[0], bundle[1])
@@ -89,6 +92,7 @@ class FileSystemSourceStore:
         return path.read_text(encoding="utf-8")
 
     def write_content(self, uri: str, content: str | bytes) -> None:
+        self._reject_memory_document_uri(uri)
         bundle = self._bundle_for_content_uri(uri)
         if bundle is not None:
             obj, _old_content = self._read_bundle(bundle[0], bundle[1])
@@ -113,12 +117,14 @@ class FileSystemSourceStore:
             self._write_atomic(path, content)
 
     def soft_delete(self, uri: str, reason: str) -> None:
+        self._reject_memory_document_uri(uri)
         obj = self.read_object(uri)
         obj.lifecycle_state = LifecycleState.DELETED
         obj.metadata = {**obj.metadata, "delete_reason": reason}
         self.write_object(obj)
 
     def delete_object(self, uri: str) -> None:
+        self._reject_memory_document_uri(uri)
         directory = self._object_dir(uri)
         if directory.exists():
             shutil.rmtree(directory)
@@ -344,6 +350,15 @@ class FileSystemSourceStore:
 
     def _object_dir(self, uri: str) -> Path:
         return ContextURI.parse(uri).to_source_path(self.root, tenant_id=self.tenant_id)
+
+    @staticmethod
+    def _reject_memory_document_uri(uri: str) -> None:
+        parsed = ContextURI.parse(uri)
+        if parsed.authority == "user" and parsed.segments[1:3] == ("memory", "documents"):
+            raise PermissionError(
+                "Markdown memory documents are not ordinary SourceStore objects; "
+                "use MemoryDocumentStore and MemoryDocumentCommitter"
+            )
 
     def _content_path(self, uri: str) -> Path:
         parsed = ContextURI.parse(uri)

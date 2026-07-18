@@ -15,16 +15,16 @@ from memoryos.operations.commit.operation_committer import OperationCommitter
 @pytest.mark.parametrize(
     "value",
     [
-        "memoryos://user/u1/memories//claim",
-        "memoryos://user/u1/memories/../claim",
-        "memoryos://user/u1/memories/%2e%2e/claim",
+        "memoryos://user/u1/memories//record",
+        "memoryos://user/u1/memories/../record",
+        "memoryos://user/u1/memories/%2e%2e/record",
         "memoryos://user/u1/memories/%2Fetc",
         "memoryos://user/u1/memories/%5Cetc",
         "memoryos://user/u1/memories/%zz",
-        "memoryos://user/u1/memories/claim?revision=1",
-        "memoryos://user/u1/memories/claim#revision-1",
-        "memoryos://user:1234/u1/memories/claim",
-        "memoryos://[broken/u1/memories/claim",
+        "memoryos://user/u1/memories/record?revision=1",
+        "memoryos://user/u1/memories/record#revision-1",
+        "memoryos://user:1234/u1/memories/record",
+        "memoryos://[broken/u1/memories/record",
     ],
 )
 def test_context_uri_rejects_noncanonical_or_escaping_forms(value: str) -> None:
@@ -33,8 +33,8 @@ def test_context_uri_rejects_noncanonical_or_escaping_forms(value: str) -> None:
 
 
 def test_context_uri_canonical_form_unifies_lock_and_disk_identity(tmp_path: Path) -> None:
-    encoded = "memoryos://USER/u1/memories/%63laim/"
-    plain = "memoryos://user/u1/memories/claim"
+    encoded = "memoryos://USER/u1/memories/%72ecord/"
+    plain = "memoryos://user/u1/memories/record"
     assert str(ContextURI.parse(encoded)) == plain
     assert ContextURI.parse(encoded).to_source_path(tmp_path) == ContextURI.parse(plain).to_source_path(
         tmp_path

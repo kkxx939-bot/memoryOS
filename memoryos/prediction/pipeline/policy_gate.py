@@ -45,16 +45,58 @@ class PolicyGate:
     def _context_block(self, action_context: ActionContext, action_policy: ActionPolicy) -> PolicyDecision | None:
         if action_context.user_id != action_policy.user_id:
             return PolicyDecision(mode="blocked", allowed=False, action="do_nothing", reason="ActionPolicy owner mismatch.")
-        if action_policy.memory_anchor_uri and not self._has_verified_memory_anchor(action_context, action_policy):
+        if action_policy.support_anchor_uri and not self._has_verified_support_anchor(action_context, action_policy):
             return PolicyDecision(
                 mode="ask_user",
                 allowed=True,
                 action="ask_user",
-                reason="Declared memory anchor is unavailable or unverified.",
+                reason="Declared support anchor is unavailable or unverified.",
             )
-        memory_text = self._section_text(action_context, "memory_rules").lower()
-        if any(token in memory_text for token in ("以后别自动", "不要自动", "禁止自动", "先问我", "no auto", "do not automatically")):
-            return PolicyDecision(mode="ask_user", allowed=True, action="ask_user", reason="Policy memory blocks automatic execution.")
+        support_rule_items = self._section_items(action_context, "support_rules")
+        required_rule_uris = {str(uri) for uri in action_policy.constrained_by_support_uris if str(uri)}
+        verified_rule_items = [
+            item
+            for item in support_rule_items
+            if item.get("verified_policy_rule") is True
+            and str(item.get("context_type") or "") == "action_policy_support"
+        ]
+        available_rule_uris = {str(item.get("uri") or "") for item in verified_rule_items}
+        if required_rule_uris - available_rule_uris:
+            return PolicyDecision(
+                mode="ask_user",
+                allowed=True,
+                action="ask_user",
+                reason="Declared policy support rule is unavailable or unverified.",
+            )
+        support_text = "\n".join(
+            f"{item.get('content', '')}\n{item.get('metadata', '')}" for item in verified_rule_items
+        ).lower()
+        structured_forbidden = any(
+            str(dict(item.get("metadata") or {}).get("policy_rule_type") or "")
+            == "action_auto_execute"
+            and str(dict(item.get("metadata") or {}).get("policy_rule_value") or "")
+            == "forbidden"
+            for item in verified_rule_items
+            if isinstance(item.get("metadata"), dict)
+        )
+        lexical_forbidden = any(
+            token in support_text
+            for token in (
+                "以后别自动",
+                "不要自动",
+                "禁止自动",
+                "先问我",
+                "no auto",
+                "do not automatically",
+            )
+        )
+        if structured_forbidden or lexical_forbidden:
+            return PolicyDecision(
+                mode="ask_user",
+                allowed=True,
+                action="ask_user",
+                reason="Policy support rule blocks automatic execution.",
+            )
         resource_uris = {item.get("uri") for item in self._section_items(action_context, "resource")}
         missing_resources = [uri for uri in action_policy.required_resource_uris if uri not in resource_uris]
         if missing_resources:
@@ -68,16 +110,16 @@ class PolicyGate:
             return PolicyDecision(mode="ask_user", allowed=True, action="ask_user", reason="Recent negative feedback requires confirmation.")
         return None
 
-    def _has_verified_memory_anchor(
+    def _has_verified_support_anchor(
         self,
         action_context: ActionContext,
         action_policy: ActionPolicy,
     ) -> bool:
         return any(
-            str(item.get("uri") or "") == action_policy.memory_anchor_uri
+            str(item.get("uri") or "") == action_policy.support_anchor_uri
             and item.get("verified_exact_anchor") is True
-            and str(item.get("context_type") or "") == "memory"
-            for item in self._section_items(action_context, "memory_anchor")
+            and str(item.get("context_type") or "") == "behavior_support"
+            for item in self._section_items(action_context, "support_anchor")
         )
 
     def _section_items(self, action_context: ActionContext, section: str) -> list[dict]:

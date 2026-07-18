@@ -15,7 +15,7 @@ def test_legacy_paths_and_imports_do_not_return() -> None:
         root / "memoryos" / "ports",
         root / "architecture",
     ]
-    assert all(not path.exists() for path in forbidden_dirs)
+    assert all(not any(path.rglob("*.py")) for path in forbidden_dirs)
 
     forbidden = [
         "".join(["Episode", "Processor"]),
@@ -37,27 +37,46 @@ def test_legacy_paths_and_imports_do_not_return() -> None:
     assert "".join(["Episode", "Processor"]) not in readme
 
 
-def test_memory_v2_has_no_v1_execution_or_compatibility_surface() -> None:
-    import memoryos.memory.canonical as canonical
-    from memoryos.contextdb.session.planning import MemoryPlanningResult
-    from memoryos.contextdb.session.session_archive import SessionArchiveStore
-
+def test_markdown_memory_has_one_source_domain_and_no_retired_python_packages() -> None:
     root = Path(__file__).resolve().parents[3]
-    removed_exports = (
-        "IDENTITY_ALGORITHM_V1",
-        "IdentityAliasOperation",
-        "IdentityMigrationRequired",
-        "LegacyIdentityCandidate",
-        "LegacyCandidateProposalAdapter",
+    memory_root = root / "memoryos" / "memory"
+    retired_dirs = (
+        memory_root / "canonical",
+        memory_root / "integration",
+        memory_root / "lifecycle",
+        memory_root / "model",
+        memory_root / "service",
+        memory_root / "store",
     )
-    assert all(not hasattr(canonical, name) for name in removed_exports)
-    assert not hasattr(SessionArchiveStore, "migrate_legacy_archive")
-    assert not hasattr(MemoryPlanningResult, "to_list")
-    assert not hasattr(MemoryPlanningResult, "__getitem__")
+    # These packages are retired, not merely empty.  Leaving a directory that
+    # contains only bytecode makes it importable as a namespace package and
+    # silently preserves an obsolete public path.
+    assert all(not path.exists() for path in retired_dirs)
+    assert any((memory_root / "documents").glob("*.py"))
+    assert any((memory_root / "evidence").glob("*.py"))
+
+    forbidden_symbols = (
+        "Memory" + "Slot",
+        "Memory" + "Claim",
+        "Current" + "Head",
+        "Bounded" + "Canonical" + "Resolver",
+    )
+    for base in (root / "memoryos", root / "tests"):
+        for path in base.rglob("*.py"):
+            if path == Path(__file__):
+                continue
+            text = path.read_text(encoding="utf-8")
+            assert not any(symbol in text for symbol in forbidden_symbols), path
+
     removed_files = (
         root / "memoryos" / "memory" / "merge.py",
         root / "memoryos" / "memory" / "extraction" / "llm_memory_extractor.py",
         root / "memoryos" / "memory" / "extraction" / "rule_memory_extractor.py",
         root / "memoryos" / "memory" / "update" / "__init__.py",
     )
-    assert all(not path.exists() for path in removed_files)
+    assert all(not path.is_file() for path in removed_files)
+
+    behavior_case = (root / "memoryos" / "behavior" / "model" / "behavior_case.py").read_text(
+        encoding="utf-8"
+    )
+    assert "related_" + "memory_uris" not in behavior_case

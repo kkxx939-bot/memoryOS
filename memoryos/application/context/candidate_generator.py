@@ -19,6 +19,12 @@ from memoryos.security.context_projection import ContextProjectionSanitizer
 
 _PRINCIPAL_ONLY_WORKSPACE = "__memoryos_principal_only__"
 _TEMPORAL_TEXT_SATISFACTION_SCORE = 0.5
+_DOCUMENT_RECORD_KINDS = frozenset(
+    {
+        CatalogRecordKind.MEMORY_DOCUMENT.value,
+        CatalogRecordKind.MEMORY_BLOCK.value,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -112,15 +118,15 @@ class CandidateGenerator:
     ) -> tuple[CatalogRecord, ...]:
         """Return a bounded SQL-filtered stream for deterministic list plans.
 
-        Empty-query CURRENT/HISTORY/OPTIONS calls are supported list views,
-        not permission to enumerate Source or Canonical state.  The Catalog
+        Empty-query CURRENT/HISTORY calls are supported list views,
+        not permission to enumerate Source state.  The Catalog
         store applies every tenant/ACL/type/path/time filter before the hard
         candidate LIMIT.
 
         A semantic query normally disables this branch.  The only exception
         is a temporal plan whose intent and indexed time constraints make the
-        candidate set deterministic: event-time OPEN_RECALL, valid-time AS_OF,
-        or transaction-time HISTORY.  Exact/FTS run first; a bounded text hit
+        candidate set deterministic: event-time OPEN_RECALL or transaction-time
+        HISTORY. Exact/FTS run first; a bounded text hit
         already satisfies the query and suppresses the broader temporal list.
         With no text hit, temporal SQL provides the non-lexical fallback while
         still applying time/path/ACL predicates before the bounded LIMIT.
@@ -134,7 +140,11 @@ class CandidateGenerator:
         lister = getattr(self.index_store, "list_catalog", None)
         if not callable(lister):
             return ()
-        raw_values: Any = lister(filters=dict(filters), limit=plan.candidate_limit)
+        raw_values: Any = lister(
+            tenant_id=plan.tenant_id or "default",
+            filters=dict(filters),
+            limit=plan.candidate_limit,
+        )
         values = raw_values if isinstance(raw_values, Sequence) else ()
         return tuple(record for record in values if isinstance(record, CatalogRecord))
 
@@ -144,8 +154,6 @@ class CandidateGenerator:
 
         if plan.query_intent == RetrievalQueryIntent.OPEN_RECALL:
             return bool(plan.event_time_from and plan.event_time_to)
-        if plan.query_intent == RetrievalQueryIntent.AS_OF:
-            return bool(plan.valid_at)
         if plan.query_intent == RetrievalQueryIntent.HISTORY:
             return bool(plan.transaction_time_from and plan.transaction_time_to)
         return False
@@ -181,6 +189,9 @@ class CandidateGenerator:
             ("session_ids", plan.session_ids),
             ("context_types", tuple(item.value for item in plan.context_types)),
             ("source_kinds", plan.source_kinds),
+            ("record_kinds", self._record_kinds(plan)),
+            ("document_ids", plan.document_ids),
+            ("document_kinds", plan.document_kinds),
             ("target_uris", plan.target_uris),
             ("target_paths", plan.target_paths),
             ("event_time_from", plan.event_time_from),
@@ -189,7 +200,6 @@ class CandidateGenerator:
             ("transaction_time_to", plan.transaction_time_to),
             ("updated_at_from", plan.updated_at_from),
             ("updated_at_to", plan.updated_at_to),
-            ("valid_at", plan.valid_at),
         ):
             if value not in (None, (), ""):
                 filters[key] = value
@@ -227,29 +237,13 @@ class CandidateGenerator:
             if shared_view:
                 # Project/user shared views are intentionally cross-adapter.
                 # Connect metadata describes the trusted caller and must not
-                # become a content filter that hides shared canonical state.
+                # become a content filter that hides tenant-shared state.
                 connect_filters.clear()
             if connect_filters:
                 filters["connect_filters"] = connect_filters
         if metadata.get("principal_absent") or plan.owner_user_id is None:
             filters["owner_user_id"] = ""
             filters["require_unscoped"] = True
-        if metadata.get("memory_types"):
-            filters["memory_type"] = metadata["memory_types"]
-        if "memory_states" in metadata:
-            if metadata["memory_states"]:
-                filters["canonical_state"] = metadata["memory_states"]
-        elif plan.query_intent == RetrievalQueryIntent.CONFLICTS:
-            filters["canonical_state"] = ("CONFLICTED",)
-        elif plan.query_intent == RetrievalQueryIntent.OPTIONS:
-            option_states = ["PROPOSED", "CONFLICTED"]
-            if metadata.get("include_candidates"):
-                # Legacy MemoryCandidate rows predate Canonical Claim state
-                # and therefore carry an empty canonical_state.  They remain
-                # reviewable through the compatibility OPTIONS view without
-                # becoming Canonical Memory or entering CURRENT retrieval.
-                option_states.append("")
-            filters["canonical_state"] = tuple(option_states)
         if metadata.get("lifecycle_state"):
             filters["lifecycle_state"] = metadata["lifecycle_state"]
         if "applicability_scope_keys" in metadata:
@@ -264,6 +258,16 @@ class CandidateGenerator:
             filters["retrieval_views"] = metadata["retrieval_views"]
         if metadata.get("include_candidates"):
             filters["include_candidates"] = True
+        requested_record_kinds = set(plan.record_kinds)
+        if (
+            plan.document_kinds
+            and requested_record_kinds.intersection(_DOCUMENT_RECORD_KINDS)
+            and requested_record_kinds.difference(_DOCUMENT_RECORD_KINDS)
+        ):
+            # A mixed Session + Markdown query uses document_kind to narrow
+            # only document projections; ordinary Session rows have no such
+            # field and must remain eligible.
+            filters["document_kinds_apply_to_documents_only"] = True
         if metadata.get("minimum_lexical_relevance") is not None:
             try:
                 minimum_lexical_relevance = float(metadata["minimum_lexical_relevance"])
@@ -274,37 +278,15 @@ class CandidateGenerator:
             filters["minimum_lexical_relevance"] = minimum_lexical_relevance
         if plan.query_intent in {
             RetrievalQueryIntent.HISTORY,
-            RetrievalQueryIntent.AS_OF,
-            RetrievalQueryIntent.CONFLICTS,
-            RetrievalQueryIntent.OPTIONS,
             RetrievalQueryIntent.OPEN_RECALL,
         }:
             filters["serving_tier"] = tuple(item.value for item in ServingTier)
         return filters
 
     def _record_kinds(self, plan: RetrievalQueryPlan) -> tuple[str, ...]:
+        if plan.record_kinds:
+            return plan.record_kinds
         all_kinds = tuple(item.value for item in CatalogRecordKind)
-        if plan.query_intent == RetrievalQueryIntent.CURRENT:
-            bounded_legacy_catalog = not callable(getattr(self.index_store, "list_catalog", None))
-            exact_claim_requested = any("/claims/" in uri for uri in plan.target_uris)
-            if bounded_legacy_catalog or exact_claim_requested:
-                return all_kinds
-            return tuple(kind for kind in all_kinds if kind != CatalogRecordKind.CLAIM_REVISION.value)
-        if plan.query_intent == RetrievalQueryIntent.HISTORY:
-            # HISTORY is the unified historical view, not a Canonical-only
-            # alias. It admits ordinary Session/Event/Resource records beside
-            # immutable Claim Revision projections while excluding only the
-            # mutable CURRENT serving overlay.
-            return tuple(kind for kind in all_kinds if kind != CatalogRecordKind.CURRENT_SLOT.value)
-        if plan.query_intent in {
-            RetrievalQueryIntent.AS_OF,
-            RetrievalQueryIntent.CONFLICTS,
-            RetrievalQueryIntent.OPTIONS,
-        }:
-            ordinary_requested = any(item.value != "memory" for item in plan.context_types)
-            if not ordinary_requested:
-                return (CatalogRecordKind.CLAIM_REVISION.value, CatalogRecordKind.CONTEXT.value)
-            return tuple(kind for kind in all_kinds if kind != CatalogRecordKind.CURRENT_SLOT.value)
         return all_kinds
 
     def _exact_records(self, plan: RetrievalQueryPlan, filters: Mapping[str, Any]) -> tuple[CatalogRecord, ...]:
@@ -325,48 +307,23 @@ class CandidateGenerator:
             target_uris,
             limit=plan.candidate_limit,
         )
-        exact_record_kinds = self._canonical_exact_record_kinds(plan, target_uris)
-        if exact_record_kinds:
-            exact_filters["record_kinds"] = exact_record_kinds
-        raw_values: Any = lister(filters=exact_filters, limit=plan.candidate_limit)
+        raw_values: Any = lister(
+            tenant_id=plan.tenant_id or "default",
+            filters=exact_filters,
+            limit=plan.candidate_limit,
+        )
         values = raw_values if isinstance(raw_values, Sequence) else ()
         return tuple(record for record in values if isinstance(record, CatalogRecord))
-
-    @staticmethod
-    def _canonical_exact_record_kinds(
-        plan: RetrievalQueryPlan,
-        target_uris: Sequence[str],
-    ) -> tuple[str, ...]:
-        """Narrow stable Canonical identities to the serving model requested.
-
-        A stable Slot URI can be shared by one CurrentSlot row and thousands
-        of immutable Claim revisions.  Intent is therefore a trusted storage
-        discriminator for exact Canonical identities: CURRENT Slot lookups use
-        only the mutable serving overlay, while historical intents use only
-        Claim Revision projections.  Mixed ordinary/Canonical URI queries keep
-        the general record-kind contract.
-        """
-
-        values = tuple(str(uri) for uri in target_uris if str(uri))
-        if not values or not all("/memories/canonical/slots/" in uri for uri in values):
-            return ()
-        if plan.query_intent == RetrievalQueryIntent.CURRENT and all(
-            "/claims/" not in uri for uri in values
-        ):
-            return (CatalogRecordKind.CURRENT_SLOT.value,)
-        if plan.query_intent in {
-            RetrievalQueryIntent.HISTORY,
-            RetrievalQueryIntent.AS_OF,
-            RetrievalQueryIntent.CONFLICTS,
-            RetrievalQueryIntent.OPTIONS,
-        }:
-            return (CatalogRecordKind.CLAIM_REVISION.value,)
-        return ()
 
     def _search_catalog(self, query: str, filters: Mapping[str, Any], limit: int) -> list[IndexHit]:
         search_catalog = getattr(self.index_store, "search_catalog", None)
         if callable(search_catalog):
-            raw_values: Any = search_catalog(query, filters=filters, limit=limit)
+            raw_values: Any = search_catalog(
+                query,
+                tenant_id=str(filters.get("tenant_id") or "default"),
+                filters=filters,
+                limit=limit,
+            )
             values = raw_values if isinstance(raw_values, Sequence) else ()
         else:
             search = getattr(self.index_store, "search", None)
@@ -374,7 +331,16 @@ class CandidateGenerator:
                 return []
             parameters = inspect.signature(search).parameters
             supports_kwargs = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
-            kwargs: dict[str, Any] = {"limit": limit}
+            if "tenant_id" not in parameters and not supports_kwargs:
+                # IndexStore exact/search contracts are tenant-qualified.  A
+                # backend that cannot bind the tenant before searching must
+                # not be used and then filtered after the fact: doing so can
+                # both scan another tenant and apply LIMIT before isolation.
+                return []
+            kwargs: dict[str, Any] = {
+                "tenant_id": str(filters.get("tenant_id") or "default"),
+                "limit": limit,
+            }
             if "filters" in parameters or supports_kwargs:
                 kwargs["filters"] = dict(filters)
             else:
@@ -413,6 +379,8 @@ class CandidateGenerator:
         metadata = dict(hit.metadata or {})
         connect = dict(metadata.get("connect", {}) or {})
         hit_context_type = str(getattr(hit.context_type, "value", hit.context_type))
+        if str(metadata.get("tenant_id") or "default") != str(filters.get("tenant_id") or "default"):
+            return False
         principal_owner = filters.get("principal_owner_id")
         hit_owner = str(metadata.get("owner_user_id") or "")
         hit_workspace = str(metadata.get("workspace_id") or metadata.get("project_id") or "")
@@ -422,7 +390,6 @@ class CandidateGenerator:
                 for item in filters.get("workspace_access_ids", ()) or ()
                 if str(item) not in {"", _PRINCIPAL_ONLY_WORKSPACE}
             }
-            record_kind = str(metadata.get("record_kind") or "")
             scope = metadata.get("scope")
             visibility = scope.get("visibility") if isinstance(scope, Mapping) else None
             explicit_principal_grant = bool(
@@ -444,20 +411,14 @@ class CandidateGenerator:
                 and not (visibility.get("allowed_principal_ids", ()) or ())
                 and not (visibility.get("allowed_service_ids", ()) or ())
             )
-            canonical_shared = bool(
-                hit_context_type == "memory"
-                and record_kind in {CatalogRecordKind.CURRENT_SLOT.value, CatalogRecordKind.CLAIM_REVISION.value}
-                and str(metadata.get("canonical_slot_id") or "")
-                and str(metadata.get("canonical_claim_id") or "")
-                and (
-                    explicit_principal_grant
-                    or explicit_service_grant
-                    or tenant_public_grant
-                    or (metadata.get("workspace_shared") is True and hit_workspace in shared_workspaces)
-                )
+            shared_record = bool(
+                explicit_principal_grant
+                or explicit_service_grant
+                or tenant_public_grant
+                or (metadata.get("workspace_shared") is True and hit_workspace in shared_workspaces)
             )
             public_context = hit_owner == "" and hit_context_type in {"resource", "skill"}
-            if hit_owner != str(principal_owner) and not public_context and not canonical_shared:
+            if hit_owner != str(principal_owner) and not public_context and not shared_record:
                 return False
         workspace_access = filters.get("workspace_access_ids")
         if workspace_access is not None and hit_workspace not in {str(item) for item in workspace_access}:
@@ -471,18 +432,29 @@ class CandidateGenerator:
             return False
         adapter_access = filters.get("adapter_access_id")
         if adapter_access not in (None, "") and hit_adapter not in {"", str(adapter_access)}:
-            hit_record_kind = str(metadata.get("record_kind") or "")
-            if hit_context_type not in {"session", "resource", "skill"} and hit_record_kind != "current_slot":
+            if hit_context_type not in {"session", "resource", "skill"}:
                 return False
         source_kinds = tuple(str(item) for item in filters.get("source_kinds", ()) or ())
         hit_source_kind = str(metadata.get("source_kind") or connect.get("source_kind") or "")
         if source_kinds and hit_source_kind not in source_kinds:
             return False
-        connect_filters = filters.get("connect_filters")
-        if (
-            isinstance(connect_filters, Mapping)
-            and str(metadata.get("record_kind") or "") != CatalogRecordKind.CURRENT_SLOT.value
+        for filter_name, metadata_name in (
+            ("record_kinds", "record_kind"),
+            ("document_ids", "document_id"),
         ):
+            allowed = {str(item) for item in filters.get(filter_name, ()) or ()}
+            if allowed and str(metadata.get(metadata_name) or "") not in allowed:
+                return False
+        allowed_document_kinds = {str(item) for item in filters.get("document_kinds", ()) or ()}
+        document_kind_is_scoped = bool(filters.get("document_kinds_apply_to_documents_only"))
+        if (
+            allowed_document_kinds
+            and (not document_kind_is_scoped or str(metadata.get("record_kind") or "") in _DOCUMENT_RECORD_KINDS)
+            and str(metadata.get("document_kind") or "") not in allowed_document_kinds
+        ):
+            return False
+        connect_filters = filters.get("connect_filters")
+        if isinstance(connect_filters, Mapping):
             for key, value in connect_filters.items():
                 if value in (None, ""):
                     continue
@@ -492,30 +464,16 @@ class CandidateGenerator:
                     return False
         allowed_views = {str(item) for item in filters.get("retrieval_views", ()) or ()}
         item_views = {str(item) for item in metadata.get("retrieval_views", ()) or ()}
-        record_kind = str(metadata.get("record_kind") or "")
-        receipt_validated_canonical = bool(
-            record_kind in {CatalogRecordKind.CURRENT_SLOT.value, CatalogRecordKind.CLAIM_REVISION.value}
-            and str(metadata.get("canonical_slot_id") or metadata.get("slot_id") or "")
-            and str(metadata.get("canonical_claim_id") or metadata.get("claim_id") or "")
-        )
         # An explicit compatibility view is a narrowing security constraint.
-        # A legacy/test backend that cannot prove a candidate's view must not
-        # turn missing metadata into permission to cross project boundaries.
-        # Receipt-bound Canonical rows are the exception: their authoritative
-        # workspace/scope check happens in BoundedCanonicalResolver, so an old
-        # projection without the legacy view mirror may proceed only to that
-        # fail-closed proof boundary.
+        # A backend that cannot prove a candidate's view must not turn missing
+        # metadata into permission to cross workspace boundaries.
         if allowed_views and (
             (item_views and not allowed_views.intersection(item_views))
-            or (not item_views and not receipt_validated_canonical)
+            or not item_views
         ):
             return False
         target_uris = {str(item) for item in filters.get("target_uris", ()) or ()}
-        hit_identity_uris = {
-            hit.uri,
-            str(metadata.get("canonical_slot_uri") or ""),
-            str(metadata.get("canonical_claim_uri") or ""),
-        }
+        hit_identity_uris = {hit.uri}
         if target_uris and not target_uris.intersection(hit_identity_uris):
             return False
         if filters.get("require_unscoped"):
@@ -537,7 +495,10 @@ class CandidateGenerator:
         record_key = str(metadata.get("catalog_record_key") or hit.uri)
         getter = getattr(self.index_store, "get_catalog", None)
         if callable(getter):
-            record = getter(record_key, tenant_id=metadata.get("tenant_id"))
+            record = getter(
+                tenant_id=str(metadata.get("tenant_id") or "default"),
+                record_key=record_key,
+            )
             if isinstance(record, CatalogRecord):
                 scores = dict(metadata.get("retrieval_scores", {}) or {})
                 score = float(scores.get("lexical") or scores.get("identity") or hit.score or 0.0)
@@ -545,24 +506,7 @@ class CandidateGenerator:
                 return self._from_record(record, branch=branch, score=score, extra_metadata=metadata)
         scores = dict(metadata.get("retrieval_scores", {}) or {})
         lexical = float(scores.get("lexical") or scores.get("identity") or hit.score or 0.0)
-        canonical_kind = str(metadata.get("canonical_kind") or "")
-        slot_id = str(metadata.get("slot_id") or metadata.get("canonical_slot_id") or "")
-        claim_id = str(metadata.get("claim_id") or metadata.get("canonical_claim_id") or "")
-        revision = int(
-            metadata.get("current_revision") or metadata.get("revision") or metadata.get("canonical_revision") or 0
-        )
-        record_kind = (
-            CatalogRecordKind.CLAIM_REVISION.value
-            if canonical_kind == "claim"
-            else str(metadata.get("record_kind") or CatalogRecordKind.CONTEXT.value)
-        )
-        slot_uri = str(metadata.get("slot_uri") or metadata.get("canonical_slot_uri") or "")
-        claim_uri = str(metadata.get("canonical_claim_uri") or (hit.uri if canonical_kind == "claim" else ""))
-        metadata = {
-            **metadata,
-            "canonical_slot_uri": slot_uri,
-            "canonical_claim_uri": claim_uri,
-        }
+        record_kind = str(metadata.get("record_kind") or CatalogRecordKind.CONTEXT.value)
         return RetrievalCandidate(
             record_key=record_key,
             uri=hit.uri,
@@ -571,12 +515,18 @@ class CandidateGenerator:
             text=hit.title,
             source_uri=hit.uri,
             record_kind=record_kind,
-            source_kind=str(metadata.get("source_kind") or canonical_kind or "context"),
+            source_kind=str(metadata.get("source_kind") or "context"),
+            tenant_id=str(metadata.get("tenant_id") or "default"),
+            owner_user_id=str(metadata.get("owner_user_id") or ""),
             session_id=str(metadata.get("session_id") or ""),
             workspace_id=str(metadata.get("workspace_id") or metadata.get("project_id") or ""),
-            canonical_slot_id=slot_id,
-            canonical_claim_id=claim_id,
-            canonical_revision=revision,
+            document_id=str(metadata.get("document_id") or ""),
+            block_id=str(metadata.get("block_id") or ""),
+            document_kind=str(metadata.get("document_kind") or ""),
+            document_revision=int(metadata.get("document_revision") or 0),
+            projection_generation=int(metadata.get("projection_generation") or 0),
+            archive_digest=str(metadata.get("archive_digest") or ""),
+            manifest_digest=str(metadata.get("manifest_digest") or ""),
             source_digest=str(metadata.get("source_digest") or ""),
             event_time=str(metadata.get("event_time") or ""),
             metadata=metadata,
@@ -597,14 +547,11 @@ class CandidateGenerator:
             "tenant_id": record.tenant_id,
             "owner_user_id": record.owner_user_id,
             "workspace_id": record.workspace_id,
-            "canonical_slot_uri": record.canonical_slot_uri,
-            "canonical_claim_uri": record.canonical_claim_uri,
-            "canonical_slot_id": record.canonical_slot_id,
-            "canonical_claim_id": record.canonical_claim_id,
-            "canonical_state": record.canonical_state,
-            "canonical_revision": record.canonical_revision,
-            "canonical_head_digest": record.canonical_head_digest,
-            "receipt_digest": record.receipt_digest,
+            "document_id": record.document_id,
+            "block_id": record.block_id,
+            "document_kind": record.document_kind,
+            "document_revision": record.document_revision,
+            "projection_generation": record.projection_generation,
             "projection_effect_hash": record.projection_effect_hash,
             "catalog_record_key": record.record_key,
             "record_kind": record.record_kind,
@@ -623,11 +570,17 @@ class CandidateGenerator:
             l2_uri=record.l2_uri,
             source_uri=record.source_uri,
             source_digest=record.source_digest,
+            tenant_id=record.tenant_id,
+            owner_user_id=record.owner_user_id,
             session_id=record.session_id,
             workspace_id=record.workspace_id,
-            canonical_slot_id=record.canonical_slot_id,
-            canonical_claim_id=record.canonical_claim_id,
-            canonical_revision=record.canonical_revision,
+            document_id=record.document_id,
+            block_id=record.block_id,
+            document_kind=record.document_kind,
+            document_revision=record.document_revision,
+            projection_generation=record.projection_generation,
+            archive_digest=str(record.metadata.get("archive_digest") or ""),
+            manifest_digest=str(record.metadata.get("manifest_digest") or ""),
             event_time=record.event_time,
             hotness=max(record.hotness, record.semantic_hotness, record.behavior_support_hotness),
             metadata=metadata,
@@ -727,11 +680,10 @@ class CandidateGenerator:
             record_key = str(metadata.get("catalog_record_key") or "")
             tenant_id = str(metadata.get("tenant_id") or "")
             expected_row_id = vector_row_id(tenant_id, record_key) if tenant_id and record_key else ""
-            legacy_public_uri = str(metadata.get("public_uri") or metadata.get("uri") or "")
             if (
                 not record_key
                 or tenant_id != str(plan.tenant_id or "default")
-                or str(hit.uri) not in {expected_row_id, legacy_public_uri}
+                or str(hit.uri) != expected_row_id
             ):
                 continue
             if record_key not in scores:
@@ -740,6 +692,7 @@ class CandidateGenerator:
         if not ordered_record_keys:
             return (), "", 0, vector_limit
         raw_records: Any = lister(
+            tenant_id=plan.tenant_id or "default",
             filters={**filters, "record_keys": tuple(ordered_record_keys)},
             limit=min(vector_limit, len(ordered_record_keys)),
         )
@@ -798,9 +751,16 @@ class CandidateGenerator:
             for seed_identity in self._relation_seed_identities(seed):
                 if relation_rows_remaining <= 0:
                     break
-                call_kwargs = {**kwargs, "limit": relation_rows_remaining}
-                supported = self._supported_kwargs(self.relation_store.relations_of, call_kwargs)
-                relations = self.relation_store.relations_of(seed_identity, **supported)
+                relations = self.relation_store.relations_of(
+                    seed_identity,
+                    tenant_id=str(kwargs["tenant_id"]),
+                    owner_user_id=(
+                        str(kwargs["owner_user_id"])
+                        if kwargs["owner_user_id"] is not None
+                        else None
+                    ),
+                    limit=relation_rows_remaining,
+                )
                 bounded_relations = relations[:relation_rows_remaining]
                 relation_rows_remaining -= len(bounded_relations)
                 for relation in bounded_relations:
@@ -815,6 +775,7 @@ class CandidateGenerator:
                         limit=self.MAX_RECORDS_PER_RELATION_TARGET,
                     )
                     raw_records: Any = lister(
+                        tenant_id=plan.tenant_id or "default",
                         filters=target_filters,
                         limit=min(
                             self.MAX_RECORDS_PER_RELATION_TARGET,
@@ -839,15 +800,7 @@ class CandidateGenerator:
 
     @classmethod
     def _relation_seed_identities(cls, seed: RetrievalCandidate) -> tuple[str, ...]:
-        metadata = dict(seed.metadata or {})
-        identities = (
-            str(metadata.get("canonical_claim_uri") or ""),
-            str(metadata.get("canonical_slot_uri") or ""),
-            seed.uri,
-        )
-        return tuple(dict.fromkeys(item for item in identities if item))[
-            : cls.MAX_RELATION_IDENTITIES_PER_SEED
-        ]
+        return (seed.uri,)
 
     @staticmethod
     def _target_identity_filters(
@@ -856,7 +809,7 @@ class CandidateGenerator:
         *,
         limit: int,
     ) -> dict[str, Any]:
-        """Bind serving, Slot, and Claim identities to one exact SQL lookup."""
+        """Bind stable serving identities to one exact SQL lookup."""
 
         exact_filters = dict(filters)
         exact_filters.pop("target_uris", None)

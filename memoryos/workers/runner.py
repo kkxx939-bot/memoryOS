@@ -13,13 +13,21 @@ from memoryos.core.durable_io.quarantine import list_quarantine_records
 from memoryos.core.readiness import RuntimeNotReadyError
 from memoryos.workers.contracts import WorkerRuntime
 from memoryos.workers.embedding_worker import EmbeddingWorker
-from memoryos.workers.memory_proposal_worker import MemoryProposalWorker
 from memoryos.workers.semantic_worker import SemanticWorker
 from memoryos.workers.session_commit_worker import SessionCommitWorker
 
 
 class WorkerRunner:
-    _ORDINARY_KINDS = frozenset({"session-commit", "memory-proposal", "memory-projection", "semantic", "embedding"})
+    _ORDINARY_KINDS = frozenset(
+        {
+            "session-commit",
+            "memory-document-edit",
+            "memory-document-scan",
+            "memory-projection",
+            "semantic",
+            "embedding",
+        }
+    )
 
     def __init__(
         self,
@@ -71,23 +79,30 @@ class WorkerRunner:
             )
             if self._stop_if_not_ready(result, allow_result=kind == "all"):
                 return result
-        if kind in {"memory-projection", "all"}:
-            result["memory_projection"] = self.client.memory_projection_worker.process_pending(limit=self.batch_size)
-            if self._stop_if_not_ready(result, allow_result=kind == "all"):
-                return result
-        if kind in {"memory-proposal", "all"}:
-            result["memory_proposal"] = MemoryProposalWorker(self.client.session_commit_service).process_pending(
+        if kind in {"memory-document-edit", "all"}:
+            result["memory_document_edit"] = self.client.memory_document_edit_worker.process_pending(
                 batch_size=self.batch_size,
                 lease_seconds=self.lease_seconds,
                 max_retries=self.max_retries,
             )
             if self._stop_if_not_ready(result, allow_result=kind == "all"):
                 return result
+        if kind in {"memory-document-scan", "all"}:
+            result["memory_document_scan"] = self.client.memory_document_scan_worker.process_pending(
+                batch_size=self.batch_size,
+                lease_seconds=self.lease_seconds,
+                max_retries=self.max_retries,
+            )
+            if self._stop_if_not_ready(result, allow_result=kind == "all"):
+                return result
+        if kind in {"memory-projection", "all"}:
+            result["memory_projection"] = self.client.memory_projection_worker.process_pending(limit=self.batch_size)
+            if self._stop_if_not_ready(result, allow_result=kind == "all"):
+                return result
         if kind in {"semantic", "all"}:
             result["semantic"] = SemanticWorker(
                 self.client.source_store,
                 self.client.queue_store,
-                migration_gate=self.client.migration_gate,
             ).process_pending(
                 limit=self.batch_size,
                 lease_seconds=self.lease_seconds,
@@ -104,7 +119,6 @@ class WorkerRunner:
                     self.client.queue_store,
                     self.client.vector_store,
                     self.client.embedding_provider,
-                    migration_gate=self.client.migration_gate,
                 ).process_pending(
                     limit=self.batch_size,
                     lease_seconds=self.lease_seconds,

@@ -1,423 +1,647 @@
-"""Durable pending-memory review orchestration."""
+"""Document-native sealed edit proposal review service."""
 
 from __future__ import annotations
 
-from typing import Any
+import hashlib
+from dataclasses import asdict, dataclass
+from difflib import unified_diff
+from typing import Any, Literal, Protocol
 
-from memoryos.application.service import ApplicationService
-from memoryos.contextdb.model.lifecycle import LifecycleState
-from memoryos.contextdb.transaction.path_lock import PathLock
-from memoryos.core.ids import stable_hash
-from memoryos.memory.canonical import CanonicalMemoryRepository, MemorySemanticProposal
-from memoryos.memory.canonical.current_head import artifact_root_for, load_current_head
-from memoryos.memory.canonical.review_command import (
-    PendingReviewCommandStore,
-    PendingReviewIdempotencyConflict,
-    validate_pending_review_record,
+from memoryos.memory.documents.commit import DocumentCommitResult, MemoryDocumentCommitter
+from memoryos.memory.documents.consolidation import (
+    ConsolidationResult,
+    ConsolidationSource,
+    MemoryDocumentConsolidator,
+    consolidation_saga_id,
 )
-from memoryos.security.trusted_context import AUTHORITATIVE_REMEMBER, TrustedRequestContext
+from memoryos.memory.documents.erase import MemoryDocumentEraseStore
+from memoryos.memory.documents.frontmatter import parse_front_matter
+from memoryos.memory.documents.model import (
+    AbsentPath,
+    DocumentEditKind,
+    DocumentEditPlan,
+    PresentPath,
+)
+from memoryos.memory.documents.path_policy import MemoryDocumentPathPolicy
+from memoryos.memory.documents.review import (
+    MemoryEditReviewRecord,
+    MemoryEditReviewStatus,
+    MemoryEditReviewStore,
+    MemoryEditReviewWorkflow,
+    ReviewConsolidationSource,
+)
+from memoryos.memory.documents.store import DocumentConflictError, DocumentNotFoundError
+from memoryos.security.trusted_context import (
+    AUTHORITATIVE_FORGET,
+    AUTHORITATIVE_REMEMBER,
+    READ_CONTEXT,
+    TrustedRequestContext,
+)
+
+ReviewDecision = Literal["APPROVE", "REJECT", "CORRECT"]
 
 
-class PendingReviewService(ApplicationService):
-    def review_pending(
+class ReadinessGate(Protocol):
+    def require_ready(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class MemoryEditReviewResult:
+    proposal_id: str
+    status: str
+    document_uri: str
+    document_id: str
+    document_kind: str
+    relative_path: str
+    document_revision: int
+    source_digest: str
+    proposed_source_digest: str
+    proposed_diff_digest: str
+    changed: bool
+    edit_summary: str
+    projection_status: str
+    replacement_proposal_id: str = ""
+    workflow_kind: str = MemoryEditReviewWorkflow.DOCUMENT_EDIT.value
+    consolidation_sources: tuple[dict[str, object], ...] = ()
+    consolidation_saga_id: str = ""
+    consolidation_status: str = ""
+    target_projection_generation: int = 0
+    target_projection_confirmed: bool = False
+    soft_forgotten_document_ids: tuple[str, ...] = ()
+    pending_document_ids: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class MemoryEditReviewPreview:
+    proposal_id: str
+    status: str
+    document_uri: str
+    document_id: str
+    document_kind: str
+    relative_path: str
+    source_digest: str
+    proposed_source_digest: str
+    proposed_diff_digest: str
+    proposed_diff: str
+    edit_summary: str
+    workflow_kind: str = MemoryEditReviewWorkflow.DOCUMENT_EDIT.value
+    consolidation_sources: tuple[dict[str, object], ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+class MemoryEditReviewService:
+    """Approve, reject or correct one immutable document CAS proposal."""
+
+    def __init__(
         self,
+        review_store: MemoryEditReviewStore,
+        committer: MemoryDocumentCommitter,
         *,
-        user_id: str,
-        pending_uri: str,
-        decision: str,
-        expected_lifecycle_revision: int,
-        expected_proposal_fingerprint: str,
-        command_id: str,
-        tenant_id: str | None = None,
-        reason: str = "",
-        corrected_proposal: MemorySemanticProposal | dict[str, Any] | None = None,
-        caller: TrustedRequestContext | None = None,
-        review_locked: Any | None = None,
-    ) -> dict[str, Any]:
-        """Apply a user-owned structured review without accepting arbitrary operations or targets."""
+        erasure_store: MemoryDocumentEraseStore | None = None,
+        readiness: ReadinessGate | None = None,
+        consolidator: MemoryDocumentConsolidator | None = None,
+    ) -> None:
+        self.review_store = review_store
+        self.committer = committer
+        self.control_store = committer.control_store
+        self.erasure_store = erasure_store or MemoryDocumentEraseStore(committer.control_store.root)
+        self.readiness = readiness
+        if consolidator is not None and consolidator.committer is not committer:
+            raise ValueError("memory review consolidator must share the document committer")
+        self.consolidator = consolidator
 
-        tenant_id = self._effective_tenant(caller, tenant_id)
+    def seal_edit_proposal(
+        self,
+        plan: DocumentEditPlan,
+        *,
+        proposed_diff: str | bytes,
+    ) -> MemoryEditReviewResult:
+        """Internal candidate path: persist exact before/after/diff without mutating live Markdown."""
+
         self._require_ready()
-        if expected_lifecycle_revision < 1:
-            raise ValueError("expected_lifecycle_revision must be positive")
-        if not expected_proposal_fingerprint or not command_id:
-            raise ValueError("pending review requires proposal fingerprint and command_id")
-        normalized_decision = str(decision or "").strip().upper()
-        allowed_decisions = {
-            "CONFIRM",
-            "CONFIRM_AND_APPLY",
-            "CORRECT",
-            "REJECT",
-            "EXPIRE",
-            "RETRY",
-        }
-        if normalized_decision not in allowed_decisions:
-            raise ValueError(
-                "pending review decision must be CONFIRM, CONFIRM_AND_APPLY, CORRECT, REJECT, EXPIRE, or RETRY"
-            )
-        if corrected_proposal is not None and not isinstance(corrected_proposal, MemorySemanticProposal | dict):
-            raise ValueError("corrected_proposal must be a semantic proposal object")
-        correction: MemorySemanticProposal | None = (
-            corrected_proposal
-            if isinstance(corrected_proposal, MemorySemanticProposal)
-            else MemorySemanticProposal.from_dict(corrected_proposal)
-            if isinstance(corrected_proposal, dict)
-            else None
+        self.erasure_store.assert_mutation_allowed(
+            plan.tenant_id,
+            plan.owner_user_id,
+            plan.document_id,
         )
-        if (normalized_decision == "CORRECT") != (correction is not None):
-            raise ValueError("CORRECT requires corrected_proposal and other decisions forbid it")
-        correction_digest = stable_hash([correction.to_dict()], length=64) if correction is not None else ""
-        review_store = PendingReviewCommandStore(self.root, tenant_id=tenant_id)
-        lock_key = f"pending-review:{tenant_id}:{pending_uri}"
-        with PathLock(self.lock_store).acquire(lock_key, ttl_seconds=120) as guard:
-            guard.checkpoint()
-            committed_pending = CanonicalMemoryRepository(
-                self.source_store,
-                self.relation_store,
-            ).load_pending(
-                pending_uri,
-                tenant_id=tenant_id,
-                owner_user_id=user_id,
-            )
-            if caller is not None:
-                caller.require(AUTHORITATIVE_REMEMBER)
-                caller.assert_identity(user_id=user_id, tenant_id=tenant_id)
-                self._require_exact_workspace(
-                    {"scope": committed_pending.scope.to_dict()},
-                    caller,
-                    pending_uri,
-                )
-            if committed_pending.lifecycle_state == LifecycleState.CONFIRMED:
-                for raw_transition in reversed(committed_pending.lifecycle_history):
-                    transition = dict(raw_transition)
-                    owning_command = str(transition.get("review_command_id") or "")
-                    if (
-                        str(transition.get("to") or "").casefold() != "confirmed"
-                        or str(transition.get("review_decision") or "").upper() != "CONFIRM_AND_APPLY"
-                        or not owning_command
-                        or owning_command == command_id
-                    ):
-                        continue
-                    owning_record = review_store.load(owning_command)
-                    if owning_record.get("status") == "running":
-                        raise PendingReviewIdempotencyConflict(
-                            "another CONFIRM_AND_APPLY command owns the in-flight resolution"
-                        )
-                    break
-            command_proof_preexisting = review_store.path(command_id).exists()
-            command = review_store.begin(
-                command_id,
-                owner_user_id=user_id,
-                pending_uri=pending_uri,
-                decision=normalized_decision,
-                expected_lifecycle_revision=expected_lifecycle_revision,
-                expected_proposal_fingerprint=expected_proposal_fingerprint,
-                reason=reason,
-                correction_proposal_digest=correction_digest,
-            )
-            if command["status"] == "completed":
-                validate_pending_review_record(command, committed_pending)
-                return dict(command["result"])
-            if command["status"] == "failed":
-                error = dict(command.get("error", {}) or {})
-                raise ValueError(
-                    "pending review command previously failed: "
-                    f"{error.get('type', 'UnknownError')}: {error.get('message', '')}"
-                )
-            self.committer.recover_pending_regular_memory(
-                user_id,
-                commit_group_id=f"pending-review:{command_id}",
-            )
-            self.committer.recover_pending_canonical(
-                user_id,
-                commit_group_id=f"pending-resolution:{command_id}",
-            )
-            self.committer.recover_pending_canonical(
-                user_id,
-                commit_group_id=f"pending-correction:{command_id}",
-            )
-            try:
-                handler = review_locked or self._review_pending_locked
-                result = handler(
-                    user_id=user_id,
-                    pending_uri=pending_uri,
-                    normalized_decision=normalized_decision,
-                    expected_lifecycle_revision=expected_lifecycle_revision,
-                    expected_proposal_fingerprint=expected_proposal_fingerprint,
-                    command_id=command_id,
-                    tenant_id=tenant_id,
-                    reason=reason,
-                    corrected_proposal=correction,
-                    caller=caller,
-                    review_request_digest=str(command["request_digest"]),
-                    command_proof_preexisting=command_proof_preexisting,
-                )
-            except (FileNotFoundError, PermissionError, KeyError, TypeError, ValueError) as exc:
-                review_store.fail(command_id, exc)
-                raise
-            except (OSError, TimeoutError, RuntimeError):
-                # The durable command stays ``running``.  A retry first
-                # recovers receipt/head/redo state and then returns or
-                # completes the exact same command effect.
-                raise
-            guard.checkpoint()
-            review_store.complete(command_id, result)
-            return result
+        record = self.review_store.seal(plan, proposed_diff=proposed_diff)
+        return self._result(record, changed=False, projection_status="AWAITING_REVIEW")
 
-    def _review_pending_locked(
+    def read_proposed_diff(
         self,
+        proposal_id: str,
         *,
-        user_id: str,
-        pending_uri: str,
-        normalized_decision: str,
-        expected_lifecycle_revision: int,
-        expected_proposal_fingerprint: str,
-        command_id: str,
-        tenant_id: str,
-        reason: str,
-        corrected_proposal: MemorySemanticProposal | None,
-        caller: TrustedRequestContext | None,
-        review_request_digest: str,
-        command_proof_preexisting: bool,
-    ) -> dict[str, Any]:
-        repository = CanonicalMemoryRepository(self.source_store, self.relation_store)
-        pending = repository.load_pending(
-            pending_uri,
-            tenant_id=tenant_id,
-            owner_user_id=user_id,
-        )
-        if caller is not None:
-            caller.require(AUTHORITATIVE_REMEMBER)
-            caller.assert_identity(user_id=user_id, tenant_id=tenant_id)
-            self._require_exact_workspace({"scope": pending.scope.to_dict()}, caller, pending_uri)
-        if pending.proposal.fingerprint != expected_proposal_fingerprint:
-            raise ValueError("pending review expected revision or proposal fingerprint mismatch")
-        command_reason_prefix = f"structured_review:{command_id}"
-        structured_history = [
-            dict(item)
-            for item in pending.lifecycle_history
-            if str(dict(item).get("review_command_id") or "") == command_id
-        ]
-        if any(
-            str(item.get("review_decision") or "").strip().upper() != normalized_decision
-            or str(item.get("review_request_digest") or "") != review_request_digest
-            for item in structured_history
-        ):
-            raise PendingReviewIdempotencyConflict(
-                "pending review command_id is already bound by a receipt to a different decision or effect"
-            )
-        legacy_command_history = any(
-            str(dict(item).get("reason") or "").startswith(
-                (command_reason_prefix, f"structured_correction:{command_id}")
-            )
-            and not dict(item).get("review_command_id")
-            for item in pending.lifecycle_history
-        )
-        if legacy_command_history and not command_proof_preexisting:
-            raise PendingReviewIdempotencyConflict(
-                "legacy pending review history has no durable request binding; command_id cannot be recreated"
-            )
-        command_history = bool(structured_history or legacy_command_history)
-        if pending.lifecycle_revision != expected_lifecycle_revision and not command_history:
-            raise ValueError("pending review expected revision or proposal fingerprint mismatch")
-        pending.assert_review_decision(normalized_decision)
-        formation = self.session_commit_service.memory_planner.formation
-        review_reason = f"structured_review:{command_id}:{reason}".rstrip(":")
-        if normalized_decision == "CORRECT":
-            assert corrected_proposal is not None
-            correction_prefix = f"structured_correction:{command_id}"
-            correction_history = any(
-                str(dict(item).get("reason") or "").startswith(correction_prefix) for item in pending.lifecycle_history
-            )
-            if pending.lifecycle_state == LifecycleState.REJECTED and correction_history:
-                return self._pending_review_recovered_result(pending_uri, pending, ())
-            evidence = corrected_proposal.atomic_evidence_ref or (
-                corrected_proposal.evidence_refs[0] if corrected_proposal.evidence_refs else None
-            )
-            if evidence is None or not evidence.source_uri:
-                raise ValueError("corrected proposal has no durable source archive")
-            archive = self.session_archive_store.read_archive(evidence.source_uri, tenant_id=tenant_id)
-            episode = self.session_commit_service.memory_planner.episode_adapter.adapt(archive)
-            corrected = formation.plan_pending_correction(
-                pending_uri,
-                corrected_proposal,
-                archive=archive,
-                episode=episode,
-                tenant_id=tenant_id,
-                owner_user_id=user_id,
-                commit_group_id=f"pending-correction:{command_id}",
-                retrieval_views=list(pending.retrieval_views),
-                reason=correction_prefix,
-                review_command_id=command_id,
-                review_decision=normalized_decision,
-                review_request_digest=review_request_digest,
-            )
-            diff = self.committer.commit(user_id, list(corrected.operations))
-            self._process_memory_projections_or_raise()
-            final = repository.load_pending(
-                pending_uri,
-                tenant_id=tenant_id,
-                owner_user_id=user_id,
-            )
-            corrected_claim_uris = tuple(
-                str(operation.target_uri)
-                for operation in corrected.operations
-                if isinstance((payload := operation.payload.get("context_object")), dict)
-                and dict(payload.get("metadata", {}) or {}).get("canonical_kind") == "claim"
-                and dict(payload.get("metadata", {}) or {}).get("state") == "ACTIVE"
-            )
-            return {
-                "uri": pending_uri,
-                "status": final.lifecycle_state.value,
-                "lifecycle_revision": final.lifecycle_revision,
-                "corrected_claim_uris": list(corrected_claim_uris),
-                "corrected_proposal_fingerprint": corrected.proposal.fingerprint,
-                "diff_id": diff.diff_id,
-            }
-        terminal = {
-            "REJECT": LifecycleState.REJECTED,
-            "EXPIRE": LifecycleState.EXPIRED,
-            "RETRY": LifecycleState.RETRYABLE,
-            "CONFIRM": LifecycleState.CONFIRMED,
-        }
-        if normalized_decision in terminal:
-            if pending.lifecycle_state == terminal[normalized_decision] and command_history:
-                return self._pending_review_recovered_result(pending_uri, pending, ())
-            operation = formation.plan_pending_lifecycle_transition(
-                pending_uri,
-                terminal[normalized_decision],
-                tenant_id=tenant_id,
-                owner_user_id=user_id,
-                commit_group_id=f"pending-review:{command_id}",
-                reason=review_reason,
-                retry_increment=normalized_decision == "RETRY",
-                review_command_id=command_id,
-                review_decision=normalized_decision,
-                review_request_digest=review_request_digest,
-            )
-            diff = self.committer.commit(user_id, [operation])
-            updated = repository.load_pending(
-                pending_uri,
-                tenant_id=tenant_id,
-                owner_user_id=user_id,
-            )
-            return {
-                "uri": pending_uri,
-                "status": updated.lifecycle_state.value,
-                "lifecycle_revision": updated.lifecycle_revision,
-                "diff_id": diff.diff_id,
-            }
-        if pending.lifecycle_state == LifecycleState.RESOLVED and command_history:
-            return self._pending_review_recovered_result(pending_uri, pending, ())
-        if pending.lifecycle_state in {LifecycleState.PENDING, LifecycleState.RETRYABLE}:
-            confirmation = formation.plan_pending_lifecycle_transition(
-                pending_uri,
-                LifecycleState.CONFIRMED,
-                tenant_id=tenant_id,
-                owner_user_id=user_id,
-                commit_group_id=f"pending-review:{command_id}",
-                reason=review_reason,
-                review_command_id=command_id,
-                review_decision=normalized_decision,
-                review_request_digest=review_request_digest,
-            )
-            self.committer.commit(user_id, [confirmation])
-            pending = repository.load_pending(
-                pending_uri,
-                tenant_id=tenant_id,
-                owner_user_id=user_id,
-            )
-        elif pending.lifecycle_state != LifecycleState.CONFIRMED:
-            raise ValueError("only PENDING, RETRYABLE, or CONFIRMED proposals can be applied")
-        evidence = pending.proposal.atomic_evidence_ref or (
-            pending.proposal.evidence_refs[0] if pending.proposal.evidence_refs else None
-        )
-        if evidence is None or not evidence.source_uri:
-            raise ValueError("confirmed pending proposal has no durable source archive")
-        archive = self.session_archive_store.read_archive(evidence.source_uri, tenant_id=tenant_id)
-        episode = self.session_commit_service.memory_planner.episode_adapter.adapt(archive)
-        resolved = formation.plan_confirmed_pending_resolution(
-            pending_uri,
-            pending.proposal,
-            archive=archive,
-            episode=episode,
-            tenant_id=tenant_id,
-            owner_user_id=user_id,
-            commit_group_id=f"pending-resolution:{command_id}",
-            retrieval_views=list(pending.retrieval_views),
-            reason=review_reason,
-            review_command_id=command_id,
-            review_decision=normalized_decision,
-            review_request_digest=review_request_digest,
-        )
-        diff = self.committer.commit(user_id, list(resolved.operations))
-        self._process_memory_projections_or_raise()
-        final = repository.load_pending(
-            pending_uri,
-            tenant_id=tenant_id,
-            owner_user_id=user_id,
-        )
-        claim_uris = [
-            str(operation.target_uri)
-            for operation in resolved.operations
-            if isinstance((payload := operation.payload.get("context_object")), dict)
-            and dict(payload.get("metadata", {}) or {}).get("canonical_kind") == "claim"
-            and dict(payload.get("metadata", {}) or {}).get("state") == "ACTIVE"
-        ]
-        return {
-            "uri": pending_uri,
-            "status": final.lifecycle_state.value,
-            "lifecycle_revision": final.lifecycle_revision,
-            "resolved_claim_uris": claim_uris,
-            "diff_id": diff.diff_id,
-        }
+        caller: TrustedRequestContext,
+    ) -> bytes:
+        self._require_ready()
+        caller.require(READ_CONTEXT)
+        record = self._owned_record(proposal_id, caller)
+        return self.review_store.load_proposed_diff(record)
 
-    def _pending_review_recovered_result(
+    def preview_edit(
         self,
-        pending_uri: str,
-        pending: Any,
-        claim_uris: tuple[str, ...],
-    ) -> dict[str, Any]:
-        diff_id = ""
-        resolved_claim_uris = list(claim_uris)
-        artifact_root = artifact_root_for(self.source_store)
-        if artifact_root is not None:
-            _head, receipt, _snapshot = load_current_head(
-                artifact_root,
-                pending_uri,
-                canonical_kind="pending_proposal",
+        proposal_id: str,
+        *,
+        caller: TrustedRequestContext,
+    ) -> MemoryEditReviewPreview:
+        """Return the caller-owned bounded diff needed for an informed decision."""
+
+        self._require_ready()
+        caller.require(READ_CONTEXT)
+        record = self._owned_record(proposal_id, caller)
+        proposed_diff = self.review_store.load_proposed_diff(record).decode("utf-8", errors="strict")
+        current = self._result(record, changed=False, projection_status="AWAITING_REVIEW")
+        return MemoryEditReviewPreview(
+            proposal_id=current.proposal_id,
+            status=current.status,
+            document_uri=current.document_uri,
+            document_id=current.document_id,
+            document_kind=current.document_kind,
+            relative_path=current.relative_path,
+            source_digest=current.source_digest,
+            proposed_source_digest=current.proposed_source_digest,
+            proposed_diff_digest=current.proposed_diff_digest,
+            proposed_diff=proposed_diff,
+            edit_summary=current.edit_summary,
+            workflow_kind=current.workflow_kind,
+            consolidation_sources=current.consolidation_sources,
+        )
+
+    def review_edit(
+        self,
+        proposal_id: str,
+        decision: ReviewDecision,
+        *,
+        caller: TrustedRequestContext,
+        corrected_edit: str | None = None,
+    ) -> MemoryEditReviewResult:
+        self._require_ready()
+        self._require_trusted_user(caller)
+        record = self._owned_record(proposal_id, caller)
+        normalized = str(decision or "").strip().upper()
+        if normalized not in {"APPROVE", "REJECT", "CORRECT"}:
+            raise ValueError("review decision must be APPROVE, REJECT or CORRECT")
+        if normalized == "CORRECT":
+            if corrected_edit is None:
+                raise ValueError("CORRECT requires corrected_edit")
+            return self._correct(record, corrected_edit)
+        if corrected_edit is not None:
+            raise ValueError("only CORRECT accepts corrected_edit")
+        if normalized == "REJECT":
+            rejected = self.review_store.transition(record, MemoryEditReviewStatus.REJECTED)
+            return self._result(rejected, changed=False, projection_status="REJECTED")
+        return self._approve(record, caller)
+
+    def _approve(
+        self,
+        record: MemoryEditReviewRecord,
+        caller: TrustedRequestContext,
+    ) -> MemoryEditReviewResult:
+        if record.workflow_kind is MemoryEditReviewWorkflow.CONSOLIDATION:
+            caller.require(AUTHORITATIVE_FORGET)
+            return self._approve_consolidation(record, caller)
+        if record.status == MemoryEditReviewStatus.APPROVED:
+            return self._result(record, changed=True, projection_status="ENQUEUED")
+        if record.status != MemoryEditReviewStatus.PENDING:
+            raise ValueError("only a PENDING document edit proposal can be approved")
+        self.erasure_store.assert_mutation_allowed(
+            record.tenant_id,
+            record.owner_user_id,
+            record.document_id,
+        )
+        plan = self.review_store.to_plan(record)
+        result = self.committer.commit(
+            plan,
+            actor_binding=f"trusted:{caller.actor_kind}:{caller.actor_id}:{caller.user_id}",
+            evidence_reference=_review_evidence_reference(record),
+        )
+        approved = self.review_store.transition(
+            record,
+            MemoryEditReviewStatus.APPROVED,
+            commit_intent_id=result.intent_id,
+        )
+        return self._result_from_commit(approved, result)
+
+    def _approve_consolidation(
+        self,
+        record: MemoryEditReviewRecord,
+        caller: TrustedRequestContext,
+    ) -> MemoryEditReviewResult:
+        if self.consolidator is None:
+            raise RuntimeError("memory consolidation review is not configured")
+        actor_binding = f"trusted:{caller.actor_kind}:{caller.actor_id}:{caller.user_id}"
+        if record.status == MemoryEditReviewStatus.APPROVED:
+            result = self.consolidator.resume(
+                tenant_id=record.tenant_id,
+                owner_user_id=record.owner_user_id,
+                saga_id=record.consolidation_saga_id,
+                actor_binding=actor_binding,
             )
-            diff_id = str(dict(receipt.get("diff", {}) or {}).get("diff_id") or "")
-            for operation in receipt.get("operations", []):
-                if not isinstance(operation, dict) or operation.get("target_uri") != pending_uri:
-                    continue
-                resolved_claim_uris.extend(
-                    str(item) for item in dict(operation.get("payload", {}) or {}).get("resolved_claim_uris", []) or []
+            return self._result(
+                record,
+                changed=True,
+                projection_status=result.status.value,
+                consolidation=result,
+            )
+        if record.status != MemoryEditReviewStatus.PENDING:
+            raise ValueError("only a PENDING consolidation proposal can be approved")
+        self.erasure_store.assert_mutation_allowed(
+            record.tenant_id,
+            record.owner_user_id,
+            record.document_id,
+        )
+        plan = self.review_store.to_plan(record)
+        idempotency_key = f"review-consolidation:{record.proposal_id}"
+        expected_saga_id = consolidation_saga_id(
+            record.tenant_id,
+            record.owner_user_id,
+            hashlib.sha256(idempotency_key.encode()).hexdigest(),
+        )
+        existing_saga = self.consolidator.saga_store.load(
+            record.tenant_id,
+            record.owner_user_id,
+            expected_saga_id,
+        )
+        sources = (
+            _sealed_consolidation_sources(record)
+            if existing_saga is not None
+            else self._validated_consolidation_sources(record, plan)
+        )
+        result = self.consolidator.consolidate(
+            plan,
+            sources,
+            idempotency_key=idempotency_key,
+            actor_binding=actor_binding,
+        )
+        approved = self.review_store.transition(
+            record,
+            MemoryEditReviewStatus.APPROVED,
+            consolidation_saga_id=result.saga_id,
+        )
+        return self._result(
+            approved,
+            changed=True,
+            projection_status=result.status.value,
+            consolidation=result,
+        )
+
+    def _validated_consolidation_sources(
+        self,
+        record: MemoryEditReviewRecord,
+        plan: DocumentEditPlan,
+    ) -> tuple[ConsolidationSource, ...]:
+        target_state = self.committer.document_store.read_state(
+            record.tenant_id,
+            record.owner_user_id,
+            record.relative_path,
+        )
+        if target_state != plan.expected_state:
+            raise DocumentConflictError(
+                "consolidation review target changed after its copy-on-write proposal"
+            )
+        if isinstance(target_state, PresentPath):
+            target_raw = self.committer.document_store.read_raw(
+                record.tenant_id,
+                record.owner_user_id,
+                relative_path=record.relative_path,
+            )
+            if hashlib.sha256(target_raw).hexdigest() != target_state.raw_sha256:
+                raise DocumentConflictError("consolidation review target changed during validation")
+            target_front_matter = parse_front_matter(
+                target_raw,
+                max_header_bytes=int(
+                    getattr(self.committer.document_store, "max_front_matter_bytes", 32 * 1024)
+                ),
+                max_depth=int(getattr(self.committer.document_store, "max_front_matter_depth", 12)),
+            )
+            if target_front_matter.document_id != record.document_id:
+                raise DocumentConflictError("consolidation review target identity changed")
+        elif not isinstance(target_state, AbsentPath):
+            raise DocumentConflictError("consolidation review target is unsafe")
+
+        sources: list[ConsolidationSource] = []
+        for source in record.consolidation_sources:
+            self.erasure_store.assert_mutation_allowed(
+                record.tenant_id,
+                record.owner_user_id,
+                source.document_id,
+            )
+            expected = PresentPath(source.relative_path, source.raw_sha256, source.size)
+            state = self.committer.document_store.read_state(
+                record.tenant_id,
+                record.owner_user_id,
+                source.relative_path,
+            )
+            if state != expected:
+                raise DocumentConflictError(
+                    "consolidation review source changed after its sealed proposal"
                 )
-                corrected_claim_uris = [
-                    str(item) for item in dict(operation.get("payload", {}) or {}).get("corrected_claim_uris", []) or []
-                ]
-                if corrected_claim_uris:
-                    result_correction = {
-                        "corrected_claim_uris": corrected_claim_uris,
-                        "corrected_proposal_fingerprint": str(
-                            dict(operation.get("payload", {}) or {}).get("corrected_proposal_fingerprint") or ""
-                        ),
-                    }
-                    break
+            raw = self.committer.document_store.read_raw(
+                record.tenant_id,
+                record.owner_user_id,
+                relative_path=source.relative_path,
+            )
+            if hashlib.sha256(raw).hexdigest() != source.raw_sha256:
+                raise DocumentConflictError("consolidation review source changed during validation")
+            parsed = parse_front_matter(
+                raw,
+                max_header_bytes=int(
+                    getattr(self.committer.document_store, "max_front_matter_bytes", 32 * 1024)
+                ),
+                max_depth=int(getattr(self.committer.document_store, "max_front_matter_depth", 12)),
+            )
+            if parsed.document_id != source.document_id:
+                raise DocumentConflictError("consolidation review source identity changed")
+            sources.append(
+                ConsolidationSource(
+                    document_id=source.document_id,
+                    relative_path=source.relative_path,
+                    raw_sha256=source.raw_sha256,
+                    size=source.size,
+                )
+            )
+        return tuple(sources)
+
+    def _correct(
+        self,
+        record: MemoryEditReviewRecord,
+        corrected_edit: str,
+    ) -> MemoryEditReviewResult:
+        corrected_plan, corrected_diff = self._corrected_plan(record, corrected_edit)
+        if record.status == MemoryEditReviewStatus.CORRECTED:
+            replacement = self.review_store.load(
+                record.tenant_id,
+                record.owner_user_id,
+                record.replacement_proposal_id,
+            )
+            if replacement is None:
+                raise DocumentNotFoundError("corrected replacement proposal is missing")
+            if not _matches_correction(
+                self.review_store,
+                record,
+                replacement,
+                corrected_plan,
+                corrected_diff,
+            ):
+                raise ValueError("review proposal is already bound to a different correction")
+            return self._result(replacement, changed=False, projection_status="AWAITING_REVIEW")
+        if record.status != MemoryEditReviewStatus.PENDING:
+            raise ValueError("only a PENDING document edit proposal can be corrected")
+        if (
+            corrected_plan.tenant_id != record.tenant_id
+            or corrected_plan.owner_user_id != record.owner_user_id
+            or corrected_plan.document_id != record.document_id
+            or corrected_plan.relative_path != record.relative_path
+            or corrected_plan.expected_state != record.expected_state
+        ):
+            raise ValueError("corrected review must retain the exact tenant, owner, document, path and before CAS")
+        self.erasure_store.assert_mutation_allowed(
+            record.tenant_id,
+            record.owner_user_id,
+            record.document_id,
+        )
+        replacement = self.review_store.seal(
+            corrected_plan,
+            proposed_diff=corrected_diff,
+            independent_evidence_references=record.independent_evidence_references,
+            workflow_kind=record.workflow_kind,
+            consolidation_sources=record.consolidation_sources,
+        )
+        self.review_store.transition(
+            record,
+            MemoryEditReviewStatus.CORRECTED,
+            replacement_proposal_id=replacement.proposal_id,
+        )
+        return self._result(replacement, changed=False, projection_status="AWAITING_REVIEW")
+
+    def _corrected_plan(
+        self,
+        record: MemoryEditReviewRecord,
+        corrected_edit: str,
+    ) -> tuple[DocumentEditPlan, bytes]:
+        if record.edit_kind not in {DocumentEditKind.CREATE, DocumentEditKind.UPDATE}:
+            raise ValueError("CORRECT only supports create/update proposals; reject other proposal kinds")
+        corrected_body = str(corrected_edit)
+        if not corrected_body.strip():
+            raise ValueError("corrected_edit is empty; reject or forget instead")
+        original_after = self.review_store.load_after_blob(record)
+        if original_after is None:
+            raise ValueError("correctable review proposal has no exact after blob")
+        parsed = parse_front_matter(
+            original_after,
+            max_header_bytes=int(getattr(self.committer.document_store, "max_front_matter_bytes", 32 * 1024)),
+            max_depth=int(getattr(self.committer.document_store, "max_front_matter_depth", 12)),
+        )
+        corrected_bytes = corrected_body.encode()
+        if not corrected_bytes.startswith(b"\n"):
+            corrected_bytes = b"\n" + corrected_bytes
+        if not corrected_bytes.endswith(b"\n"):
+            corrected_bytes += b"\n"
+        after = parsed.header_bytes + corrected_bytes
+        if after == original_after:
+            raise ValueError("corrected_edit does not change the sealed proposal")
+        diff = "".join(
+            unified_diff(
+                original_after.decode().splitlines(keepends=True),
+                after.decode().splitlines(keepends=True),
+                fromfile="sealed-proposal",
+                tofile="corrected-proposal",
+            )
+        ).encode()
+        digest = hashlib.sha256(after).hexdigest()
+        return (
+            DocumentEditPlan(
+                idempotency_key=f"correct:{record.proposal_id}:{digest}",
+                tenant_id=record.tenant_id,
+                owner_user_id=record.owner_user_id,
+                edit_kind=record.edit_kind,
+                expected_state=record.expected_state,
+                evidence_digest=digest,
+                edit_summary=f"corrected review: {record.edit_summary}"[:500],
+                document_id=record.document_id,
+                relative_path=record.relative_path,
+                after_bytes=after,
+                new_relative_path=record.new_relative_path,
+                expected_new_state=record.expected_new_state,
+                expected_registration_document_id=record.expected_registration_document_id,
+            ),
+            diff,
+        )
+
+    def _owned_record(
+        self,
+        proposal_id: str,
+        caller: TrustedRequestContext,
+    ) -> MemoryEditReviewRecord:
+        record = self.review_store.load(caller.tenant_id, caller.user_id, proposal_id)
+        if record is None:
+            raise DocumentNotFoundError("memory edit review proposal does not exist")
+        caller.assert_identity(user_id=record.owner_user_id, tenant_id=record.tenant_id)
+        return record
+
+    def _result_from_commit(
+        self,
+        record: MemoryEditReviewRecord,
+        commit: DocumentCommitResult,
+    ) -> MemoryEditReviewResult:
+        control = commit.control or self.control_store.load_control(
+            record.tenant_id,
+            record.owner_user_id,
+            record.document_id,
+        )
+        return self._result(
+            record,
+            changed=commit.event is not None and not commit.no_op,
+            projection_status="ENQUEUED" if commit.event is not None else "UNCHANGED",
+            document_revision=control.logical_revision if control is not None else 0,
+            source_digest=control.raw_sha256 if control is not None else "",
+        )
+
+    def _result(
+        self,
+        record: MemoryEditReviewRecord,
+        *,
+        changed: bool,
+        projection_status: str,
+        document_revision: int | None = None,
+        source_digest: str | None = None,
+        consolidation: ConsolidationResult | None = None,
+    ) -> MemoryEditReviewResult:
+        control = self.control_store.load_control(
+            record.tenant_id,
+            record.owner_user_id,
+            record.document_id,
+        )
+        if document_revision is None:
+            document_revision = control.logical_revision if control is not None else 0
+        if source_digest is None:
+            if control is not None:
+                source_digest = control.raw_sha256
+            elif isinstance(record.expected_state, PresentPath):
+                source_digest = record.expected_state.raw_sha256
             else:
-                result_correction = {}
-        result: dict[str, Any] = {
-            "uri": pending_uri,
-            "status": pending.lifecycle_state.value,
-            "lifecycle_revision": pending.lifecycle_revision,
-            "diff_id": diff_id,
-        }
-        if pending.lifecycle_state == LifecycleState.RESOLVED:
-            result["resolved_claim_uris"] = list(dict.fromkeys(resolved_claim_uris))
-        result.update(result_correction if artifact_root is not None else {})
-        return result
+                source_digest = ""
+        return MemoryEditReviewResult(
+            proposal_id=record.proposal_id,
+            status=record.status.value,
+            document_uri=MemoryDocumentPathPolicy.document_uri(
+                record.owner_user_id,
+                record.document_id,
+            ),
+            document_id=record.document_id,
+            document_kind=MemoryDocumentPathPolicy.kind_for(record.relative_path).value,
+            relative_path=record.relative_path,
+            document_revision=document_revision,
+            source_digest=source_digest,
+            proposed_source_digest=record.after_blob_digest,
+            proposed_diff_digest=record.proposed_diff_blob_digest,
+            changed=changed,
+            edit_summary=record.edit_summary,
+            projection_status=projection_status,
+            replacement_proposal_id=record.replacement_proposal_id,
+            workflow_kind=record.workflow_kind.value,
+            consolidation_sources=tuple(
+                _consolidation_source_payload(record.owner_user_id, source)
+                for source in record.consolidation_sources
+            ),
+            consolidation_saga_id=(
+                consolidation.saga_id if consolidation is not None else record.consolidation_saga_id
+            ),
+            consolidation_status=(consolidation.status.value if consolidation is not None else ""),
+            target_projection_generation=(
+                consolidation.target_projection_generation if consolidation is not None else 0
+            ),
+            target_projection_confirmed=(
+                consolidation.target_projection_confirmed if consolidation is not None else False
+            ),
+            soft_forgotten_document_ids=(
+                consolidation.soft_forgotten_document_ids if consolidation is not None else ()
+            ),
+            pending_document_ids=(
+                consolidation.pending_document_ids if consolidation is not None else ()
+            ),
+        )
+
+    def _require_ready(self) -> None:
+        if self.readiness is not None:
+            self.readiness.require_ready()
+
+    @staticmethod
+    def _require_trusted_user(caller: TrustedRequestContext) -> None:
+        caller.require(AUTHORITATIVE_REMEMBER)
+        if caller.actor_kind != "user":
+            raise PermissionError("memory edit review decisions require a trusted user actor")
 
 
+def _matches_correction(
+    store: MemoryEditReviewStore,
+    original: MemoryEditReviewRecord,
+    replacement: MemoryEditReviewRecord,
+    corrected_plan: DocumentEditPlan,
+    corrected_diff: str | bytes,
+) -> bool:
+    diff = corrected_diff.encode() if isinstance(corrected_diff, str) else bytes(corrected_diff)
+    replacement_plan = store.to_plan(replacement)
+    return (
+        replacement.proposed_diff_blob_digest == hashlib.sha256(diff).hexdigest()
+        and replacement_plan.tenant_id == corrected_plan.tenant_id
+        and replacement_plan.owner_user_id == corrected_plan.owner_user_id
+        and replacement_plan.document_id == corrected_plan.document_id
+        and replacement_plan.edit_kind == corrected_plan.edit_kind
+        and replacement_plan.expected_state == corrected_plan.expected_state
+        and replacement_plan.expected_new_state == corrected_plan.expected_new_state
+        and replacement_plan.relative_path == corrected_plan.relative_path
+        and replacement_plan.new_relative_path == corrected_plan.new_relative_path
+        and replacement_plan.expected_registration_document_id == corrected_plan.expected_registration_document_id
+        and replacement_plan.evidence_digest == corrected_plan.evidence_digest
+        and replacement_plan.edit_summary == corrected_plan.edit_summary
+        and replacement_plan.after_bytes == corrected_plan.after_bytes
+        and replacement.workflow_kind == original.workflow_kind
+        and replacement.consolidation_sources == original.consolidation_sources
+    )
 
-__all__ = ["PendingReviewService"]
+
+def _consolidation_source_payload(
+    owner_user_id: str,
+    source: ReviewConsolidationSource,
+) -> dict[str, object]:
+    return {
+        "document_uri": MemoryDocumentPathPolicy.document_uri(owner_user_id, source.document_id),
+        "document_id": source.document_id,
+        "relative_path": source.relative_path,
+        "source_digest": source.raw_sha256,
+        "size": source.size,
+    }
+
+
+def _sealed_consolidation_sources(
+    record: MemoryEditReviewRecord,
+) -> tuple[ConsolidationSource, ...]:
+    return tuple(
+        ConsolidationSource(
+            document_id=source.document_id,
+            relative_path=source.relative_path,
+            raw_sha256=source.raw_sha256,
+            size=source.size,
+        )
+        for source in record.consolidation_sources
+    )
+
+
+def _review_evidence_reference(record: MemoryEditReviewRecord) -> str:
+    if record.independent_evidence_references:
+        return record.independent_evidence_references[0]
+    return f"review-proposal:{record.proposal_id}:sha256:{record.evidence_digest}"
+
+
+__all__ = [
+    "MemoryEditReviewResult",
+    "MemoryEditReviewPreview",
+    "MemoryEditReviewService",
+    "ReviewDecision",
+]

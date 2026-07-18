@@ -313,12 +313,18 @@ def test_archive_search_is_a_unified_retrieval_wrapper(tmp_path: Path, monkeypat
             "tool_results": [],
         },
     )
-    results = client.archive_search("report", user_id="u1", tenant_id="default")
+    results = client.archive_search(
+        "report",
+        user_id="u1",
+        tenant_id="default",
+        timezone_name="Asia/Singapore",
+    )
 
     assert len(calls) == 1
-    assert calls[0]["options"].context_types == (ContextType.SESSION,)
+    assert calls[0]["options"].context_types == (ContextType.SESSION, ContextType.MEMORY)
     assert calls[0]["options"].query_intent is RetrievalQueryIntent.OPEN_RECALL
-    assert calls[0]["options"].metadata_filters == {"minimum_lexical_relevance": 1.0}
+    assert calls[0]["options"].timezone == "Asia/Singapore"
+    assert calls[0]["options"].metadata_filters == {}
     assert results == [
         {
             "uri": "memoryos://context/session-1/tool-1",

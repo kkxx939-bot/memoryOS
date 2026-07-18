@@ -20,9 +20,13 @@ class RewardPenaltyIdempotencyTest(unittest.TestCase):
         self.source = FileSystemSourceStore(self.root)
         self.index = InMemoryIndexStore()
         self.committer = OperationCommitter(self.source, self.index, str(self.root))
-        self.policy = ActionPolicy(user_id="u1", scene_key="hot", action="turn_on_ac", memory_anchor_uri="memoryos://user/u1/memories/anchors/hot")
+        self.policy = ActionPolicy(user_id="u1", scene_key="hot", action="turn_on_ac", support_anchor_uri="memoryos://user/u1/support/behavior/hot")
         self.source.write_object(self.policy.to_context_object(), content="policy")
-        self.index.upsert_index(self.policy.to_context_object(), content="policy")
+        self.index.upsert_index(
+            self.policy.to_context_object(),
+            content="policy",
+            tenant_id="default",
+        )
 
     def tearDown(self) -> None:
         self.tmp.cleanup()

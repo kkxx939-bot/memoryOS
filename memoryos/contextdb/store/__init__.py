@@ -49,8 +49,12 @@ if TYPE_CHECKING:
     from memoryos.contextdb.store.index_consistency import (
         IndexConsistencyService as IndexConsistencyService,
     )
+    from memoryos.contextdb.store.index_store import CatalogStore as CatalogStore
     from memoryos.contextdb.store.index_store import IndexHit as IndexHit
     from memoryos.contextdb.store.index_store import IndexStore as IndexStore
+    from memoryos.contextdb.store.index_store import (
+        MemoryDocumentProjectionStore as MemoryDocumentProjectionStore,
+    )
     from memoryos.contextdb.store.lock_store import LockStore as LockStore
     from memoryos.contextdb.store.lock_store import LockToken as LockToken
     from memoryos.contextdb.store.queue_store import QueueJob as QueueJob
@@ -62,8 +66,13 @@ _EXPORTS = {
     "FileSystemSourceStore": ("memoryos.adapters.persistence.filesystem.source_store", "FileSystemSourceStore"),
     "IndexConsistencyResult": ("memoryos.contextdb.store.index_consistency", "IndexConsistencyResult"),
     "IndexConsistencyService": ("memoryos.contextdb.store.index_consistency", "IndexConsistencyService"),
+    "CatalogStore": ("memoryos.contextdb.store.index_store", "CatalogStore"),
     "IndexHit": ("memoryos.contextdb.store.index_store", "IndexHit"),
     "IndexStore": ("memoryos.contextdb.store.index_store", "IndexStore"),
+    "MemoryDocumentProjectionStore": (
+        "memoryos.contextdb.store.index_store",
+        "MemoryDocumentProjectionStore",
+    ),
     "InMemoryIndexStore": ("memoryos.adapters.persistence.in_memory.index_store", "InMemoryIndexStore"),
     "InMemoryLockStore": ("memoryos.adapters.persistence.in_memory.lock_store", "InMemoryLockStore"),
     "InMemoryQueueStore": ("memoryos.adapters.persistence.in_memory.queue_store", "InMemoryQueueStore"),

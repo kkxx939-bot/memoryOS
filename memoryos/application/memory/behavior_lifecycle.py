@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from memoryos.behavior.model.behavior_case import BehaviorCase
 from memoryos.behavior.model.behavior_pattern import BehaviorCluster, BehaviorPattern
 from memoryos.behavior.update.behavior_window import BehaviorWindowEvaluator
-from memoryos.memory.model.memory import MemoryAnchor
+from memoryos.support import SupportAnchor
 
 
 @dataclass(frozen=True)
@@ -16,8 +16,8 @@ class BehaviorLifecycleResult:
     temporary_cases: list[BehaviorCase]
     cluster: BehaviorCluster | None = None
     pattern: BehaviorPattern | None = None
-    memory_anchor: MemoryAnchor | None = None
-    memory_candidate_required: bool = False
+    support_anchor: SupportAnchor | None = None
+    support_candidate_required: bool = False
 
 
 class BehaviorLifecycleService:
@@ -31,7 +31,7 @@ class BehaviorLifecycleService:
         anchor = self._anchor(user_id, scene_key, relevant)
         cluster = self._cluster(user_id, scene_key, anchor.uri, decision.similar_refs_3d)
         if not decision.create_pattern:
-            return BehaviorLifecycleResult(temporary_cases=[], cluster=cluster, memory_anchor=anchor)
+            return BehaviorLifecycleResult(temporary_cases=[], cluster=cluster, support_anchor=anchor)
         pattern = self._pattern(
             user_id,
             scene_key,
@@ -44,15 +44,15 @@ class BehaviorLifecycleService:
             temporary_cases=[],
             cluster=cluster,
             pattern=pattern,
-            memory_anchor=anchor,
-            memory_candidate_required=True,
+            support_anchor=anchor,
+            support_candidate_required=True,
         )
 
     def _cluster(self, user_id: str, scene_key: str, anchor_uri: str, case_refs: list[str]) -> BehaviorCluster:
         return BehaviorCluster(
             user_id=user_id,
             scene_key=scene_key,
-            memory_anchor_uri=anchor_uri,
+            support_anchor_uri=anchor_uri,
             case_refs=case_refs,
             confidence=min(0.85, 0.35 + len(case_refs) * 0.12),
         )
@@ -70,16 +70,16 @@ class BehaviorLifecycleService:
             user_id=user_id,
             scene_key=scene_key,
             trigger_conditions={"scene_key": scene_key, "context_tags": list(similarity_key)},
-            memory_anchor_uri=anchor_uri,
+            support_anchor_uri=anchor_uri,
             case_refs=case_refs,
             action_distribution=self._action_distribution(cases),
             hotness=min(1.0, len(case_refs) * 0.12),
             confidence=min(0.95, 0.45 + len(case_refs) * 0.10),
         )
 
-    def _anchor(self, user_id: str, scene_key: str, cases: list[BehaviorCase]) -> MemoryAnchor:
-        uri = f"memoryos://user/{user_id}/memories/anchors/{scene_key}"
-        return MemoryAnchor(
+    def _anchor(self, user_id: str, scene_key: str, cases: list[BehaviorCase]) -> SupportAnchor:
+        uri = f"memoryos://user/{user_id}/support/behavior/{scene_key}"
+        return SupportAnchor(
             uri=uri,
             user_id=user_id,
             title=f"Behavior anchor {scene_key}",

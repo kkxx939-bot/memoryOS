@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from contextlib import contextmanager
 from threading import RLock
 from typing import Any, Protocol
 
@@ -31,10 +29,6 @@ class ContextDBAdministration(Protocol):
 
     def rebuild_index(self, *, owner_user_id: str | None = None) -> dict[str, Any]: ...
 
-    def resume_derived_serving_rebuild_if_needed(self) -> dict[str, Any]: ...
-
-    def rollback_derived_serving_rebuild(self, reason: str) -> dict[str, Any]: ...
-
     def verify_consistency(self, *, owner_user_id: str | None = None) -> dict[str, Any]: ...
 
 
@@ -47,9 +41,9 @@ class GenericContextMaintenance:
         index_store: IndexStore,
         relation_store: RelationStore,
         *,
+        tenant_id: str,
         domain_overlay: ContextDomainOverlay | None = None,
         index_policy: ContextIndexPolicy | None = None,
-        migration_gate: Any | None = None,
         readiness: Any | None = None,
         serving_lock: RLock | None = None,
         relation_domain_policy: RelationDomainPolicy | None = None,
@@ -57,23 +51,14 @@ class GenericContextMaintenance:
         self.source_store = source_store
         self.index_store = index_store
         self.relation_store = relation_store
+        self.tenant_id = str(tenant_id or "").strip()
+        if not self.tenant_id:
+            raise ValueError("generic maintenance requires an explicit tenant_id")
         self.domain_overlay = domain_overlay or NoDomainOverlay()
         self.index_policy = index_policy or NoContextIndexPolicy()
-        self.migration_gate = migration_gate
         self.readiness = readiness
         self.serving_lock = serving_lock or RLock()
         self.relation_domain_policy = relation_domain_policy or NoRelationDomainPolicy()
-
-    @contextmanager
-    def _projection_fence(self) -> Iterator[None]:
-        acquire = getattr(self.migration_gate, "acquire_projection_fence", None)
-        release = getattr(self.migration_gate, "release_projection_fence", None)
-        token = acquire() if callable(acquire) else None
-        try:
-            yield
-        finally:
-            if callable(release):
-                release(token)
 
     def _require_ready(self) -> None:
         if self.readiness is not None:
@@ -84,49 +69,19 @@ class GenericContextMaintenance:
             self.source_store,
             self.index_store,
             self.relation_store,
-            migration_gate=self.migration_gate,
+            tenant_id=self.tenant_id,
             domain_overlay=self.domain_overlay,
             index_policy=self.index_policy,
-            relation_domain_policy=self.relation_domain_policy,
         )
 
     def rebuild_index(self, *, owner_user_id: str | None = None) -> dict[str, Any]:
-        with self._projection_fence():
-            self._require_ready()
-            with self.serving_lock:
-                if owner_user_id is None:
-                    result = self._service().rebuild(projection_fence_held=True)
-                    return self._payload(result)
-                rebuilt = 0
-                for obj in self.source_store.list_objects():
-                    if (
-                        obj.owner_user_id != owner_user_id
-                        or self.domain_overlay.owns_object(obj)
-                    ):
-                        continue
-                    try:
-                        content = self.source_store.read_content(obj.uri)
-                    except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
-                        content = obj.title
-                    self.index_store.upsert_index(obj, content=content)
-                    rebuilt += 1
-                payload = self._owner_payload(
-                    self._service().verify(),
-                    owner_user_id=owner_user_id,
-                )
-                payload["rebuilt_count"] = rebuilt
-                return payload
-
-    def resume_derived_serving_rebuild_if_needed(self) -> dict[str, Any]:
-        return {"resumed": False, "state": "NOT_CONFIGURED"}
-
-    def rollback_derived_serving_rebuild(self, reason: str) -> dict[str, Any]:
-        del reason
-        raise RuntimeError("generic ContextDB has no derived serving rebuild journal")
+        self._require_ready()
+        with self.serving_lock:
+            return self._payload(self._service().rebuild(owner_user_id=owner_user_id))
 
     def verify_consistency(self, *, owner_user_id: str | None = None) -> dict[str, Any]:
         self._require_ready()
-        result = self._service().verify()
+        result = self._service().verify(owner_user_id=owner_user_id)
         if owner_user_id is None:
             return self._payload(result)
         return self._owner_payload(result, owner_user_id=owner_user_id)
@@ -144,7 +99,8 @@ class GenericContextMaintenance:
             if obj.owner_user_id == owner_user_id
             and not self.domain_overlay.owns_object(obj)
         }
-        indexed_uris = set(self.index_store.indexed_uris())
+        tenant_id = self._tenant_id()
+        indexed_uris = set(self.index_store.indexed_uris(tenant_id=tenant_id))
         payload["source_count"] = len(source_uris)
         payload["indexed_count"] = len(source_uris & indexed_uris)
         payload["missing_index"] = [
@@ -168,6 +124,9 @@ class GenericContextMaintenance:
             or payload["broken_relations"]
         )
         return payload
+
+    def _tenant_id(self) -> str:
+        return self.tenant_id
 
     @staticmethod
     def _payload(result: IndexConsistencyResult) -> dict[str, Any]:

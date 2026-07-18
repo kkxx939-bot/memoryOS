@@ -4,6 +4,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from memoryos.action_policy.integration.commit_registration import (
+    register_default_action_policy_commit_handlers,
+)
 from memoryos.action_policy.model.action_policy import ActionPolicy
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_type import ContextType
@@ -15,6 +18,7 @@ from memoryos.operations.model.operation_action import OperationAction
 
 class OperationCommitterActionPolicyTest(unittest.TestCase):
     def setUp(self) -> None:
+        register_default_action_policy_commit_handlers()
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.source = FileSystemSourceStore(self.root)
@@ -24,11 +28,15 @@ class OperationCommitterActionPolicyTest(unittest.TestCase):
             user_id="u1",
             scene_key="hot_room",
             action="turn_on_air_conditioner",
-            memory_anchor_uri="memoryos://user/u1/memories/anchors/home_comfort",
+            support_anchor_uri="memoryos://user/u1/support/behavior/home_comfort",
             auto_execute_allowed=True,
         )
         self.source.write_object(self.policy.to_context_object(), content="policy content")
-        self.index.upsert_index(self.policy.to_context_object(), content="policy content")
+        self.index.upsert_index(
+            self.policy.to_context_object(),
+            content="policy content",
+            tenant_id="default",
+        )
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -83,27 +91,27 @@ class OperationCommitterActionPolicyTest(unittest.TestCase):
         self.assertEqual(self.stored()["status"], "disabled_auto_execute")
 
     def test_compress_does_not_delete_source_content(self) -> None:
-        memory_obj = ContextObject(
-            uri="memoryos://user/u1/memories/preferences/temp",
-            context_type=ContextType.MEMORY,
-            title="temperature preference",
+        ordinary_obj = ContextObject(
+            uri="memoryos://user/u1/behavior_cases/compress-me",
+            context_type=ContextType.BEHAVIOR_CASE,
+            title="compressible behavior case",
             owner_user_id="u1",
         )
-        self.source.write_object(memory_obj, content="full source text")
-        self.index.upsert_index(memory_obj, content="full source text")
+        self.source.write_object(ordinary_obj, content="full source text")
+        self.index.upsert_index(ordinary_obj, content="full source text", tenant_id="default")
         self.committer.commit(
             "u1",
             [
                 ContextOperation(
                     user_id="u1",
-                    context_type=ContextType.MEMORY,
+                    context_type=ContextType.BEHAVIOR_CASE,
                     action=OperationAction.COMPRESS,
-                    target_uri=memory_obj.uri,
+                    target_uri=ordinary_obj.uri,
                     payload={"reason": "cold memory"},
                 )
             ],
         )
-        self.assertEqual(self.source.read_content(memory_obj.uri), "full source text")
+        self.assertEqual(self.source.read_content(ordinary_obj.uri), "full source text")
 
 
 if __name__ == "__main__":

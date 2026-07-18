@@ -8,7 +8,6 @@ from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_relation import ContextRelation
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.store.local_stores import FileSystemSourceStore, InMemoryIndexStore, InMemoryRelationStore
-from memoryos.memory.integration.context_overlay import CanonicalMemoryContextOverlay
 from memoryos.operations.commit.operation_committer import OperationCommitter
 
 
@@ -28,16 +27,16 @@ def test_context_db_facade_reads_writes_searches_relations_and_rebuilds(tmp_path
         ),
     )
     obj = ContextObject(
-        uri="memoryos://user/u1/memories/profile/temp",
-        context_type=ContextType.MEMORY,
+        uri="memoryos://user/u1/resources/profile/temp",
+        context_type=ContextType.RESOURCE,
         title="temperature preference",
         owner_user_id="u1",
-        layers=ContextLayers(l2_uri="memoryos://user/u1/memories/profile/temp/body.md"),
+        layers=ContextLayers(l2_uri="memoryos://user/u1/resources/profile/temp/body.md"),
     )
 
     db.write_object(obj, content="prefers 26C")
     assert db.read_object(obj.uri).title == "temperature preference"
-    assert [hit.uri for hit in db.search("26C", owner_user_id="u1", context_type=ContextType.MEMORY)] == [obj.uri]
+    assert [hit.uri for hit in db.search("26C", owner_user_id="u1", context_type=ContextType.RESOURCE)] == [obj.uri]
 
     relation = ContextRelation(
         source_uri="memoryos://user/u1/action_policies/hot/turn_on_ac",
@@ -65,7 +64,7 @@ def test_context_db_facade_reads_writes_searches_relations_and_rebuilds(tmp_path
     assert len(source.read_object(obj.uri).relations) == 1
     assert len(db.relations_of(relation.source_uri, owner_user_id="u1")) == 1
 
-    index.clear()
+    index.clear(tenant_id="default")
     missing = db.verify_consistency(owner_user_id="u1")
     assert missing["source_count"] == 1
     assert missing["indexed_count"] == 0
@@ -77,16 +76,16 @@ def test_context_db_facade_reads_writes_searches_relations_and_rebuilds(tmp_path
     assert rebuilt["missing_index"] == []
 
     orphan = ContextObject(
-        uri="memoryos://user/u1/memories/profile/orphan",
-        context_type=ContextType.MEMORY,
+        uri="memoryos://user/u1/resources/profile/orphan",
+        context_type=ContextType.RESOURCE,
         title="orphan",
         owner_user_id="u1",
     )
-    index.upsert_index(orphan, content="orphan")
+    index.upsert_index(orphan, content="orphan", tenant_id="default")
     assert orphan.uri in db.verify_consistency(owner_user_id="u1")["dangling_index"]
 
 
-def test_context_db_add_relation_rejects_unproved_canonical_target(tmp_path) -> None:  # noqa: ANN001
+def test_context_db_cannot_seed_markdown_document_source(tmp_path) -> None:  # noqa: ANN001
     source = FileSystemSourceStore(tmp_path / "source", tenant_id="t1")
     index = InMemoryIndexStore()
     relations = InMemoryRelationStore()
@@ -102,33 +101,15 @@ def test_context_db_add_relation_rejects_unproved_canonical_target(tmp_path) -> 
             tenant_id="t1",
         ),
     )
-    db._configure_extensions(domain_overlay=CanonicalMemoryContextOverlay())
-    policy = ContextObject(
-        uri="memoryos://user/u1/action_policies/unproved-canonical",
-        context_type=ContextType.ACTION_POLICY,
-        title="unproved canonical relation source",
+    document = ContextObject(
+        uri="memoryos://user/u1/memory/documents/memdoc_01J00000000000000000000000",
+        context_type=ContextType.RESOURCE,
+        title="document projection",
         owner_user_id="u1",
         tenant_id="t1",
-    )
-    claim = ContextObject(
-        uri="memoryos://user/u1/memories/canonical/slots/s1/claims/c1",
-        context_type=ContextType.MEMORY,
-        title="unproved claim",
-        owner_user_id="u1",
-        tenant_id="t1",
-        metadata={"canonical_kind": "claim", "claim_id": "c1", "state": "ACTIVE"},
-        schema_version="canonical_memory_v2",
-    )
-    db.seed_object(policy, content="policy")
-    source.write_object(claim, content="unproved")
-    edge = ContextRelation(
-        source_uri=policy.uri,
-        relation_type="constrained_by",
-        target_uri=claim.uri,
-        metadata={"tenant_id": "t1", "owner_user_id": "u1"},
     )
 
-    with pytest.raises(FileNotFoundError, match="no committed transaction proof"):
-        db.add_relation(edge)
-    assert not source.read_object(policy.uri).relations
-    assert not relations.relations_of(policy.uri, tenant_id="t1")
+    with pytest.raises(PermissionError, match="domain-owned context cannot be seeded"):
+        db.seed_object(document, content="must not become Source authority")
+    with pytest.raises(PermissionError, match="not ordinary SourceStore objects"):
+        source.read_object(document.uri)

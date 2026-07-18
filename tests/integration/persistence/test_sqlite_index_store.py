@@ -9,7 +9,7 @@ from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.store.local_stores import InMemoryIndexStore
 from memoryos.contextdb.store.sqlite_index_store import SQLiteIndexStore
-from memoryos.memory.canonical.scope import ScopeRef
+from memoryos.core.types import ScopeRef
 
 
 class SQLiteIndexStoreTest(unittest.TestCase):
@@ -17,14 +17,14 @@ class SQLiteIndexStoreTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteIndexStore(Path(tmp) / "index.sqlite3")
             u1 = ContextObject(
-                uri="memoryos://user/u1/memories/preferences/temp",
-                context_type=ContextType.MEMORY,
+                uri="memoryos://user/u1/resources/preferences/temp",
+                context_type=ContextType.RESOURCE,
                 title="temperature preference",
                 owner_user_id="u1",
             )
             u2 = ContextObject(
-                uri="memoryos://user/u2/memories/preferences/temp",
-                context_type=ContextType.MEMORY,
+                uri="memoryos://user/u2/resources/preferences/temp",
+                context_type=ContextType.RESOURCE,
                 title="temperature preference",
                 owner_user_id="u2",
             )
@@ -34,24 +34,31 @@ class SQLiteIndexStoreTest(unittest.TestCase):
                 title="turn on ac policy",
                 owner_user_id="u1",
             )
-            store.upsert_index(u1, content="prefers 26 degree")
-            store.upsert_index(u2, content="prefers 18 degree")
-            store.upsert_index(policy, content="hot room turn_on_ac")
-            self.assertEqual(store.search("26", filters={"owner_user_id": "u1"})[0].uri, u1.uri)
-            self.assertFalse(store.search("18", filters={"owner_user_id": "u1"}))
+            store.upsert_index(u1, content="prefers 26 degree", tenant_id="default")
+            store.upsert_index(u2, content="prefers 18 degree", tenant_id="default")
+            store.upsert_index(policy, content="hot room turn_on_ac", tenant_id="default")
             self.assertEqual(
-                store.search("turn_on_ac", filters={"owner_user_id": "u1", "context_type": "action_policy"})[0].uri,
+                store.search("26", tenant_id="default", filters={"owner_user_id": "u1"})[0].uri,
+                u1.uri,
+            )
+            self.assertFalse(store.search("18", tenant_id="default", filters={"owner_user_id": "u1"}))
+            self.assertEqual(
+                store.search(
+                    "turn_on_ac",
+                    tenant_id="default",
+                    filters={"owner_user_id": "u1", "context_type": "action_policy"},
+                )[0].uri,
                 policy.uri,
             )
-            store.delete_index(u1.uri)
-            self.assertFalse(store.search("26", filters={"owner_user_id": "u1"}))
+            store.delete_index(u1.uri, tenant_id="default")
+            self.assertFalse(store.search("26", tenant_id="default", filters={"owner_user_id": "u1"}))
 
     def test_applicability_filter_treats_query_scopes_as_available_superset(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteIndexStore(Path(tmp) / "index.sqlite3")
             obj = ContextObject(
-                uri="memoryos://user/u1/memories/preferences/music",
-                context_type=ContextType.MEMORY,
+                uri="memoryos://user/u1/resources/preferences/music",
+                context_type=ContextType.RESOURCE,
                 title="quiet hours",
                 owner_user_id="u1",
                 metadata={
@@ -65,20 +72,21 @@ class SQLiteIndexStoreTest(unittest.TestCase):
                     }
                 },
             )
-            store.upsert_index(obj, content="quiet music")
+            store.upsert_index(obj, content="quiet music", tenant_id="default")
             available = [
                 "memoryos:principal:u1",
                 "memoryos:environment:home",
                 "memoryos:asset:reachy_01",
                 "memoryos:location:kitchen",
             ]
-            assert store.search("quiet", filters={"applicability_scope_keys": available})
+            assert store.search("quiet", tenant_id="default", filters={"applicability_scope_keys": available})
             assert not store.search(
                 "quiet",
+                tenant_id="default",
                 filters={"applicability_scope_keys": ["memoryos:principal:u1"]},
             )
 
-    def test_parent_aware_scope_keys_are_indexed_and_migrated_without_flat_fallback(self) -> None:
+    def test_parent_aware_scope_keys_are_indexed_without_flat_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "index.sqlite3"
             store = SQLiteIndexStore(path)
@@ -86,7 +94,7 @@ class SQLiteIndexStoreTest(unittest.TestCase):
             def scoped(uri: str, parent: str) -> ContextObject:
                 return ContextObject(
                     uri=uri,
-                    context_type=ContextType.MEMORY,
+                    context_type=ContextType.RESOURCE,
                     title="camera calibration",
                     owner_user_id="u1",
                     metadata={
@@ -105,80 +113,35 @@ class SQLiteIndexStoreTest(unittest.TestCase):
                     },
                 )
 
-            first = scoped("memoryos://user/u1/memories/camera-a", "workspace-a")
-            second = scoped("memoryos://user/u1/memories/camera-b", "workspace-b")
-            malformed = scoped("memoryos://user/u1/memories/malformed", "workspace-c")
+            first = scoped("memoryos://user/u1/resources/camera-a", "workspace-a")
+            second = scoped("memoryos://user/u1/resources/camera-b", "workspace-b")
+            malformed = scoped("memoryos://user/u1/resources/malformed", "workspace-c")
             malformed.title = "malformed legacy scope"
-            store.upsert_index(first, content="camera calibration")
-            store.upsert_index(second, content="camera calibration")
-            store.upsert_index(malformed, content="malformed legacy scope")
+            store.upsert_index(first, content="camera calibration", tenant_id="default")
+            store.upsert_index(second, content="camera calibration", tenant_id="default")
+            store.upsert_index(malformed, content="malformed scope", tenant_id="default")
             first_key = ScopeRef("memoryos", "asset", "camera", parent_path=("workspace-a",)).key
             assert [
                 hit.uri
                 for hit in store.search(
                     "camera",
+                    tenant_id="default",
                     filters={"owner_user_id": "u1", "applicability_scope_keys": [first_key]},
                 )
             ] == [first.uri]
-
-            with sqlite3.connect(path) as conn:
-                conn.execute("UPDATE contexts SET scope_keys = ?", ('["memoryos:asset:camera"]',))
-                conn.execute(
-                    "UPDATE contexts SET metadata_json = ? WHERE uri = ?",
-                    ('{"scope":{"applicability":{"all_of":"broken"}}}', malformed.uri),
-                )
-                conn.execute(
-                    "UPDATE contexts SET scope_keys = ? WHERE uri = ?",
-                    ('{"memoryos:asset:camera":true}', malformed.uri),
-                )
-                conn.execute("PRAGMA user_version = 1")
-            migrated = SQLiteIndexStore(path)
-            assert [
-                hit.uri
-                for hit in migrated.search(
-                    "camera",
-                    filters={"owner_user_id": "u1", "applicability_scope_keys": [first_key]},
-                )
-            ] == [first.uri]
-            assert not migrated.search("malformed", filters={"owner_user_id": "u1"})
-            with sqlite3.connect(path) as conn:
-                conn.execute(
-                    "UPDATE contexts SET scope_keys = ? WHERE uri = ?",
-                    ('{"memoryos:asset:camera":true}', malformed.uri),
-                )
-            assert not migrated.search("malformed", filters={"owner_user_id": "u1"})
-
-    def test_pending_admission_is_hidden_by_default_and_explicitly_reviewable(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            store = SQLiteIndexStore(Path(tmp) / "index.sqlite3")
-            pending = ContextObject(
-                uri="memoryos://user/u1/memories/pending/p1",
-                context_type=ContextType.MEMORY,
-                title="pending database proposal",
-                owner_user_id="u1",
-                metadata={"admission": {"decision": "pending"}},
-            )
-            store.upsert_index(pending, content="PostgreSQL candidate")
-
-            assert not store.search("PostgreSQL", filters={"owner_user_id": "u1"})
-            reviewed = store.search(
-                "PostgreSQL",
-                filters={"owner_user_id": "u1", "admission_status": "pending"},
-            )
-            assert [hit.uri for hit in reviewed] == [pending.uri]
 
     def test_fts_disabled_does_not_restore_python_row_scan_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteIndexStore(Path(tmp) / "index.sqlite3")
             related = ContextObject(
-                uri="memoryos://user/u1/memories/redis",
-                context_type=ContextType.MEMORY,
+                uri="memoryos://user/u1/resources/redis",
+                context_type=ContextType.RESOURCE,
                 title="Redis cache",
                 owner_user_id="u1",
             )
             unrelated = ContextObject(
-                uri="memoryos://user/u1/memories/redistribution",
-                context_type=ContextType.MEMORY,
+                uri="memoryos://user/u1/resources/redistribution",
+                context_type=ContextType.RESOURCE,
                 title="redistribution guide",
                 owner_user_id="u1",
                 hotness=1.0,
@@ -186,18 +149,18 @@ class SQLiteIndexStoreTest(unittest.TestCase):
                 behavior_support_hotness=1.0,
             )
             chinese = ContextObject(
-                uri="memoryos://user/u1/memories/chinese",
-                context_type=ContextType.MEMORY,
+                uri="memoryos://user/u1/resources/chinese",
+                context_type=ContextType.RESOURCE,
                 title="数据库继续使用PostgreSQL",
                 owner_user_id="u1",
             )
-            store.upsert_index(related, content="Redis is the cache backend")
-            store.upsert_index(unrelated, content="redistribution strategy")
-            store.upsert_index(chinese, content="生产数据库继续使用PostgreSQL")
+            store.upsert_index(related, content="Redis is the cache backend", tenant_id="default")
+            store.upsert_index(unrelated, content="redistribution strategy", tenant_id="default")
+            store.upsert_index(chinese, content="生产数据库继续使用PostgreSQL", tenant_id="default")
             store.fts_enabled = False
 
-            assert store.search("Redis", filters={"owner_user_id": "u1"}) == []
-            assert store.search("数据库继续使用", filters={"owner_user_id": "u1"}) == []
+            assert store.search("Redis", tenant_id="default", filters={"owner_user_id": "u1"}) == []
+            assert store.search("数据库继续使用", tenant_id="default", filters={"owner_user_id": "u1"}) == []
 
     def test_runtime_fts_storage_failure_is_not_reported_as_empty_success(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -206,35 +169,41 @@ class SQLiteIndexStoreTest(unittest.TestCase):
                 conn.execute("DROP TABLE contexts_fts")
 
             with self.assertRaises(sqlite3.OperationalError):
-                store.search_catalog("must remain observable", filters={"tenant_id": "default"})
+                store.search_catalog("must remain observable", tenant_id="default")
 
     def test_inmemory_lexical_matching_matches_sqlite_token_semantics(self) -> None:
         store = InMemoryIndexStore()
         related = ContextObject(
-            uri="memoryos://user/u1/memories/redis",
-            context_type=ContextType.MEMORY,
+            uri="memoryos://user/u1/resources/redis",
+            context_type=ContextType.RESOURCE,
             title="Redis cache",
             owner_user_id="u1",
         )
         unrelated = ContextObject(
-            uri="memoryos://user/u1/memories/redistribution",
-            context_type=ContextType.MEMORY,
+            uri="memoryos://user/u1/resources/redistribution",
+            context_type=ContextType.RESOURCE,
             title="redistribution guide",
             owner_user_id="u1",
             hotness=1.0,
         )
         chinese = ContextObject(
-            uri="memoryos://user/u1/memories/chinese",
-            context_type=ContextType.MEMORY,
+            uri="memoryos://user/u1/resources/chinese",
+            context_type=ContextType.RESOURCE,
             title="数据库继续使用PostgreSQL",
             owner_user_id="u1",
         )
-        store.upsert_index(related, content="Redis cache backend")
-        store.upsert_index(unrelated, content="redistribution strategy")
-        store.upsert_index(chinese, content="生产数据库继续使用PostgreSQL")
+        store.upsert_index(related, content="Redis cache backend", tenant_id="default")
+        store.upsert_index(unrelated, content="redistribution strategy", tenant_id="default")
+        store.upsert_index(chinese, content="生产数据库继续使用PostgreSQL", tenant_id="default")
 
-        assert [hit.uri for hit in store.search("Redis", filters={"owner_user_id": "u1"})] == [related.uri]
-        assert chinese.uri in {hit.uri for hit in store.search("数据库继续使用", filters={"owner_user_id": "u1"})}
+        assert [
+            hit.uri
+            for hit in store.search("Redis", tenant_id="default", filters={"owner_user_id": "u1"})
+        ] == [related.uri]
+        assert chinese.uri in {
+            hit.uri
+            for hit in store.search("数据库继续使用", tenant_id="default", filters={"owner_user_id": "u1"})
+        }
 
 
 if __name__ == "__main__":

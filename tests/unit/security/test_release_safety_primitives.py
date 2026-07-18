@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import multiprocessing
 import os
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -15,26 +15,12 @@ from memoryos.contextdb.model.context_relation import ContextRelation
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.retrieval.service import RetrievalService
 from memoryos.contextdb.session.commit_group import CommitGroupIntegrityError, CommitGroupStore
-from memoryos.contextdb.store.local_stores import (
-    FileSystemSourceStore,
-    InMemoryIndexStore,
-    InMemoryRelationStore,
-)
 from memoryos.contextdb.store.vector_store import InMemoryVectorStore
 from memoryos.core.file_lock import open_private_lock
-from memoryos.memory.canonical.evidence import EvidenceRef
-from memoryos.memory.canonical.retrieval import CanonicalQueryIntent, OfflineCanonicalMemoryRetriever
-from memoryos.memory.canonical.state import (
-    CanonicalMemoryInvariantError,
-    MemoryClaim,
-    MemoryRevision,
-    TransitionProfile,
-    revision_payload_with_effective_validity,
-)
+from memoryos.core.integrity import canonical_digest
 from memoryos.operations.commit.audit_writer import AuditWriter
 from memoryos.operations.commit.diff_writer import DiffWriter
 from memoryos.operations.commit.effect_marker import atomic_create_json, atomic_write_json
-from memoryos.operations.commit.operation_committer import OperationCommitter
 from memoryos.operations.commit.quarantine import quarantine_control_file
 from memoryos.operations.commit.redo_log import RedoLog
 from memoryos.operations.model.context_diff import ContextDiff
@@ -65,8 +51,8 @@ def test_context_hotness_rejects_nonfinite_values(field: str, value: float) -> N
     kwargs: dict[str, Any] = {field: value}
     with pytest.raises(ValueError, match="finite"):
         ContextObject(
-            uri="memoryos://user/u1/memories/nonfinite",
-            context_type=ContextType.MEMORY,
+            uri="memoryos://user/u1/resources/nonfinite",
+            context_type=ContextType.RESOURCE,
             title="nonfinite",
             **kwargs,
         )
@@ -76,94 +62,17 @@ def test_context_hotness_rejects_nonfinite_values(field: str, value: float) -> N
 def test_relation_and_vector_inputs_reject_nonfinite_values(value: float) -> None:
     with pytest.raises(ValueError, match="finite"):
         ContextRelation(
-            source_uri="memoryos://user/u1/memories/a",
+            source_uri="memoryos://user/u1/resources/a",
             relation_type="related",
-            target_uri="memoryos://user/u1/memories/b",
+            target_uri="memoryos://user/u1/resources/b",
             weight=value,
         )
     vectors = InMemoryVectorStore()
     with pytest.raises(ValueError, match="finite"):
-        vectors.upsert_vector("memoryos://user/u1/memories/a", [1.0, value])
-    vectors.upsert_vector("memoryos://user/u1/memories/a", [1.0, 0.0])
+        vectors.upsert_vector("memoryos://user/u1/resources/a", [1.0, value])
+    vectors.upsert_vector("memoryos://user/u1/resources/a", [1.0, 0.0])
     with pytest.raises(ValueError, match="finite"):
         vectors.search_vector([value, 0.0], namespace="")
-
-
-def test_regular_commit_rejects_unproved_canonical_target_and_canonical_source(tmp_path: Path) -> None:
-    source = FileSystemSourceStore(tmp_path, tenant_id="t1")
-    relations = InMemoryRelationStore()
-    committer = OperationCommitter(
-        source,
-        InMemoryIndexStore(),
-        str(tmp_path),
-        relation_store=relations,
-        tenant_id="t1",
-    )
-    ordinary_uri = "memoryos://user/u1/memories/ordinary"
-    canonical_uri = "memoryos://user/u1/memories/canonical/slots/s1/claims/c1"
-    ordinary = ContextObject(
-        uri=ordinary_uri,
-        context_type=ContextType.MEMORY,
-        title="ordinary",
-        owner_user_id="u1",
-        tenant_id="t1",
-        relations=[
-            ContextRelation(
-                source_uri=ordinary_uri,
-                relation_type="related_to",
-                target_uri=canonical_uri,
-                metadata={"tenant_id": "t1", "owner_user_id": "u1"},
-            )
-        ],
-    )
-    operation = ContextOperation(
-        context_type=ContextType.MEMORY,
-        action=OperationAction.ADD,
-        target_uri=ordinary_uri,
-        user_id="u1",
-        payload={
-            "tenant_id": "t1",
-            "context_object": ordinary.to_dict(),
-            "content": "ordinary",
-        },
-    )
-
-    with pytest.raises(FileNotFoundError, match="canonical object is not committed"):
-        committer.commit("u1", [operation])
-    with pytest.raises(FileNotFoundError):
-        source.read_object(ordinary_uri)
-    assert not relations.relations_of(ordinary_uri, tenant_id="t1")
-
-    forged_authority = ContextObject(
-        uri="memoryos://user/u1/memories/ordinary-forged-authority",
-        context_type=ContextType.MEMORY,
-        title="ordinary authority carrying a forged canonical Source edge",
-        owner_user_id="u1",
-        tenant_id="t1",
-        relations=[
-            ContextRelation(
-                source_uri=canonical_uri,
-                relation_type="forged_outgoing",
-                target_uri=ordinary_uri,
-                metadata={"tenant_id": "t1", "owner_user_id": "u1"},
-            )
-        ],
-    )
-    forged = ContextOperation(
-        context_type=ContextType.MEMORY,
-        action=OperationAction.ADD,
-        target_uri=forged_authority.uri,
-        user_id="u1",
-        payload={
-            "tenant_id": "t1",
-            "context_object": forged_authority.to_dict(),
-            "content": "forged",
-        },
-    )
-    with pytest.raises(ValueError, match="canonical Source relation"):
-        committer.commit("u1", [forged])
-    with pytest.raises(FileNotFoundError):
-        source.read_object(forged_authority.uri)
 
 
 def test_api_limits_share_one_hard_bound() -> None:
@@ -199,91 +108,7 @@ def test_api_limits_share_one_hard_bound() -> None:
         )
 
 
-def _revision(revision: int, *, valid_from: str, valid_to: str | None = None) -> MemoryRevision:
-    return MemoryRevision(
-        revision=revision,
-        state="ACTIVE",
-        value_fields={"canonical_value": f"value-{revision}"},
-        evidence_refs=(EvidenceRef(f"e{revision}", None, f"hash-{revision}"),),
-        proposal_id=f"p{revision}",
-        relation="UNRELATED",
-        epistemic_status="EXPLICIT",
-        previous_revision=revision - 1 if revision > 1 else None,
-        valid_from=valid_from,
-        valid_to=valid_to,
-        transaction_time=valid_from,
-    )
-
-
-def test_revision_intervals_require_timezone_and_positive_duration() -> None:
-    with pytest.raises(ValueError, match="timezone"):
-        _revision(1, valid_from="2026-01-01T00:00:00")
-    with pytest.raises(ValueError, match="later"):
-        _revision(
-            1,
-            valid_from="2026-01-01T00:00:00+00:00",
-            valid_to="2026-01-01T00:00:00+00:00",
-        )
-    with pytest.raises(ValueError, match="later"):
-        _revision(
-            1,
-            valid_from="2026-01-02T00:00:00+00:00",
-            valid_to="2026-01-01T00:00:00+00:00",
-        )
-
-
-def test_equal_effective_time_transition_is_normalized_to_legal_interval() -> None:
-    timestamp = "2026-01-01T00:00:00+00:00"
-    first = _revision(1, valid_from=timestamp)
-    claim = MemoryClaim(
-        "claim",
-        "memoryos://user/u1/memories/canonical/slots/slot/claims/claim",
-        "slot",
-        "value",
-        TransitionProfile.AUTHORITATIVE_STATE,
-        (first,),
-    )
-    updated = claim.with_revision(_revision(2, valid_from=timestamp))
-    first_start = datetime.fromisoformat(updated.revisions[0].valid_from)
-    second_start = datetime.fromisoformat(updated.revisions[1].valid_from)
-    assert updated.revisions[0] == first
-    assert updated.revisions[0].valid_to is None
-    assert first_start < second_start
-
-
-def test_derived_revision_validity_is_half_open_and_fails_closed_on_corruption() -> None:
-    first = _revision(1, valid_from="2026-01-01T00:00:00+00:00")
-    second = _revision(2, valid_from="2026-01-02T00:00:00+00:00")
-    rows = (first.to_dict(), second.to_dict())
-
-    effective = revision_payload_with_effective_validity(rows, 1)
-
-    assert first.valid_to is None
-    assert effective["valid_to"] == second.valid_from
-    with pytest.raises(CanonicalMemoryInvariantError, match="duplicated"):
-        revision_payload_with_effective_validity((first.to_dict(), first.to_dict()), 1)
-    corrupt = first.to_dict()
-    corrupt["valid_to"] = first.valid_from
-    with pytest.raises(CanonicalMemoryInvariantError, match="later"):
-        revision_payload_with_effective_validity((corrupt,), 1)
-
-
-def test_current_effective_time_and_negated_intent_are_fail_closed(tmp_path: Path) -> None:
-    retriever = OfflineCanonicalMemoryRetriever(
-        FileSystemSourceStore(tmp_path),
-        InMemoryIndexStore(),
-        offline_admin=True,
-    )
-    future = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
-    expired_start = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
-    expired_end = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
-    assert retriever._revision_is_effective({"valid_from": future, "valid_to": None}) is False
-    assert retriever._revision_is_effective({"valid_from": expired_start, "valid_to": expired_end}) is False
-    for text in ("没有冲突", "不看历史", "do not show alternatives", "without history"):
-        assert retriever.classify_intent(text) == CanonicalQueryIntent.CURRENT
-
-
-def test_commit_group_retry_is_finite_and_corrupt_state_is_quarantined(tmp_path: Path) -> None:
+def test_commit_group_consumer_retry_is_finite_and_corrupt_state_is_quarantined(tmp_path: Path) -> None:
     store = CommitGroupStore(tmp_path)
     status = store.create(
         "group-a",
@@ -291,23 +116,26 @@ def test_commit_group_retry_is_finite_and_corrupt_state_is_quarantined(tmp_path:
         archive_uri="memoryos://user/u1/sessions/history/a",
         user_id="u1",
         tenant_id="default",
+        archive_digest=canonical_digest({"archive": "a"}),
+        manifest_digest=canonical_digest({"manifest": "a"}),
     )
-    assert status.canonical_status == "pending"
+    assert status.consumers["memory"].status == "pending"
     for attempt in range(1, store.MAX_ATTEMPTS + 1):
         attempt_id = f"attempt-{attempt}"
-        assert store.claim_canonical("group-a", attempt_id=attempt_id)
-        status = store.fail_canonical(
+        assert store.claim_consumer("group-a", "memory", attempt_id=attempt_id)
+        status = store.fail_consumer(
             "group-a",
+            "memory",
             "OSError",
             retryable=True,
             attempt_id=attempt_id,
         )
-    assert status.canonical_status == "dead_letter"
-    assert status.canonical_attempt_count == store.MAX_ATTEMPTS
-    assert status.canonical_last_error == "OSError"
-    assert status.canonical_next_retry_at == ""
-    assert store.claim_canonical("group-a", attempt_id="stale") is False
-    assert store.pending() == []
+    memory = status.consumers["memory"]
+    assert memory.status == "dead_letter"
+    assert memory.attempt_count == store.MAX_ATTEMPTS
+    assert memory.last_error == "OSError"
+    assert memory.next_retry_at == ""
+    assert store.claim_consumer("group-a", "memory", attempt_id="stale") is False
 
     broken = store.path("broken-group")
     broken.parent.mkdir(parents=True, exist_ok=True)
@@ -315,7 +143,7 @@ def test_commit_group_retry_is_finite_and_corrupt_state_is_quarantined(tmp_path:
     with pytest.raises(CommitGroupIntegrityError, match="quarantined"):
         store.load("broken-group")
     assert not broken.exists()
-    quarantined = list((tmp_path / "system" / "quarantine" / "commit_group").glob("*.original"))
+    quarantined = list((tmp_path / "system" / "quarantine" / "session_commit_group").glob("*.original"))
     assert len(quarantined) == 1
 
 
@@ -346,9 +174,9 @@ def _regular_operation(operation_id: str) -> ContextOperation:
     return ContextOperation(
         operation_id=operation_id,
         user_id="u1",
-        context_type=ContextType.MEMORY,
+        context_type=ContextType.RESOURCE,
         action=OperationAction.ADD,
-        target_uri=f"memoryos://user/u1/memories/{operation_id}",
+        target_uri=f"memoryos://user/u1/resources/{operation_id}",
         payload={"tenant_id": "default"},
     )
 
@@ -552,8 +380,11 @@ def test_recall_trace_redacts_secret_query_and_uses_private_file(tmp_path: Path)
         tenant_id="default",
     )
     trace = service.read_trace(trace_id)
-    assert "sk-live-secret" not in trace["query"]
-    assert "<redacted>" in trace["query"]
+    assert "query" not in trace
+    assert trace["query_digest"] == hashlib.sha256(
+        b"OPENAI_API_KEY=sk-live-secret"
+    ).hexdigest()
+    assert trace["query_utf8_bytes"] == len(b"OPENAI_API_KEY=sk-live-secret")
     path = service.trace_root / f"{trace_id}.json"
     assert path.stat().st_mode & 0o777 == 0o600
 

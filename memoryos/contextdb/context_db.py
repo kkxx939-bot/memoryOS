@@ -7,7 +7,6 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
-from importlib import import_module
 from threading import RLock
 from typing import TYPE_CHECKING, Any, TypeAlias
 
@@ -38,11 +37,10 @@ from memoryos.contextdb.store.relation_store import RelationStore
 from memoryos.contextdb.store.source_store import SourceStore
 
 if TYPE_CHECKING:
-    # Preserve the historical annotation spellings without introducing a
-    # runtime dependency on operations or canonical Memory implementations.
+    # Preserve the public annotation spelling without introducing a runtime
+    # dependency on the operations implementation.
     CommitResult: TypeAlias = Any
     OperationCommitter: TypeAlias = ContextCommitter
-    ProjectionRecordStore: TypeAlias = Any
     from memoryos.operations.model.context_operation import ContextOperation
 
 
@@ -57,14 +55,11 @@ class ContextDB:
         queue_store: QueueStore | None = None,
         session_commit_service=None,
         committer: OperationCommitter | None = None,
-        projection_store: ProjectionRecordStore | None = None,
-        canonical_projector=None,
-        current_slot_projector=None,
+        document_overlay: Any | None = None,
         tombstone_service=None,
         retention_manager=None,
-        migration_gate=None,
-        unified_context_migration=None,
         readiness=None,
+        tenant_id: str = "",
     ) -> None:
         self.source_store = source_store
         self.index_store = index_store
@@ -72,9 +67,7 @@ class ContextDB:
         self.queue_store = queue_store
         self.session_commit_service = session_commit_service
         self.committer = committer
-        self.projection_store = projection_store
-        self.canonical_projector = canonical_projector
-        self.current_slot_projector = current_slot_projector
+        self.tenant_id = str(tenant_id or getattr(source_store, "tenant_id", "default") or "default")
         self.tombstone_service = tombstone_service
         if (
             self.committer is not None
@@ -85,15 +78,11 @@ class ContextDB:
             # preserve the same DELETE outbox boundary as the runtime factory.
             self.committer.tombstone_service = tombstone_service
         self.retention_manager = retention_manager
-        self.migration_gate = migration_gate
-        if self.committer is not None and migration_gate is not None:
-            bound_gate = getattr(self.committer, "migration_gate", None)
-            if bound_gate is None:
-                self.committer.migration_gate = migration_gate
-            elif bound_gate is not migration_gate:
-                raise ValueError("ContextDB committer migration gate differs from its serving gate")
-        self.unified_context_migration = unified_context_migration
         self.readiness = readiness
+        # Markdown documents are not SourceStore objects.  Retrieval receives
+        # a Catalog candidate and asks this exact-byte reader to validate its
+        # live path/digest before exposing content.
+        self.memory_document_overlay = document_overlay
         # Administrative rebuilds and online retrieval share one publication
         # boundary so a query observes either the pre-rebuild or post-rebuild
         # serving state, never a partially republished Catalog.
@@ -117,9 +106,9 @@ class ContextDB:
             self.source_store,
             self.index_store,
             self.relation_store,
+            tenant_id=self.tenant_id,
             domain_overlay=self.domain_overlay,
             index_policy=self.index_policy,
-            migration_gate=self.migration_gate,
             readiness=self.readiness,
             serving_lock=self.serving_lock,
             relation_domain_policy=self.relation_domain_policy,
@@ -130,17 +119,11 @@ class ContextDB:
             self.readiness.require_ready()
 
     @contextmanager
-    def _migration_projection_fence(self) -> Iterator[None]:
-        """Serialize direct Source/serving mutations with tenant rebuilds."""
+    def _mutation_fence(self) -> Iterator[None]:
+        """Serialize Source and serving publication within this composition."""
 
-        acquire = getattr(self.migration_gate, "acquire_projection_fence", None)
-        release = getattr(self.migration_gate, "release_projection_fence", None)
-        fence = acquire() if callable(acquire) else None
-        try:
+        with self.serving_lock:
             yield
-        finally:
-            if callable(release):
-                release(fence)
 
     def read_object(self, uri: str) -> ContextObject:
         self._require_ready()
@@ -158,20 +141,24 @@ class ContextDB:
 
     def seed_object(self, obj: ContextObject, content: str | bytes = "") -> None:
         """处理 seed object 这一步。"""
-        with self._migration_projection_fence():
+        with self._mutation_fence():
             self._require_ready()
-            if self._domain_owned_object(obj):
+            if self._domain_owned_object(obj) or self._document_owned_object(obj):
                 raise PermissionError(
                     "domain-owned context cannot be seeded through ContextDB; use its domain committer "
-                    "or a startup-owned migration/recovery SourceStore"
+                    "or a startup-owned recovery SourceStore"
                 )
             self.source_store.write_object(obj, content=content)
-            self.index_store.upsert_index(obj, content=self._index_content(obj, content))
+            self.index_store.upsert_index(
+                obj,
+                content=self._index_content(obj, content),
+                tenant_id=str(obj.tenant_id or self.tenant_id),
+            )
 
     import_object = seed_object
 
     def delete_context(self, uri: str, *, reason: str = "context_deleted") -> dict[str, Any]:
-        with self._migration_projection_fence():
+        with self._mutation_fence():
             return self._delete_context_unfenced(uri, reason=reason)
 
     def _delete_context_unfenced(self, uri: str, *, reason: str) -> dict[str, Any]:
@@ -200,7 +187,7 @@ class ContextDB:
         }
 
     def delete_session_context(self, session_id: str, *, reason: str = "session_deleted") -> dict[str, Any]:
-        with self._migration_projection_fence():
+        with self._mutation_fence():
             return self._delete_session_context_unfenced(session_id, reason=reason)
 
     def _delete_session_context_unfenced(self, session_id: str, *, reason: str) -> dict[str, Any]:
@@ -228,7 +215,7 @@ class ContextDB:
         }
 
     def run_retention_cycle(self, *, now: datetime | None = None) -> dict[str, Any]:
-        with self._migration_projection_fence():
+        with self._mutation_fence():
             return self._run_retention_cycle_unfenced(now=now)
 
     def _run_retention_cycle_unfenced(self, *, now: datetime | None = None) -> dict[str, Any]:
@@ -241,7 +228,7 @@ class ContextDB:
         tiers = self.retention_manager.apply_serving_tiers(tenant_id=tenant_id, now=now)
         vectors = self.retention_manager.gc_vectors(tenant_id=tenant_id)
         stale = self.retention_manager.gc_stale_projections(tenant_id=tenant_id)
-        auxiliary = self.retention_manager.gc_auxiliary_state(now=now)
+        auxiliary = self.retention_manager.gc_auxiliary_state(tenant_id=tenant_id, now=now)
         return {
             "tenant_id": tenant_id,
             "tiers": asdict(tiers),
@@ -257,7 +244,7 @@ class ContextDB:
         owner_user_id: str = "",
         now: datetime | None = None,
     ) -> dict[str, Any] | None:
-        with self._migration_projection_fence():
+        with self._mutation_fence():
             return self._compact_session_context_unfenced(
                 session_id,
                 owner_user_id=owner_user_id,
@@ -294,7 +281,7 @@ class ContextDB:
         *,
         now: datetime | None = None,
     ) -> dict[str, Any]:
-        with self._migration_projection_fence():
+        with self._mutation_fence():
             return self._restore_cold_context_unfenced(record_key, now=now)
 
     def _restore_cold_context_unfenced(
@@ -322,7 +309,7 @@ class ContextDB:
         owner_user_id: str,
         now: datetime | None = None,
     ) -> dict[str, Any] | None:
-        with self._migration_projection_fence():
+        with self._mutation_fence():
             return self._compact_timeline_context_unfenced(
                 timeline_path,
                 owner_user_id=owner_user_id,
@@ -359,7 +346,7 @@ class ContextDB:
     ) -> tuple[str, ...]:
         """Durably journal all projections before a normal Context is retired."""
 
-        with self._migration_projection_fence():
+        with self._mutation_fence():
             if self.tombstone_service is None:
                 raise RuntimeError("Context deletion requires ProjectionTombstoneService")
             return self.tombstone_service.enqueue_uri(
@@ -369,13 +356,21 @@ class ContextDB:
                 require_source_retired=True,
             )
 
-    def process_projection_tombstones(self, tombstone_ids: list[str] | tuple[str, ...]):
+    def process_projection_tombstones(
+        self,
+        tombstone_ids: list[str] | tuple[str, ...],
+        *,
+        tenant_id: str = "",
+    ):
         """Apply one delete request's exact journal set without queue starvation."""
 
-        with self._migration_projection_fence():
+        with self._mutation_fence():
             if self.tombstone_service is None:
                 raise RuntimeError("Context deletion requires ProjectionTombstoneService")
-            return self.tombstone_service.process_tombstones(tombstone_ids)
+            return self.tombstone_service.process_tombstones(
+                tombstone_ids,
+                tenant_id=str(tenant_id or self.tenant_id),
+            )
 
     def commit_operation(self, operation: ContextOperation) -> CommitResult:
         self._require_ready()
@@ -396,11 +391,17 @@ class ContextDB:
         return results
 
     def add_relation(self, relation: ContextRelation) -> None:
-        with self._migration_projection_fence():
+        with self._mutation_fence():
             self._add_relation_unfenced(relation)
 
     def _add_relation_unfenced(self, relation: ContextRelation) -> None:
         self._require_ready()
+        if self._document_owned_uri(relation.source_uri) or self._document_owned_uri(
+            relation.target_uri
+        ):
+            raise PermissionError(
+                "Markdown document relations can only be published by the document projector"
+            )
         domain_source = self._domain_owned_uri(relation.source_uri)
         endpoint_objects: dict[str, ContextObject] = {}
         for uri in (relation.source_uri, relation.target_uri):
@@ -409,6 +410,10 @@ class ContextDB:
             except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
                 continue
             endpoint_objects[uri] = endpoint
+            if self._document_owned_object(endpoint):
+                raise PermissionError(
+                    "Markdown document relations can only be published by the document projector"
+                )
             if uri == relation.source_uri and self._domain_owned_object(endpoint):
                 domain_source = True
         if domain_source:
@@ -554,7 +559,7 @@ class ContextDB:
         if callable(reconcile):
             reconcile((relation,), tenant_id=tenant_id)
             return
-        self.relation_store.add_relation(relation)
+        self.relation_store.add_relation(relation, tenant_id=tenant_id)
 
     @staticmethod
     def _ordinary_relation_equal(left: ContextRelation, right: ContextRelation) -> bool:
@@ -597,7 +602,14 @@ class ContextDB:
             filters["admission_status"] = admission_status
         if allowed_uris is not None:
             filters["allowed_uris"] = tuple(allowed_uris)
-        hits = self.index_store.search(query, filters=filters, limit=limit)
+        effective_tenant = str(tenant_id or self.tenant_id)
+        filters["tenant_id"] = effective_tenant
+        hits = self.index_store.search(
+            query,
+            tenant_id=effective_tenant,
+            filters=filters,
+            limit=limit,
+        )
         visible: list[IndexHit] = []
         for hit in hits:
             if self.index_policy.owns_index_entry(
@@ -623,6 +635,7 @@ class ContextDB:
         tenant_id: str | None = None,
     ) -> list[ContextRelation]:
         self._require_ready()
+        effective_tenant = str(tenant_id or self.tenant_id)
         domain_target = self._domain_owned_uri(uri)
         if not domain_target:
             try:
@@ -637,9 +650,13 @@ class ContextDB:
                 self.relation_store,
                 uri,
                 owner_user_id=owner_user_id,
-                tenant_id=tenant_id,
+                tenant_id=effective_tenant,
             )
-        return self.relation_store.relations_of(uri, tenant_id=tenant_id, owner_user_id=owner_user_id)
+        return self.relation_store.relations_of(
+            uri,
+            tenant_id=effective_tenant,
+            owner_user_id=owner_user_id,
+        )
 
     def commit_session(self, archive: SessionArchive, *, async_commit: bool = True) -> SessionCommitResult:
         self._require_ready()
@@ -649,12 +666,6 @@ class ContextDB:
 
     def rebuild_index(self, *, owner_user_id: str | None = None) -> dict:
         return self.administration_service.rebuild_index(owner_user_id=owner_user_id)
-
-    def resume_derived_serving_rebuild_if_needed(self) -> dict[str, Any]:
-        return self.administration_service.resume_derived_serving_rebuild_if_needed()
-
-    def rollback_derived_serving_rebuild(self, reason: str) -> dict[str, Any]:
-        return self.administration_service.rollback_derived_serving_rebuild(reason)
 
     def verify_consistency(self, *, owner_user_id: str | None = None) -> dict:
         return self.administration_service.verify_consistency(owner_user_id=owner_user_id)
@@ -670,24 +681,14 @@ class ContextDB:
     def _domain_owned_uri(self, uri: str) -> bool:
         return self.domain_overlay.owns_uri(uri)
 
+    @staticmethod
+    def _document_owned_object(obj: ContextObject) -> bool:
+        return obj.context_type is ContextType.MEMORY or ContextDB._document_owned_uri(obj.uri)
 
-_COMPATIBILITY_ATTRS = {
-    "CommitResult": ("memoryos.operations.model.context_diff", "ContextDiff"),
-    "ContextOperation": ("memoryos.operations.model.context_operation", "ContextOperation"),
-    "OperationCommitter": ("memoryos.operations.commit.operation_committer", "OperationCommitter"),
-    "ProjectionRecordStore": ("memoryos.memory.canonical.projection_state", "ProjectionRecordStore"),
-}
-
-
-def __getattr__(name: str) -> Any:
-    """Resolve historical incidental exports only when explicitly requested."""
-
-    target = _COMPATIBILITY_ATTRS.get(name)
-    if target is None:
-        raise AttributeError(name)
-    value = getattr(import_module(target[0]), target[1])
-    globals()[name] = value
-    return value
+    @staticmethod
+    def _document_owned_uri(uri: str) -> bool:
+        raw = str(uri or "")
+        return raw.startswith("memoryos://user/") and "/memory/documents/" in raw
 
 
-__all__ = ["CommitResult", "ContextDB"]
+__all__ = ["ContextDB"]

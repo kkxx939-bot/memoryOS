@@ -358,11 +358,6 @@ class RegularEffectExecutor:
 
         expected = committer._unique_relation_specs(expected)
         previous = committer._unique_relation_specs(previous)
-        if any(committer._regular_relation_has_canonical_endpoint(spec) for spec in expected):
-            raise ValueError(
-                "regular operations cannot publish a canonical Source relation; "
-                "canonical Source relations require an immutable canonical receipt"
-            )
         authority_uri = str(
             (desired.uri if desired is not None else "")
             or (current.uri if current is not None else "")
@@ -457,9 +452,7 @@ class RegularEffectExecutor:
         if len(expected) != len(manifest.get("expected", [])) or len(remove) != len(manifest.get("remove", [])):
             raise RedoIntegrityError("regular redo relation manifest contains an invalid entry")
         if expected != committer._unique_relation_specs(expected) or remove != committer._unique_relation_keys(remove):
-            raise RedoIntegrityError("regular redo relation manifest is not canonical")
-        if any(committer._regular_relation_has_canonical_endpoint(spec) for spec in expected):
-            raise RedoIntegrityError("regular redo relation manifest crosses the canonical memory boundary")
+            raise RedoIntegrityError("regular redo relation manifest is not normalized")
         expected_keys = {committer._relation_spec_key(spec) for spec in expected}
         if any(committer._relation_spec_key(item) in expected_keys for item in remove):
             raise RedoIntegrityError("regular redo relation manifest removes an expected relation")
@@ -538,24 +531,6 @@ class RegularEffectExecutor:
         }
 
     @staticmethod
-    def _regular_relation_has_canonical_endpoint(committer, spec: dict) -> bool:
-        uri = str(spec.get("source_uri") or "")
-        if not uri or not uri.startswith("memoryos://"):
-            return False
-        policy = committer.relation_domain_policy
-        if policy is None:
-            return False
-        if policy.owns_uri(uri):
-            return True
-        try:
-            obj = committer.source_store.read_object(uri)
-        except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
-            return False
-        if policy.owns_object(obj):
-            return True
-        return False
-
-    @staticmethod
     def _ordinary_relation_eligibility(
         committer,
         spec: dict,
@@ -571,12 +546,6 @@ class RegularEffectExecutor:
             source_store=committer.source_store,
             index_store=committer.index_store,
             authority_object=authority_object,
-            domain_policy=committer.relation_domain_policy,
-            domain_reader=(
-                (lambda uri: committer._read_committed_canonical(uri).object)
-                if committer.relation_domain_policy is not None
-                else None
-            ),
             allow_virtual_targets=True,
         )
 

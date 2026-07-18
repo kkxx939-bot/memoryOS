@@ -1,750 +1,956 @@
 from __future__ import annotations
 
-from dataclasses import replace
-from datetime import datetime, timezone
+from pathlib import Path
+from threading import Event, Thread
 
 import pytest
 
-from memoryos.api.sdk.client import MemoryOSClient
-from memoryos.contextdb.catalog import CatalogRecordKind, ServingTier
-from memoryos.contextdb.model.context_object import ContextObject
-from memoryos.contextdb.model.context_relation import ContextRelation
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.retrieval.context_assembler import ContextAssembler
-from memoryos.contextdb.retrieval.orchestrator import RetrievalUnavailableError
-from memoryos.contextdb.session.session_model import SessionArchive
-from memoryos.contextdb.store.sqlite_index_store import SQLiteIndexStore
-from memoryos.contextdb.store.vector_store import InMemoryVectorStore
-from memoryos.contextdb.unified_migration import (
-    DERIVED_SERVING_REBUILD_NAME,
-    MigrationState,
-    ReadRoute,
+from memoryos.adapters.persistence.filesystem.memory_document_store import (
+    FileSystemMemoryDocumentStore,
 )
-from memoryos.memory.canonical.visibility import CommittedStateIntegrityError
-from memoryos.operations.model.context_operation import ContextOperation
-from memoryos.operations.model.operation_action import OperationAction
+from memoryos.adapters.persistence.in_memory.queue_store import InMemoryQueueStore
+from memoryos.adapters.persistence.in_memory.relation_store import InMemoryRelationStore
+from memoryos.contextdb.catalog import CatalogRecordKind
+from memoryos.contextdb.model.context_relation import ContextRelation
+from memoryos.contextdb.store.sqlite_index_store import SQLiteIndexStore
+from memoryos.contextdb.store.vector_store import InMemoryVectorStore, vector_row_id
+from memoryos.memory.documents import (
+    ABSENT,
+    DocumentControlRecord,
+    DocumentDeletionStatus,
+    DocumentEraseStatus,
+    DocumentPublicationBarrier,
+    MemoryDocumentControlStore,
+    MemoryDocumentEraser,
+    MemoryDocumentEraseStore,
+    MemoryDocumentRevisionStore,
+    PresentPath,
+    new_document_id,
+    render_new_document,
+)
+from memoryos.memory.documents.path_policy import MemoryDocumentPathPolicy
 from memoryos.providers.embedding import HashingEmbeddingProvider
-from memoryos.runtime.readiness import RuntimeReadinessState
+from memoryos.workers.memory_document_projection_worker import (
+    MemoryDocumentCatalogEraseBackend,
+    MemoryDocumentProjectionWorker,
+)
 
 
-def _archive(session_id: str, *, created_at: str) -> SessionArchive:
-    return SessionArchive(
-        user_id="u1",
-        session_id=session_id,
-        archive_uri=f"memoryos://user/u1/sessions/history/{session_id}",
-        created_at=created_at,
-        metadata={
-            "tenant_id": "tenant-a",
-            "timezone": "Asia/Singapore",
-            "project_id": "memoryOS",
-        },
-        messages=[
-            {
-                "role": "user",
-                "content": f"read desktop file for {session_id}",
-                "occurred_at": created_at,
-            }
-        ],
-        tool_results=[
-            {
-                "tool_name": "read_file",
-                "output": f"API_KEY=never-index-this rebuild marker {session_id}",
-                "path": f"/Users/u1/Desktop/{session_id}.txt",
-                "important": True,
-                "occurred_at": created_at,
-            }
-        ],
+def _components(root: Path):  # noqa: ANN202
+    documents = FileSystemMemoryDocumentStore(root)
+    controls = MemoryDocumentControlStore(root)
+    catalog = SQLiteIndexStore(root / "catalog.sqlite3")
+    worker = MemoryDocumentProjectionWorker(
+        documents,
+        controls,
+        catalog,
+        InMemoryQueueStore(),
     )
+    return documents, catalog, worker
 
 
-def _session_records(client: MemoryOSClient, session_id: str):
-    store = client.index_store
-    assert isinstance(store, SQLiteIndexStore)
-    return store.scan_catalog_batch(
-        filters={
-            "tenant_id": "tenant-a",
-            "session_ids": (session_id,),
-            "include_inactive": True,
-        },
-        limit=1_000,
-    )
-
-
-def test_full_rebuild_restores_every_serving_plane_without_resurrecting_session_delete(
-    tmp_path,
-) -> None:
+def _rich_components(root: Path):  # noqa: ANN202
+    documents = FileSystemMemoryDocumentStore(root)
+    controls = MemoryDocumentControlStore(root)
+    catalog = SQLiteIndexStore(root / "catalog.sqlite3")
+    relations = InMemoryRelationStore()
     vectors = InMemoryVectorStore()
-    client = MemoryOSClient(
-        str(tmp_path),
-        tenant_id="tenant-a",
+    worker = MemoryDocumentProjectionWorker(
+        documents,
+        controls,
+        catalog,
+        InMemoryQueueStore(),
         vector_store=vectors,
         embedding_provider=HashingEmbeddingProvider(),
+        relation_store=relations,
     )
-    recent = _archive(
-        "recent-live",
-        created_at=datetime.now(timezone.utc).isoformat(),
-    )
-    old = _archive("old-live", created_at="2000-01-01T00:00:00+00:00")
-    deleted = _archive("deleted-session", created_at="2026-07-14T09:00:00+08:00")
-    for archive in (recent, old, deleted):
-        result = client.session_commit_service.sync_archive(
-            archive,
-            enqueue_commit_job=False,
+    return documents, controls, catalog, relations, vectors, worker
+
+
+def _write_soft_barrier(
+    controls: MemoryDocumentControlStore,
+    document_id: str,
+    relative_path: str,
+    *,
+    generation: int = 2,
+) -> DocumentPublicationBarrier:
+    return controls.write_publication_barrier(
+        DocumentPublicationBarrier(
+            tenant_id="t1",
+            owner_user_id="u1",
+            document_id=document_id,
+            relative_path=relative_path,
+            deletion_generation=generation,
+            deletion_event_digest="a" * 64,
+            status=DocumentDeletionStatus.SOFT_FORGOTTEN,
+            updated_at="2026-07-18T00:00:00+00:00",
         )
-        assert result.session_projection_status == "projected"
-
-    future_projector_record = replace(
-        _session_records(client, deleted.session_id)[0],
-        record_key="session:deleted-session:future-projector-kind",
-        source_kind="future_projector_kind",
-    )
-    deleted_result = client.context_db.delete_session_context(deleted.session_id)
-    assert deleted_result["processed"]
-    assert not _session_records(client, deleted.session_id)
-    catalog_store = client.index_store
-    assert isinstance(catalog_store, SQLiteIndexStore)
-    assert catalog_store.rebuildable_catalog_records((future_projector_record,)) == ()
-
-    first_claim = client.remember(
-        user_id="u1",
-        content="PostgreSQL",
-        memory_type="project_decision",
-        project_id="memoryOS",
-        identity_fields={"decision_topic": "primary database"},
-    )
-    first_metadata = client.source_store.read_object(str(first_claim["uri"])).metadata
-    slot_id = str(first_metadata["slot_id"])
-    claim_id = str(first_metadata["claim_id"])
-
-    claim_uri = str(first_claim["uri"])
-    committed_relations = client.relation_store.relations_of(claim_uri)
-    assert committed_relations
-    removed_relation = committed_relations[0]
-    client.relation_store.delete_relation(
-        removed_relation.source_uri,
-        removed_relation.relation_type,
-        removed_relation.target_uri,
-    )
-    assert removed_relation not in client.relation_store.relations_of(claim_uri)
-
-    vectors.upsert_vector(
-        "orphan-tenant-a",
-        [1.0, 0.0],
-        metadata={"tenant_id": "tenant-a", "catalog_record_key": "missing"},
-    )
-    vectors.upsert_vector(
-        "other-tenant",
-        [0.0, 1.0],
-        metadata={"tenant_id": "tenant-b", "catalog_record_key": "keep"},
-    )
-    store = client.index_store
-    assert isinstance(store, SQLiteIndexStore)
-    main_migration_before = store.get_migration_state(
-        "unified-context-catalog-v1",
-        tenant_id="tenant-a",
     )
 
-    rebuilt = client.context_db.rebuild_index()
 
-    assert rebuilt["state"] == "COMPLETED"
-    assert rebuilt["consistent"] is True
-    # Explicit remember() contributes its own immutable evidence archive.
-    assert rebuilt["session_catalog"]["processed_archives"] >= 3
-    assert rebuilt["session_catalog"]["tombstoned_records"] > 0
-    assert _session_records(client, recent.session_id)
-    assert not _session_records(client, deleted.session_id)
-    assert all(
-        record.serving_tier == ServingTier.ARCHIVED.value
-        for record in _session_records(client, old.session_id)
-    )
-    assert vectors.get_vector_metadata("orphan-tenant-a") is None
-    assert vectors.get_vector_metadata("other-tenant") is not None
-    assert any(
-        (
-            relation.source_uri,
-            relation.relation_type,
-            relation.target_uri,
-        )
-        == (
-            removed_relation.source_uri,
-            removed_relation.relation_type,
-            removed_relation.target_uri,
-        )
-        for relation in client.relation_store.relations_of(claim_uri)
-    )
-
-    current_rows = store.scan_catalog_batch(
+def _document_records(catalog: SQLiteIndexStore, document_id: str, *, include_inactive: bool = False):  # noqa: ANN202
+    return catalog.scan_catalog_batch(
+        tenant_id="t1",
         filters={
-            "tenant_id": "tenant-a",
-            "canonical_slot_ids": (slot_id,),
-            "record_kind": CatalogRecordKind.CURRENT_SLOT.value,
-            "include_inactive": True,
-        },
-        limit=10,
-    )
-    history_rows = store.scan_catalog_batch(
-        filters={
-            "tenant_id": "tenant-a",
-            "canonical_slot_ids": (slot_id,),
-            "record_kind": CatalogRecordKind.CLAIM_REVISION.value,
-            "include_inactive": True,
-        },
-        limit=10,
-    )
-    assert len(current_rows) == 1
-    assert current_rows[0].canonical_claim_id == claim_id
-    assert len(history_rows) >= 1
-    canonical_vector_kinds = {
-        str((vectors.get_vector_metadata(uri) or {}).get("record_kind") or "")
-        for uri in vectors.rows
-    }
-    assert CatalogRecordKind.CURRENT_SLOT.value in canonical_vector_kinds
-    assert CatalogRecordKind.CLAIM_REVISION.value in canonical_vector_kinds
-
-    derived = store.get_migration_state(
-        DERIVED_SERVING_REBUILD_NAME,
-        tenant_id="tenant-a",
-    )
-    assert derived is not None and derived["state"] == MigrationState.COMPLETED.value
-    assert derived["details_json"]["last_completed_phase"] == "VERIFY"
-    assert (
-        store.get_migration_state("unified-context-catalog-v1", tenant_id="tenant-a")
-        == main_migration_before
-    )
-
-    first_epoch = rebuilt["rebuild_epoch"]
-    replay = client.context_db.rebuild_index()
-    assert replay["state"] == "COMPLETED"
-    assert replay["rebuild_epoch"] != first_epoch
-    assert len(_session_records(client, recent.session_id)) == len(
-        {record.record_key for record in _session_records(client, recent.session_id)}
-    )
-    assert not _session_records(client, deleted.session_id)
-
-
-def test_atomic_clear_gate_is_fail_closed_and_startup_resumes_from_archive_checkpoint(
-    tmp_path,
-) -> None:
-    vectors = InMemoryVectorStore()
-    client = MemoryOSClient(
-        str(tmp_path),
-        tenant_id="tenant-a",
-        vector_store=vectors,
-        embedding_provider=HashingEmbeddingProvider(),
-    )
-    first = _archive("resume-first", created_at="2026-07-14T09:00:00+08:00")
-    second = _archive("resume-second", created_at="2026-07-14T10:00:00+08:00")
-    for archive in (first, second):
-        client.session_commit_service.sync_archive(archive, enqueue_commit_job=False)
-    store = client.index_store
-    assert isinstance(store, SQLiteIndexStore)
-
-    started = store.begin_tenant_serving_rebuild(
-        DERIVED_SERVING_REBUILD_NAME,
-        tenant_id="tenant-a",
-        batch_size=1,
-        details={
-            "rebuild_epoch": "simulated-crash-epoch",
-            "phase": "VECTOR_CLEANUP",
-            "session_checkpoint": "",
-            "current_slot_checkpoint": "",
-        },
-    )
-    assert started["state"] == MigrationState.BACKFILLING.value
-    assert not _session_records(client, first.session_id)
-    assert client.migration_gate is not None
-    assert client.migration_gate.feature_gate.read_route is ReadRoute.LEGACY
-    assert client.migration_gate.empty_result_requires_unavailable
-    rolled_back = client.context_db.rollback_derived_serving_rebuild(
-        "operator paused after simulated crash",
-    )
-    assert rolled_back["state"] == MigrationState.ROLLBACK.value
-    assert rolled_back["details_json"]["rollback_from"] == MigrationState.BACKFILLING.value
-    assert client.migration_gate.feature_gate.read_route is ReadRoute.LEGACY
-    with pytest.raises(RetrievalUnavailableError):
-        client.search_context(
-            "resume-first",
-            user_id="u1",
-            project_id="memoryOS",
-            tenant_id="tenant-a",
-        )
-
-    assert vectors.delete_by_filter({"tenant_id": "tenant-a"}) >= 0
-    assert client.unified_context_migration is not None
-    first_batch = client.unified_context_migration.rebuild_session_catalog_next_batch(
-        "",
-        batch_size=1,
-    )
-    assert first_batch.processed_archives == 1 and not first_batch.complete
-    store.set_migration_state(
-        DERIVED_SERVING_REBUILD_NAME,
-        MigrationState.BACKFILLING.value,
-        first_batch.checkpoint,
-        {
-            **started["details_json"],
-            "phase": "SESSION_CATALOG",
-            "session_checkpoint": first_batch.checkpoint,
-            "session_archives": 1,
-            "session_records": first_batch.projected_records,
-            "session_vectors": first_batch.vectors_projected,
-            "session_tombstoned_records": first_batch.tombstoned_records,
-        },
-        tenant_id="tenant-a",
-        batch_size=1,
-    )
-
-    restarted = MemoryOSClient(
-        str(tmp_path),
-        tenant_id="tenant-a",
-        vector_store=vectors,
-        embedding_provider=HashingEmbeddingProvider(),
-    )
-
-    assert restarted.readiness.state is RuntimeReadinessState.READY
-    assert _session_records(restarted, first.session_id)
-    assert _session_records(restarted, second.session_id)
-    resumed = restarted.index_store.get_migration_state(  # type: ignore[attr-defined]
-        DERIVED_SERVING_REBUILD_NAME,
-        tenant_id="tenant-a",
-    )
-    assert resumed is not None and resumed["state"] == MigrationState.COMPLETED.value
-    assert resumed["details_json"]["session_catalog"]["processed_archives"] == 2
-
-
-def test_full_rebuild_restores_ordinary_source_relations_and_preserves_other_tenant_canonical(
-    tmp_path,
-) -> None:  # noqa: ANN001
-    client = MemoryOSClient(
-        str(tmp_path),
-        tenant_id="tenant-a",
-        vector_store=InMemoryVectorStore(),
-        embedding_provider=HashingEmbeddingProvider(),
-    )
-    canonical = client.remember(
-        user_id="u1",
-        content="PostgreSQL",
-        memory_type="project_decision",
-        project_id="memoryOS",
-        identity_fields={"decision_topic": "ordinary relation rebuild target"},
-    )
-    canonical_uri = str(canonical["uri"])
-    policy = ContextObject(
-        uri="memoryos://user/u1/action_policies/rebuild/ordinary-source",
-        context_type=ContextType.ACTION_POLICY,
-        title="ordinary relation source",
-        owner_user_id="u1",
-        tenant_id="tenant-a",
-    )
-    ordinary_target = ContextObject(
-        uri="memoryos://user/u1/memories/rules/ordinary-target",
-        context_type=ContextType.MEMORY,
-        title="ordinary relation target",
-        owner_user_id="u1",
-        tenant_id="tenant-a",
-    )
-    client.context_db.seed_object(policy, content="ordinary policy")
-    client.context_db.seed_object(ordinary_target, content="ordinary target")
-    inbound_canonical = ContextRelation(
-        source_uri=policy.uri,
-        relation_type="constrained_by",
-        target_uri=canonical_uri,
-        metadata={"tenant_id": "tenant-a", "owner_user_id": "u1"},
-    )
-    ordinary = ContextRelation(
-        source_uri=policy.uri,
-        relation_type="related_to",
-        target_uri=ordinary_target.uri,
-        metadata={"tenant_id": "tenant-a", "owner_user_id": "u1"},
-    )
-    client.context_db.add_relation(inbound_canonical)
-    client.context_db.add_relation(ordinary)
-    source_before = client.source_store.read_object(policy.uri).to_dict()
-
-    old = ContextObject(
-        uri="memoryos://user/u1/memories/rules/superseded-old",
-        context_type=ContextType.MEMORY,
-        title="old ordinary rule",
-        owner_user_id="u1",
-        tenant_id="tenant-a",
-    )
-    new = ContextObject(
-        uri="memoryos://user/u1/memories/rules/superseded-new",
-        context_type=ContextType.MEMORY,
-        title="new ordinary rule",
-        owner_user_id="u1",
-        tenant_id="tenant-a",
-    )
-    client.context_db.seed_object(old, content="old")
-    client.context_db.commit_operation(
-        ContextOperation(
-            user_id="u1",
-            context_type=ContextType.MEMORY,
-            action=OperationAction.SUPERSEDE,
-            target_uri=old.uri,
-            payload={
-                "tenant_id": "tenant-a",
-                "context_object": new.to_dict(),
-                "content": "new",
-                "reason": "ordinary rebuild proof",
-            },
-        )
-    )
-
-    canonical_rows = [
-        relation
-        for relation in client.relation_store.relations_of(canonical_uri, tenant_id="tenant-a")
-        if relation.source_uri.startswith("memoryos://")
-        and "/memories/canonical/" in relation.source_uri
-    ]
-    assert canonical_rows
-    canonical_a = canonical_rows[0]
-    canonical_b = ContextRelation(
-        source_uri=canonical_a.source_uri,
-        relation_type=canonical_a.relation_type,
-        target_uri=canonical_a.target_uri,
-        weight=canonical_a.weight,
-        metadata={**dict(canonical_a.metadata), "tenant_id": "tenant-b"},
-        created_at=canonical_a.created_at,
-    )
-    client.relation_store.add_relation(canonical_b)
-    stale_inbound = ContextRelation(
-        source_uri=policy.uri,
-        relation_type="stale_inbound",
-        target_uri=canonical_uri,
-        metadata={"tenant_id": "tenant-a", "owner_user_id": "u1"},
-    )
-    stale_ordinary = ContextRelation(
-        source_uri=policy.uri,
-        relation_type="stale_ordinary",
-        target_uri=ordinary_target.uri,
-        metadata={"tenant_id": "tenant-a", "owner_user_id": "u1"},
-    )
-    client.relation_store.add_relation(stale_inbound)
-    client.relation_store.add_relation(stale_ordinary)
-    for wanted in (inbound_canonical, ordinary):
-        client.relation_store.delete_relation(
-            wanted.source_uri,
-            wanted.relation_type,
-            wanted.target_uri,
-            tenant_id="tenant-a",
-        )
-
-    rebuilt = client.context_db.rebuild_index()
-    assert rebuilt["ordinary_relations"]["objects"] >= 4
-    assert rebuilt["ordinary_relations"]["written"] >= 4
-    assert client.source_store.read_object(policy.uri).to_dict() == source_before
-    tenant_a = client.relation_store.relations_of(policy.uri, tenant_id="tenant-a")
-    tenant_a_keys = {
-        (relation.source_uri, relation.relation_type, relation.target_uri)
-        for relation in tenant_a
-    }
-    assert (inbound_canonical.source_uri, inbound_canonical.relation_type, inbound_canonical.target_uri) in tenant_a_keys
-    assert (ordinary.source_uri, ordinary.relation_type, ordinary.target_uri) in tenant_a_keys
-    assert (stale_inbound.source_uri, stale_inbound.relation_type, stale_inbound.target_uri) not in tenant_a_keys
-    assert (stale_ordinary.source_uri, stale_ordinary.relation_type, stale_ordinary.target_uri) not in tenant_a_keys
-    supersede_keys = {
-        (relation.source_uri, relation.relation_type, relation.target_uri)
-        for relation in client.relation_store.relations_of(old.uri, tenant_id="tenant-a")
-    }
-    assert (new.uri, "supersedes", old.uri) in supersede_keys
-    assert (old.uri, "superseded_by", new.uri) in supersede_keys
-    assert client.relation_store.relations_of(canonical_a.source_uri, tenant_id="tenant-b") == [canonical_b]
-
-    # Source references remain evidence, but a retired target can never be
-    # republished online or by a later serving rebuild.
-    client.context_db.delete_context(ordinary_target.uri)
-    assert any(
-        (item.source_uri, item.relation_type, item.target_uri)
-        == (ordinary.source_uri, ordinary.relation_type, ordinary.target_uri)
-        for item in client.source_store.read_object(policy.uri).relations
-    )
-    assert not any(
-        (item.source_uri, item.relation_type, item.target_uri)
-        == (ordinary.source_uri, ordinary.relation_type, ordinary.target_uri)
-        for item in client.relation_store.relations_of(policy.uri, tenant_id="tenant-a")
-    )
-    with pytest.raises(ValueError, match="not serving-eligible"):
-        client.context_db.add_relation(ordinary)
-
-    client.context_db.rebuild_index()
-    assert not any(
-        (item.source_uri, item.relation_type, item.target_uri)
-        == (ordinary.source_uri, ordinary.relation_type, ordinary.target_uri)
-        for item in client.relation_store.relations_of(policy.uri, tenant_id="tenant-a")
-    )
-
-
-def test_add_relation_fails_closed_on_tampered_canonical_target(tmp_path) -> None:  # noqa: ANN001
-    client = MemoryOSClient(
-        str(tmp_path),
-        tenant_id="tenant-a",
-        vector_store=InMemoryVectorStore(),
-        embedding_provider=HashingEmbeddingProvider(),
-    )
-    remembered = client.remember(
-        user_id="u1",
-        content="PostgreSQL",
-        memory_type="project_decision",
-        project_id="memoryOS",
-        identity_fields={"decision_topic": "tampered relation target"},
-    )
-    claim_uri = str(remembered["uri"])
-    policy = ContextObject(
-        uri="memoryos://user/u1/action_policies/tampered-canonical-target",
-        context_type=ContextType.ACTION_POLICY,
-        title="tampered canonical target source",
-        owner_user_id="u1",
-        tenant_id="tenant-a",
-    )
-    client.context_db.seed_object(policy, content="policy")
-    tampered = client.source_store.read_object(claim_uri)
-    tampered.metadata = {**tampered.metadata, "canonical_value": "unproved overwrite"}
-    client.source_store.write_object(tampered)
-    edge = ContextRelation(
-        source_uri=policy.uri,
-        relation_type="constrained_by",
-        target_uri=claim_uri,
-        metadata={"tenant_id": "tenant-a", "owner_user_id": "u1"},
-    )
-
-    with pytest.raises(CommittedStateIntegrityError, match="live Source bundle disagree"):
-        client.context_db.add_relation(edge)
-    assert not client.source_store.read_object(policy.uri).relations
-    assert not client.relation_store.relations_of(policy.uri, tenant_id="tenant-a")
-
-
-def test_ordinary_relation_delete_barriers_prevent_online_and_rebuild_resurrection(
-    tmp_path,
-) -> None:  # noqa: ANN001
-    client = MemoryOSClient(
-        str(tmp_path),
-        tenant_id="tenant-a",
-        vector_store=InMemoryVectorStore(),
-        embedding_provider=HashingEmbeddingProvider(),
-    )
-    policy = ContextObject(
-        uri="memoryos://user/u1/action_policies/delete-barrier/source",
-        context_type=ContextType.ACTION_POLICY,
-        title="delete barrier source",
-        owner_user_id="u1",
-        tenant_id="tenant-a",
-    )
-    inbound = ContextObject(
-        uri="memoryos://user/u1/memories/rules/delete-barrier-inbound",
-        context_type=ContextType.MEMORY,
-        title="delete barrier inbound",
-        owner_user_id="u1",
-        tenant_id="tenant-a",
-    )
-    resource = ContextObject(
-        uri="memoryos://user/u1/resources/delete-barrier-resource",
-        context_type=ContextType.RESOURCE,
-        title="delete barrier resource",
-        owner_user_id="u1",
-        tenant_id="tenant-a",
-    )
-    session_source = ContextObject(
-        uri="memoryos://user/u1/action_policies/delete-barrier/session-source",
-        context_type=ContextType.ACTION_POLICY,
-        title="session relation source",
-        owner_user_id="u1",
-        tenant_id="tenant-a",
-    )
-    global_resource = ContextObject(
-        uri="memoryos://resources/desktop/shared-delete-barrier-proof",
-        context_type=ContextType.RESOURCE,
-        title="global resource",
-        owner_user_id=None,
-        tenant_id="default",
-    )
-    for obj in (policy, inbound, resource, session_source, global_resource):
-        client.context_db.seed_object(obj, content=obj.title)
-    stale_current = client.index_store.enqueue_tombstone(  # type: ignore[attr-defined]
-        tenant_id="tenant-a",
-        record_key="slot:retired-projection:current",
-        uri=resource.uri,
-        reason="old_current_slot_replaced",
-        source_revision=1,
-        payload={"record_kind": "current_slot"},
-    )
-    client.index_store.mark_tombstone_applied(stale_current["tombstone_id"])  # type: ignore[attr-defined]
-    assert (
-        client.index_store.ordinary_relation_endpoint_state(
-            resource.uri,
-            tenant_id="tenant-a",
-        )
-        == "active"
-    )
-    archive = _archive("ordinary-relation-deleted-session", created_at="2026-07-14T09:00:00+08:00")
-    client.session_commit_service.sync_archive(archive, enqueue_commit_job=False)
-
-    resource_edge = ContextRelation(
-        source_uri=policy.uri,
-        relation_type="requires_resource",
-        target_uri=resource.uri,
-        metadata={"tenant_id": "tenant-a", "owner_user_id": "u1"},
-    )
-    inbound_edge = ContextRelation(
-        source_uri=inbound.uri,
-        relation_type="constrains",
-        target_uri=policy.uri,
-        metadata={"tenant_id": "tenant-a", "owner_user_id": "u1"},
-    )
-    session_edge = ContextRelation(
-        source_uri=session_source.uri,
-        relation_type="observed_in",
-        target_uri=archive.archive_uri,
-        metadata={
-            "tenant_id": "tenant-a",
             "owner_user_id": "u1",
-            "session_id": archive.session_id,
+            "document_id": document_id,
+            "record_kind": CatalogRecordKind.MEMORY_DOCUMENT.value,
+            "include_inactive": include_inactive,
         },
-    )
-    global_edge = ContextRelation(
-        source_uri=session_source.uri,
-        relation_type="requires_resource",
-        target_uri=global_resource.uri,
-        metadata={"tenant_id": "tenant-a", "owner_user_id": "u1"},
-    )
-    for edge in (resource_edge, inbound_edge, session_edge, global_edge):
-        client.context_db.add_relation(edge)
-
-    client.context_db.delete_context(resource.uri, reason="resource_deleted")
-    assert not [
-        edge
-        for edge in client.relation_store.relations_of(policy.uri, tenant_id="tenant-a")
-        if edge.target_uri == resource.uri
-    ]
-    with pytest.raises(ValueError, match="not serving-eligible"):
-        client.context_db.add_relation(resource_edge)
-
-    client.context_db.delete_context(policy.uri, reason="source_deleted")
-    assert not [
-        edge
-        for edge in client.relation_store.relations_of(inbound.uri, tenant_id="tenant-a")
-        if edge.target_uri == policy.uri
-    ]
-    client.context_db.delete_session_context(archive.session_id, reason="session_deleted")
-    assert not [
-        edge
-        for edge in client.relation_store.relations_of(session_source.uri, tenant_id="tenant-a")
-        if edge.target_uri == archive.archive_uri
-    ]
-
-    client.context_db.rebuild_index()
-    all_tenant_relations = [
-        edge
-        for edge in client.relation_store.all_relations()
-        if str(edge.metadata.get("tenant_id") or "default") == "tenant-a"
-    ]
-    deleted_endpoints = {resource.uri, policy.uri, archive.archive_uri}
-    assert not [
-        edge
-        for edge in all_tenant_relations
-        if edge.source_uri in deleted_endpoints or edge.target_uri in deleted_endpoints
-    ]
-    assert any(
-        edge.source_uri == global_edge.source_uri
-        and edge.relation_type == global_edge.relation_type
-        and edge.target_uri == global_edge.target_uri
-        for edge in all_tenant_relations
+        limit=100,
     )
 
-def test_cleaning_session_tombstone_blocks_rebuild_then_startup_replays_and_resumes(
-    tmp_path,
-) -> None:
-    vectors = InMemoryVectorStore()
-    client = MemoryOSClient(
-        str(tmp_path),
-        tenant_id="tenant-a",
-        vector_store=vectors,
-        embedding_provider=HashingEmbeddingProvider(),
-    )
-    archive = _archive("cleaning-delete", created_at="2026-07-14T09:00:00+08:00")
-    client.session_commit_service.sync_archive(archive, enqueue_commit_job=False)
-    assert client.context_db.tombstone_service is not None
-    tombstones = client.context_db.tombstone_service.enqueue_session(
-        archive.session_id,
-        tenant_id="tenant-a",
-        reason="session_deleted",
-    )
-    assert tombstones
-    store = client.index_store
-    assert isinstance(store, SQLiteIndexStore)
-    rows = store.get_tombstones(tombstones)
-    barrier_id = next(
-        str(row["tombstone_id"])
-        for row in rows
-        if row["payload_json"].get("record_kind") == "session_delete_barrier"
-    )
-    cleaning = store.begin_tombstone_cleanup(barrier_id)
-    assert cleaning is not None and cleaning["status"] == "CLEANING"
 
-    with pytest.raises(RuntimeError, match="in-progress tombstone"):
-        client.context_db.rebuild_index()
+def test_full_scan_rebuild_restores_document_catalog_from_exact_live_markdown(tmp_path: Path) -> None:
+    documents, catalog, worker = _components(tmp_path)
+    document_id = new_document_id()
+    raw = render_new_document(document_id, "# Durable preference\n\nUse concise answers.\n")
+    created = documents.create("t1", "u1", "preferences.md", raw, expected=ABSENT)
 
-    failed = store.get_migration_state(
-        DERIVED_SERVING_REBUILD_NAME,
-        tenant_id="tenant-a",
-    )
-    assert failed is not None and failed["state"] == MigrationState.FAILED.value
-    assert failed["details_json"]["phase"] == "SESSION_CATALOG"
-    assert client.readiness.state is RuntimeReadinessState.NOT_READY
-    assert not _session_records(client, archive.session_id)
+    first = worker.rebuild_owner("t1", "u1")
+    assert first == {"projected": 1, "skipped": 0, "deleted": 0, "documents": 1}
+    before = _document_records(catalog, document_id)
+    assert len(before) == 1
+    assert before[0].source_digest == created.raw_sha256
+    assert before[0].l2_uri == created.uri
 
-    restarted = MemoryOSClient(
-        str(tmp_path),
-        tenant_id="tenant-a",
-        vector_store=vectors,
-        embedding_provider=HashingEmbeddingProvider(),
-    )
+    catalog.clear(tenant_id="t1")
+    assert _document_records(catalog, document_id) == []
 
-    assert restarted.readiness.state is RuntimeReadinessState.READY
-    assert not _session_records(restarted, archive.session_id)
-    completed = restarted.index_store.get_migration_state(  # type: ignore[attr-defined]
-        DERIVED_SERVING_REBUILD_NAME,
-        tenant_id="tenant-a",
-    )
-    assert completed is not None and completed["state"] == MigrationState.COMPLETED.value
-    tombstone_rows = store.get_tombstones(tombstones)
-    assert tombstone_rows and all(row["status"] == "APPLIED" for row in tombstone_rows)
+    rebuilt = worker.rebuild_owner("t1", "u1")
+    assert rebuilt["projected"] == 1
+    after = _document_records(catalog, document_id)
+    assert len(after) == 1
+    assert after[0].source_digest == created.raw_sha256
+    assert worker.verify_owner("t1", "u1") == {"verified": 1, "projected": 1}
 
 
-def test_cross_process_gate_change_after_candidate_read_never_returns_partial_success(
-    tmp_path,
+def test_external_delete_barrier_prevents_rebuild_resurrection(tmp_path: Path) -> None:
+    documents, catalog, worker = _components(tmp_path)
+    document_id = new_document_id()
+    relative_path = "knowledge/topics/deleted.md"
+    raw = render_new_document(document_id, "# Deleted\n\nDo not resurrect this text.\n")
+    documents.create("t1", "u1", relative_path, raw, expected=ABSENT)
+    worker.rebuild_owner("t1", "u1")
+
+    state = documents.read_state("t1", "u1", relative_path)
+    assert isinstance(state, PresentPath)
+    documents.delete("t1", "u1", document_id, expected_state=state)
+    _write_soft_barrier(worker.control_store, document_id, relative_path)
+    deleted = worker.rebuild_owner("t1", "u1")
+    assert deleted["deleted"] == 1
+    projection_state = catalog.get_memory_document_projection_state(
+        tenant_id="t1",
+        owner_user_id="u1",
+        document_id=document_id,
+    )
+    assert projection_state is not None
+    assert projection_state["deletion_status"] == "SOFT_FORGOTTEN"
+    assert _document_records(catalog, document_id) == []
+
+    documents.create("t1", "u1", relative_path, raw, expected=ABSENT)
+    replay = worker.rebuild_owner("t1", "u1")
+    assert replay["projected"] == 0
+    assert replay["skipped"] == 1
+    assert _document_records(catalog, document_id) == []
+
+    barrier = worker.control_store.load_publication_barrier("t1", "u1", document_id)
+    assert barrier is not None and barrier.status is DocumentDeletionStatus.SOFT_FORGOTTEN
+    for serving_file in tmp_path.glob("catalog.sqlite3*"):
+        serving_file.unlink()
+    recreated_catalog = SQLiteIndexStore(tmp_path / "catalog.sqlite3")
+    recreated_worker = MemoryDocumentProjectionWorker(
+        documents,
+        worker.control_store,
+        recreated_catalog,
+        InMemoryQueueStore(),
+    )
+
+    after_sqlite_loss = recreated_worker.rebuild_owner("t1", "u1")
+
+    assert after_sqlite_loss["projected"] == 0
+    assert after_sqlite_loss["skipped"] == 1
+    recreated_state = recreated_catalog.get_memory_document_projection_state(
+        tenant_id="t1",
+        owner_user_id="u1",
+        document_id=document_id,
+    )
+    assert recreated_state is not None
+    assert recreated_state["deletion_generation"] == barrier.deletion_generation
+    assert recreated_state["deletion_event_digest"] == barrier.deletion_event_digest
+    assert recreated_state["deletion_status"] == barrier.status.value
+    assert _document_records(recreated_catalog, document_id) == []
+
+
+def test_external_target_delete_rebuild_removes_exact_inbound_document_links(tmp_path: Path) -> None:
+    documents, controls, _catalog, relations, _vectors, worker = _rich_components(tmp_path)
+    source_id = new_document_id()
+    target_id = new_document_id()
+    source_path = "knowledge/topics/source.md"
+    target_path = "knowledge/topics/target.md"
+    documents.create(
+        "t1",
+        "u1",
+        source_path,
+        render_new_document(source_id, "# Source\n\n[Target](target.md)\n"),
+        expected=ABSENT,
+    )
+    documents.create(
+        "t1",
+        "u1",
+        target_path,
+        render_new_document(target_id, "# Target\n\nDelete externally.\n"),
+        expected=ABSENT,
+    )
+    worker.rebuild_owner("t1", "u1")
+    target_uri = MemoryDocumentPathPolicy.document_uri("u1", target_id)
+    assert relations.relations_of(target_uri, tenant_id="t1", owner_user_id="u1")
+
+    documents.delete(
+        "t1",
+        "u1",
+        target_id,
+        expected_state=documents.read_state("t1", "u1", target_path),
+    )
+    _write_soft_barrier(controls, target_id, target_path)
+    rebuilt = worker.rebuild_owner("t1", "u1")
+
+    assert rebuilt["deleted"] == 1
+    assert relations.relations_of(target_uri, tenant_id="t1", owner_user_id="u1") == []
+    barrier = controls.load_publication_barrier("t1", "u1", target_id)
+    assert barrier is not None and barrier.status is DocumentDeletionStatus.SOFT_FORGOTTEN
+    worker.rebuild_owner("t1", "u1")
+    assert relations.relations_of(target_uri, tenant_id="t1", owner_user_id="u1") == []
+
+
+def test_hard_erased_identity_stays_blocked_after_sqlite_recreation(tmp_path: Path) -> None:
+    documents, catalog, worker = _components(tmp_path)
+    controls = worker.control_store
+    document_id = new_document_id()
+    relative_path = "knowledge/topics/hard-erased.md"
+    raw = render_new_document(document_id, "# Erased\n\nNever republish these old bytes.\n")
+    created = documents.create("t1", "u1", relative_path, raw, expected=ABSENT)
+    worker.rebuild_owner("t1", "u1")
+    eraser = MemoryDocumentEraser(
+        documents,
+        controls,
+        MemoryDocumentRevisionStore(tmp_path),
+        cleanup_backends=(MemoryDocumentCatalogEraseBackend(worker),),
+    )
+
+    erased = eraser.hard_erase(
+        tenant_id="t1",
+        owner_user_id="u1",
+        document_id=document_id,
+        expected_source_digest=created.raw_sha256,
+        relative_path=relative_path,
+    )
+
+    assert erased.completed is True
+    barrier = controls.load_publication_barrier("t1", "u1", document_id)
+    assert barrier is not None and barrier.status is DocumentDeletionStatus.HARD_ERASED
+    documents.create("t1", "u1", relative_path, raw, expected=ABSENT)
+    for serving_file in tmp_path.glob("catalog.sqlite3*"):
+        serving_file.unlink()
+    recreated_catalog = SQLiteIndexStore(tmp_path / "catalog.sqlite3")
+    recreated_worker = MemoryDocumentProjectionWorker(
+        documents,
+        controls,
+        recreated_catalog,
+        InMemoryQueueStore(),
+    )
+
+    rebuilt = recreated_worker.rebuild_owner("t1", "u1")
+
+    assert rebuilt["projected"] == 0
+    assert rebuilt["skipped"] == 1
+    state = recreated_catalog.get_memory_document_projection_state(
+        tenant_id="t1",
+        owner_user_id="u1",
+        document_id=document_id,
+    )
+    assert state is not None
+    assert state["deletion_generation"] == barrier.deletion_generation
+    assert state["deletion_event_digest"] == barrier.deletion_event_digest
+    assert state["deletion_status"] == "HARD_ERASED"
+    assert _document_records(recreated_catalog, document_id) == []
+
+
+def test_rebuild_replays_erasure_epoch_created_before_hard_barrier(tmp_path: Path) -> None:
+    documents, _catalog_store, worker = _components(tmp_path)
+    document_id = new_document_id()
+    relative_path = "knowledge/topics/crash-before-barrier.md"
+    raw = render_new_document(document_id, "# Secret\n\nCRASH_SECRET must not return.\n")
+    created = documents.create("t1", "u1", relative_path, raw, expected=ABSENT)
+    worker.rebuild_owner("t1", "u1")
+    erase_store = MemoryDocumentEraseStore(tmp_path)
+    erase_store.begin(
+        tenant_id="t1",
+        owner_user_id="u1",
+        document_id=document_id,
+        relative_path=relative_path,
+        source_digest=created.raw_sha256,
+        document_revision_floor=0,
+        projection_generation_floor=0,
+        backend_names=("local.live_source",),
+        independent_evidence_retained=(),
+        started_at="2026-07-18T00:00:00+00:00",
+    )
+    for serving_file in tmp_path.glob("catalog.sqlite3*"):
+        serving_file.unlink()
+    recreated_catalog = SQLiteIndexStore(tmp_path / "catalog.sqlite3")
+    recreated_worker = MemoryDocumentProjectionWorker(
+        documents,
+        worker.control_store,
+        recreated_catalog,
+        InMemoryQueueStore(),
+    )
+
+    rebuilt = recreated_worker.rebuild_owner("t1", "u1")
+
+    assert rebuilt["projected"] == 0
+    assert rebuilt["skipped"] == 1
+    assert _document_records(recreated_catalog, document_id, include_inactive=True) == []
+    barrier = worker.control_store.load_publication_barrier("t1", "u1", document_id)
+    assert barrier is not None and barrier.status is DocumentDeletionStatus.HARD_ERASED
+    state = recreated_catalog.get_memory_document_projection_state(
+        tenant_id="t1",
+        owner_user_id="u1",
+        document_id=document_id,
+    )
+    assert state is not None and state["deletion_status"] == "HARD_ERASED"
+
+
+def test_hard_erase_seals_barrier_above_full_rebuild_serving_generation(tmp_path: Path) -> None:
+    documents, catalog, worker = _components(tmp_path)
+    document_id = new_document_id()
+    relative_path = "knowledge/topics/generation-ahead.md"
+    raw = render_new_document(document_id, "# Generation one\n\nOLD_SECRET\n")
+    created = documents.create("t1", "u1", relative_path, raw, expected=ABSENT)
+    worker.rebuild_owner("t1", "u1")
+    updated_raw = render_new_document(document_id, "# Generation two\n\nNEW_SECRET\n")
+    updated = documents.replace(
+        "t1",
+        "u1",
+        document_id,
+        updated_raw,
+        expected_state=documents.read_state("t1", "u1", relative_path),
+    )
+    worker.rebuild_owner("t1", "u1")
+    before = catalog.get_memory_document_projection_state(
+        tenant_id="t1",
+        owner_user_id="u1",
+        document_id=document_id,
+    )
+    assert before is not None and before["projection_generation"] == 2
+    eraser = MemoryDocumentEraser(
+        documents,
+        worker.control_store,
+        MemoryDocumentRevisionStore(tmp_path),
+        cleanup_backends=(MemoryDocumentCatalogEraseBackend(worker),),
+    )
+
+    result = eraser.hard_erase(
+        tenant_id="t1",
+        owner_user_id="u1",
+        document_id=document_id,
+        expected_source_digest=updated.raw_sha256,
+        relative_path=relative_path,
+    )
+
+    assert result.record.status is DocumentEraseStatus.ERASED
+    barrier = worker.control_store.load_publication_barrier("t1", "u1", document_id)
+    assert barrier is not None and barrier.deletion_generation >= 3
+    state = catalog.get_memory_document_projection_state(
+        tenant_id="t1",
+        owner_user_id="u1",
+        document_id=document_id,
+    )
+    assert state is not None
+    assert state["deletion_generation"] == barrier.deletion_generation
+    assert state["deletion_status"] == "HARD_ERASED"
+    assert _document_records(catalog, document_id, include_inactive=True) == []
+    assert created.raw_sha256 != updated.raw_sha256
+
+
+def test_tombstone_journal_lookup_is_exact_owner_scoped(tmp_path: Path) -> None:
+    documents, catalog, worker = _components(tmp_path)
+    document_id = new_document_id()
+    for owner in ("a-owner", "z-owner"):
+        raw = render_new_document(document_id, f"# {owner}\n\nowner scoped\n")
+        documents.create("t1", owner, "knowledge/topics/shared-id.md", raw, expected=ABSENT)
+        worker.rebuild_owner("t1", owner)
+    catalog.clear(tenant_id="t1")
+
+    catalog.tombstone_memory_document_projection(
+        tenant_id="t1",
+        owner_user_id="z-owner",
+        document_id=document_id,
+        deletion_generation=1,
+        deletion_event_digest="d" * 64,
+        deletion_status="HARD_ERASED",
+        relative_path="knowledge/topics/shared-id.md",
+    )
+
+    with catalog._connect() as connection:
+        rows = connection.execute(
+            "SELECT source_uri, owner_user_id, status FROM context_projection_journal "
+            "WHERE tenant_id = 't1' AND projector_kind = 'memory_document' ORDER BY source_uri"
+        ).fetchall()
+    by_uri = {str(row["source_uri"]): (str(row["owner_user_id"]), str(row["status"])) for row in rows}
+    a_uri = MemoryDocumentPathPolicy.document_uri("a-owner", document_id)
+    z_uri = MemoryDocumentPathPolicy.document_uri("z-owner", document_id)
+    assert by_uri[a_uri] == ("a-owner", "PENDING")
+    assert by_uri[z_uri] == ("z-owner", "TOMBSTONED")
+
+
+def test_hard_erase_replays_derived_cleanup_after_catalog_commit_crash(
+    tmp_path: Path,
     monkeypatch,
-) -> None:
-    client = MemoryOSClient(str(tmp_path), tenant_id="tenant-a")
-    archive = _archive(
-        "cross-process-race",
-        created_at=datetime.now(timezone.utc).isoformat(),
+) -> None:  # noqa: ANN001
+    documents = FileSystemMemoryDocumentStore(tmp_path)
+    controls = MemoryDocumentControlStore(tmp_path)
+    catalog = SQLiteIndexStore(tmp_path / "catalog.sqlite3")
+    relations = InMemoryRelationStore()
+    vectors = InMemoryVectorStore()
+    worker = MemoryDocumentProjectionWorker(
+        documents,
+        controls,
+        catalog,
+        InMemoryQueueStore(),
+        vector_store=vectors,
+        embedding_provider=HashingEmbeddingProvider(),
+        relation_store=relations,
     )
-    client.session_commit_service.sync_archive(archive, enqueue_commit_job=False)
-    store = client.index_store
-    assert isinstance(store, SQLiteIndexStore)
-    assembler = ContextAssembler(client.context_db, hybrid_search=client.hybrid_search)
-    original = assembler.unified_retrieval.generator.generate
+    target_id = new_document_id()
+    source_id = new_document_id()
+    target_path = "knowledge/topics/target.md"
+    source_path = "knowledge/topics/source.md"
+    target = documents.create(
+        "t1",
+        "u1",
+        target_path,
+        render_new_document(target_id, "# Target\n\nTARGET_SECRET\n"),
+        expected=ABSENT,
+    )
+    documents.create(
+        "t1",
+        "u1",
+        source_path,
+        render_new_document(source_id, "# Source\n\n[Target](target.md)\n"),
+        expected=ABSENT,
+    )
+    worker.rebuild_owner("t1", "u1")
+    target_uri = MemoryDocumentPathPolicy.document_uri("u1", target_id)
+    assert relations.relations_of(target_uri, tenant_id="t1", owner_user_id="u1")
+    assert any(metadata.get("document_id") == target_id for _vector, metadata in vectors.rows.values())
+    original_tombstone = catalog.tombstone_memory_document_projection
+    crashed = False
 
-    def clear_after_candidate_read(plan):  # noqa: ANN001, ANN202 - test fault injection.
-        generated = original(plan)
-        store.begin_tenant_serving_rebuild(
-            DERIVED_SERVING_REBUILD_NAME,
-            tenant_id="tenant-a",
-            batch_size=1,
-            details={"rebuild_epoch": "cross-process-race", "phase": "VECTOR_CLEANUP"},
-        )
-        return generated
+    def crash_after_catalog_commit(**kwargs):  # noqa: ANN003, ANN202
+        nonlocal crashed
+        result = original_tombstone(**kwargs)
+        if not crashed:
+            crashed = True
+            raise RuntimeError("fault after Catalog tombstone commit")
+        return result
 
-    monkeypatch.setattr(
-        assembler.unified_retrieval.generator,
-        "generate",
-        clear_after_candidate_read,
+    monkeypatch.setattr(catalog, "tombstone_memory_document_projection", crash_after_catalog_commit)
+    eraser = MemoryDocumentEraser(
+        documents,
+        controls,
+        MemoryDocumentRevisionStore(tmp_path),
+        cleanup_backends=(MemoryDocumentCatalogEraseBackend(worker),),
     )
 
-    with pytest.raises(RetrievalUnavailableError, match="derived serving"):
-        assembler.search(
-            "cross-process-race",
-            user_id="u1",
-            project_id="memoryOS",
-            tenant_id="tenant-a",
+    first = eraser.hard_erase(
+        tenant_id="t1",
+        owner_user_id="u1",
+        document_id=target_id,
+        expected_source_digest=target.raw_sha256,
+        relative_path=target_path,
+    )
+    assert first.record.status is DocumentEraseStatus.ERASE_PENDING
+    assert relations.relations_of(target_uri, tenant_id="t1", owner_user_id="u1")
+    assert any(metadata.get("document_id") == target_id for _vector, metadata in vectors.rows.values())
+
+    replay = eraser.hard_erase(
+        tenant_id="t1",
+        owner_user_id="u1",
+        document_id=target_id,
+        expected_source_digest=target.raw_sha256,
+        relative_path=target_path,
+    )
+
+    assert replay.record.status is DocumentEraseStatus.ERASED
+    assert relations.relations_of(target_uri, tenant_id="t1", owner_user_id="u1") == []
+    assert not any(metadata.get("document_id") == target_id for _vector, metadata in vectors.rows.values())
+    assert any(metadata.get("document_id") == source_id for _vector, metadata in vectors.rows.values())
+
+
+def test_owner_relation_lock_orders_cross_document_link_add_after_target_erase(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    documents = FileSystemMemoryDocumentStore(tmp_path)
+    controls = MemoryDocumentControlStore(tmp_path)
+    catalog = SQLiteIndexStore(tmp_path / "catalog.sqlite3")
+    relations = InMemoryRelationStore()
+    worker = MemoryDocumentProjectionWorker(
+        documents,
+        controls,
+        catalog,
+        InMemoryQueueStore(),
+        relation_store=relations,
+    )
+    target_id = new_document_id()
+    source_id = new_document_id()
+    target_path = "knowledge/topics/target.md"
+    source_path = "knowledge/topics/source.md"
+    target = documents.create(
+        "t1",
+        "u1",
+        target_path,
+        render_new_document(target_id, "# Target\n\nErase me.\n"),
+        expected=ABSENT,
+    )
+    source = documents.create(
+        "t1",
+        "u1",
+        source_path,
+        render_new_document(source_id, "# Source\n\n[Target](target.md)\n"),
+        expected=ABSENT,
+    )
+    worker.rebuild_owner("t1", "u1")
+    updated_source = documents.replace(
+        "t1",
+        "u1",
+        source_id,
+        render_new_document(source_id, "# Source updated\n\n[Target](target.md)\n"),
+        expected_state=documents.read_state("t1", "u1", source_path),
+    )
+    link_ready = Event()
+    release_link = Event()
+    original_add = relations.add_relation
+
+    def pause_before_add(relation, *, tenant_id):  # noqa: ANN001, ANN202
+        if relation.source_uri == MemoryDocumentPathPolicy.document_uri("u1", source_id):
+            link_ready.set()
+            assert release_link.wait(5)
+        return original_add(relation, tenant_id=tenant_id)
+
+    monkeypatch.setattr(relations, "add_relation", pause_before_add)
+    eraser = MemoryDocumentEraser(
+        documents,
+        controls,
+        MemoryDocumentRevisionStore(tmp_path),
+        cleanup_backends=(MemoryDocumentCatalogEraseBackend(worker),),
+    )
+    errors: list[BaseException] = []
+    erase_results = []
+
+    def rebuild_source() -> None:
+        try:
+            worker.rebuild_owner("t1", "u1")
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def erase_target() -> None:
+        try:
+            erase_results.append(
+                eraser.hard_erase(
+                    tenant_id="t1",
+                    owner_user_id="u1",
+                    document_id=target_id,
+                    expected_source_digest=target.raw_sha256,
+                    relative_path=target_path,
+                )
+            )
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    rebuild_thread = Thread(target=rebuild_source)
+    rebuild_thread.start()
+    assert link_ready.wait(5)
+    erase_thread = Thread(target=erase_target)
+    erase_thread.start()
+    erase_thread.join(0.25)
+    release_link.set()
+    rebuild_thread.join(5)
+    erase_thread.join(5)
+
+    assert errors == []
+    assert not rebuild_thread.is_alive() and not erase_thread.is_alive()
+    assert erase_results and erase_results[0].record.status is DocumentEraseStatus.ERASED
+    target_uri = MemoryDocumentPathPolicy.document_uri("u1", target_id)
+    assert relations.relations_of(target_uri, tenant_id="t1", owner_user_id="u1") == []
+    assert updated_source.raw_sha256 != source.raw_sha256
+
+
+def test_soft_forget_replays_exact_derivative_cleanup_after_catalog_commit_crash(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    documents, controls, catalog, relations, vectors, worker = _rich_components(tmp_path)
+    source_id = new_document_id()
+    target_id = new_document_id()
+    source_path = "knowledge/topics/source.md"
+    target_path = "knowledge/topics/target.md"
+    source = documents.create(
+        "t1",
+        "u1",
+        source_path,
+        render_new_document(source_id, "# Source\n\n[Target](target.md)\n"),
+        expected=ABSENT,
+    )
+    documents.create(
+        "t1",
+        "u1",
+        target_path,
+        render_new_document(target_id, "# Target\n\nKeep target derivatives.\n"),
+        expected=ABSENT,
+    )
+    worker.rebuild_owner("t1", "u1")
+    source_uri = MemoryDocumentPathPolicy.document_uri("u1", source_id)
+    target_uri = MemoryDocumentPathPolicy.document_uri("u1", target_id)
+    assert relations.relations_of(source_uri, tenant_id="t1", owner_user_id="u1")
+    source_vector_ids = {
+        row_id for row_id, (_vector, metadata) in vectors.rows.items() if metadata.get("document_id") == source_id
+    }
+    target_vector_ids = {
+        row_id for row_id, (_vector, metadata) in vectors.rows.items() if metadata.get("document_id") == target_id
+    }
+    assert source_vector_ids and target_vector_ids
+    _write_soft_barrier(controls, source_id, source_path)
+    documents.delete(
+        "t1",
+        "u1",
+        source_id,
+        expected_state=documents.read_state("t1", "u1", source_path),
+    )
+    original_delete = vectors.delete_vector
+    failed = False
+
+    def fail_first_vector_delete(row_id: str) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise RuntimeError("fault after soft Catalog tombstone commit")
+        original_delete(row_id)
+
+    monkeypatch.setattr(vectors, "delete_vector", fail_first_vector_delete)
+    with pytest.raises(RuntimeError, match="soft Catalog tombstone"):
+        worker.rebuild_owner("t1", "u1")
+    state = catalog.get_memory_document_projection_state(
+        tenant_id="t1",
+        owner_user_id="u1",
+        document_id=source_id,
+    )
+    assert state is not None and state["deletion_status"] == "SOFT_FORGOTTEN"
+    assert source_vector_ids <= set(vectors.rows)
+    assert relations.relations_of(source_uri, tenant_id="t1", owner_user_id="u1")
+
+    replay = worker.rebuild_owner("t1", "u1")
+
+    assert replay["projected"] == 0
+    assert not (source_vector_ids & set(vectors.rows))
+    assert target_vector_ids <= set(vectors.rows)
+    assert relations.relations_of(source_uri, tenant_id="t1", owner_user_id="u1") == []
+    target_state = catalog.get_memory_document_projection_state(
+        tenant_id="t1",
+        owner_user_id="u1",
+        document_id=target_id,
+    )
+    assert target_state is not None and target_state["deletion_status"] == ""
+    assert relations.relations_of(target_uri, tenant_id="t1", owner_user_id="u1") == []
+    assert source.raw_sha256
+
+
+def test_soft_barrier_rebuild_after_sqlite_loss_purges_orphan_derivatives(tmp_path: Path) -> None:
+    documents, controls, _catalog, relations, vectors, worker = _rich_components(tmp_path)
+    source_id = new_document_id()
+    target_id = new_document_id()
+    source_path = "knowledge/topics/source.md"
+    target_path = "knowledge/topics/target.md"
+    documents.create(
+        "t1",
+        "u1",
+        source_path,
+        render_new_document(source_id, "# Source\n\n[Target](target.md)\n"),
+        expected=ABSENT,
+    )
+    documents.create(
+        "t1",
+        "u1",
+        target_path,
+        render_new_document(target_id, "# Target\n\nKeep me.\n"),
+        expected=ABSENT,
+    )
+    worker.rebuild_owner("t1", "u1")
+    source_uri = MemoryDocumentPathPolicy.document_uri("u1", source_id)
+    source_vectors = {
+        row_id for row_id, (_vector, metadata) in vectors.rows.items() if metadata.get("document_id") == source_id
+    }
+    target_vectors = {
+        row_id for row_id, (_vector, metadata) in vectors.rows.items() if metadata.get("document_id") == target_id
+    }
+    assert source_vectors and target_vectors
+    assert relations.relations_of(source_uri, tenant_id="t1", owner_user_id="u1")
+    _write_soft_barrier(controls, source_id, source_path)
+    documents.delete(
+        "t1",
+        "u1",
+        source_id,
+        expected_state=documents.read_state("t1", "u1", source_path),
+    )
+    for serving_file in tmp_path.glob("catalog.sqlite3*"):
+        serving_file.unlink()
+    recreated_catalog = SQLiteIndexStore(tmp_path / "catalog.sqlite3")
+    recreated_worker = MemoryDocumentProjectionWorker(
+        documents,
+        controls,
+        recreated_catalog,
+        InMemoryQueueStore(),
+        vector_store=vectors,
+        embedding_provider=HashingEmbeddingProvider(),
+        relation_store=relations,
+    )
+
+    rebuilt = recreated_worker.rebuild_owner("t1", "u1")
+
+    assert rebuilt["projected"] == 1
+    assert not (source_vectors & set(vectors.rows))
+    assert target_vectors <= set(vectors.rows)
+    assert relations.relations_of(source_uri, tenant_id="t1", owner_user_id="u1") == []
+    state = recreated_catalog.get_memory_document_projection_state(
+        tenant_id="t1",
+        owner_user_id="u1",
+        document_id=source_id,
+    )
+    assert state is not None and state["deletion_status"] == "SOFT_FORGOTTEN"
+
+
+def test_soft_barrier_blocks_inbound_link_until_exact_explicit_restore(tmp_path: Path) -> None:
+    documents, controls, catalog, relations, _vectors, worker = _rich_components(tmp_path)
+    source_id = new_document_id()
+    target_id = new_document_id()
+    source_path = "knowledge/topics/source.md"
+    target_path = "knowledge/topics/target.md"
+    source = documents.create(
+        "t1",
+        "u1",
+        source_path,
+        render_new_document(source_id, "# Source\n\n[Target](target.md)\n"),
+        expected=ABSENT,
+    )
+    target = documents.create(
+        "t1",
+        "u1",
+        target_path,
+        render_new_document(target_id, "# Target\n\nRestore lineage.\n"),
+        expected=ABSENT,
+    )
+    worker.rebuild_owner("t1", "u1")
+    target_uri = MemoryDocumentPathPolicy.document_uri("u1", target_id)
+    barrier = _write_soft_barrier(controls, target_id, target_path)
+    worker._mirror_barrier(barrier)
+    updated_source = documents.replace(
+        "t1",
+        "u1",
+        source_id,
+        render_new_document(source_id, "# Source updated\n\n[Target](target.md)\n"),
+        expected_state=documents.read_state("t1", "u1", source_path),
+    )
+    worker._publish_live(
+        tenant_id="t1",
+        owner_user_id="u1",
+        document_id=source_id,
+        relative_path=source_path,
+        source_digest=updated_source.raw_sha256,
+        document_revision=2,
+        projection_generation=2,
+        expected_previous_generation=1,
+    )
+    assert relations.relations_of(target_uri, tenant_id="t1", owner_user_id="u1") == []
+    controls.write_control(
+        DocumentControlRecord(
+            tenant_id="t1",
+            owner_user_id="u1",
+            document_id=target_id,
+            relative_path=target_path,
+            raw_sha256=target.raw_sha256,
+            size=target.size,
+            logical_revision=3,
+            projection_generation=3,
+            status="present",
+            last_event_id=f"memchg_{'b' * 64}",
+            updated_at="2026-07-18T00:00:01+00:00",
+            restored_from_deletion_generation=barrier.deletion_generation,
         )
+    )
+    worker._publish_live(
+        tenant_id="t1",
+        owner_user_id="u1",
+        document_id=target_id,
+        relative_path=target_path,
+        source_digest=target.raw_sha256,
+        document_revision=3,
+        projection_generation=3,
+        expected_previous_generation=0,
+        restored_from_deletion_generation=barrier.deletion_generation,
+    )
+    source_record = _document_records(catalog, source_id)[0]
+    worker._replace_document_links(
+        source_record,
+        documents.read_raw("t1", "u1", document_id=source_id),
+    )
+    assert relations.relations_of(target_uri, tenant_id="t1", owner_user_id="u1")
+    assert source.raw_sha256 != updated_source.raw_sha256
+
+
+def test_soft_mirror_owner_lock_removes_link_added_before_fence_linearizes(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    documents, controls, _catalog, relations, _vectors, worker = _rich_components(tmp_path)
+    source_id = new_document_id()
+    target_id = new_document_id()
+    source_path = "knowledge/topics/source.md"
+    target_path = "knowledge/topics/target.md"
+    documents.create(
+        "t1",
+        "u1",
+        source_path,
+        render_new_document(source_id, "# Source\n\n[Target](target.md)\n"),
+        expected=ABSENT,
+    )
+    documents.create(
+        "t1",
+        "u1",
+        target_path,
+        render_new_document(target_id, "# Target\n\nSoft delete.\n"),
+        expected=ABSENT,
+    )
+    worker.rebuild_owner("t1", "u1")
+    documents.replace(
+        "t1",
+        "u1",
+        source_id,
+        render_new_document(source_id, "# Source changed\n\n[Target](target.md)\n"),
+        expected_state=documents.read_state("t1", "u1", source_path),
+    )
+    link_ready = Event()
+    release_link = Event()
+    original_add = relations.add_relation
+
+    def pause_before_add(relation, *, tenant_id):  # noqa: ANN001, ANN202
+        if relation.source_uri == MemoryDocumentPathPolicy.document_uri("u1", source_id):
+            link_ready.set()
+            assert release_link.wait(5)
+        original_add(relation, tenant_id=tenant_id)
+
+    monkeypatch.setattr(relations, "add_relation", pause_before_add)
+    errors: list[BaseException] = []
+
+    def rebuild_source() -> None:
+        try:
+            worker.rebuild_owner("t1", "u1")
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    mirror_results: list[tuple[str, ...]] = []
+
+    def mirror_soft_barrier(barrier: DocumentPublicationBarrier) -> None:
+        try:
+            mirror_results.append(worker._mirror_barrier(barrier))
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    rebuild_thread = Thread(target=rebuild_source)
+    rebuild_thread.start()
+    assert link_ready.wait(5)
+    barrier = _write_soft_barrier(controls, target_id, target_path)
+    mirror_thread = Thread(target=mirror_soft_barrier, args=(barrier,))
+    mirror_thread.start()
+    mirror_thread.join(0.25)
+    release_link.set()
+    rebuild_thread.join(5)
+    mirror_thread.join(5)
+
+    assert errors == []
+    assert not rebuild_thread.is_alive() and not mirror_thread.is_alive()
+    assert mirror_results
+    target_uri = MemoryDocumentPathPolicy.document_uri("u1", target_id)
+    assert relations.relations_of(target_uri, tenant_id="t1", owner_user_id="u1") == []
+
+
+def test_remove_obsolete_drains_more_than_one_relation_adapter_batch(tmp_path: Path) -> None:
+    documents = FileSystemMemoryDocumentStore(tmp_path)
+    controls = MemoryDocumentControlStore(tmp_path)
+    catalog = SQLiteIndexStore(tmp_path / "catalog.sqlite3")
+    relations = InMemoryRelationStore()
+    worker = MemoryDocumentProjectionWorker(
+        documents,
+        controls,
+        catalog,
+        InMemoryQueueStore(),
+        relation_store=relations,
+    )
+    uri = MemoryDocumentPathPolicy.document_uri("u1", new_document_id())
+    record_key = "memory-document:u1:obsolete"
+    for index in range(1_501):
+        relations.add_relation(
+            ContextRelation(
+                source_uri=uri,
+                relation_type="links_to",
+                target_uri=f"memoryos://resources/target/{index}",
+                metadata={
+                    "tenant_id": "t1",
+                    "owner_user_id": "u1",
+                    "catalog_record_key": record_key,
+                },
+            ),
+            tenant_id="t1",
+        )
+
+    worker._remove_obsolete("t1", (record_key,), {record_key: uri})
+
+    assert relations.relations_of(uri, tenant_id="t1", owner_user_id="u1") == []
+
+
+def test_remove_obsolete_uses_exact_metadata_fallback_for_noncanonical_vector_row(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    documents = FileSystemMemoryDocumentStore(tmp_path)
+    controls = MemoryDocumentControlStore(tmp_path)
+    catalog = SQLiteIndexStore(tmp_path / "catalog.sqlite3")
+    vectors = InMemoryVectorStore()
+    worker = MemoryDocumentProjectionWorker(
+        documents,
+        controls,
+        catalog,
+        InMemoryQueueStore(),
+        vector_store=vectors,
+        embedding_provider=HashingEmbeddingProvider(),
+    )
+    record_key = "memory-document:u1:legacy-vector"
+    expected_row_id = vector_row_id("t1", record_key)
+    metadata = {"tenant_id": "t1", "catalog_record_key": record_key}
+    vectors.upsert_vector(expected_row_id, [1.0], metadata)
+    embedding, stored_metadata = vectors.rows.pop(expected_row_id)
+    vectors._discard_metadata_identity(expected_row_id, stored_metadata)
+    legacy_row_id = "memoryos-vector://legacy/noncanonical-row"
+    vectors.rows[legacy_row_id] = (embedding, stored_metadata)
+    vectors._index_metadata_identity(legacy_row_id, stored_metadata)
+    original_delete = vectors.delete_vector
+
+    def ignore_only_expected_row_id(row_id: str) -> None:
+        if row_id != expected_row_id:
+            original_delete(row_id)
+
+    monkeypatch.setattr(vectors, "delete_vector", ignore_only_expected_row_id)
+
+    worker._remove_obsolete("t1", (record_key,), {})
+
+    assert legacy_row_id not in vectors.rows

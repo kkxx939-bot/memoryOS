@@ -20,7 +20,6 @@ class BehaviorCase:
     user_actual_action: str | None = None
     feedback_type: str = "unknown"
     reward: float = 0.0
-    related_memory_uris: list[str] = field(default_factory=list)
     related_policy_uris: list[str] = field(default_factory=list)
     created_at: str = field(default_factory=utc_now)
 
@@ -38,7 +37,6 @@ class BehaviorCase:
             "user_actual_action": self.user_actual_action,
             "feedback_type": self.feedback_type,
             "reward": self.reward,
-            "related_memory_uris": self.related_memory_uris,
             "related_policy_uris": self.related_policy_uris,
             "created_at": self.created_at,
         }

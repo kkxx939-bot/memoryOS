@@ -60,7 +60,27 @@ def test_sqlite_lock_store_concurrent_acquire_has_one_winner(tmp_path) -> None:
     stores[0].release(winners[0])
 
 
-def test_sqlite_lock_store_migrates_existing_table_with_monotonic_fence(tmp_path) -> None:
+def test_sqlite_lock_store_fresh_schema_is_complete_and_exact(tmp_path) -> None:
+    path = tmp_path / "locks.sqlite3"
+
+    SQLiteLockStore(path)
+
+    with sqlite3.connect(path) as conn:
+        layout = tuple(
+            (row[1], row[2], row[3], row[4], row[5])
+            for row in conn.execute("PRAGMA table_info(locks)")
+        )
+    assert layout == (
+        ("lock_key", "TEXT", 0, None, 1),
+        ("token", "TEXT", 1, None, 0),
+        ("expires_at", "TEXT", 1, None, 0),
+        ("owner", "TEXT", 1, None, 0),
+        ("created_at", "TEXT", 1, None, 0),
+        ("fence", "INTEGER", 1, "0", 0),
+    )
+
+
+def test_sqlite_lock_store_rejects_old_schema_without_alter(tmp_path) -> None:
     path = tmp_path / "locks.sqlite3"
     with sqlite3.connect(path) as conn:
         conn.execute(
@@ -74,15 +94,12 @@ def test_sqlite_lock_store_migrates_existing_table_with_monotonic_fence(tmp_path
             )
             """
         )
-    store = SQLiteLockStore(path)
+    with pytest.raises(RuntimeError, match="unsupported LockStore layout"):
+        SQLiteLockStore(path)
 
     with sqlite3.connect(path) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(locks)").fetchall()}
-    assert "fence" in columns
-    first = store.acquire("migrated")
-    store.release(first)
-    second = store.acquire("migrated")
-    assert (first.fence, second.fence) == (1, 2)
+    assert "fence" not in columns
 
 
 def test_sqlite_lock_store_rejects_stale_token_from_fenced_section(tmp_path) -> None:

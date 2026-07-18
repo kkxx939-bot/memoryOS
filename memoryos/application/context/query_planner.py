@@ -14,7 +14,6 @@ from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.retrieval.query_plan import (
     DEFAULT_CANDIDATE_LIMIT,
     DEFAULT_FINAL_LIMIT,
-    CanonicalResolutionMode,
     RetrievalOptions,
     RetrievalQueryIntent,
     RetrievalQueryPlan,
@@ -27,30 +26,27 @@ _KNOWN_LEGACY_KEYS = frozenset(
         "applicability_scope_keys",
         "applicability_scopes",
         "candidate_limit",
-        "canonical_resolution_mode",
-        "claim_uris",
         "connect_metadata",
         "context_type",
         "context_types",
+        "document_ids",
+        "document_kinds",
         "event_time_from",
         "event_time_to",
         "expand_relations",
         "final_limit",
-        "lifecycle_state",
         "limit",
-        "memory_states",
-        "memory_types",
         "metadata",
         "metadata_filters",
         "owner_user_id",
         "project_id",
         "query_intent",
+        "record_kinds",
         "relation_expansion",
         "retrieval_views",
         "search_scope",
         "session_id",
         "session_ids",
-        "slot_uris",
         "source_kind",
         "source_kinds",
         "target_paths",
@@ -63,21 +59,15 @@ _KNOWN_LEGACY_KEYS = frozenset(
         "updated_at_from",
         "updated_at_to",
         "user_id",
-        "valid_at",
         "workspace_id",
         "workspace_ids",
     }
 )
 
-_PROJECT_SCOPE_KINDS = {
-    "project_rules": "rules",
-    "project_decisions": "decisions",
-    "project_knowledge": "knowledge",
-    "project_agent_experience": "agent_experience",
-}
 _PRINCIPAL_ONLY_WORKSPACE = "__memoryos_principal_only__"
 _CHINESE_CALENDAR_DATE = re.compile(
-    r"(?<!\d)(?:(?P<year>\d{4})\s*年\s*)?(?P<month>\d{1,2})\s*月\s*(?P<day>\d{1,2})\s*日"
+    r"(?<!\d)(?:(?P<year>\d{4})\s*年\s*)?(?:(?P<month>\d{1,2})\s*月\s*)?"
+    r"(?P<day>\d{1,2})\s*(?:号|日)(?!\d)"
 )
 _TRANSACTION_TIME_CUES = (
     "系统新增",
@@ -91,15 +81,16 @@ _TRANSACTION_TIME_CUES = (
     "transaction time",
     "transaction_time",
 )
-_VALID_TIME_CUES = (
-    "当时",
-    "那时",
-    "有效",
-    "使用什么",
-    "用的什么",
-    "是什么状态",
-    "valid at",
-    "valid_at",
+_PAST_CHAT_CUES = (
+    "之前讨论",
+    "之前聊",
+    "讨论过",
+    "聊过",
+    "回顾",
+    "还记得吗",
+    "过去对话",
+    "past chat",
+    "discussed",
 )
 
 
@@ -230,11 +221,27 @@ def _apply_deterministic_query_filters(
     match = matches[0]
     try:
         local_today = _today_in_timezone(now, options.timezone)
-        inferred_date = date(
-            int(match.group("year") or local_today.year),
-            int(match.group("month")),
-            int(match.group("day")),
-        )
+        raw_month = match.group("month")
+        raw_year = match.group("year")
+        day = int(match.group("day"))
+        if raw_month is None:
+            normalized_query = semantic_query.casefold()
+            if not any(cue in normalized_query for cue in _PAST_CHAT_CUES):
+                return options
+            try:
+                candidate = date(local_today.year, local_today.month, day)
+            except ValueError:
+                candidate = None
+            if candidate is None or candidate > local_today:
+                previous_month_end = local_today.replace(day=1) - timedelta(days=1)
+                candidate = date(previous_month_end.year, previous_month_end.month, day)
+            inferred_date = candidate
+        else:
+            inferred_date = date(
+                int(raw_year or local_today.year),
+                int(raw_month),
+                day,
+            )
     except (TypeError, ValueError):
         return options
 
@@ -242,8 +249,8 @@ def _apply_deterministic_query_filters(
     normalized_query = semantic_query.casefold()
     if any(cue in normalized_query for cue in _TRANSACTION_TIME_CUES):
         # Transaction-time questions ask what the system wrote on that day,
-        # including immutable Claim Revision rows that may no longer be the
-        # CURRENT Slot value. Preserve any non-default caller intent; otherwise
+        # including immutable historical rows that may no longer be the
+        # latest source-time value. Preserve any non-default caller intent; otherwise
         # convert the public default to the unified historical view.
         inferred_intent = (
             RetrievalQueryIntent.HISTORY
@@ -259,26 +266,8 @@ def _apply_deterministic_query_filters(
             query_intent=inferred_intent,
         )
 
-    date_followed_by_state = re.search(r"日\s*(?:时|当时|那时)", semantic_query) is not None
-    if date_followed_by_state or any(cue in normalized_query for cue in _VALID_TIME_CUES):
-        if options.valid_at:
-            return options
-        # A deterministically inferred valid-time question needs immutable
-        # Claim Revision candidates. Preserve any non-default caller intent;
-        # otherwise convert CURRENT (the public default) to AS_OF. Scope and
-        # all explicit ACL/path filters were already bound and remain intact.
-        inferred_intent = (
-            RetrievalQueryIntent.AS_OF
-            if options.query_intent == RetrievalQueryIntent.CURRENT
-            else options.query_intent
-        )
-        return replace(options, valid_at=local_day, query_intent=inferred_intent)
-
     if options.event_time_from or options.event_time_to:
         return options
-    target_paths = options.target_paths
-    if not target_paths:
-        target_paths = (f"timeline/{inferred_date:%Y/%m/%d}",)
     inferred_intent = (
         RetrievalQueryIntent.OPEN_RECALL
         if options.query_intent == RetrievalQueryIntent.CURRENT
@@ -286,7 +275,6 @@ def _apply_deterministic_query_filters(
     )
     return replace(
         options,
-        target_paths=target_paths,
         event_time_from=local_day,
         event_time_to=local_day,
         query_intent=inferred_intent,
@@ -389,6 +377,13 @@ def merge_retrieval_options(primary: RetrievalOptions, fallback: RetrievalOption
         target_paths=_merge_compatible_collection(primary.target_paths, fallback.target_paths, "target_paths"),
         context_types=_merge_compatible_collection(primary.context_types, fallback.context_types, "context_types"),
         source_kinds=_merge_compatible_collection(primary.source_kinds, fallback.source_kinds, "source_kinds"),
+        record_kinds=_merge_compatible_collection(primary.record_kinds, fallback.record_kinds, "record_kinds"),
+        document_ids=_merge_compatible_collection(primary.document_ids, fallback.document_ids, "document_ids"),
+        document_kinds=_merge_compatible_collection(
+            primary.document_kinds,
+            fallback.document_kinds,
+            "document_kinds",
+        ),
         tenant_id=_merge_explicit_scalar(primary.tenant_id, fallback.tenant_id, "tenant_id"),
         owner_user_id=_merge_explicit_scalar(
             primary.owner_user_id,
@@ -428,7 +423,6 @@ def merge_retrieval_options(primary: RetrievalOptions, fallback: RetrievalOption
             fallback.updated_at_to,
             "updated_at_to",
         ),
-        valid_at=_merge_explicit_scalar(primary.valid_at, fallback.valid_at, "valid_at"),
         metadata_filters=_merge_metadata(fallback.metadata_filters, primary.metadata_filters),
         legacy_search_scope=_merge_explicit_scalar(
             primary.legacy_search_scope,
@@ -456,24 +450,16 @@ def retrieval_options_from_legacy(flat_kwargs: Mapping[str, Any]) -> RetrievalOp
     if unknown:
         raise ValueError(f"unknown legacy retrieval options: {', '.join(unknown)}")
     raw = {key: value for key, value in flat_kwargs.items() if value is not None}
-    explicit_query_intent = "query_intent" in raw
-    requested_memory_states = {
-        str(item).strip().upper()
-        for item in _sequence_value(raw.get("memory_states"), "memory_states")
-        if str(item).strip()
-    }
-
     owner_user_id = _coalesce_scalar_alias(raw, "owner_user_id", "user_id")
     workspace_ids = _coalesce_collection_aliases(raw, "workspace_ids", ("workspace_id", "project_id"))
     session_ids = _coalesce_collection_aliases(raw, "session_ids", ("session_id",))
     context_types = _coalesce_type_filters(raw)
     source_kinds = _coalesce_sequence_alias(raw, "source_kinds", "source_kind")
+    record_kinds = _pop_sequence(raw, "record_kinds")
+    document_ids = _pop_sequence(raw, "document_ids")
+    document_kinds = _pop_sequence(raw, "document_kinds")
 
-    target_uris = _merge_sequences(
-        _pop_sequence(raw, "target_uris"),
-        _pop_sequence(raw, "claim_uris"),
-        _pop_sequence(raw, "slot_uris"),
-    )
+    target_uris = _pop_sequence(raw, "target_uris")
     target_paths = _pop_sequence(raw, "target_paths")
 
     final_limit = _coalesce_limit(raw)
@@ -487,41 +473,9 @@ def retrieval_options_from_legacy(flat_kwargs: Mapping[str, Any]) -> RetrievalOp
     search_scope_value = raw.pop("search_scope", None)
     search_scope = _optional_string(search_scope_value, "search_scope")
     explicit_views = _pop_sequence(raw, "retrieval_views")
-    project_id = _optional_string(flat_kwargs.get("project_id"), "project_id")
+    retrieval_views = explicit_views
     adapter_id = _optional_string(raw.get("adapter_id"), "adapter_id")
-    retrieval_views = _legacy_retrieval_views(
-        search_scope=search_scope,
-        explicit_views=explicit_views,
-        owner_user_id=owner_user_id,
-        project_id=project_id,
-        adapter_id=adapter_id,
-    )
-    view_constraints = _translate_retrieval_views(retrieval_views)
-
-    owner_user_id = _merge_scalar_constraint(
-        owner_user_id,
-        view_constraints.owner_user_id,
-        "owner_user_id",
-    )
-    adapter_id = _merge_scalar_constraint(adapter_id, view_constraints.adapter_id, "adapter_id")
-    workspace_ids = _intersect_or_inherit(
-        workspace_ids,
-        view_constraints.workspace_ids,
-        "workspace_ids",
-    )
-    target_paths = _merge_sequences(target_paths, view_constraints.target_paths)
-    if retrieval_views:
-        metadata_filters = _merge_metadata(metadata_filters, {"retrieval_views": list(retrieval_views)})
-        if not context_types:
-            context_types = (ContextType.MEMORY,)
-    if search_scope in {"candidates", "all_with_candidates"}:
-        metadata_filters = _merge_metadata(metadata_filters, {"include_candidates": True})
-
-    inferred_intent = _legacy_intent_for_states(requested_memory_states)
-    query_intent_raw = raw.pop(
-        "query_intent",
-        inferred_intent if not explicit_query_intent and inferred_intent is not None else RetrievalQueryIntent.CURRENT,
-    )
+    query_intent_raw = raw.pop("query_intent", RetrievalQueryIntent.CURRENT)
     try:
         query_intent = (
             query_intent_raw
@@ -530,14 +484,14 @@ def retrieval_options_from_legacy(flat_kwargs: Mapping[str, Any]) -> RetrievalOp
         )
     except ValueError as exc:
         raise ValueError(f"unknown legacy query_intent: {query_intent_raw!r}") from exc
-    if search_scope == "candidates" and query_intent == RetrievalQueryIntent.CURRENT:
-        query_intent = RetrievalQueryIntent.OPTIONS
-
     options = RetrievalOptions(
         target_uris=target_uris,
         target_paths=target_paths,
         context_types=context_types,
         source_kinds=source_kinds,
+        record_kinds=record_kinds,
+        document_ids=document_ids,
+        document_kinds=document_kinds,
         tenant_id=raw.pop("tenant_id", None),
         owner_user_id=owner_user_id,
         workspace_ids=workspace_ids,
@@ -549,10 +503,8 @@ def retrieval_options_from_legacy(flat_kwargs: Mapping[str, Any]) -> RetrievalOp
         transaction_time_to=raw.pop("transaction_time_to", None),
         updated_at_from=raw.pop("updated_at_from", None),
         updated_at_to=raw.pop("updated_at_to", None),
-        valid_at=raw.pop("valid_at", None),
         timezone=raw.pop("timezone", "UTC"),
         query_intent=query_intent,
-        canonical_resolution_mode=raw.pop("canonical_resolution_mode", CanonicalResolutionMode.AUTO),
         relation_expansion=relation_expansion,
         candidate_limit=candidate_limit,
         final_limit=final_limit,
@@ -565,100 +517,6 @@ def retrieval_options_from_legacy(flat_kwargs: Mapping[str, Any]) -> RetrievalOp
         # Every accepted key must have a deterministic destination above.
         raise AssertionError(f"unconsumed legacy retrieval options: {', '.join(sorted(raw))}")
     return options
-
-
-@dataclass(frozen=True)
-class _ViewConstraints:
-    target_paths: tuple[str, ...] = ()
-    owner_user_id: str | None = None
-    workspace_ids: tuple[str, ...] = ()
-    adapter_id: str | None = None
-
-
-def _legacy_retrieval_views(
-    *,
-    search_scope: str | None,
-    explicit_views: tuple[str, ...],
-    owner_user_id: str | None,
-    project_id: str | None,
-    adapter_id: str | None,
-) -> tuple[str, ...]:
-    if explicit_views:
-        return explicit_views
-    if search_scope is None:
-        return ()
-    if search_scope not in {
-        "default",
-        "agent_private",
-        "user_profile",
-        "user_preferences",
-        "all_shared_memory",
-        "candidates",
-        "all_with_candidates",
-        *_PROJECT_SCOPE_KINDS,
-    }:
-        raise ValueError(f"unsupported legacy search_scope: {search_scope!r}")
-    if search_scope == "agent_private":
-        if not adapter_id:
-            raise ValueError("agent_private search_scope requires adapter_id")
-        return (f"agent:{adapter_id}:private",)
-    if search_scope == "user_profile":
-        if not owner_user_id:
-            raise ValueError("user_profile search_scope requires user_id")
-        return (f"user:{owner_user_id}:profile",)
-    if search_scope == "user_preferences":
-        if not owner_user_id:
-            raise ValueError("user_preferences search_scope requires user_id")
-        return (f"user:{owner_user_id}:preferences",)
-    if search_scope in _PROJECT_SCOPE_KINDS:
-        if not project_id:
-            raise ValueError(f"{search_scope} search_scope requires project_id")
-        return (f"project:{project_id}:{_PROJECT_SCOPE_KINDS[search_scope]}",)
-
-    views: list[str] = []
-    if search_scope not in {"all_shared_memory"} and adapter_id:
-        views.append(f"agent:{adapter_id}:private")
-    if owner_user_id:
-        views.extend((f"user:{owner_user_id}:profile", f"user:{owner_user_id}:preferences"))
-    if project_id:
-        views.extend(f"project:{project_id}:{kind}" for kind in ("rules", "decisions", "knowledge", "agent_experience"))
-    if not views:
-        raise ValueError(f"{search_scope} search_scope resolved to no authorized retrieval views")
-    return tuple(views)
-
-
-def _translate_retrieval_views(retrieval_views: tuple[str, ...]) -> _ViewConstraints:
-    paths: list[str] = []
-    owners: list[str] = []
-    workspaces: list[str] = []
-    adapters: list[str] = []
-    for view in retrieval_views:
-        parts = view.split(":")
-        if len(parts) < 3:
-            continue
-        namespace = parts[0].lower()
-        identifier = ":".join(parts[1:-1]).strip()
-        kind = parts[-1].lower()
-        if not identifier:
-            raise ValueError(f"invalid legacy retrieval_view: {view!r}")
-        if namespace == "user" and kind in {"profile", "preferences"}:
-            owners.append(identifier)
-            paths.append(f"memories/{'profiles' if kind == 'profile' else 'preferences'}")
-        elif namespace == "project" and kind in {"rules", "decisions", "knowledge", "agent_experience"}:
-            workspaces.append(identifier)
-            if kind in {"rules", "decisions"}:
-                paths.append(f"memories/{kind}")
-            else:
-                paths.append(f"projects/{identifier}")
-        elif namespace == "agent" and kind == "private":
-            adapters.append(identifier)
-            paths.append(f"agents/{identifier}")
-    return _ViewConstraints(
-        target_paths=_dedupe(paths),
-        owner_user_id=_one_or_none(owners, "owner_user_id"),
-        workspace_ids=_dedupe(workspaces),
-        adapter_id=_one_or_none(adapters, "adapter_id"),
-    )
 
 
 def _coalesce_scalar_alias(raw: dict[str, Any], primary: str, alias: str) -> str | None:
@@ -737,13 +595,7 @@ def _merged_metadata_filters(raw: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(value, Mapping):
                 raise TypeError(f"{key} must be a mapping")
             merged = _merge_metadata(merged, value)
-    for legacy_key in (
-        "applicability_scope_keys",
-        "applicability_scopes",
-        "memory_states",
-        "memory_types",
-        "lifecycle_state",
-    ):
+    for legacy_key in ("applicability_scope_keys", "applicability_scopes"):
         value = raw.pop(legacy_key, None)
         if value is not None:
             merged = _merge_metadata(merged, {legacy_key: value})
@@ -897,21 +749,6 @@ def _sequence_value(value: Any, key: str) -> tuple[Any, ...]:
     if not isinstance(value, Sequence):
         raise TypeError(f"{key} must be a sequence")
     return _dedupe(list(value))
-
-
-def _legacy_intent_for_states(states: set[str]) -> RetrievalQueryIntent | None:
-    """Preserve the canonical intent historically implied by state filters."""
-
-    if states & {"SUPERSEDED", "RETRACTED"}:
-        return RetrievalQueryIntent.HISTORY
-    conflicted = "CONFLICTED" in states or "CONFLICT" in states
-    if conflicted and states <= {"CONFLICT", "CONFLICTED"}:
-        return RetrievalQueryIntent.CONFLICTS
-    if states & {"PROPOSED", "CONFLICT", "CONFLICTED"} and "ACTIVE" not in states:
-        return RetrievalQueryIntent.OPTIONS
-    if states == {"ACTIVE"}:
-        return RetrievalQueryIntent.CURRENT
-    return None
 
 
 def _merge_sequences(*values: tuple[Any, ...]) -> tuple[Any, ...]:

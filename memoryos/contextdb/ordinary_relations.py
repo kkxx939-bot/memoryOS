@@ -114,24 +114,25 @@ def ordinary_relation_specs_for_object(obj: ContextObject) -> list[dict[str, Any
         )
 
     if obj.context_type == ContextType.ACTION_POLICY:
-        add(obj.uri, "anchored_by", str(metadata.get("memory_anchor_uri", "")), authority_metadata)
+        add(obj.uri, "anchored_by", str(metadata.get("support_anchor_uri", "")), authority_metadata)
         for uri in metadata.get("required_resource_uris", []) or []:
             add(obj.uri, "requires_resource", str(uri), authority_metadata)
         for uri in metadata.get("required_skill_uris", []) or []:
             add(obj.uri, "requires_skill", str(uri), authority_metadata)
         for uri in metadata.get("supported_behavior_pattern_uris", []) or []:
             add(obj.uri, "supported_by", str(uri), authority_metadata)
-        for uri in metadata.get("constrained_by_memory_uris", []) or []:
+        for uri in metadata.get("constrained_by_support_uris", []) or []:
             add(obj.uri, "constrained_by", str(uri), authority_metadata)
     elif obj.context_type in {ContextType.BEHAVIOR_PATTERN, ContextType.BEHAVIOR_CLUSTER}:
-        add(obj.uri, "anchored_by", str(metadata.get("memory_anchor_uri", "")), authority_metadata)
+        add(obj.uri, "anchored_by", str(metadata.get("support_anchor_uri", "")), authority_metadata)
         for uri in metadata.get("case_refs", []) or []:
             add(obj.uri, "aggregated_from", str(uri), authority_metadata)
         for uri in metadata.get("related_policy_uris", []) or metadata.get("policy_uris", []) or []:
             add(str(uri), "supported_by", obj.uri, authority_metadata)
-    elif obj.context_type == ContextType.MEMORY:
+    elif obj.context_type == ContextType.ACTION_POLICY_SUPPORT:
         for policy_uri in metadata.get("constrains_policy_uris", []) or []:
             add(str(policy_uri), "constrained_by", obj.uri, authority_metadata)
+    elif obj.context_type == ContextType.BEHAVIOR_SUPPORT:
         for behavior_uri in metadata.get("supporting_behavior_uris", []) or []:
             add(obj.uri, "evidence_for", str(behavior_uri), authority_metadata)
 

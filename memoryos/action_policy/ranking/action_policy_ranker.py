@@ -14,12 +14,12 @@ class ActionPolicyRanker:
         policies: list[ActionPolicy],
         similarity_scores: dict[str, float] | None = None,
         context_feasibility: dict[str, float] | None = None,
-        verified_memory_anchor_uris: Collection[str] | None = None,
+        verified_support_anchor_uris: Collection[str] | None = None,
     ) -> list[ActionCandidate]:
         similarity_scores = similarity_scores or {}
         context_feasibility = context_feasibility or {}
         verified_anchors = {
-            str(uri) for uri in (verified_memory_anchor_uris or ()) if str(uri)
+            str(uri) for uri in (verified_support_anchor_uris or ()) if str(uri)
         }
         candidates = []
         for policy in policies:
@@ -30,8 +30,8 @@ class ActionPolicyRanker:
                 "behavior_pattern_confidence": policy.confidence,
                 "q_value": policy.q_value,
                 "reward_score_normalized": min(1.0, policy.reward_score / 10.0),
-                "memory_anchor_match": 1.0
-                if policy.memory_anchor_uri and policy.memory_anchor_uri in verified_anchors
+                "support_anchor_match": 1.0
+                if policy.support_anchor_uri and policy.support_anchor_uri in verified_anchors
                 else 0.0,
                 "context_feasibility": context_feasibility.get(policy.uri, 0.5),
                 "penalty_score": min(1.0, policy.penalty_score / 10.0),
@@ -42,7 +42,7 @@ class ActionPolicyRanker:
                 + features["behavior_pattern_confidence"] * 0.20
                 + features["q_value"] * 0.25
                 + features["reward_score_normalized"] * 0.10
-                + features["memory_anchor_match"] * 0.10
+                + features["support_anchor_match"] * 0.10
                 + features["context_feasibility"] * 0.10
                 - features["penalty_score"] * 0.20
                 - features["safety_risk"] * 0.50

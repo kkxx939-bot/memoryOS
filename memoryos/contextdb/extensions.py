@@ -44,7 +44,7 @@ class ContextDomainOverlay(ContextDomainClassifier, Protocol):
         uri: str,
         *,
         owner_user_id: str | None = None,
-        tenant_id: str | None = None,
+        tenant_id: str,
     ) -> list[ContextRelation]: ...
 
 
@@ -94,7 +94,7 @@ class NoDomainOverlay:
         uri: str,
         *,
         owner_user_id: str | None = None,
-        tenant_id: str | None = None,
+        tenant_id: str,
     ) -> list[ContextRelation]:
         del source_store
         return relation_store.relations_of(

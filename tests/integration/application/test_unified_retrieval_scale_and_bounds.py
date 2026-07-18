@@ -2,27 +2,90 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Sequence
-from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
 from memoryos.api.sdk.client import MemoryOSClient
-from memoryos.contextdb.catalog import CatalogRecord, CatalogRecordKind
+from memoryos.contextdb.catalog import CatalogRecord, CatalogRecordKind, catalog_vector_metadata
 from memoryos.contextdb.context_db import ContextDB
+from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.retrieval.candidate_generator import CandidateGenerator
 from memoryos.contextdb.retrieval.orchestrator import UnifiedRetrievalOrchestrator
-from memoryos.contextdb.retrieval.query_plan import (
-    CanonicalResolutionMode,
-    RetrievalOptions,
-    RetrievalQueryIntent,
-    RetrievalQueryPlan,
+from memoryos.contextdb.retrieval.query_plan import RetrievalOptions, RetrievalQueryIntent, RetrievalQueryPlan
+from memoryos.contextdb.store.local_stores import (
+    FileSystemSourceStore,
+    InMemoryIndexStore,
+    InMemoryRelationStore,
 )
-from memoryos.contextdb.store.local_stores import FileSystemSourceStore, InMemoryRelationStore
 from memoryos.contextdb.store.sqlite_index_store import SQLiteIndexStore
-from memoryos.contextdb.store.vector_store import InMemoryVectorStore, VectorHit
+from memoryos.contextdb.store.vector_store import InMemoryVectorStore, VectorHit, vector_row_id
 
 _TIME = "2026-07-14T03:30:00+00:00"
+
+
+def test_candidate_generator_binds_tenant_on_generic_index_search() -> None:
+    index = InMemoryIndexStore()
+    shared_uri = "memoryos://user/u1/resources/shared"
+    for tenant_id, content in (
+        ("tenant-a", "tenant-bound-query visible-a"),
+        ("tenant-b", "tenant-bound-query hidden-b"),
+    ):
+        index.upsert_index(
+            ContextObject(
+                uri=shared_uri,
+                context_type=ContextType.RESOURCE,
+                title=content,
+                tenant_id=tenant_id,
+                owner_user_id="u1",
+            ),
+            content=content,
+            tenant_id=tenant_id,
+        )
+    generated = CandidateGenerator(index).generate(
+        RetrievalQueryPlan(
+            semantic_query="tenant-bound-query",
+            tenant_id="tenant-a",
+            owner_user_id="u1",
+            candidate_limit=10,
+            final_limit=10,
+        )
+    )
+    assert generated.fts_candidates == 1
+    assert generated.branches["lexical"][0].tenant_id == "tenant-a"
+    assert generated.branches["lexical"][0].title.endswith("visible-a")
+
+
+def test_generic_in_memory_index_preserves_source_digest_for_bounded_l2(tmp_path: Path) -> None:
+    source = FileSystemSourceStore(tmp_path / "embedded-source", tenant_id="tenant-a")
+    index = InMemoryIndexStore()
+    obj = ContextObject(
+        uri="memoryos://user/u1/resources/embedded",
+        context_type=ContextType.RESOURCE,
+        title="embedded resource",
+        tenant_id="tenant-a",
+        owner_user_id="u1",
+    )
+    content = "embedded-l2-marker exact source bytes"
+    source.write_object(obj, content=content)
+    index.upsert_index(obj, content=content, tenant_id="tenant-a")
+
+    result = UnifiedRetrievalOrchestrator(
+        ContextDB(source, index, InMemoryRelationStore())
+    ).execute(
+        RetrievalQueryPlan(
+            semantic_query="embedded-l2-marker",
+            context_types=(ContextType.RESOURCE,),
+            tenant_id="tenant-a",
+            owner_user_id="u1",
+            candidate_limit=10,
+            final_limit=10,
+            token_budget=1_024,
+        )
+    )
+
+    assert result.contexts[0]["selected_layer"] == "L2"
+    assert result.contexts[0]["content"] == content
 
 
 def _session_root(session_index: int) -> CatalogRecord:
@@ -83,115 +146,104 @@ def _tool_result(tool_index: int) -> CatalogRecord:
     )
 
 
-def _current_slot(slot_index: int) -> CatalogRecord:
-    slot_id = f"slot-{slot_index:04d}"
-    claim_id = f"claim-{slot_index:04d}-b"
+def _memory_document(document_index: int) -> CatalogRecord:
+    document_id = f"document-{document_index:04d}"
+    uri = f"memoryos://user/u1/memories/documents/{document_id}"
     return CatalogRecord(
-        record_key=f"slot:{slot_id}:current",
-        uri=f"memoryos://user/u1/memories/canonical/slots/{slot_id}",
+        record_key=f"memory-document:u1:{document_id}",
+        uri=uri,
         tenant_id="tenant-a",
         owner_user_id="u1",
         context_type="memory",
-        source_kind="canonical_projection",
-        record_kind=CatalogRecordKind.CURRENT_SLOT.value,
-        tree_paths=(f"memories/preferences/user-{slot_index:04d}/dimension",),
+        source_kind="markdown_memory_document",
+        record_kind=CatalogRecordKind.MEMORY_DOCUMENT.value,
+        tree_paths=(f"memories/knowledge/topics/user-{document_index:04d}",),
+        primary_tree_path=f"memories/knowledge/topics/user-{document_index:04d}",
         created_at=_TIME,
         updated_at=_TIME,
         transaction_time=_TIME,
-        valid_from=_TIME,
-        title=f"Current slot {slot_index}",
-        l0_text=f"Current preference {slot_index}",
-        l1_text=f"Current canonical value {slot_index}",
-        source_uri=f"memoryos://user/u1/memories/canonical/slots/{slot_id}/claims/{claim_id}",
-        source_digest=f"current-digest-{slot_index:04d}",
+        title=f"Topic document {document_index}",
+        l0_text=f"Topic {document_index}",
+        l1_text=f"Markdown topic document {document_index}",
+        l2_uri=uri,
+        source_uri=uri,
+        source_digest=f"document-digest-{document_index:04d}",
         source_revision=3,
-        canonical_slot_id=slot_id,
-        canonical_slot_uri=f"memoryos://user/u1/memories/canonical/slots/{slot_id}",
-        canonical_claim_id=claim_id,
-        canonical_claim_uri=f"memoryos://user/u1/memories/canonical/slots/{slot_id}/claims/{claim_id}",
-        canonical_revision=1,
-        canonical_state="ACTIVE",
-        canonical_head_digest=f"head-{slot_index:04d}",
-        receipt_digest=f"receipt-{slot_index:04d}",
-        projection_effect_hash=f"effect-{slot_index:04d}",
-        metadata={"memory_type": "preference", "canonical_value": slot_index},
+        document_id=document_id,
+        document_kind="topic",
+        document_revision=3,
+        projection_generation=3,
+        projection_effect_hash=f"document-digest-{document_index:04d}",
+        metadata={"relative_path": f"knowledge/topics/user-{document_index:04d}.md"},
     )
 
 
-def _claim_revision(slot_index: int, claim_suffix: str, revision: int) -> CatalogRecord:
-    slot_id = f"slot-{slot_index:04d}"
-    claim_id = f"claim-{slot_index:04d}-{claim_suffix}"
-    state = "ACTIVE" if claim_suffix == "b" else "SUPERSEDED"
+def _memory_block(document_index: int, block_index: int) -> CatalogRecord:
+    document = _memory_document(document_index)
+    block_id = f"block-{document_index:04d}-{block_index}"
     return CatalogRecord(
-        record_key=f"claim:{claim_id}:revision:{revision}",
-        uri=f"memoryos://user/u1/memories/canonical/slots/{slot_id}/claims/{claim_id}",
-        tenant_id="tenant-a",
-        owner_user_id="u1",
-        context_type="memory",
-        source_kind="canonical_projection",
-        record_kind=CatalogRecordKind.CLAIM_REVISION.value,
-        tree_paths=(f"memories/preferences/user-{slot_index:04d}/dimension",),
-        created_at=_TIME,
-        updated_at=_TIME,
-        transaction_time=_TIME,
-        valid_from=_TIME,
-        title=f"Claim {claim_id} revision {revision}",
-        l0_text=f"Claim {claim_suffix}",
-        l1_text=f"Canonical history value {slot_index}-{claim_suffix}-{revision}",
-        source_uri=f"memoryos://user/u1/memories/canonical/slots/{slot_id}/claims/{claim_id}",
-        source_digest=f"claim-digest-{slot_index:04d}-{claim_suffix}-{revision}",
-        source_revision=revision,
-        canonical_slot_id=slot_id,
-        canonical_slot_uri=f"memoryos://user/u1/memories/canonical/slots/{slot_id}",
-        canonical_claim_id=claim_id,
-        canonical_claim_uri=f"memoryos://user/u1/memories/canonical/slots/{slot_id}/claims/{claim_id}",
-        canonical_revision=revision,
-        canonical_state=state,
-        metadata={"memory_type": "preference", "canonical_value": f"{slot_index}-{claim_suffix}"},
+        **{
+            **document.__dict__,
+            "record_key": f"memory-block:u1:{block_id}",
+            "uri": f"{document.uri}/blocks/{block_id}",
+            "record_kind": CatalogRecordKind.MEMORY_BLOCK.value,
+            "parent_uri": document.uri,
+            "block_id": block_id,
+            "title": f"Topic section {block_index}",
+            "l0_text": f"Section {block_index}",
+            "l1_text": f"Markdown block {document_index}-{block_index}",
+        }
     )
 
 
-def test_sqlite_catalog_handles_1000_sessions_10000_tools_and_1000_slot_histories(
+def test_sqlite_catalog_handles_1000_sessions_10000_tools_and_1000_memory_documents(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
     store = SQLiteIndexStore(tmp_path / "scale.sqlite3")
 
-    records: list[CatalogRecord] = []
-    records.extend(_session_root(index) for index in range(1_000))
-    records.extend(_tool_result(index) for index in range(10_000))
-    for index in range(1_000):
-        records.extend(
-            (
-                _current_slot(index),
-                _claim_revision(index, "a", 1),
-                _claim_revision(index, "a", 2),
-                _claim_revision(index, "b", 1),
-            )
-        )
+    records = [
+        *(_session_root(index) for index in range(1_000)),
+        *(_tool_result(index) for index in range(10_000)),
+    ]
     for start in range(0, len(records), 500):
-        assert store.upsert_catalog_batch(records[start : start + 500]) == len(records[start : start + 500])
+        assert store.upsert_catalog_batch(
+            records[start : start + 500], tenant_id="tenant-a"
+        ) == len(records[start : start + 500])
+    for index in range(1_000):
+        document = _memory_document(index)
+        store.replace_memory_document_projection(
+            document,
+            tuple(_memory_block(index, block_index) for block_index in range(3)),
+            None,
+            tenant_id="tenant-a",
+            owner_user_id="u1",
+        )
+    # Keep a hard serving ceiling while allowing this deliberately oversized
+    # fixture to exercise FTS plus ACL and path predicates in one query.
+    store.online_vm_step_limit = 5_000_000
 
     filters = {
         "tenant_id": "tenant-a",
         "principal_owner_id": "u1",
         "workspace_access_ids": ("", "memoryOS"),
         "context_types": ("session",),
-        "source_kinds": ("tool_result",),
+        "record_kinds": (CatalogRecordKind.TOOL_RESULT.value,),
         "target_paths": ("resources/repository",),
         "event_time_from": "2026-07-14T00:00:00+00:00",
         "event_time_to": "2026-07-15T00:00:00+00:00",
     }
-    hits = store.search_catalog("boundedneedle09999", filters=filters, limit=25)
+    hits = store.search_catalog("boundedneedle09999", tenant_id="tenant-a", filters=filters, limit=25)
     assert hits
     assert hits[0].metadata["catalog_record_key"] == "session:session-0999:tool:09999"
     assert len(hits) <= 25
 
     with sqlite3.connect(store.path) as conn:
         counts = dict(conn.execute("SELECT record_kind, count(*) FROM contexts GROUP BY record_kind"))
-        current_duplicates = conn.execute(
-            "SELECT count(*) FROM (SELECT canonical_slot_id FROM contexts "
-            "WHERE record_kind = 'current_slot' GROUP BY tenant_id, canonical_slot_id HAVING count(*) > 1)"
+        document_duplicates = conn.execute(
+            "SELECT count(*) FROM (SELECT document_id FROM contexts "
+            "WHERE record_kind = 'memory_document' "
+            "GROUP BY tenant_id, owner_user_id, document_id HAVING count(*) > 1)"
         ).fetchone()[0]
 
         def explain(sql: str, parameters: Sequence[Any]) -> str:
@@ -227,39 +279,44 @@ def test_sqlite_catalog_handles_1000_sessions_10000_tools_and_1000_slot_historie
         }
     assert counts[CatalogRecordKind.SESSION_ROOT.value] == 1_000
     assert counts[CatalogRecordKind.TOOL_RESULT.value] == 10_000
-    assert counts[CatalogRecordKind.CURRENT_SLOT.value] == 1_000
-    assert counts[CatalogRecordKind.CLAIM_REVISION.value] == 3_000
-    assert current_duplicates == 0
+    assert counts[CatalogRecordKind.MEMORY_DOCUMENT.value] == 1_000
+    assert counts[CatalogRecordKind.MEMORY_BLOCK.value] == 3_000
+    assert document_duplicates == 0
 
-    query_plan = " ".join(store.explain_structured_query(filters, limit=25))
-    assert "idx_context_path_acl_workspace_event" in query_plan
-    assert "idx_contexts_record_key" in query_plan
+    query_plan = " ".join(
+        store.explain_structured_query(tenant_id="tenant-a", filters=filters, limit=25)
+    )
+    assert "idx_contexts_tenant_event_time" in query_plan
+    assert "idx_context_path" in query_plan
+    assert "context_acl_grants" in query_plan
     assert "INDEX" in index_plans["tenant"]
-    assert "idx_contexts_tenant_owner_type" in index_plans["owner"]
-    assert "idx_context_paths_type_path" in index_plans["context_type"]
-    assert "idx_context_paths_path_valid" in index_plans["path"]
+    assert "INDEX" in index_plans["owner"]
+    assert "idx_context_paths_tenant_path" in index_plans["context_type"]
+    assert "idx_context_paths_tenant_path" in index_plans["path"]
     assert "idx_contexts_tenant_event_time" in index_plans["event_time"]
     assert "idx_contexts_tenant_transaction_time" in index_plans["transaction_time"]
-    current_slot_plan = " ".join(
+    document_plan = " ".join(
         store.explain_structured_query(
-            {
+            tenant_id="tenant-a",
+            filters={
                 "tenant_id": "tenant-a",
-                "canonical_slot_ids": ("slot-0001",),
-                "record_kinds": (CatalogRecordKind.CURRENT_SLOT.value,),
+                "document_ids": ("document-0001",),
+                "record_kinds": (CatalogRecordKind.MEMORY_DOCUMENT.value,),
             },
             limit=1,
         )
     )
-    assert "uq_contexts_current_slot" in current_slot_plan
-    exact_current = store.list_catalog(
+    assert "idx_contexts_tenant_document_id" in document_plan
+    exact_document = store.list_catalog(
+        tenant_id="tenant-a",
         filters={
             "tenant_id": "tenant-a",
-            "canonical_slot_ids": ("slot-0001",),
-            "record_kinds": (CatalogRecordKind.CURRENT_SLOT.value,),
+            "document_ids": ("document-0001",),
+            "record_kinds": (CatalogRecordKind.MEMORY_DOCUMENT.value,),
         },
         limit=1,
     )
-    assert [record.record_key for record in exact_current] == ["slot:slot-0001:current"]
+    assert [record.record_key for record in exact_document] == ["memory-document:u1:document-0001"]
 
     source = FileSystemSourceStore(tmp_path / "source", tenant_id="tenant-a")
     vector = _NoEnumerationVector()
@@ -281,14 +338,13 @@ def test_sqlite_catalog_handles_1000_sessions_10000_tools_and_1000_slot_historie
             semantic_query="boundedneedle09999",
             target_paths=("resources/repository",),
             context_types=(ContextType.SESSION,),
-            source_kinds=("tool_result",),
+            record_kinds=(CatalogRecordKind.TOOL_RESULT.value,),
             tenant_id="tenant-a",
             owner_user_id="u1",
             workspace_ids=("memoryOS",),
             event_time_from="2026-07-14T00:00:00+00:00",
             event_time_to="2026-07-15T00:00:00+00:00",
             query_intent=RetrievalQueryIntent.OPEN_RECALL,
-            canonical_resolution_mode=CanonicalResolutionMode.DISABLED,
             candidate_limit=25,
             final_limit=10,
             token_budget=1_024,
@@ -299,20 +355,19 @@ def test_sqlite_catalog_handles_1000_sessions_10000_tools_and_1000_slot_historie
     assert result.metrics.structured_candidates == 0
     assert result.metrics.exact_candidates == 0
     assert result.metrics.fts_candidates == 1
-    assert result.metrics.canonical_validated <= 25
+    assert result.metrics.selected_count <= 25
     assert result.metrics.source_reads <= 28
     assert result.metrics.vector_overfetch <= 200
     assert result.metrics.selected_count <= 10
     assert vector.max_candidate_count <= 25
 
 
-def test_exact_slot_identity_bounds_10000_revisions_before_current_and_history_top_k(
+def test_document_identity_bounds_10000_blocks_before_document_and_block_top_k(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
-    store = SQLiteIndexStore(tmp_path / "same-slot-history.sqlite3")
-    current = _current_slot(9_999)
-    slot_uri = current.canonical_slot_uri
+    store = SQLiteIndexStore(tmp_path / "large-memory-document.sqlite3")
+    document = _memory_document(9_999)
     private_scope = {
         "visibility": {
             "tenant_id": "tenant-a",
@@ -321,95 +376,109 @@ def test_exact_slot_identity_bounds_10000_revisions_before_current_and_history_t
             "allowed_service_ids": (),
         }
     }
-    current = replace(
-        current,
-        uri=f"{slot_uri}/serving/current",
-        metadata={**dict(current.metadata), "scope": private_scope},
+    document = CatalogRecord(
+        **{
+            **document.__dict__,
+            "metadata": {**dict(document.metadata), "scope": private_scope},
+        }
     )
-    history = tuple(
-        replace(
-            record,
-            metadata={**dict(record.metadata), "scope": private_scope},
+    blocks = tuple(
+        CatalogRecord(
+            **{
+                **record.__dict__,
+                "metadata": {**dict(record.metadata), "scope": private_scope},
+            }
         )
-        for record in (
-            _claim_revision(9_999, "history", revision) for revision in range(1, 10_001)
-        )
+        for record in (_memory_block(9_999, block_index) for block_index in range(10_000))
     )
-    store.upsert_catalog(current)
-    for start in range(0, len(history), 500):
-        assert store.upsert_catalog_batch(history[start : start + 500]) == len(
-            history[start : start + 500]
-        )
+    store.replace_memory_document_projection(
+        document,
+        blocks,
+        None,
+        tenant_id="tenant-a",
+        owner_user_id="u1",
+    )
 
     real_list_catalog = store.list_catalog
-    identity_calls: list[tuple[dict[str, Any], int]] = []
+    catalog_calls: list[tuple[dict[str, Any], int]] = []
 
     def recording_list_catalog(
         *,
+        tenant_id: str,
         filters: dict[str, Any] | None = None,
         limit: int = 100,
     ) -> list[CatalogRecord]:
         copied = dict(filters or {})
-        if copied.get("target_identity_uris"):
-            identity_calls.append((copied, limit))
-        return real_list_catalog(filters=copied, limit=limit)
+        if copied.get("target_identity_uris") or copied.get("document_ids"):
+            catalog_calls.append((copied, limit))
+        return real_list_catalog(tenant_id=tenant_id, filters=copied, limit=limit)
 
     monkeypatch.setattr(store, "list_catalog", recording_list_catalog)
-    # An unbounded 10k-row identity materialization exceeds this ceiling;
-    # the indexed branch-local Top-K remains comfortably below it.
+    # Materializing every block exceeds this ceiling. Both the live document
+    # lookup and the block stream must remain indexed, branch-local Top-K.
     store.online_vm_step_limit = 50_000
-    common: dict[str, Any] = {
-        "semantic_query": "",
-        "target_uris": (slot_uri,),
-        "context_types": (ContextType.MEMORY,),
-        "tenant_id": "tenant-a",
-        "owner_user_id": "u1",
-        "canonical_resolution_mode": CanonicalResolutionMode.DISABLED,
-        "token_budget": 1_024,
-    }
-    current_result = CandidateGenerator(store).generate(
+    document_result = CandidateGenerator(store).generate(
         RetrievalQueryPlan(
-            **common,
-            query_intent=RetrievalQueryIntent.CURRENT,
+            semantic_query="",
+            target_uris=(document.uri,),
+            context_types=(ContextType.MEMORY,),
+            record_kinds=(CatalogRecordKind.MEMORY_DOCUMENT.value,),
+            document_ids=(document.document_id,),
+            tenant_id="tenant-a",
+            owner_user_id="u1",
+            query_intent=RetrievalQueryIntent.EXACT,
             candidate_limit=3,
             final_limit=3,
+            token_budget=1_024,
         )
     )
-    current_filters, current_limit = identity_calls[-1]
-    assert [candidate.record_key for candidate in current_result.branches["exact"]] == [
-        current.record_key
+    document_filters, document_limit = catalog_calls[-1]
+    assert [candidate.record_key for candidate in document_result.branches["exact"]] == [
+        document.record_key
     ]
-    assert current_result.exact_candidates == 1
-    assert current_limit == 3
-    assert current_filters["record_kinds"] == (CatalogRecordKind.CURRENT_SLOT.value,)
-    assert current_filters["_identity_candidate_limit"] == 3
+    assert document_result.exact_candidates == 1
+    assert document_limit == 3
+    assert document_filters["record_kinds"] == (CatalogRecordKind.MEMORY_DOCUMENT.value,)
+    assert document_filters["document_ids"] == (document.document_id,)
+    assert document_filters["_identity_candidate_limit"] == 3
 
-    identity_calls.clear()
-    history_result = CandidateGenerator(store).generate(
+    catalog_calls.clear()
+    block_result = CandidateGenerator(store).generate(
         RetrievalQueryPlan(
-            **common,
-            query_intent=RetrievalQueryIntent.HISTORY,
+            semantic_query="",
+            context_types=(ContextType.MEMORY,),
+            record_kinds=(CatalogRecordKind.MEMORY_BLOCK.value,),
+            document_ids=(document.document_id,),
+            tenant_id="tenant-a",
+            owner_user_id="u1",
+            query_intent=RetrievalQueryIntent.CURRENT,
             candidate_limit=7,
             final_limit=7,
+            token_budget=1_024,
         )
     )
-    history_filters, history_limit = identity_calls[-1]
-    assert len(history_result.branches["exact"]) == 7
+    block_filters, block_limit = catalog_calls[-1]
+    assert len(block_result.branches["structured"]) == 7
     assert all(
-        candidate.record_kind == CatalogRecordKind.CLAIM_REVISION.value
-        for candidate in history_result.branches["exact"]
+        candidate.record_kind == CatalogRecordKind.MEMORY_BLOCK.value
+        and candidate.document_id == document.document_id
+        for candidate in block_result.branches["structured"]
     )
-    assert history_result.exact_candidates == 7
-    assert history_limit == 7
-    assert history_filters["record_kinds"] == (CatalogRecordKind.CLAIM_REVISION.value,)
-    assert history_filters["_identity_candidate_limit"] == 7
+    assert block_result.structured_candidates == 7
+    assert block_result.exact_candidates == 0
+    assert block_limit == 7
+    assert block_filters["record_kinds"] == (CatalogRecordKind.MEMORY_BLOCK.value,)
+    assert block_filters["document_ids"] == (document.document_id,)
 
-    for exact_filters, limit in ((current_filters, 3), (history_filters, 7)):
-        explain = store.explain_structured_query(exact_filters, limit=limit)
-        joined = " ".join(explain)
-        assert "idx_contexts_tenant_canonical_slot_uri" in joined
-        assert "idx_context_acl_grants_record" in joined
-        assert not any("SCAN identity_" in detail for detail in explain)
+    explain = store.explain_structured_query(
+        tenant_id="tenant-a",
+        filters=block_filters,
+        limit=block_limit,
+    )
+    joined = " ".join(explain)
+    assert "idx_contexts_tenant_document" in joined
+    assert "context_acl_grants" in joined
+    assert not any("SCAN c" in detail for detail in explain)
 
 
 def test_metadata_exact_applies_acl_before_overflow_detection(tmp_path: Path) -> None:
@@ -458,10 +527,11 @@ def test_metadata_exact_applies_acl_before_overflow_detection(tmp_path: Path) ->
         l1_text="authorized",
         metadata={"scene_key": "shared-exact-identity"},
     )
-    assert store.upsert_catalog_batch((*crowded, authorized)) == 902
+    assert store.upsert_catalog_batch((*crowded, authorized), tenant_id="tenant-a") == 902
 
     hits = store.search_catalog(
         "shared-exact-identity",
+        tenant_id="tenant-a",
         filters={
             "tenant_id": "tenant-a",
             "principal_owner_id": "u1",
@@ -541,10 +611,15 @@ def test_online_sdk_chain_never_enumerates_sources_vectors_or_archive_tree(
         tenant_id="tenant-a",
     )
     tool = cast(SQLiteIndexStore, client.index_store).list_catalog(
+        tenant_id="tenant-a",
         filters={"tenant_id": "tenant-a", "record_kinds": (CatalogRecordKind.TOOL_RESULT.value,)},
         limit=10,
     )[0]
-    vector.upsert_vector(tool.uri, [1.0, 1.0], {"tenant_id": "tenant-a"})
+    vector.upsert_vector(
+        vector_row_id("tenant-a", tool.record_key),
+        [1.0, 1.0],
+        catalog_vector_metadata(tool),
+    )
     vector.reject_enumeration = True
 
     def prohibited(*_args: Any, **_kwargs: Any) -> Any:
@@ -557,12 +632,11 @@ def test_online_sdk_chain_never_enumerates_sources_vectors_or_archive_tree(
     options = RetrievalOptions(
         target_paths=("resources/repository",),
         context_types=(ContextType.SESSION,),
-        source_kinds=("tool_result",),
+        record_kinds=(CatalogRecordKind.TOOL_RESULT.value,),
         tenant_id="tenant-a",
         owner_user_id="u1",
         workspace_ids=("memoryOS",),
         query_intent=RetrievalQueryIntent.OPEN_RECALL,
-        canonical_resolution_mode=CanonicalResolutionMode.DISABLED,
         candidate_limit=25,
         final_limit=10,
         token_budget=1_024,
@@ -578,7 +652,7 @@ def test_online_sdk_chain_never_enumerates_sources_vectors_or_archive_tree(
 
     assert hits
     assert vector.max_candidate_count <= options.candidate_limit
-    assert int(trace["canonical_validated"]) <= options.candidate_limit
+    assert int(trace["memory_validated"]) <= options.candidate_limit
     assert int(trace["source_reads"]) <= options.candidate_limit
     assert int(trace["vector_overfetch"]) <= 200
     assert int(trace["selected_count"]) <= options.final_limit

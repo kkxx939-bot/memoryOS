@@ -18,8 +18,8 @@ def _seed(db: ContextDB, policy: ActionPolicy) -> None:
 
 def test_exact_scene_policies_do_not_mix_cross_scene_when_actions_are_covered(tmp_path) -> None:
     db = _db(tmp_path)
-    exact = ActionPolicy(user_id="u1", scene_key="hot_home", action="turn_on_ac", memory_anchor_uri="memoryos://user/u1/memories/anchors/hot")
-    cross = ActionPolicy(user_id="u1", scene_key="hot_office", action="turn_on_ac", memory_anchor_uri="memoryos://user/u1/memories/anchors/hot", q_value=0.99)
+    exact = ActionPolicy(user_id="u1", scene_key="hot_home", action="turn_on_ac", support_anchor_uri="memoryos://user/u1/support/behavior/hot")
+    cross = ActionPolicy(user_id="u1", scene_key="hot_office", action="turn_on_ac", support_anchor_uri="memoryos://user/u1/support/behavior/hot", q_value=0.99)
     _seed(db, exact)
     _seed(db, cross)
 
@@ -31,8 +31,8 @@ def test_exact_scene_policies_do_not_mix_cross_scene_when_actions_are_covered(tm
 
 def test_cross_scene_policy_only_fills_when_exact_scene_is_insufficient(tmp_path) -> None:
     db = _db(tmp_path)
-    exact = ActionPolicy(user_id="u1", scene_key="hot_home", action="turn_on_ac", memory_anchor_uri="memoryos://user/u1/memories/anchors/hot")
-    fallback = ActionPolicy(user_id="u1", scene_key="hot_office", action="turn_on_fan", memory_anchor_uri="memoryos://user/u1/memories/anchors/hot", q_value=0.99)
+    exact = ActionPolicy(user_id="u1", scene_key="hot_home", action="turn_on_ac", support_anchor_uri="memoryos://user/u1/support/behavior/hot")
+    fallback = ActionPolicy(user_id="u1", scene_key="hot_office", action="turn_on_fan", support_anchor_uri="memoryos://user/u1/support/behavior/hot", q_value=0.99)
     _seed(db, exact)
     _seed(db, fallback)
 

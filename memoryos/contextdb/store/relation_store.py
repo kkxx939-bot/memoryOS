@@ -9,13 +9,13 @@ from memoryos.contextdb.model.context_relation import ContextRelation
 
 
 class RelationStore(Protocol):
-    def add_relation(self, relation: ContextRelation) -> None: ...
+    def add_relation(self, relation: ContextRelation, *, tenant_id: str) -> None: ...
 
     def relations_of(
         self,
         uri: str,
         *,
-        tenant_id: str | None = None,
+        tenant_id: str,
         owner_user_id: str | None = None,
         limit: int | None = None,
     ) -> list[ContextRelation]: ...
@@ -26,7 +26,7 @@ class RelationStore(Protocol):
         relation_type: str,
         target_uri: str,
         *,
-        tenant_id: str | None = None,
+        tenant_id: str,
     ) -> None: ...
 
     def delete_projection_relations(
@@ -35,6 +35,15 @@ class RelationStore(Protocol):
         *,
         tenant_id: str,
         catalog_record_key: str,
+        limit: int,
+    ) -> int: ...
+
+    def delete_memory_document_relations(
+        self,
+        uri: str,
+        *,
+        tenant_id: str,
+        owner_user_id: str,
         limit: int,
     ) -> int: ...
 
@@ -49,7 +58,7 @@ class RelationStore(Protocol):
         tenant_id: str,
     ) -> dict[str, int]: ...
 
-    def all_relations(self) -> list[ContextRelation]: ...
+    def all_relations(self, *, tenant_id: str) -> list[ContextRelation]: ...
 
 
 __all__ = ["RelationStore"]

@@ -50,10 +50,12 @@ def generate_l0_for_object(obj: Any, content: str = "") -> str:
             status = bullet_value(metadata, "status", "active")
             auto_execute = bullet_value(metadata, "auto_execute_allowed", "False")
             return f"在 {scene_key} 场景下，{action} 是候选动作；当前 q_value={q_value}，状态={status}，自动执行={auto_execute}。"
-        if context_type == ContextType.MEMORY:
-            kind = bullet_value(metadata, "memory_kind", metadata.get("kind", "explicit"))
-            confidence = bullet_value(metadata, "confidence", "1.0")
-            return f"用户相关记忆：{title}；类型={kind}，置信度={confidence}。"
+        if context_type == ContextType.BEHAVIOR_SUPPORT:
+            confidence = bullet_value(metadata, "confidence", getattr(obj, "semantic_hotness", 0.0))
+            return f"行为支持锚点：{title}；用于连接行为证据，置信度={confidence}。"
+        if context_type == ContextType.ACTION_POLICY_SUPPORT:
+            rule_value = bullet_value(metadata, "policy_rule_value", "")
+            return f"动作策略支持规则：{title}；规则值={rule_value or 'unspecified'}。"
         if context_type == ContextType.SESSION:
             return f"会话记录：{title}；包含用户交互、观察和预测上下文。"
         if context_type == ContextType.RESOURCE:
@@ -90,8 +92,8 @@ def generate_l1_for_object(obj: Any, content: str = "") -> str:
                 "Dominant Actions:",
                 *action_lines(metadata),
                 "",
-                "Memory Anchor:",
-                f"- {bullet_value(metadata, 'memory_anchor_uri', '')}",
+                "Support Anchor:",
+                f"- {bullet_value(metadata, 'support_anchor_uri', '')}",
                 "",
                 "Action Policies:",
                 f"- {metadata.get('related_policy_uris', metadata.get('policy_uris', []))}",
@@ -121,29 +123,38 @@ def generate_l1_for_object(obj: Any, content: str = "") -> str:
                 f"- negative_feedback_count: {bullet_value(metadata, 'negative_feedback_count', 0)}",
                 "",
                 "Relations:",
-                f"- memory_anchor_uri: {bullet_value(metadata, 'memory_anchor_uri', '')}",
+                f"- support_anchor_uri: {bullet_value(metadata, 'support_anchor_uri', '')}",
                 f"- supported_behavior_pattern_uris: {metadata.get('supported_behavior_pattern_uris', [])}",
-                f"- constrained_by_memory_uris: {metadata.get('constrained_by_memory_uris', [])}",
+                f"- constrained_by_support_uris: {metadata.get('constrained_by_support_uris', [])}",
                 f"- required_resource_uris: {metadata.get('required_resource_uris', [])}",
                 f"- required_skill_uris: {metadata.get('required_skill_uris', [])}",
             ]
             return "\n".join(lines).strip() + "\n"
-        if context_type == ContextType.MEMORY:
+        if context_type is not None and context_type in {
+            ContextType.BEHAVIOR_SUPPORT,
+            ContextType.ACTION_POLICY_SUPPORT,
+        }:
             lines = [
-                f"# Memory: {title}",
+                f"# {context_type.value}: {title}",
                 "",
                 "Kind:",
-                f"- {bullet_value(metadata, 'memory_kind', metadata.get('kind', 'explicit'))}",
+                f"- {bullet_value(metadata, 'support_anchor_kind', '')}",
                 "",
                 "Content:",
-                f"- {l0_abstract(content or bullet_value(metadata, 'summary', title), 500)}",
+                f"- {l0_abstract(content or bullet_value(metadata, 'content', title), 500)}",
                 "",
                 "Relations:",
-                f"- supports behavior: {metadata.get('supporting_behavior_uris', [])}",
-                f"- constrains policy: {metadata.get('constrains_policy_uris', [])}",
+                f"- supporting_behavior_uris: {metadata.get('supporting_behavior_uris', [])}",
+                f"- constrains_policy_uris: {metadata.get('constrains_policy_uris', [])}",
             ]
             return "\n".join(lines).strip() + "\n"
-        if context_type is not None and context_type in {ContextType.BEHAVIOR_CASE, ContextType.BEHAVIOR_CLUSTER, ContextType.SESSION, ContextType.RESOURCE, ContextType.SKILL}:
+        if context_type is not None and context_type in {
+            ContextType.BEHAVIOR_CASE,
+            ContextType.BEHAVIOR_CLUSTER,
+            ContextType.SESSION,
+            ContextType.RESOURCE,
+            ContextType.SKILL,
+        }:
             return l1_overview(
                 f"{context_type.value}: {title}",
                 [

@@ -26,7 +26,7 @@ class ActionPolicy:
     user_id: str
     scene_key: str
     action: str
-    memory_anchor_uri: str
+    support_anchor_uri: str
     policy_id: str = ""
     q_value: float = 0.5
     confidence: float = 0.5
@@ -43,11 +43,13 @@ class ActionPolicy:
     auto_execute_allowed: bool = False
     cooldown_until: str | None = None
     evidence_refs: list[str] = field(default_factory=list)
-    required_context_types: list[str] = field(default_factory=lambda: ["memory", "behavior_pattern", "resource", "skill"])
+    required_context_types: list[str] = field(
+        default_factory=lambda: ["behavior_support", "behavior_pattern", "resource", "skill"]
+    )
     required_resource_uris: list[str] = field(default_factory=list)
     required_skill_uris: list[str] = field(default_factory=list)
     supported_behavior_pattern_uris: list[str] = field(default_factory=list)
-    constrained_by_memory_uris: list[str] = field(default_factory=list)
+    constrained_by_support_uris: list[str] = field(default_factory=list)
     cross_scene_fallback: bool = False
     applied_operation_ids: list[str] = field(default_factory=list)
     last_opportunity_at: str | None = None
@@ -56,8 +58,8 @@ class ActionPolicy:
     updated_at: str = field(default_factory=utc_now)
 
     def __post_init__(self) -> None:
-        if not self.memory_anchor_uri:
-            raise ValueError("ActionPolicy requires memory_anchor_uri")
+        if not self.support_anchor_uri:
+            raise ValueError("ActionPolicy requires support_anchor_uri")
         self.action = canonical_action(self.action)
         if not self.policy_id:
             self.policy_id = stable_hash([self.user_id, self.scene_key, self.action], length=16)
@@ -103,13 +105,13 @@ class ActionPolicy:
             "status": self.status.value,
             "auto_execute_allowed": self.auto_execute_allowed,
             "cooldown_until": self.cooldown_until,
-            "memory_anchor_uri": self.memory_anchor_uri,
+            "support_anchor_uri": self.support_anchor_uri,
             "evidence_refs": self.evidence_refs,
             "required_context_types": self.required_context_types,
             "required_resource_uris": self.required_resource_uris,
             "required_skill_uris": self.required_skill_uris,
             "supported_behavior_pattern_uris": self.supported_behavior_pattern_uris,
-            "constrained_by_memory_uris": self.constrained_by_memory_uris,
+            "constrained_by_support_uris": self.constrained_by_support_uris,
             "applied_operation_ids": self.applied_operation_ids[-500:],
             "last_opportunity_at": self.last_opportunity_at,
             "last_activated_at": self.last_activated_at,

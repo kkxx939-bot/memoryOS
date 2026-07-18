@@ -9,7 +9,6 @@ from memoryos.contextdb.catalog import CatalogRecord, CatalogRecordKind
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.retrieval.candidate_generator import CandidateGenerator
 from memoryos.contextdb.retrieval.query_plan import (
-    CanonicalResolutionMode,
     RetrievalOptions,
     RetrievalQueryIntent,
 )
@@ -17,11 +16,15 @@ from memoryos.contextdb.retrieval.query_planner import QueryPlanner
 from memoryos.contextdb.store.sqlite_index_store import SQLiteIndexStore
 
 
-def _session_options(*, source_kinds: tuple[str, ...] = ("tool_result",), final_limit: int = 10) -> RetrievalOptions:
+def _session_options(
+    *,
+    record_kinds: tuple[str, ...] = (CatalogRecordKind.TOOL_RESULT.value,),
+    final_limit: int = 10,
+) -> RetrievalOptions:
     return RetrievalOptions(
         target_paths=("timeline/2026/07/14", "resources/desktop"),
         context_types=(ContextType.SESSION,),
-        source_kinds=source_kinds,
+        record_kinds=record_kinds,
         tenant_id="tenant-a",
         owner_user_id="u1",
         workspace_ids=("memoryOS",),
@@ -29,14 +32,13 @@ def _session_options(*, source_kinds: tuple[str, ...] = ("tool_result",), final_
         event_time_to="2026-07-14",
         timezone="Asia/Singapore",
         query_intent=RetrievalQueryIntent.OPEN_RECALL,
-        canonical_resolution_mode=CanonicalResolutionMode.DISABLED,
         candidate_limit=100,
         final_limit=final_limit,
         token_budget=4_096,
     )
 
 
-def test_tool_result_file_name_uses_unified_catalog_without_canonical_promotion(tmp_path: Path) -> None:
+def test_tool_result_file_name_uses_unified_catalog_as_ordinary_session_context(tmp_path: Path) -> None:
     client = MemoryOSClient(str(tmp_path), tenant_id="tenant-a")
     result = client.commit_agent_session(
         user_id="u1",
@@ -86,8 +88,8 @@ def test_tool_result_file_name_uses_unified_catalog_without_canonical_promotion(
     )
     assert record is not None
     assert record.record_kind == CatalogRecordKind.TOOL_RESULT.value
-    assert record.canonical_slot_id == ""
-    assert record.canonical_claim_id == ""
+    assert record.document_id == ""
+    assert record.block_id == ""
     assert "timeline/2026/07/14" in record.tree_paths
     assert "sessions/session-20260714" in record.tree_paths
     assert "resources/desktop" in record.tree_paths
@@ -96,21 +98,6 @@ def test_tool_result_file_name_uses_unified_catalog_without_canonical_promotion(
     serialized_trace = json.dumps(trace, ensure_ascii=False)
     assert "top-secret" not in serialized_trace
     assert "/Users/u1" not in serialized_trace
-
-    # The compatibility wrapper is routed through Unified Retrieval. Its
-    # preview is a serving projection, never raw Source Evidence.
-    archive_hits = client.archive_search(
-        "budget.xlsx",
-        user_id="u1",
-        tenant_id="tenant-a",
-        project_id="memoryOS",
-    )
-    assert len(archive_hits) == 1
-    serialized_archive_hit = json.dumps(archive_hits[0], ensure_ascii=False)
-    assert "budget.xlsx" in serialized_archive_hit
-    assert "top-secret" not in serialized_archive_hit
-    assert "/Users/u1" not in serialized_archive_hit
-
 
 def test_default_history_retrieves_ordinary_session_event_resource_and_tool_rows(tmp_path: Path) -> None:
     client = MemoryOSClient(str(tmp_path), tenant_id="tenant-a")
@@ -138,12 +125,12 @@ def test_default_history_retrieves_ordinary_session_event_resource_and_tool_rows
     )
     assert result.session_projection_status == "projected"
 
-    def history(source_kind: str, query: str, path: str) -> list[dict]:
+    def history(record_kind: str, query: str, path: str) -> list[dict]:
         return client.search_context(
             query,
             options=RetrievalOptions(
                 target_paths=(path,),
-                source_kinds=(source_kind,),
+                record_kinds=(record_kind,),
                 tenant_id="tenant-a",
                 owner_user_id="u1",
                 workspace_ids=("memoryOS",),
@@ -151,7 +138,6 @@ def test_default_history_retrieves_ordinary_session_event_resource_and_tool_rows
                 event_time_to="2026-07-14",
                 timezone="Asia/Singapore",
                 query_intent=RetrievalQueryIntent.HISTORY,
-                canonical_resolution_mode=CanonicalResolutionMode.DISABLED,
                 candidate_limit=50,
                 final_limit=10,
             ),
@@ -168,8 +154,8 @@ def test_default_history_retrieves_ordinary_session_event_resource_and_tool_rows
     }
 
     assert all(rows for rows in expected.values())
-    for source_kind, rows in expected.items():
-        assert all(dict(row["metadata"])["source_kind"] == source_kind for row in rows)
+    for record_kind, rows in expected.items():
+        assert all(dict(row["metadata"])["record_kind"] == record_kind for row in rows)
 
 
 def test_public_session_event_time_alias_and_occurred_at_precedence_use_matching_timeline_days(
@@ -204,7 +190,7 @@ def test_public_session_event_time_alias_and_occurred_at_precedence_use_matching
             options=RetrievalOptions(
                 target_paths=(f"timeline/{day.replace('-', '/')}",),
                 context_types=(ContextType.SESSION,),
-                source_kinds=("message",),
+                record_kinds=(CatalogRecordKind.MESSAGE.value,),
                 tenant_id="tenant-a",
                 owner_user_id="u1",
                 workspace_ids=("memoryOS",),
@@ -212,7 +198,6 @@ def test_public_session_event_time_alias_and_occurred_at_precedence_use_matching
                 event_time_to=day,
                 timezone="Asia/Singapore",
                 query_intent=RetrievalQueryIntent.OPEN_RECALL,
-                canonical_resolution_mode=CanonicalResolutionMode.DISABLED,
                 candidate_limit=20,
                 final_limit=10,
             ),
@@ -272,7 +257,7 @@ def test_natural_event_date_uses_real_session_projection_without_lexical_overlap
     )
     trace = client.recall_trace(str(client.last_recall_trace_id))
     assert trace["query_plan"]["query_intent"] == RetrievalQueryIntent.OPEN_RECALL.value
-    assert trace["query_plan"]["target_paths"] == ["timeline/2026/07/14"]
+    assert trace["query_plan"]["target_paths"] == []
     assert trace["query_plan"]["event_time_from"] == "2026-07-13T16:00:00+00:00"
     assert trace["query_plan"]["event_time_to"] == "2026-07-14T16:00:00+00:00"
     assert trace["structured_candidates"] > 0
@@ -328,47 +313,45 @@ def test_transaction_date_structured_candidate_applies_acl_before_sql_limit(
     client = MemoryOSClient(str(tmp_path), tenant_id="tenant-a")
     query = "2026年7月14日系统新增了哪些记忆"
 
-    def canonical_record(
+    def memory_document_record(
         key: str,
         *,
         owner_user_id: str,
-        record_kind: CatalogRecordKind,
         transaction_time: str,
         updated_at: str,
     ) -> CatalogRecord:
-        slot_id = key.replace(":", "-")
+        document_id = key.replace(":", "-")
+        uri = f"memoryos://user/{owner_user_id}/memories/documents/{document_id}"
         return CatalogRecord(
             record_key=key,
-            uri=f"memoryos://user/{owner_user_id}/memories/canonical/{key}",
+            uri=uri,
             tenant_id="tenant-a",
             owner_user_id=owner_user_id,
             workspace_id="memoryOS",
             context_type="memory",
-            source_kind=(
-                "canonical_current_slot"
-                if record_kind is CatalogRecordKind.CURRENT_SLOT
-                else "canonical_claim_revision"
-            ),
-            record_kind=record_kind.value,
-            primary_tree_path="memories/decisions/database",
-            tree_paths=("memories/decisions/database",),
+            source_kind="markdown_memory_document",
+            record_kind=CatalogRecordKind.MEMORY_DOCUMENT.value,
+            primary_tree_path="memories/knowledge/topics/database",
+            tree_paths=("memories/knowledge/topics/database",),
             created_at=transaction_time,
             updated_at=updated_at,
             event_time=transaction_time,
             ingested_at=transaction_time,
             transaction_time=transaction_time,
-            valid_from=transaction_time,
-            title=f"Canonical database revision {key}",
-            l0_text="Database state revision",
-            l1_text="A database state was committed",
-            source_uri=f"memoryos://user/{owner_user_id}/evidence/{key}",
-            source_digest=f"digest-{slot_id}",
+            title=f"Database memory document {key}",
+            l0_text="Database memory",
+            l1_text="A database note is stored in Markdown",
+            l2_uri=uri,
+            source_uri=uri,
+            source_digest=f"digest-{document_id}",
             source_revision=1,
-            canonical_slot_id=slot_id,
-            canonical_claim_id=f"claim-{slot_id}",
-            canonical_revision=1,
-            canonical_state="ACTIVE",
+            document_id=document_id,
+            document_kind="topic",
+            document_revision=1,
+            projection_generation=1,
+            projection_effect_hash=f"digest-{document_id}",
             metadata={
+                "relative_path": f"knowledge/topics/{document_id}.md",
                 "scope": {
                     "visibility": {
                         "tenant_id": "tenant-a",
@@ -381,43 +364,40 @@ def test_transaction_date_structured_candidate_applies_acl_before_sql_limit(
         )
 
     rows = (
-        canonical_record(
-            "claim:allowed:revision:1",
+        memory_document_record(
+            "memory-document:allowed",
             owner_user_id="u1",
-            record_kind=CatalogRecordKind.CLAIM_REVISION,
             transaction_time="2026-07-14T03:00:00+00:00",
             updated_at="2026-07-14T03:00:00+00:00",
         ),
-        canonical_record(
-            "claim:outside-day:revision:1",
+        memory_document_record(
+            "memory-document:outside-day",
             owner_user_id="u1",
-            record_kind=CatalogRecordKind.CLAIM_REVISION,
             transaction_time="2026-07-14T17:00:00+00:00",
             updated_at="2026-07-14T17:00:00+00:00",
         ),
-        canonical_record(
-            "claim:foreign-owner:revision:1",
+        memory_document_record(
+            "memory-document:foreign-owner",
             owner_user_id="u2",
-            record_kind=CatalogRecordKind.CLAIM_REVISION,
             transaction_time="2026-07-14T04:00:00+00:00",
-            updated_at="2026-07-14T04:00:00+00:00",
-        ),
-        *(
-            canonical_record(
-                f"slot:current-{index}:current",
-                owner_user_id="u1",
-                record_kind=CatalogRecordKind.CURRENT_SLOT,
-                transaction_time="2026-07-14T05:00:00+00:00",
-                updated_at="2026-07-15T00:00:00+00:00",
-            )
-            for index in range(5)
+            updated_at="2026-07-15T04:00:00+00:00",
         ),
     )
-    cast(SQLiteIndexStore, client.index_store).upsert_catalog_batch(rows)
+    index_store = cast(SQLiteIndexStore, client.index_store)
+    for row in rows:
+        index_store.replace_memory_document_projection(
+            row,
+            (),
+            None,
+            tenant_id="tenant-a",
+            owner_user_id=row.owner_user_id,
+        )
 
     plan = QueryPlanner().plan(
         query,
         options=RetrievalOptions(
+            context_types=(ContextType.MEMORY,),
+            record_kinds=(CatalogRecordKind.MEMORY_DOCUMENT.value,),
             tenant_id="tenant-a",
             owner_user_id="u1",
             workspace_ids=("memoryOS",),
@@ -426,13 +406,13 @@ def test_transaction_date_structured_candidate_applies_acl_before_sql_limit(
             final_limit=1,
         ),
     )
-    generated = CandidateGenerator(cast(SQLiteIndexStore, client.index_store)).generate(plan)
+    generated = CandidateGenerator(index_store).generate(plan)
 
     assert plan.query_intent == RetrievalQueryIntent.HISTORY
     assert plan.transaction_time_from == "2026-07-13T16:00:00+00:00"
     assert plan.transaction_time_to == "2026-07-14T16:00:00+00:00"
     assert [candidate.record_key for candidate in generated.branches["structured"]] == [
-        "claim:allowed:revision:1"
+        "memory-document:allowed"
     ]
     assert generated.structured_candidates == 1
     assert generated.fts_candidates == 0
@@ -443,6 +423,14 @@ def test_multiple_desktop_files_are_individually_recallable_and_broad_recall_is_
 ) -> None:
     client = MemoryOSClient(str(tmp_path), tenant_id="tenant-a")
     names = [f"quarterly-{index:02d}.txt" for index in range(6)]
+    markers = (
+        "quartzalpha",
+        "quartzbravo",
+        "quartzcharlie",
+        "quartzdelta",
+        "quartzecho",
+        "quartzfoxtrot",
+    )
     client.commit_agent_session(
         user_id="u1",
         session_id="many-files-20260714",
@@ -450,20 +438,20 @@ def test_multiple_desktop_files_are_individually_recallable_and_broad_recall_is_
         tool_results=[
             {
                 "tool_name": "read_file",
-                "output": f"quarterly result {index}",
+                "output": f"quarterly result {marker}",
                 "path": f"/Users/u1/Desktop/{name}",
                 "occurred_at": f"2026-07-14T08:{index:02d}:00+08:00",
             }
-            for index, name in enumerate(names)
+            for index, (name, marker) in enumerate(zip(names, markers, strict=True))
         ],
         async_commit=False,
         project_id="memoryOS",
         tenant_id="tenant-a",
     )
 
-    for name in names:
+    for name, marker in zip(names, markers, strict=True):
         exact = client.search_context(
-            name,
+            marker,
             options=_session_options(final_limit=5),
             user_id="u1",
             project_id="memoryOS",

@@ -16,10 +16,9 @@ from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.contextdb.store.index_store import IndexStore
 from memoryos.contextdb.store.source_store import SourceStore
 from memoryos.core.ids import stable_hash
-from memoryos.memory.model.memory import MemoryAnchor
-from memoryos.memory.service.memory_updater import MemoryUpdater
 from memoryos.operations.model.context_operation import ContextOperation
 from memoryos.operations.model.operation_action import OperationAction
+from memoryos.support import SupportAnchor, SupportAnchorUpdater
 
 
 class BehaviorCommitPlanner:
@@ -29,7 +28,7 @@ class BehaviorCommitPlanner:
         self.case_writer = BehaviorCaseWriter()
         self.cluster_updater = BehaviorClusterUpdater()
         self.pattern_updater = BehaviorPatternUpdater()
-        self.memory_updater = MemoryUpdater()
+        self.support_updater = SupportAnchorUpdater()
         self.window_evaluator = BehaviorWindowEvaluator()
 
     def plan(self, archive: SessionArchive) -> list[ContextOperation]:
@@ -63,7 +62,7 @@ class BehaviorCommitPlanner:
             operations.append(self.case_writer.add_case(case))
 
         for scene_key, cases in cases_by_scene.items():
-            anchor_uri = f"memoryos://user/{archive.user_id}/memories/anchors/{scene_key}_anchor"
+            anchor_uri = f"memoryos://user/{archive.user_id}/support/behavior/{scene_key}_anchor"
             current_case_refs = [
                 f"memoryos://user/{archive.user_id}/behavior/cases/{case.scene_key}/{case.case_id}" for case in cases
             ]
@@ -72,7 +71,7 @@ class BehaviorCommitPlanner:
             case_refs = decision.similar_refs_30d or [*current_case_refs]
             if decision.create_cluster:
                 operations.append(
-                    self.memory_updater.add_memory(
+                    self._support_anchor_operation(
                         self._anchor(archive.user_id, scene_key, case_refs),
                         evidence=[{"source": "behavior_cluster", "case_refs": case_refs}],
                     )
@@ -80,7 +79,7 @@ class BehaviorCommitPlanner:
                 cluster = BehaviorCluster(
                     user_id=archive.user_id,
                     scene_key=scene_key,
-                    memory_anchor_uri=anchor_uri,
+                    support_anchor_uri=anchor_uri,
                     case_refs=decision.similar_refs_3d,
                 )
                 cluster.cluster_id = (
@@ -97,7 +96,7 @@ class BehaviorCommitPlanner:
                     user_id=archive.user_id,
                     scene_key=scene_key,
                     trigger_conditions={"scene_key": scene_key, "context_tags": list(decision.similarity_key)},
-                    memory_anchor_uri=anchor_uri,
+                    support_anchor_uri=anchor_uri,
                     case_refs=case_refs,
                     action_distribution=[{"action": action, "count": count} for action, count in actions.items()],
                     hotness=0.65,
@@ -120,7 +119,17 @@ class BehaviorCommitPlanner:
                         source_session_id=archive.session_id,
                     )
                 )
-        return operations
+        return [self._bind_operation_tenant(operation) for operation in operations]
+
+    def _bind_operation_tenant(self, operation: ContextOperation) -> ContextOperation:
+        """Stamp planner-owned ordinary effects with the planner's bound tenant."""
+
+        tenant_id = self._tenant_id()
+        operation.payload["tenant_id"] = tenant_id
+        context_object = operation.payload.get("context_object")
+        if isinstance(context_object, dict):
+            context_object["tenant_id"] = tenant_id
+        return operation
 
     def _feedback_for_observation(self, feedback_items: list[dict], observation: dict, scene_key: str) -> dict:
         if not feedback_items:
@@ -145,7 +154,14 @@ class BehaviorCommitPlanner:
         seen: set[str] = set()
         for context_type in (ContextType.BEHAVIOR_CASE, ContextType.BEHAVIOR_CLUSTER, ContextType.BEHAVIOR_PATTERN):
             hits = self.index_store.search(
-                scene_key, filters={"owner_user_id": user_id, "context_type": context_type.value}, limit=20
+                scene_key,
+                tenant_id=self._tenant_id(),
+                filters={
+                    "tenant_id": self._tenant_id(),
+                    "owner_user_id": user_id,
+                    "context_type": context_type.value,
+                },
+                limit=20,
             )
             for hit in hits:
                 if hit.uri in seen:
@@ -160,16 +176,44 @@ class BehaviorCommitPlanner:
                 records.append(self.window_evaluator.historical_record(hit.uri, metadata))
         return records
 
-    def _anchor(self, user_id: str, scene_key: str, case_refs: list[str]) -> MemoryAnchor:
+    def _anchor(self, user_id: str, scene_key: str, case_refs: list[str]) -> SupportAnchor:
         anchor_key = f"{scene_key}_anchor"
-        return MemoryAnchor(
-            uri=f"memoryos://user/{user_id}/memories/anchors/{anchor_key}",
+        return SupportAnchor(
+            uri=f"memoryos://user/{user_id}/support/behavior/{anchor_key}",
             user_id=user_id,
             title=f"{scene_key} behavior anchor",
             content=f"Recurring behavior theme for {scene_key}.",
             anchor_key=anchor_key,
             supporting_behavior_uris=case_refs,
         )
+
+    def _support_anchor_operation(
+        self,
+        anchor: SupportAnchor,
+        *,
+        evidence: list[dict],
+    ) -> ContextOperation:
+        operation = self.support_updater.add(anchor, evidence=evidence)
+        if self.source_store is None:
+            return operation
+        try:
+            current = self.source_store.read_object(anchor.uri)
+        except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+            return operation
+        if (
+            current.context_type != ContextType.BEHAVIOR_SUPPORT
+            or current.owner_user_id != anchor.user_id
+            or str(current.tenant_id or "default") != self._tenant_id()
+        ):
+            raise ValueError("behavior support anchor identity mismatch")
+        operation.action = OperationAction.UPDATE
+        context_object = operation.payload.get("context_object")
+        if isinstance(context_object, dict):
+            context_object["created_at"] = current.created_at
+        return operation
+
+    def _tenant_id(self) -> str:
+        return str(getattr(self.source_store, "tenant_id", "default") or "default")
 
     def _prediction_for_scene(self, archive: SessionArchive, scene_key: str) -> dict:
         for prediction in archive.predictions:

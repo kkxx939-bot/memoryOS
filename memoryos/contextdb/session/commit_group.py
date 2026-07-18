@@ -1,11 +1,12 @@
-"""Compatibility exports for the operations-owned durable commit group."""
+"""Stable exports for the Session-owned durable commit group."""
 
-from memoryos.operations.commit.commit_group import (
+from memoryos.application.session.commit_group import (
     CONSUMERS,
     CommitGroupIntegrityError,
     CommitGroupStatus,
     CommitGroupStore,
     ConsumerStatus,
+    MemoryDocumentEffect,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "CommitGroupStatus",
     "CommitGroupStore",
     "ConsumerStatus",
+    "MemoryDocumentEffect",
 ]

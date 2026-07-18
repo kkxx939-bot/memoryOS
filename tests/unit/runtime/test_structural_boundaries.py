@@ -20,18 +20,26 @@ def test_client_initializes_with_runtime_container(tmp_path) -> None:
     assert app.sessions is client.agent_session_service
     assert container.context_db is not None
     assert container.agent_session_service is not None
+    assert container.memory_document_consolidator.saga_store is container.memory_document_consolidation_store
+    assert container.memory_command_service.consolidator is container.memory_document_consolidator
+    assert client.memory_document_consolidator is client.memory_command_service.consolidator
 
 
-def test_memory_has_single_lifecycle_and_service_paths() -> None:
-    from memoryos.memory.lifecycle import MemoryCoolingPolicy
-    from memoryos.memory.service import MemoryUpdater
+def test_memory_public_api_is_document_owned() -> None:
+    from memoryos.memory import (
+        DocumentCommitResult,
+        MemoryDocument,
+        MemoryDocumentCommitter,
+        MemoryEditProposal,
+    )
 
     root = Path(__file__).resolve().parents[3]
-    assert MemoryCoolingPolicy.__name__ == "MemoryCoolingPolicy"
-    assert MemoryUpdater.__name__ == "MemoryUpdater"
-    assert not (root / "memoryos" / "memory" / "update" / "__init__.py").exists()
-    assert not (root / "memoryos" / "memory" / "update" / "memory_cooling.py").exists()
-    assert not (root / "memoryos" / "memory" / "update" / "memory_updater.py").exists()
+    assert MemoryDocument.__name__ == "MemoryDocument"
+    assert MemoryDocumentCommitter.__name__ == "MemoryDocumentCommitter"
+    assert MemoryEditProposal.__name__ == "MemoryEditProposal"
+    assert DocumentCommitResult.__name__ == "DocumentCommitResult"
+    assert not tuple((root / "memoryos" / "memory" / "model").glob("*.py"))
+    assert not tuple((root / "memoryos" / "memory" / "service").glob("*.py"))
 
 
 def test_contextdb_boundary_imports() -> None:
@@ -57,29 +65,12 @@ def test_contextdb_boundary_imports() -> None:
 def test_online_retrieval_exports_only_the_unified_product_boundary() -> None:
     import memoryos.contextdb.retrieval as retrieval
     import memoryos.contextdb.retrieval.hybrid_search as internal_hybrid
-    import memoryos.memory.canonical as canonical
-    from memoryos.contextdb.retrieval.hierarchical_retriever import OfflineHierarchicalRetriever
-    from memoryos.memory.canonical.retrieval import OfflineCanonicalMemoryRetriever
 
     assert not hasattr(retrieval, "HybridSearch")
     assert not hasattr(retrieval, "HierarchicalRetriever")
     assert internal_hybrid.__all__ == []
-    assert not hasattr(canonical, "CanonicalMemoryRetriever")
-    assert canonical.OfflineCanonicalMemoryRetriever is OfflineCanonicalMemoryRetriever
-
-    try:
-        OfflineCanonicalMemoryRetriever(None, None, offline_admin=False)  # type: ignore[arg-type]
-    except PermissionError:
-        pass
-    else:  # pragma: no cover - protects a security boundary, not a normal branch.
-        raise AssertionError("offline canonical snapshot reader accepted an online caller")
-
-    try:
-        OfflineHierarchicalRetriever(None, offline_admin=False)  # type: ignore[arg-type]
-    except PermissionError:
-        pass
-    else:  # pragma: no cover - protects a security boundary, not a normal branch.
-        raise AssertionError("offline hierarchical reader accepted an online caller")
+    root = Path(__file__).resolve().parents[3]
+    assert not (root / "memoryos" / "contextdb" / "retrieval" / "hierarchical_retriever.py").exists()
 
 
 def test_product_retrieval_modules_contain_no_global_scan_or_snapshot_call() -> None:
@@ -88,14 +79,12 @@ def test_product_retrieval_modules_contain_no_global_scan_or_snapshot_call() -> 
         "memoryos/api/sdk/client.py",
         "memoryos/api/http/app.py",
         "memoryos/api/mcp/tools.py",
-        "memoryos/contextdb/retrieval/context_assembler.py",
-        "memoryos/contextdb/retrieval/service.py",
-        "memoryos/contextdb/retrieval/orchestrator.py",
-        "memoryos/contextdb/retrieval/candidate_generator.py",
-        "memoryos/contextdb/retrieval/canonical_resolver.py",
+        "memoryos/application/context/assembler.py",
+        "memoryos/application/context/query_service.py",
+        "memoryos/application/context/orchestrator.py",
+        "memoryos/application/context/candidate_generator.py",
     )
     forbidden_calls = (
-        "capture_committed_canonical_snapshot(",
         ".list_objects(",
         ".vector_uris(",
         ".glob(",
@@ -106,11 +95,6 @@ def test_product_retrieval_modules_contain_no_global_scan_or_snapshot_call() -> 
         source = (root / relative_path).read_text(encoding="utf-8")
         for forbidden_call in forbidden_calls:
             assert forbidden_call not in source, f"{relative_path} contains {forbidden_call}"
-
-    offline_source = (root / "memoryos/memory/canonical/retrieval.py").read_text(encoding="utf-8")
-    assert "class OfflineCanonicalMemoryRetriever" in offline_source
-    assert "capture_committed_canonical_snapshot(" in offline_source
-
 
 def test_provider_boundary_imports() -> None:
     from memoryos.contextdb.store.vector_store import VectorStore

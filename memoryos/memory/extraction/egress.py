@@ -9,7 +9,7 @@ from enum import Enum
 from typing import Any, Protocol, cast
 
 from memoryos.contextdb.session.session_model import SessionArchive
-from memoryos.memory.canonical.episode import EvidenceEpisode
+from memoryos.memory.evidence.episode import EvidenceEpisode
 from memoryos.security.sanitization import (
     ENV_SECRET_RE,
     INLINE_SECRET_RE,
@@ -174,9 +174,9 @@ class StructuredTextSensitivityClassifier:
         result: set[SensitivityCategory] = set()
         for memory in memories:
             for value in (
-                getattr(memory, "canonical_value", ""),
-                getattr(memory, "identity_fields", {}),
-                getattr(memory, "scope", {}),
+                getattr(memory, "title", ""),
+                getattr(memory, "body", ""),
+                getattr(memory, "subject", ""),
                 getattr(memory, "l0", ""),
                 getattr(memory, "l1", ""),
                 getattr(memory, "l2", ""),

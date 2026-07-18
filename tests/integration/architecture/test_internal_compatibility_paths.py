@@ -24,7 +24,6 @@ OLD_MODULES = (
     "memoryos.api.sdk.result",
     "memoryos.behavior.update.behavior_lifecycle",
     "memoryos.contextdb.retrieval.candidate_generator",
-    "memoryos.contextdb.retrieval.canonical_resolver",
     "memoryos.contextdb.retrieval.context_assembler",
     "memoryos.contextdb.retrieval.orchestrator",
     "memoryos.contextdb.retrieval.packing",
@@ -55,12 +54,6 @@ OLD_MODULES = (
 )
 
 MOVED_SYMBOLS = {
-    "memoryos.memory.canonical.event": {
-        "canonical_digest",
-        "canonical_json",
-        "canonicalize",
-        "immutable_snapshot",
-    },
     "memoryos.operations.commit.effect_marker": {
         "atomic_write_bytes",
         "atomic_write_json",
@@ -78,8 +71,6 @@ MOVED_SYMBOLS = {
         "QueueLeaseIdentityError",
         "QueueStore",
         "RelationStore",
-        "is_canonical_memory_object",
-        "is_canonical_memory_uri",
     },
     "memoryos.contextdb.scope": {
         "AuthorityPolicy",

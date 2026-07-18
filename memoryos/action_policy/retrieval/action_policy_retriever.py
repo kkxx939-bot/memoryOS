@@ -70,7 +70,7 @@ class ActionPolicyRetriever:
             if self.hybrid_search is not None:
                 hits = self.hybrid_search.search(
                     query,
-                    filters={"owner_user_id": user_id},
+                    filters={"tenant_id": self._tenant_id(), "owner_user_id": user_id},
                     namespace=f"memoryos://user/{user_id}/",
                     context_type=ContextType.ACTION_POLICY,
                     limit=max(limit * 3, 20),
@@ -78,7 +78,12 @@ class ActionPolicyRetriever:
             else:
                 hits = self.index_store.search(
                     query,
-                    filters={"owner_user_id": user_id, "context_type": ContextType.ACTION_POLICY.value},
+                    tenant_id=self._tenant_id(),
+                    filters={
+                        "tenant_id": self._tenant_id(),
+                        "owner_user_id": user_id,
+                        "context_type": ContextType.ACTION_POLICY.value,
+                    },
                     limit=max(limit * 3, 20),
                 )
             for hit in hits:
@@ -129,3 +134,6 @@ class ActionPolicyRetriever:
         from memoryos.security.action_risk import canonical_action
 
         return canonical_action(action)
+
+    def _tenant_id(self) -> str:
+        return str(getattr(self.source_store, "tenant_id", "default") or "default")

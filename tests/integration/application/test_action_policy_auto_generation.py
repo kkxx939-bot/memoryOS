@@ -62,7 +62,7 @@ def test_behavior_windows_auto_generate_and_update_action_policy(tmp_path) -> No
     policy_uri = f"memoryos://user/u1/action_policies/{obs.scene_key}/turn_on_ac"
     policy = client.context_db.read_object(policy_uri)
     assert policy.context_type == ContextType.ACTION_POLICY
-    assert policy.metadata["memory_anchor_uri"]
+    assert policy.metadata["support_anchor_uri"]
     assert policy.metadata["supported_behavior_pattern_uris"]
     assert policy.metadata["auto_execute_allowed"] is False
 

@@ -21,17 +21,17 @@ def _seed(db: ContextDB, policy: ActionPolicy, lifecycle: LifecycleState = Lifec
 
 def test_retriever_loads_filters_and_keeps_disabled_auto_execute(tmp_path) -> None:
     db = _db(tmp_path)
-    active = ActionPolicy(user_id="u1", scene_key="hot", action="turn_on_ac", memory_anchor_uri="memoryos://user/u1/memories/anchors/hot")
+    active = ActionPolicy(user_id="u1", scene_key="hot", action="turn_on_ac", support_anchor_uri="memoryos://user/u1/support/behavior/hot")
     disabled = ActionPolicy(
         user_id="u1",
         scene_key="hot",
         action="turn_on_fan",
-        memory_anchor_uri="memoryos://user/u1/memories/anchors/hot",
+        support_anchor_uri="memoryos://user/u1/support/behavior/hot",
         status=ActionPolicyStatus.DISABLED_AUTO_EXECUTE,
     )
-    other_user = ActionPolicy(user_id="u2", scene_key="hot", action="turn_on_ac", memory_anchor_uri="memoryos://user/u2/memories/anchors/hot")
-    deleted = ActionPolicy(user_id="u1", scene_key="hot", action="drink_water", memory_anchor_uri="memoryos://user/u1/memories/anchors/hot")
-    obsolete = ActionPolicy(user_id="u1", scene_key="hot", action="smoke", memory_anchor_uri="memoryos://user/u1/memories/anchors/hot")
+    other_user = ActionPolicy(user_id="u2", scene_key="hot", action="turn_on_ac", support_anchor_uri="memoryos://user/u2/support/behavior/hot")
+    deleted = ActionPolicy(user_id="u1", scene_key="hot", action="drink_water", support_anchor_uri="memoryos://user/u1/support/behavior/hot")
+    obsolete = ActionPolicy(user_id="u1", scene_key="hot", action="smoke", support_anchor_uri="memoryos://user/u1/support/behavior/hot")
     for policy in (active, disabled, other_user):
         _seed(db, policy)
     _seed(db, deleted, lifecycle=LifecycleState.DELETED)

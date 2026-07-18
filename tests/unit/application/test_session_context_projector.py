@@ -14,11 +14,13 @@ class _Catalog:
     def __init__(self) -> None:
         self.records: dict[str, CatalogRecord] = {}
 
-    def upsert_catalog_batch(self, records: tuple[CatalogRecord, ...]) -> None:
+    def upsert_catalog_batch(self, records: tuple[CatalogRecord, ...], *, tenant_id: str) -> None:
         for record in records:
+            assert record.tenant_id == tenant_id
             self.records[record.record_key] = record
 
-    def upsert_catalog(self, record: CatalogRecord) -> None:
+    def upsert_catalog(self, record: CatalogRecord, *, tenant_id: str) -> None:
+        assert record.tenant_id == tenant_id
         self.records[record.record_key] = record
 
 
@@ -60,7 +62,7 @@ def _written_archive(tmp_path: Path) -> SessionArchive:
     return archive
 
 
-def test_tool_result_file_names_project_to_catalog_without_canonical_identity(tmp_path: Path) -> None:
+def test_tool_result_file_names_project_to_catalog_as_session_records(tmp_path: Path) -> None:
     archive = _written_archive(tmp_path)
     catalog = _Catalog()
 
@@ -72,7 +74,7 @@ def test_tool_result_file_names_project_to_catalog_without_canonical_identity(tm
     ]
     assert {record.metadata["resource_name"] for record in tool_results} == {"budget.xlsx", "roadmap.md"}
     assert all(record.context_type == "session" for record in tool_results)
-    assert all(record.canonical_slot_id == "" and record.canonical_claim_id == "" for record in tool_results)
+    assert all(record.document_id == "" and record.block_id == "" for record in tool_results)
     assert all("timeline/2026/07/14" in record.tree_paths for record in tool_results)
     assert all("resources/desktop" in record.tree_paths for record in tool_results)
     assert all(record.source_uri == archive.archive_uri for record in tool_results)
@@ -353,8 +355,6 @@ def test_session_vectors_use_only_sanitized_policy_eligible_records(tmp_path: Pa
         "event_time",
         "ingested_at",
         "transaction_time",
-        "valid_from",
-        "valid_to",
         "source_uri",
         "source_digest",
         "source_revision",
@@ -408,9 +408,10 @@ def test_same_session_manifests_keep_catalog_identity_and_vector_ownership_disti
 
     first_result = projector.project(first)
     root_uri = f"{first.archive_uri}/context/root"
-    first_vector = vectors.get_vector_metadata(root_uri)
+    first_root_key = next(key for key in first_result.record_keys if catalog.records[key].uri == root_uri)
+    first_vector = vectors.get_vector_metadata(vector_row_id("tenant-a", first_root_key))
     assert first_vector is not None
-    first_root_key = str(first_vector["catalog_record_key"])
+    assert first_root_key == str(first_vector["catalog_record_key"])
 
     second = SessionArchive(
         user_id="u1",

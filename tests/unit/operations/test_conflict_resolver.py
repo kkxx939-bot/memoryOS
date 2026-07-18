@@ -18,10 +18,65 @@ class ConflictResolverTest(unittest.TestCase):
         action: OperationAction,
         target: str | None = "uri",
         payload: dict | None = None,
-        context_type: ContextType = ContextType.MEMORY,
+        context_type: ContextType = ContextType.BEHAVIOR_CASE,
+        *,
+        user_id: str = "u1",
     ) -> ContextOperation:
         return ContextOperation(
-            user_id="u1", context_type=context_type, action=action, target_uri=target, payload=payload or {}
+            user_id=user_id,
+            context_type=context_type,
+            action=action,
+            target_uri=target,
+            payload=payload or {},
+        )
+
+    def policy_support(
+        self,
+        policy_uri: str,
+        *,
+        tenant_id: str = "default",
+        related_action: str = "turn_on_ac",
+        context_type: ContextType = ContextType.ACTION_POLICY_SUPPORT,
+        user_id: str = "u1",
+        metadata_overrides: dict | None = None,
+    ) -> ContextOperation:
+        metadata = {
+            "support_anchor_kind": "action_policy",
+            "policy_rule_type": "action_auto_execute",
+            "policy_rule_value": "forbidden",
+            "related_action": related_action,
+            "constrains_policy_uris": [policy_uri],
+            **(metadata_overrides or {}),
+        }
+        return self.op(
+            OperationAction.ADD,
+            target="memoryos://user/u1/support/action-policy/no-auto",
+            payload={
+                "tenant_id": tenant_id,
+                "context_object": {"tenant_id": tenant_id, "metadata": metadata},
+            },
+            context_type=context_type,
+            user_id=user_id,
+        )
+
+    def action_update(
+        self,
+        policy_uri: str,
+        *,
+        action: str = "turn_on_ac",
+        tenant_id: str = "default",
+        user_id: str = "u1",
+    ) -> ContextOperation:
+        return self.op(
+            OperationAction.UPDATE,
+            target=policy_uri,
+            payload={
+                "tenant_id": tenant_id,
+                "action": action,
+                "auto_execute_allowed": True,
+            },
+            context_type=ContextType.ACTION_POLICY,
+            user_id=user_id,
         )
 
     def test_delete_overrides_update(self) -> None:
@@ -38,443 +93,67 @@ class ConflictResolverTest(unittest.TestCase):
         self.assertEqual(result.accepted[0].payload["a"], 1)
         self.assertEqual(result.accepted[0].payload["b"], 2)
 
-    def test_policy_memory_constrains_action_policy(self) -> None:
-        global_scope = {
-            "applicability": {
-                "all_of": [{"namespace": "memoryos", "kind": "global", "id": "tenant"}]
-            }
-        }
-        policy_memory = self.op(
-            OperationAction.ADD,
-            target="rule",
-            payload={
-                "memory_type": "project_rule",
-                "context_object": {
-                    "metadata": {
-                        "memory_kind": "policy_memory",
-                        "state": "ACTIVE",
-                        "canonical_rule_type": "action_auto_execute",
-                        "related_action": "turn_on_ac",
-                        "scope": global_scope,
-                        "revisions": [{"value_fields": {"canonical_value": "forbidden"}}],
-                    }
-                },
-            },
-        )
-        action_update = self.op(
-            OperationAction.UPDATE,
-            target="policy",
-            payload={"action": "turn_on_ac", "scope": global_scope},
-            context_type=ContextType.ACTION_POLICY,
-        )
-        result = self.resolver.resolve([policy_memory, action_update])
+    def test_structured_policy_support_constrains_exact_action_policy(self) -> None:
+        policy_uri = "memoryos://user/u1/action_policies/hot/turn_on_ac"
+        support = self.policy_support(policy_uri)
+        action_update = self.action_update(policy_uri)
+
+        result = self.resolver.resolve([support, action_update])
+
         self.assertFalse(action_update.payload["auto_execute_allowed"])
         self.assertEqual(action_update.payload["status"], "disabled_auto_execute")
         self.assertTrue(
-            any(item["type"] == ConflictType.POLICY_MEMORY_CONSTRAINS_ACTION.value for item in result.conflicts)
+            any(
+                item["type"] == ConflictType.POLICY_SUPPORT_CONSTRAINS_ACTION.value
+                for item in result.conflicts
+            )
         )
 
-    def test_historical_only_tail_cannot_activate_a_current_policy_constraint(self) -> None:
-        global_scope = {
-            "applicability": {
-                "all_of": [{"namespace": "memoryos", "kind": "global", "id": "tenant"}]
-            }
-        }
-        policy_memory = self.op(
+    def test_lexical_ordinary_text_has_no_policy_authority(self) -> None:
+        policy_uri = "memoryos://user/u1/action_policies/hot/turn_on_ac"
+        lexical_context = self.op(
             OperationAction.ADD,
-            target="rule",
-            payload={
-                "memory_type": "project_rule",
-                "context_object": {
-                    "metadata": {
-                        "canonical_kind": "claim",
-                        "memory_kind": "policy_memory",
-                        "state": "ACTIVE",
-                        "current_revision": 1,
-                        "revision": 2,
-                        "canonical_rule_type": "action_auto_execute",
-                        "related_action": "turn_on_ac",
-                        "scope": global_scope,
-                        "revisions": [
-                            {
-                                "revision": 1,
-                                "value_fields": {"canonical_value": "allowed"},
-                                "qualifiers": {},
-                            },
-                            {
-                                "revision": 2,
-                                "value_fields": {"canonical_value": "forbidden"},
-                                "qualifiers": {"non_current_historical": True},
-                            },
-                        ],
-                    }
-                },
-            },
+            target="memoryos://user/u1/behavior_cases/no-auto",
+            payload={"content": "不要自动执行", "action": "turn_on_ac"},
+            context_type=ContextType.BEHAVIOR_CASE,
         )
-        action_update = self.op(
-            OperationAction.UPDATE,
-            target="policy",
-            payload={"action": "turn_on_ac", "scope": global_scope, "auto_execute_allowed": True},
-            context_type=ContextType.ACTION_POLICY,
-        )
+        action_update = self.action_update(policy_uri)
 
-        self.resolver.resolve([policy_memory, action_update])
+        self.resolver.resolve([lexical_context, action_update])
 
         self.assertTrue(action_update.payload["auto_execute_allowed"])
 
-    def test_lexical_rule_without_active_structured_relation_cannot_modify_action_policy(self) -> None:
-        memory = self.op(
-            OperationAction.ADD,
-            target="rule",
-            payload={"memory_kind": "policy_memory", "content": "不要自动执行"},
+    def test_policy_support_requires_structured_forbidden_rule(self) -> None:
+        policy_uri = "memoryos://user/u1/action_policies/hot/turn_on_ac"
+        malformed = (
+            {"support_anchor_kind": "behavior"},
+            {"policy_rule_type": "other"},
+            {"policy_rule_value": "allowed"},
+            {"constrains_policy_uris": []},
         )
-        action_update = self.op(
-            OperationAction.UPDATE,
-            target="policy",
-            payload={"action": "turn_on_ac", "auto_execute_allowed": True},
-            context_type=ContextType.ACTION_POLICY,
-        )
-        self.resolver.resolve([memory, action_update])
-        self.assertTrue(action_update.payload["auto_execute_allowed"])
-
-    def test_structured_policy_memory_cannot_constrain_another_scope(self) -> None:
-        def scope(identifier: str) -> dict:
-            return {"applicability": {"all_of": [{"namespace": "memoryos", "kind": "workspace", "id": identifier}]}}
-
-        policy_memory = self.op(
-            OperationAction.ADD,
-            target="rule",
-            payload={
-                "memory_type": "project_rule",
-                "context_object": {
-                    "metadata": {
-                        "memory_kind": "policy_memory",
-                        "state": "ACTIVE",
-                        "canonical_rule_type": "action_auto_execute",
-                        "related_action": "turn_on_ac",
-                        "scope": scope("workspace-a"),
-                        "revisions": [{"value_fields": {"canonical_value": "forbidden"}}],
-                    }
-                },
-            },
-        )
-        action_update = self.op(
-            OperationAction.UPDATE,
-            target="policy",
-            payload={
-                "action": "turn_on_ac",
-                "auto_execute_allowed": True,
-                "scope": scope("workspace-b"),
-            },
-            context_type=ContextType.ACTION_POLICY,
-        )
-        self.resolver.resolve([policy_memory, action_update])
-        self.assertTrue(action_update.payload["auto_execute_allowed"])
-
-    def test_structured_policy_memory_cannot_constrain_same_asset_id_under_another_parent(self) -> None:
-        def scope(parent: str) -> dict:
-            return {
-                "applicability": {
-                    "all_of": [
-                        {
-                            "namespace": "memoryos",
-                            "kind": "asset",
-                            "id": "camera",
-                            "parent_path": [parent],
-                        }
-                    ]
-                }
-            }
-
-        policy_memory = self.op(
-            OperationAction.ADD,
-            target="rule",
-            payload={
-                "memory_type": "project_rule",
-                "context_object": {
-                    "metadata": {
-                        "memory_kind": "policy_memory",
-                        "state": "ACTIVE",
-                        "canonical_rule_type": "action_auto_execute",
-                        "related_action": "capture",
-                        "scope": scope("workspace-a"),
-                        "revisions": [{"value_fields": {"canonical_value": "forbidden"}}],
-                    }
-                },
-            },
-        )
-        action_update = self.op(
-            OperationAction.UPDATE,
-            target="policy",
-            payload={
-                "action": "capture",
-                "auto_execute_allowed": True,
-                "scope": scope("workspace-b"),
-            },
-            context_type=ContextType.ACTION_POLICY,
-        )
-
-        self.resolver.resolve([policy_memory, action_update])
-
-        self.assertTrue(action_update.payload["auto_execute_allowed"])
-
-    def test_malformed_all_of_cannot_be_dropped_to_make_policy_rule_global(self) -> None:
-        malformed_scope = {
-            "applicability": {
-                "all_of": [
-                    {"namespace": "memoryos", "kind": "workspace", "id": "w1"},
-                    {"namespace": "memoryos", "kind": "location"},
-                ]
-            }
-        }
-        policy_memory = self.op(
-            OperationAction.ADD,
-            target="rule",
-            payload={
-                "memory_type": "project_rule",
-                "context_object": {
-                    "metadata": {
-                        "memory_kind": "policy_memory",
-                        "state": "ACTIVE",
-                        "canonical_rule_type": "action_auto_execute",
-                        "related_action": "capture",
-                        "scope": malformed_scope,
-                        "revisions": [{"value_fields": {"canonical_value": "forbidden"}}],
-                    }
-                },
-            },
-        )
-        action_update = self.op(
-            OperationAction.UPDATE,
-            target="policy",
-            payload={
-                "action": "capture",
-                "auto_execute_allowed": True,
-                "scope": {
-                    "applicability": {
-                        "all_of": [{"namespace": "memoryos", "kind": "workspace", "id": "w1"}]
-                    }
-                },
-            },
-            context_type=ContextType.ACTION_POLICY,
-        )
-
-        self.resolver.resolve([policy_memory, action_update])
-
-        self.assertTrue(action_update.payload["auto_execute_allowed"])
-
-    def test_empty_scope_cannot_be_promoted_to_global_policy(self) -> None:
-        policy_memory = self.op(
-            OperationAction.ADD,
-            target="rule",
-            payload={
-                "memory_type": "project_rule",
-                "context_object": {
-                    "metadata": {
-                        "memory_kind": "policy_memory",
-                        "state": "ACTIVE",
-                        "canonical_rule_type": "action_auto_execute",
-                        "related_action": "capture",
-                        "scope": {"applicability": {"all_of": []}},
-                        "revisions": [{"value_fields": {"canonical_value": "forbidden"}}],
-                    }
-                },
-            },
-        )
-        action_update = self.op(
-            OperationAction.UPDATE,
-            target="policy",
-            payload={
-                "action": "capture",
-                "auto_execute_allowed": True,
-                "scope": {
-                    "applicability": {
-                        "all_of": [{"namespace": "memoryos", "kind": "workspace", "id": "w1"}]
-                    }
-                },
-            },
-            context_type=ContextType.ACTION_POLICY,
-        )
-
-        self.resolver.resolve([policy_memory, action_update])
-
-        self.assertTrue(action_update.payload["auto_execute_allowed"])
-
-    def test_explicit_falsy_metadata_scope_never_falls_back_to_top_level_scope(self) -> None:
-        workspace_scope = {
-            "applicability": {
-                "all_of": [{"namespace": "memoryos", "kind": "workspace", "id": "w1"}]
-            }
-        }
-        malformed_scopes: tuple[list[object] | dict[str, object] | None, ...] = ([], {}, None)
-        for malformed_scope in malformed_scopes:
-            with self.subTest(malformed_scope=malformed_scope):
-                policy_memory = self.op(
-                    OperationAction.ADD,
-                    target="rule",
-                    payload={
-                        "memory_type": "project_rule",
-                        "scope": workspace_scope,
-                        "context_object": {
-                            "metadata": {
-                                "memory_kind": "policy_memory",
-                                "state": "ACTIVE",
-                                "canonical_rule_type": "action_auto_execute",
-                                "related_action": "capture",
-                                "scope": malformed_scope,
-                                "revisions": [{"value_fields": {"canonical_value": "forbidden"}}],
-                            }
-                        },
-                    },
+        for overrides in malformed:
+            with self.subTest(overrides=overrides):
+                action_update = self.action_update(policy_uri)
+                self.resolver.resolve(
+                    [self.policy_support(policy_uri, metadata_overrides=overrides), action_update]
                 )
-                action_update = self.op(
-                    OperationAction.UPDATE,
-                    target="policy",
-                    payload={
-                        "action": "capture",
-                        "auto_execute_allowed": True,
-                        "scope": workspace_scope,
-                    },
-                    context_type=ContextType.ACTION_POLICY,
-                )
-
-                self.resolver.resolve([policy_memory, action_update])
-
                 self.assertTrue(action_update.payload["auto_execute_allowed"])
 
-    def test_missing_metadata_scope_can_use_strict_top_level_scope(self) -> None:
-        workspace_scope = {
-            "applicability": {
-                "all_of": [{"namespace": "memoryos", "kind": "workspace", "id": "w1"}]
-            }
-        }
-        policy_memory = self.op(
-            OperationAction.ADD,
-            target="rule",
-            payload={
-                "memory_type": "project_rule",
-                "scope": workspace_scope,
-                "context_object": {
-                    "metadata": {
-                        "memory_kind": "policy_memory",
-                        "state": "ACTIVE",
-                        "canonical_rule_type": "action_auto_execute",
-                        "related_action": "capture",
-                        "revisions": [{"value_fields": {"canonical_value": "forbidden"}}],
-                    }
-                },
-            },
+    def test_policy_support_is_exact_uri_action_user_and_tenant_scoped(self) -> None:
+        policy_uri = "memoryos://user/u1/action_policies/hot/turn_on_ac"
+        cases = (
+            (
+                self.policy_support("memoryos://user/u1/action_policies/other/turn_on_ac"),
+                self.action_update(policy_uri),
+            ),
+            (self.policy_support(policy_uri), self.action_update(policy_uri, action="turn_on_fan")),
+            (self.policy_support(policy_uri, tenant_id="t1"), self.action_update(policy_uri, tenant_id="t2")),
+            (self.policy_support(policy_uri, user_id="u2"), self.action_update(policy_uri, user_id="u1")),
         )
-        action_update = self.op(
-            OperationAction.UPDATE,
-            target="policy",
-            payload={
-                "action": "capture",
-                "auto_execute_allowed": True,
-                "scope": workspace_scope,
-            },
-            context_type=ContextType.ACTION_POLICY,
-        )
-
-        self.resolver.resolve([policy_memory, action_update])
-
-        self.assertFalse(action_update.payload["auto_execute_allowed"])
-
-    def test_workspace_rule_applies_to_more_specific_principal_policy(self) -> None:
-        workspace = {"namespace": "memoryos", "kind": "workspace", "id": "w1"}
-        principal = {"namespace": "memoryos", "kind": "principal", "id": "u1"}
-        policy_memory = self.op(
-            OperationAction.ADD,
-            target="rule",
-            payload={
-                "tenant_id": "t1",
-                "memory_type": "project_rule",
-                "context_object": {
-                    "tenant_id": "t1",
-                    "metadata": {
-                        "memory_kind": "policy_memory",
-                        "state": "ACTIVE",
-                        "canonical_rule_type": "action_auto_execute",
-                        "related_action": "capture",
-                        "scope": {"applicability": {"all_of": [workspace]}},
-                        "revisions": [{"value_fields": {"canonical_value": "forbidden"}}],
-                    },
-                },
-            },
-        )
-        action_update = self.op(
-            OperationAction.UPDATE,
-            target="policy",
-            payload={
-                "tenant_id": "t1",
-                "action": "capture",
-                "auto_execute_allowed": True,
-                "scope": {"applicability": {"all_of": [workspace, principal]}},
-            },
-            context_type=ContextType.ACTION_POLICY,
-        )
-
-        self.resolver.resolve([policy_memory, action_update])
-
-        self.assertFalse(action_update.payload["auto_execute_allowed"])
-
-    def test_global_rule_stays_within_user_and_tenant_boundary(self) -> None:
-        global_scope = {
-            "applicability": {
-                "all_of": [{"namespace": "memoryos", "kind": "global", "id": "tenant"}]
-            }
-        }
-        workspace_scope = {
-            "applicability": {
-                "all_of": [{"namespace": "memoryos", "kind": "workspace", "id": "w1"}]
-            }
-        }
-        policy_memory = self.op(
-            OperationAction.ADD,
-            target="rule",
-            payload={
-                "tenant_id": "t1",
-                "memory_type": "project_rule",
-                "context_object": {
-                    "tenant_id": "t1",
-                    "metadata": {
-                        "memory_kind": "policy_memory",
-                        "state": "ACTIVE",
-                        "canonical_rule_type": "action_auto_execute",
-                        "related_action": "capture",
-                        "scope": global_scope,
-                        "revisions": [{"value_fields": {"canonical_value": "forbidden"}}],
-                    },
-                },
-            },
-        )
-        other_tenant = self.op(
-            OperationAction.UPDATE,
-            target="policy",
-            payload={
-                "tenant_id": "t2",
-                "action": "capture",
-                "auto_execute_allowed": True,
-                "scope": workspace_scope,
-            },
-            context_type=ContextType.ACTION_POLICY,
-        )
-        same_tenant = self.op(
-            OperationAction.UPDATE,
-            target="same-tenant-policy",
-            payload={
-                "tenant_id": "t1",
-                "action": "capture",
-                "auto_execute_allowed": True,
-                "scope": workspace_scope,
-            },
-            context_type=ContextType.ACTION_POLICY,
-        )
-
-        self.resolver.resolve([policy_memory, other_tenant, same_tenant])
-
-        self.assertTrue(other_tenant.payload["auto_execute_allowed"])
-        self.assertFalse(same_tenant.payload["auto_execute_allowed"])
+        for support, action_update in cases:
+            with self.subTest(support=support.operation_id, action=action_update.operation_id):
+                self.resolver.resolve([support, action_update])
+                self.assertTrue(action_update.payload["auto_execute_allowed"])
 
     def test_disabled_auto_execute_reward_does_not_restore_auto_execute(self) -> None:
         reward = self.op(
@@ -491,7 +170,12 @@ class ConflictResolverTest(unittest.TestCase):
         supersede = self.op(OperationAction.SUPERSEDE, target=None)
         result = self.resolver.resolve([supersede])
         self.assertEqual(result.accepted[0].status, OperationStatus.PENDING)
-        self.assertTrue(any(item["type"] == ConflictType.SUPERSEDE_REQUIRES_TARGET.value for item in result.conflicts))
+        self.assertTrue(
+            any(
+                item["type"] == ConflictType.SUPERSEDE_REQUIRES_TARGET.value
+                for item in result.conflicts
+            )
+        )
 
 
 if __name__ == "__main__":

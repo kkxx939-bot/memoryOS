@@ -31,7 +31,7 @@ from memoryos.contextdb.projection_equivalence import (
 from memoryos.contextdb.retrieval.embedding import EmbeddingProvider
 from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.contextdb.store.vector import VectorStore, vector_row_id
-from memoryos.memory.canonical.episode import EvidenceEpisode, SessionArchiveEpisodeAdapter
+from memoryos.memory.evidence import EvidenceEpisode, SessionArchiveEpisodeAdapter
 from memoryos.security.context_projection import ContextProjectionSanitizer
 from memoryos.security.workspace_identity import normalize_workspace_id, repository_workspace_id
 
@@ -77,7 +77,7 @@ def workspace_id_from_session_metadata(metadata: Mapping[str, Any]) -> str:
 
 
 class CatalogProjectionStore(Protocol):
-    def upsert_catalog(self, record: CatalogRecord) -> None: ...
+    def upsert_catalog(self, record: CatalogRecord, *, tenant_id: str) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -93,7 +93,7 @@ class SessionProjectionResult:
 
 
 class SessionContextProjector:
-    """Project one verified archive without creating a Canonical Slot/Claim."""
+    """Project one verified archive into rebuildable serving records."""
 
     def __init__(
         self,
@@ -118,18 +118,24 @@ class SessionContextProjector:
         self,
         archive: SessionArchive,
         *,
+        async_outputs: Mapping[str, Any] | None = None,
         respect_applied_tombstones: bool = False,
     ) -> SessionProjectionResult:
         if not archive.archive_digest or not archive.manifest_digest:
             raise ValueError("SessionArchive must be durably written before projection")
+        tenant_id = str(archive.metadata.get("tenant_id") or "default")
         episode = SessionArchiveEpisodeAdapter().adapt(archive)
-        expected_records = self.build_records(archive, episode=episode)
+        expected_records = self.build_records(
+            archive,
+            episode=episode,
+            async_outputs=async_outputs,
+        )
         records = expected_records
         if respect_applied_tombstones:
             selector = getattr(self.catalog_store, "rebuildable_catalog_records", None)
             if not callable(selector):
                 raise RuntimeError("Session Catalog rebuild requires durable tombstone filtering")
-            selected: Any = selector(expected_records)
+            selected: Any = selector(expected_records, tenant_id=tenant_id)
             if not isinstance(selected, Sequence) or any(
                 not isinstance(record, CatalogRecord) for record in selected
             ):
@@ -143,10 +149,10 @@ class SessionContextProjector:
         )
         batch = getattr(self.catalog_store, "upsert_catalog_batch", None)
         if callable(batch):
-            batch(pending_records)
+            batch(pending_records, tenant_id=tenant_id)
         else:
             for record in pending_records:
-                self.catalog_store.upsert_catalog(record)
+                self.catalog_store.upsert_catalog(record, tenant_id=tenant_id)
         projected_vector_uris: list[str] = []
         try:
             if self.vector_store is not None:
@@ -176,21 +182,25 @@ class SessionContextProjector:
                 for record in records
             )
             if callable(batch):
-                batch(degraded)
+                batch(degraded, tenant_id=tenant_id)
             else:
                 for record in degraded:
-                    self.catalog_store.upsert_catalog(record)
+                    self.catalog_store.upsert_catalog(record, tenant_id=tenant_id)
             raise
         if vector_rows:
             completed = tuple(
                 replace(record, projection_status=CatalogProjectionStatus.PROJECTED.value) for record in records
             )
             if callable(batch):
-                batch(completed)
+                batch(completed, tenant_id=tenant_id)
             else:
                 for record in completed:
-                    self.catalog_store.upsert_catalog(record)
-        proof = self.prove_projection(archive, expected_records=records)
+                    self.catalog_store.upsert_catalog(record, tenant_id=tenant_id)
+        proof = self.prove_projection(
+            archive,
+            expected_records=records,
+            async_outputs=async_outputs,
+        )
         return SessionProjectionResult(
             archive_uri=archive.archive_uri,
             source_digest=archive.archive_digest,
@@ -207,6 +217,7 @@ class SessionContextProjector:
         archive: SessionArchive,
         *,
         expected_records: Sequence[CatalogRecord] | None = None,
+        async_outputs: Mapping[str, Any] | None = None,
     ) -> ProjectionEquivalenceProof | None:
         """Prove one archive projection through an exact evidence lookup.
 
@@ -218,7 +229,11 @@ class SessionContextProjector:
         lookup = getattr(self.catalog_store, "list_catalog_projection_records", None)
         if not callable(lookup):
             return None
-        expected = tuple(self.build_records(archive) if expected_records is None else expected_records)
+        expected = tuple(
+            self.build_records(archive, async_outputs=async_outputs)
+            if expected_records is None
+            else expected_records
+        )
         raw_actual: Any = lookup(
             tenant_id=str(archive.metadata.get("tenant_id") or "default"),
             source_uri=archive.archive_uri,
@@ -281,6 +296,7 @@ class SessionContextProjector:
         archive: SessionArchive,
         *,
         episode: EvidenceEpisode | None = None,
+        async_outputs: Mapping[str, Any] | None = None,
     ) -> tuple[CatalogRecord, ...]:
         episode = episode or SessionArchiveEpisodeAdapter().adapt(archive)
         tenant_id = episode.tenant_id
@@ -308,6 +324,32 @@ class SessionContextProjector:
                 f"used_skills: {len(archive.used_skills)}",
             ],
         )
+        summary_metadata: dict[str, Any] = {"summary_source": "session_archive"}
+        if async_outputs is not None:
+            head = async_outputs.get("head")
+            manifest = async_outputs.get("manifest")
+            if not isinstance(head, Mapping) or not isinstance(manifest, Mapping):
+                raise TypeError("Session async outputs require verified head and manifest metadata")
+            if (
+                str(head.get("task_id") or "") != archive.task_id
+                or str(manifest.get("task_id") or "") != archive.task_id
+                or str(head.get("archive_uri") or "") != archive.archive_uri
+                or str(manifest.get("archive_uri") or "") != archive.archive_uri
+            ):
+                raise ValueError("Session async outputs are detached from their archive")
+            async_abstract = async_outputs.get("abstract")
+            async_overview = async_outputs.get("overview")
+            if not isinstance(async_abstract, str) or not isinstance(async_overview, str):
+                raise TypeError("Session async summaries must be text")
+            abstract = async_abstract
+            overview = async_overview
+            manifest_digest = str(manifest.get("manifest_digest") or "")
+            if len(manifest_digest) != 64:
+                raise ValueError("Session async output manifest digest is invalid")
+            summary_metadata = {
+                "summary_source": "session_async_outputs",
+                "async_output_manifest_digest": manifest_digest,
+            }
         common = {
             "tenant_id": tenant_id,
             "owner_user_id": owner_user_id,
@@ -322,8 +364,6 @@ class SessionContextProjector:
             "l2_uri": archive.archive_uri,
             "source_revision": 1,
             "projection_effect_hash": archive.manifest_digest,
-            "canonical_slot_id": "",
-            "canonical_claim_id": "",
         }
         root_uri = f"{archive.archive_uri.rstrip('/')}/context/root"
         records: list[CatalogRecord] = [
@@ -347,6 +387,7 @@ class SessionContextProjector:
                     "manifest_digest": archive.manifest_digest,
                     "vector_eligible": True,
                     "projection_source": "session_archive",
+                    **summary_metadata,
                 },
             ),
             self._record(
@@ -364,7 +405,11 @@ class SessionContextProjector:
                 l1_text="",
                 source_uri=archive.archive_uri,
                 source_digest=archive.archive_digest,
-                metadata={"archive_uri": archive.archive_uri, "vector_eligible": False},
+                metadata={
+                    "archive_uri": archive.archive_uri,
+                    "vector_eligible": False,
+                    **summary_metadata,
+                },
             ),
             self._record(
                 **common,
@@ -381,7 +426,11 @@ class SessionContextProjector:
                 l1_text=overview,
                 source_uri=archive.archive_uri,
                 source_digest=archive.archive_digest,
-                metadata={"archive_uri": archive.archive_uri, "vector_eligible": False},
+                metadata={
+                    "archive_uri": archive.archive_uri,
+                    "vector_eligible": False,
+                    **summary_metadata,
+                },
             ),
         ]
 

@@ -176,6 +176,7 @@ class ProjectionTombstoneService:
         after_record_key = ""
         while True:
             raw_records: Any = scanner(
+                tenant_id=tenant_id,
                 after_record_key=after_record_key,
                 filters=filters,
                 limit=1_000,
@@ -250,11 +251,16 @@ class ProjectionTombstoneService:
             queued.append(str(row["tombstone_id"]))
         return tuple(queued)
 
-    def process_pending(self, *, limit: int = 100) -> TombstoneRunResult:
-        rows = self.index_store.get_pending_tombstones(limit=limit)
-        return self._process_rows(rows)
+    def process_pending(self, *, tenant_id: str, limit: int = 100) -> TombstoneRunResult:
+        rows = self.index_store.get_pending_tombstones(tenant_id=tenant_id, limit=limit)
+        return self._process_rows(rows, tenant_id=tenant_id)
 
-    def process_tombstones(self, tombstone_ids: Sequence[str]) -> TombstoneRunResult:
+    def process_tombstones(
+        self,
+        tombstone_ids: Sequence[str],
+        *,
+        tenant_id: str,
+    ) -> TombstoneRunResult:
         """Apply exactly the tombstones created by one public delete request."""
 
         requested = tuple(dict.fromkeys(str(item) for item in tombstone_ids if str(item)))
@@ -263,7 +269,7 @@ class ProjectionTombstoneService:
         getter = getattr(self.index_store, "get_tombstones", None)
         if not callable(getter):
             raise TypeError("projection cleanup requires exact durable tombstone reads")
-        raw_rows: Any = getter(requested)
+        raw_rows: Any = getter(requested, tenant_id=tenant_id)
         if not isinstance(raw_rows, Sequence) or isinstance(raw_rows, str | bytes):
             raise TypeError("durable tombstone store returned an invalid batch")
         rows = tuple(row for row in raw_rows if isinstance(row, Mapping))
@@ -273,18 +279,28 @@ class ProjectionTombstoneService:
         missing = tuple(tombstone_id for tombstone_id in requested if tombstone_id not in found)
         if missing:
             return TombstoneRunResult(failed=missing)
-        return self._process_rows(rows)
+        return self._process_rows(rows, tenant_id=tenant_id)
 
-    def _process_rows(self, rows: Sequence[Mapping[str, Any]]) -> TombstoneRunResult:
+    def _process_rows(
+        self,
+        rows: Sequence[Mapping[str, Any]],
+        *,
+        tenant_id: str,
+    ) -> TombstoneRunResult:
         processed: list[str] = []
         failed: list[str] = []
         stale: list[str] = []
         for row in rows:
+            if self._row_tenant(row) != tenant_id:
+                raise PermissionError("tombstone batch crossed the requested tenant boundary")
             tombstone_id = str(row.get("tombstone_id") or "")
             cleanup_started = str(row.get("status") or "") == "CLEANING"
             try:
                 self._validate_source_boundary(row)
-                begun = self.index_store.begin_tombstone_cleanup(tombstone_id)
+                begun = self.index_store.begin_tombstone_cleanup(
+                    tombstone_id,
+                    tenant_id=tenant_id,
+                )
                 if not isinstance(begun, Mapping):
                     raise RuntimeError("durable tombstone disappeared before cleanup")
                 status = str(begun.get("status") or "")
@@ -300,7 +316,10 @@ class ProjectionTombstoneService:
                 row = begun
                 self._delete_vector(row)
                 self._delete_relations(row)
-                applied = self.index_store.finish_tombstone_cleanup(tombstone_id)
+                applied = self.index_store.finish_tombstone_cleanup(
+                    tombstone_id,
+                    tenant_id=tenant_id,
+                )
                 if not isinstance(applied, Mapping):
                     raise RuntimeError("durable tombstone disappeared during application")
                 status = str(applied.get("status") or "")
@@ -314,7 +333,11 @@ class ProjectionTombstoneService:
                 marker_name = "mark_tombstone_cleanup_failed" if cleanup_started else "mark_tombstone_failed"
                 marker = getattr(self.index_store, marker_name, None)
                 if callable(marker):
-                    marker(tombstone_id, f"{type(exc).__name__}: {exc}")
+                    marker(
+                        tombstone_id,
+                        f"{type(exc).__name__}: {exc}",
+                        tenant_id=tenant_id,
+                    )
                 failed.append(tombstone_id)
         return TombstoneRunResult(tuple(processed), tuple(failed), tuple(stale))
 
@@ -350,33 +373,29 @@ class ProjectionTombstoneService:
             if not uris or len(uris) > 16:
                 raise ValueError("vector-delete tombstone URI list is empty or unbounded")
             catalog_record_key = str(payload.get("catalog_record_key") or "")
-            tenant_id = str(row.get("tenant_id") or "default")
+            tenant_id = self._row_tenant(row)
             expected_row_id = vector_row_id(tenant_id, catalog_record_key)
-            for uri in tuple(dict.fromkeys((expected_row_id, *uris))):
-                if not self._vector_delete_matches(
-                    row,
-                    uri,
-                    expected_record_key=catalog_record_key,
-                    expected_revision=int(payload.get("expected_source_revision") or 0),
-                    expected_effect=str(payload.get("expected_projection_effect_hash") or ""),
-                ):
-                    continue
-                self.vector_store.delete_vector(uri)
+            if any(uri != expected_row_id for uri in uris):
+                raise ValueError("vector-delete tombstone contains a non-Catalog row ID")
+            if self._vector_delete_matches(
+                row,
+                expected_row_id,
+                expected_record_key=catalog_record_key,
+                expected_revision=int(payload.get("expected_source_revision") or 0),
+                expected_effect=str(payload.get("expected_projection_effect_hash") or ""),
+            ):
+                self.vector_store.delete_vector(expected_row_id)
             return
         record_key = str(row.get("record_key") or "")
-        tenant_id = str(row.get("tenant_id") or "default")
+        tenant_id = self._row_tenant(row)
         if not record_key:
             raise ValueError("projection tombstone has no Catalog vector identity")
         if str(payload.get("record_kind") or "") == "orphan_projection_cleanup":
             self._delete_orphan_vectors(row, payload)
             return
         row_id = vector_row_id(tenant_id, record_key)
-        legacy_ids = tuple(
-            str(value) for value in (row.get("uri"), payload.get("projection_uri"), payload.get("source_uri")) if value
-        )
-        for candidate_id in tuple(dict.fromkeys((row_id, *legacy_ids))):
-            if self._vector_delete_matches(row, candidate_id):
-                self.vector_store.delete_vector(candidate_id)
+        if self._vector_delete_matches(row, row_id):
+            self.vector_store.delete_vector(row_id)
 
     def _delete_orphan_vectors(
         self,
@@ -398,14 +417,18 @@ class ProjectionTombstoneService:
         deleter = getattr(self.vector_store, "delete_by_filter", None)
         if not capabilities.supports_delete_by_filter or not callable(deleter):
             raise RuntimeError("orphan vector cleanup requires exact delete-by-filter capability")
-        tenant_id = str(row.get("tenant_id") or "")
-        identity = str(payload.get("projection_uri") or payload.get("source_uri") or row.get("uri") or "")
-        if not tenant_id or not identity:
-            raise ValueError("orphan vector cleanup requires tenant and public/source identity")
-        for field in ("public_uri", "uri", "source_uri"):
-            deleted = deleter({"tenant_id": tenant_id, field: identity})
-            if not isinstance(deleted, int) or isinstance(deleted, bool) or deleted < 0:
-                raise TypeError("vector delete-by-filter returned an invalid deletion count")
+        tenant_id = self._row_tenant(row)
+        catalog_record_key = str(payload.get("catalog_record_key") or "")
+        source_uri = str(payload.get("source_uri") or row.get("uri") or "")
+        if catalog_record_key:
+            selector = {"tenant_id": tenant_id, "catalog_record_key": catalog_record_key}
+        elif source_uri:
+            selector = {"tenant_id": tenant_id, "source_uri": source_uri}
+        else:
+            raise ValueError("orphan vector cleanup requires a durable projection identity")
+        deleted = deleter(selector)
+        if not isinstance(deleted, int) or isinstance(deleted, bool) or deleted < 0:
+            raise TypeError("vector delete-by-filter returned an invalid deletion count")
 
     def _delete_relations(self, row: Mapping[str, Any]) -> None:
         payload = dict(row.get("payload_json") or {})
@@ -428,7 +451,7 @@ class ProjectionTombstoneService:
                 raise TypeError("relation cleanup requires bounded projection ownership deletion")
             while True:
                 kwargs: dict[str, Any] = {
-                    "tenant_id": str(row.get("tenant_id") or "default"),
+                    "tenant_id": self._row_tenant(row),
                     "limit": 1_000,
                 }
                 if not orphan_cleanup:
@@ -465,11 +488,11 @@ class ProjectionTombstoneService:
         metadata = metadata_value
         expected_record_key = expected_record_key or str(row.get("record_key") or "")
         actual_record_key = str(metadata.get("catalog_record_key") or "")
-        if actual_record_key and expected_record_key and actual_record_key != expected_record_key:
+        if not expected_record_key or actual_record_key != expected_record_key:
             return False
         actual_tenant = str(metadata.get("tenant_id") or "")
-        expected_tenant = str(row.get("tenant_id") or "")
-        if actual_tenant and expected_tenant and actual_tenant != expected_tenant:
+        expected_tenant = self._row_tenant(row)
+        if actual_tenant != expected_tenant:
             return False
         expected_revision = (
             int(row.get("source_revision") or 0) if expected_revision is None else int(expected_revision)
@@ -502,7 +525,7 @@ class ProjectionTombstoneService:
             raise TypeError("vector-delete tombstone requires exact Catalog reads")
         current = getter(
             catalog_record_key,
-            tenant_id=str(row.get("tenant_id") or "default"),
+            tenant_id=self._row_tenant(row),
         )
         if current is None:
             # An orphaned vector still needs cleanup after its Catalog row is
@@ -513,6 +536,13 @@ class ProjectionTombstoneService:
         expected_updated_at = str(payload.get("expected_updated_at") or "")
         expected_serving_tier = str(payload.get("expected_serving_tier") or "")
         return bool(current.updated_at == expected_updated_at and current.serving_tier == expected_serving_tier)
+
+    @staticmethod
+    def _row_tenant(row: Mapping[str, Any]) -> str:
+        tenant_id = str(row.get("tenant_id") or "").strip()
+        if not tenant_id:
+            raise ValueError("tombstone row is missing tenant_id")
+        return tenant_id
 
 
 __all__ = ["ProjectionTombstoneService", "TombstoneRunResult"]

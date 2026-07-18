@@ -1,252 +1,210 @@
 from __future__ import annotations
 
-import asyncio
-import json
+from pathlib import Path
 
-from memoryos.api.http.app import MemoryOSASGI
 from memoryos.api.sdk.client import MemoryOSClient
-from memoryos.api.trusted_context import ATTEST_USER_INPUT, DEFAULT_AGENT_CAPABILITIES, TrustedRequestContext
-from memoryos.connect import ConnectMetadata
-from memoryos.memory.extraction import FakeMemoryModelProvider, LLMMemoryExtractorBackend
+from memoryos.api.trusted_context import (
+    AUTHORITATIVE_FORGET,
+    AUTHORITATIVE_REMEMBER,
+    HARD_ERASE_MEMORY,
+    READ_CONTEXT,
+    TrustedRequestContext,
+)
+from memoryos.contextdb.session.session_model import SessionArchive
+from memoryos.memory.documents.model import ABSENT
 
 
-def _project_rule_response(event_id: str, text: str, project_id: str, *, proposal_id: str) -> str:
-    atomic = {"event_id": event_id, "span_start": 0, "span_end": len(text)}
-    semantic = {
-        "speech_act": "confirmation",
-        "commitment": "confirmed",
-        "temporal_scope": "current",
-        "relation_to_existing": "unrelated",
-        "utterance_mode": "directive",
-        "attribution": "source_actor",
-        "durability": "durable",
-        "modal_force": "require",
-        "atomicity": "atomic",
-    }
-    rule_topic = text.split("must ", 1)[-1].rstrip(".")
-    identity = {"rule_topic": rule_topic}
-    values = {"canonical_value": "required", "rule": text}
-    bindings = {
-        **{f"identity.{key}": [atomic] for key in identity},
-        **{f"value.{key}": [atomic] for key in values},
-        **{f"semantic.{key}": [atomic] for key in semantic},
-        "transition": [atomic],
-    }
-    return json.dumps(
-        {
-            "candidates": [
-                {
-                    "proposal_id": proposal_id,
-                    "memory_type": "project_rule",
-                    "identity_fields": identity,
-                    "value_fields": values,
-                    "semantic": semantic,
-                    "epistemic_status": "EXPLICIT",
-                    "suggested_scope_refs": [{"namespace": "memoryos", "kind": "workspace", "id": project_id}],
-                    "evidence_refs": [atomic],
-                    "atomic_evidence_ref": atomic,
-                    "field_evidence_refs": bindings,
-                    "confidence": 0.95,
-                    "source_role": "user",
-                }
-            ]
-        }
-    )
-
-
-def test_finalize_extract_commit_and_cross_agent_project_recall(tmp_path) -> None:  # noqa: ANN001
-    text = "Project rule: must run pytest before merge."
-    provider = FakeMemoryModelProvider(_project_rule_response("m1", text, "project-a", proposal_id="p-pytest"))
-    client = MemoryOSClient(str(tmp_path), memory_extractor=LLMMemoryExtractorBackend(provider))
-    result = client.commit_agent_session(
+def _caller(*, tenant_id: str = "default") -> TrustedRequestContext:
+    return TrustedRequestContext(
+        tenant_id=tenant_id,
         user_id="u1",
-        session_id="claude-native",
-        session_key="stable-session",
-        project_id="project-a",
-        messages=[{"id": "m1", "role": "user", "content": text}],
-        connect_metadata=ConnectMetadata.default_agent("claude_code").to_dict(),
-        async_commit=True,
-    )
-    assert result.done is True
-    shared = client.search_context(
-        "pytest",
-        user_id="u1",
-        project_id="project-a",
-        search_scope="project_rules",
-        connect_metadata=ConnectMetadata.default_agent("codex").to_dict(),
-    )
-    isolated = client.search_context(
-        "pytest",
-        user_id="u1",
-        project_id="project-b",
-        search_scope="project_rules",
-        connect_metadata=ConnectMetadata.default_agent("codex").to_dict(),
-    )
-    assert any("pytest" in item["text"] for item in shared)
-    assert isolated == []
-    assembled = client.assemble_context(
-        "pytest", user_id="u1", project_id="project-a", search_scope="project_rules", token_budget=100
-    )
-    assert "pytest" in assembled["packed_context"]
-    assert client.recall_trace(assembled["trace_id"])["selected"]
-
-
-def test_worker_queued_to_committed_is_idempotent(tmp_path) -> None:  # noqa: ANN001
-    from memoryos.workers.session_commit_worker import SessionCommitWorker
-
-    client = MemoryOSClient(str(tmp_path))
-    queued = client.commit_agent_session(
-        user_id="u1",
-        session_id="s1",
-        messages=[{"role": "user", "content": "Remember: I prefer concise output."}],
-        connect_metadata=ConnectMetadata.default_agent("codex").to_dict(),
-        async_commit=False,
-    )
-    first = SessionCommitWorker(client.session_commit_service).process_pending()
-    second = SessionCommitWorker(client.session_commit_service).process_pending()
-    assert queued.status == "queued"
-    assert first["committed"] == 1
-    assert second["claimed"] == 0
-
-
-def test_user_preference_is_recalled_across_projects(tmp_path) -> None:  # noqa: ANN001
-    client = MemoryOSClient(str(tmp_path))
-    client.remember(
-        user_id="u1",
-        memory_type="preference",
-        title="Response style",
-        content="I prefer concise engineering responses.",
-    )
-    project_a = client.search_context(
-        "concise",
-        user_id="u1",
-        project_id="project-a",
-        search_scope="user_preferences",
-    )
-    project_b = client.search_context(
-        "concise",
-        user_id="u1",
-        project_id="project-b",
-        search_scope="user_preferences",
-    )
-    assert project_a and project_b
-    assert project_a[0]["uri"] == project_b[0]["uri"]
-
-
-def test_runtime_injected_llm_extractor_enters_operation_plane(tmp_path) -> None:  # noqa: ANN001
-    text = "We decided to use SQLite as the primary storage backend."
-    atomic = {"event_id": "message:0", "span_start": 0, "span_end": len(text)}
-    semantic = {
-        "speech_act": "confirmation",
-        "commitment": "confirmed",
-        "temporal_scope": "current",
-        "relation_to_existing": "unrelated",
-        "utterance_mode": "assertion",
-        "attribution": "source_actor",
-        "durability": "durable",
-        "modal_force": "none",
-        "atomicity": "atomic",
-    }
-    bindings = {
-        "identity.decision_topic": [atomic],
-        "value.canonical_value": [atomic],
-        **{f"semantic.{field_name}": [atomic] for field_name in semantic},
-        "transition": [atomic],
-    }
-    provider = FakeMemoryModelProvider(
-        response=json.dumps(
+        actor_kind="user",
+        actor_id="u1",
+        capabilities=frozenset(
             {
-                "candidates": [
-                    {
-                        "proposal_id": "p-sqlite",
-                        "memory_type": "project_decision",
-                        "identity_fields": {"decision_topic": "primary storage backend"},
-                        "value_fields": {"canonical_value": "SQLite"},
-                        "semantic": semantic,
-                        "epistemic_status": "EXPLICIT",
-                        "suggested_scope_refs": [{"namespace": "memoryos", "kind": "workspace", "id": "p1"}],
-                        "evidence_refs": [atomic],
-                        "atomic_evidence_ref": atomic,
-                        "field_evidence_refs": bindings,
-                        "confidence": 0.9,
-                        "source_role": "user",
-                    }
-                ]
+                READ_CONTEXT,
+                AUTHORITATIVE_REMEMBER,
+                AUTHORITATIVE_FORGET,
+                HARD_ERASE_MEMORY,
             }
-        )
-    )
-    client = MemoryOSClient(str(tmp_path), memory_extractor=LLMMemoryExtractorBackend(provider))
-    client.commit_agent_session(
-        user_id="u1",
-        session_id="s1",
-        project_id="p1",
-        messages=[{"role": "user", "content": text}],
-        connect_metadata=ConnectMetadata.default_agent("codex").to_dict(),
-        async_commit=True,
-    )
-    results = client.search_context("SQLite", user_id="u1", project_id="p1", search_scope="project_decisions")
-    assert results
-    assert client.health()["memory_extractor"] == "ready"
-
-
-def test_http_session_append_finalize_recall_flow(tmp_path) -> None:  # noqa: ANN001
-    text = "Project rule: must run ruff before merge."
-    provider = FakeMemoryModelProvider(_project_rule_response("e1", text, "p1", proposal_id="p-ruff"))
-    client = MemoryOSClient(
-        str(tmp_path),
-        mode="server",
-        memory_extractor=LLMMemoryExtractorBackend(provider),
-    )
-    app = MemoryOSASGI(
-        client,
-        api_token="test-token",
-        trusted_context=TrustedRequestContext(
-            tenant_id="default",
-            user_id="u1",
-            actor_kind="agent",
-            actor_id="openclaw",
-            capabilities=DEFAULT_AGENT_CAPABILITIES | frozenset({ATTEST_USER_INPUT}),
-            allowed_workspace_ids=frozenset({"p1"}),
         ),
     )
 
-    async def post(path: str, payload: dict) -> dict:
-        sent = []
-        incoming = iter([{"type": "http.request", "body": json.dumps(payload).encode(), "more_body": False}])
 
-        async def receive():  # noqa: ANN202
-            return next(incoming)
+def test_explicit_document_commands_round_trip_through_sdk(tmp_path: Path) -> None:
+    client = MemoryOSClient(str(tmp_path))
+    caller = _caller()
 
-        async def send(message):  # noqa: ANN001, ANN202
-            sent.append(message)
-
-        await app(
-            {
-                "type": "http",
-                "method": "POST",
-                "path": path,
-                "headers": [(b"authorization", b"Bearer test-token")],
-            },
-            receive,
-            send,
-        )
-        assert sent[0]["status"] == 200
-        return json.loads(sent[1]["body"])
-
-    event = asyncio.run(
-        post(
-            "/v1/sessions/events",
-            {
-                "event_id": "e1",
-                "event_type": "PROMPT_SUBMIT",
-                "adapter_id": "openclaw",
-                "user_id": "u1",
-                "project_id": "p1",
-                "session_id": "native",
-                "prompt": text,
-            },
-        )
+    remembered = client.remember(
+        "I prefer concise engineering responses.",
+        target_hint="preference:Response style",
+        caller=caller,
     )
-    finalized = asyncio.run(post(f"/v1/sessions/{event['session_key']}/finalize", {}))
-    assert finalized["done"] is True
-    assert client.search_context("ruff", user_id="u1", project_id="p1", search_scope="project_rules")
+    assert remembered["changed"] is True
+    assert remembered["projection_status"] == "ENQUEUED"
+    assert remembered["relative_path"] == "preferences.md"
+
+    edited = client.edit_memory_document(
+        remembered["document_uri"],
+        "I prefer concise responses with runnable examples.",
+        remembered["source_digest"],
+        caller=caller,
+    )
+    assert edited["document_id"] == remembered["document_id"]
+    assert edited["document_revision"] > remembered["document_revision"]
+
+    history = client.list_memory_history(remembered["document_uri"], caller=caller)
+    assert history["document_id"] == remembered["document_id"]
+    assert len(history["revisions"]) >= 2
+
+    forgotten = client.forget(
+        remembered["document_uri"],
+        mode="SOFT_FORGET",
+        expected_digest=edited["source_digest"],
+        caller=caller,
+    )
+    assert forgotten["mode"] == "SOFT_FORGET"
+    assert forgotten["recoverable"] is True
+
+    restored = client.restore_memory_revision(
+        remembered["document_uri"],
+        revision=1,
+        expected_digest="",
+        caller=caller,
+    )
+    assert restored["changed"] is True
+    assert restored["document_id"] == remembered["document_id"]
+
+
+def test_rename_and_roll_forward_merge_are_public_sdk_operations(tmp_path: Path) -> None:
+    client = MemoryOSClient(str(tmp_path))
+    caller = _caller()
+    target = client.remember("Merge target before", target_hint="topic:merge-target", caller=caller)
+    source = client.remember("Merge source body", target_hint="topic:merge-source", caller=caller)
+
+    renamed = client.rename_memory_document(
+        target["document_uri"],
+        "knowledge/entities/merge-target.md",
+        target["source_digest"],
+        caller=caller,
+    )
+
+    assert renamed["document_id"] == target["document_id"]
+    assert renamed["document_uri"] == target["document_uri"]
+    assert renamed["relative_path"] == "knowledge/entities/merge-target.md"
+    waiting = client.merge_memory_documents(
+        renamed["document_uri"],
+        "Merge target before\n\nMerge source body",
+        renamed["source_digest"],
+        [
+            {
+                "document_uri": source["document_uri"],
+                "expected_digest": source["source_digest"],
+            }
+        ],
+        caller=caller,
+    )
+    assert waiting["status"] == "AWAITING_TARGET_PROJECTION"
+    assert waiting["pending_document_ids"] == [source["document_id"]]
+
+    client._process_memory_projections_or_raise()
+    completed = client.resume_memory_consolidation(waiting["saga_id"], caller=caller)
+
+    assert completed["status"] == "COMPLETED"
+    assert completed["soft_forgotten_document_ids"] == [source["document_id"]]
+    assert b"Merge source body" in client.memory_document_store.read_raw(
+        "default",
+        "u1",
+        document_id=target["document_id"],
+    )
+    assert client.memory_document_store.read_state(
+        "default",
+        "u1",
+        source["relative_path"],
+    ) == ABSENT
+
+
+def test_hard_erase_reports_derived_cleanup_and_retained_evidence(tmp_path: Path) -> None:
+    client = MemoryOSClient(str(tmp_path))
+    caller = _caller()
+    remembered = client.remember("Erase this exact memory document.", caller=caller)
+
+    result = client.forget(
+        remembered["document_uri"],
+        mode="HARD_ERASE",
+        expected_digest=remembered["source_digest"],
+        caller=caller,
+    )
+
+    assert result["mode"] == "HARD_ERASE"
+    assert result["recoverable"] is False
+    assert result["erasure_status"] in {"ERASE_PENDING", "ERASED"}
+    assert isinstance(result["pending_backends"], (list, tuple))
+    assert isinstance(result["independent_evidence_retained"], (list, tuple))
+    assert result["media_disclaimer"]
+
+
+def test_real_session_uncertain_memory_waits_for_review_then_uses_document_committer(tmp_path: Path) -> None:
+    client = MemoryOSClient(str(tmp_path))
+    caller = _caller()
+    archive = SessionArchive(
+        user_id="u1",
+        session_id="session-auto-review",
+        archive_uri="memoryos://user/u1/sessions/history/session-auto-review",
+        task_id="task-auto-review",
+        created_at="2026-07-17T10:00:00+08:00",
+        messages=[
+            {
+                "id": "event-auto-review",
+                "role": "user",
+                "content": "请记住 auto-review-proof-token 的部署说明",
+                "occurred_at": "2026-07-17T10:00:00+08:00",
+            }
+        ],
+        metadata={"tenant_id": "default"},
+    )
+
+    committed = client.context_db.commit_session(archive, async_commit=True)
+
+    assert committed.done is True
+    assert committed.memory_document_change_count == 0
+    assert committed.edit_proposal_count == 1
+    assert len(committed.edit_proposal_ids) == 1
+    proposal_id = committed.edit_proposal_ids[0]
+    record = client.memory_review_service.review_store.load("default", "u1", proposal_id)
+    assert record is not None
+    assert record.independent_evidence_references == (archive.archive_uri,)
+    assert client.memory_document_store.read_state("default", "u1", record.relative_path) == ABSENT
+    preview = client.preview_memory_edit(proposal_id, caller=caller)
+    assert preview["proposal_id"] == proposal_id
+    assert "auto-review-proof-token" in preview["proposed_diff"]
+
+    approved = client.review_memory_edit(proposal_id, "APPROVE", caller=caller)
+    client._process_memory_projections_or_raise()
+
+    assert approved["changed"] is True
+    assert approved["projection_status"] == "ENQUEUED"
+    assert b"auto-review-proof-token" in client.memory_document_store.read_raw(
+        "default",
+        "u1",
+        document_id=approved["document_id"],
+    )
+
+    erased = client.forget(
+        approved["document_uri"],
+        mode="HARD_ERASE",
+        expected_digest=approved["source_digest"],
+        caller=caller,
+    )
+    assert erased["erasure_status"] == "ERASED"
+    assert erased["independent_evidence_retained"] == [archive.archive_uri]
+
+    restarted = MemoryOSClient(str(tmp_path))
+    replayed = restarted.forget(
+        approved["document_uri"],
+        mode="HARD_ERASE",
+        expected_digest=approved["source_digest"],
+        caller=caller,
+    )
+    assert replayed["erasure_status"] == "ERASED"
+    assert replayed["independent_evidence_retained"] == [archive.archive_uri]

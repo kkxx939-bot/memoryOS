@@ -22,7 +22,7 @@ from memoryos.application.context.retrieval_service import RetrievalService
 from memoryos.application.service import ApplicationService
 from memoryos.contextdb.model.context_uri import ContextURI
 from memoryos.contextdb.retrieval.query_plan import RetrievalOptions
-from memoryos.memory.canonical.visibility import committed_content, read_committed_canonical
+from memoryos.memory.documents.path_policy import MemoryDocumentPathPolicy
 from memoryos.security.trusted_context import READ_CONTEXT, TrustedRequestContext
 
 
@@ -41,10 +41,9 @@ class ContextQueryService(ApplicationService):
         project_id: str = "",
         tenant_id: str | None = None,
         applicability_scopes: list[dict[str, Any]] | None = None,
-        memory_states: list[str] | None = None,
-        memory_types: list[str] | None = None,
-        claim_uris: list[str] | None = None,
-        slot_uris: list[str] | None = None,
+        record_kinds: list[str] | None = None,
+        document_ids: list[str] | None = None,
+        document_kinds: list[str] | None = None,
         query_intent: str | None = None,
         caller: TrustedRequestContext | None = None,
     ) -> list[dict[str, Any]]:
@@ -76,10 +75,7 @@ class ContextQueryService(ApplicationService):
             )
 
         connect_filters = self._connect_filters_from_metadata(connect_metadata)
-        resolved_scope_keys = _scope_keys(
-            applicability_scopes,
-            aliases=getattr(self, "_tenant_memory_aliases", None),
-        )
+        resolved_scope_keys = _scope_keys(applicability_scopes)
         legacy_options = retrieval_options_from_legacy(
             {
                 "user_id": user_id,
@@ -93,10 +89,9 @@ class ContextQueryService(ApplicationService):
                 "adapter_id": connect_filters.get("adapter_id"),
                 "tenant_id": tenant_id,
                 "applicability_scope_keys": resolved_scope_keys or None,
-                "memory_states": memory_states,
-                "memory_types": memory_types,
-                "claim_uris": claim_uris,
-                "slot_uris": slot_uris,
+                "record_kinds": record_kinds,
+                "document_ids": document_ids,
+                "document_kinds": document_kinds,
                 "query_intent": query_intent,
             }
         )
@@ -139,10 +134,9 @@ class ContextQueryService(ApplicationService):
         project_id: str = "",
         tenant_id: str | None = None,
         applicability_scopes: list[dict[str, Any]] | None = None,
-        memory_states: list[str] | None = None,
-        memory_types: list[str] | None = None,
-        claim_uris: list[str] | None = None,
-        slot_uris: list[str] | None = None,
+        record_kinds: list[str] | None = None,
+        document_ids: list[str] | None = None,
+        document_kinds: list[str] | None = None,
         query_intent: str | None = None,
         caller: TrustedRequestContext | None = None,
     ) -> dict[str, Any]:
@@ -175,10 +169,7 @@ class ContextQueryService(ApplicationService):
 
         metadata = self._parse_connect_metadata(connect_metadata)
         connect_filters = self._connect_filters_from_metadata(connect_metadata)
-        resolved_scope_keys = _scope_keys(
-            applicability_scopes,
-            aliases=getattr(self, "_tenant_memory_aliases", None),
-        )
+        resolved_scope_keys = _scope_keys(applicability_scopes)
         legacy_options = retrieval_options_from_legacy(
             {
                 "user_id": user_id,
@@ -193,10 +184,9 @@ class ContextQueryService(ApplicationService):
                 "adapter_id": connect_filters.get("adapter_id"),
                 "tenant_id": tenant_id,
                 "applicability_scope_keys": resolved_scope_keys or None,
-                "memory_states": memory_states,
-                "memory_types": memory_types,
-                "claim_uris": claim_uris,
-                "slot_uris": slot_uris,
+                "record_kinds": record_kinds,
+                "document_ids": document_ids,
+                "document_kinds": document_kinds,
                 "query_intent": query_intent,
             }
         )
@@ -270,51 +260,61 @@ class ContextQueryService(ApplicationService):
         parsed = ContextURI.parse(uri)
         if caller is not None:
             caller.require(READ_CONTEXT)
-        committed = None
-        if "/memories/canonical/" in uri or "/memories/pending/" in uri:
-            committed = read_committed_canonical(self.source_store, uri, self.relation_store)
-            obj = committed.object
-        else:
-            obj = self.context_db.read_object(uri)
-            if dict(obj.metadata or {}).get("canonical_kind") in {"slot", "claim", "pending_proposal"}:
-                committed = read_committed_canonical(self.source_store, uri, self.relation_store)
-                obj = committed.object
+        if len(parsed.segments) == 4 and parsed.segments[1:3] == ("memory", "documents"):
+            owner_user_id, document_id = MemoryDocumentPathPolicy.parse_document_uri(uri)
+            if caller is not None and owner_user_id != caller.user_id:
+                raise FileNotFoundError(uri)
+            records = self.index_store.get_catalog_by_uri(
+                tenant_id=tenant_id,
+                uri=uri,
+                limit=2,
+            )
+            document_records = [
+                record
+                for record in records
+                if record.record_kind == "memory_document" and record.document_id == document_id
+            ]
+            if len(document_records) != 1:
+                raise FileNotFoundError(uri)
+            record = document_records[0]
+            if record.owner_user_id != owner_user_id:
+                raise FileNotFoundError(uri)
+            requested_layer = layer.upper()
+            if requested_layer == "L0":
+                content = record.l0_text
+            elif requested_layer == "L1":
+                content = record.l1_text
+            elif requested_layer == "L2":
+                overlay = getattr(self.context_db, "memory_document_overlay", None)
+                if overlay is None:
+                    raise FileNotFoundError(uri)
+                view = overlay.read(
+                    tenant_id=tenant_id,
+                    owner_user_id=owner_user_id,
+                    document_uri=uri,
+                    relative_path=str(record.metadata.get("relative_path") or ""),
+                    expected_source_digest=record.source_digest,
+                )
+                content = view.markdown
+            else:
+                raise FileNotFoundError(f"layer unavailable: {layer}")
+            return {"object": record.to_dict(), "layer": requested_layer, "content": content}
+        obj = self.context_db.read_object(uri)
         if caller is not None:
             self._require_exact_read_visibility(uri, obj, caller)
         requested_layer = layer.upper()
-        if committed is not None and requested_layer != "L2":
-            metadata = dict(obj.metadata or {})
-            if metadata.get("canonical_kind") != "claim":
-                raise FileNotFoundError(f"committed layer unavailable: {layer}")
-            revision = int(metadata.get("revision", 0) or 0)
-            self.memory_projection_worker._verify_claim_projection(obj.uri, revision)
-            record = self.memory_projection_worker.projector.record_store.load_current(
-                obj.uri,
-                source_revision=revision,
-            )
-            if record is None:
-                raise FileNotFoundError(f"committed layer unavailable: {layer}")
-            layer_uri = {
-                "L0": record.l0_uri,
-                "L1": record.l1_uri,
-            }.get(requested_layer)
-        else:
-            layer_uri = {
-                "L0": obj.layers.l0_uri,
-                "L1": obj.layers.l1_uri,
-                "L2": obj.layers.l2_uri or obj.uri,
-            }.get(requested_layer)
+        layer_uri = {
+            "L0": obj.layers.l0_uri,
+            "L1": obj.layers.l1_uri,
+            "L2": obj.layers.l2_uri or obj.uri,
+        }.get(requested_layer)
         if not layer_uri:
             raise FileNotFoundError(f"layer unavailable: {layer}")
         if caller is not None:
             layer_parsed = ContextURI.parse(layer_uri)
             if layer_parsed.authority != parsed.authority or layer_parsed.user_id != parsed.user_id:
                 raise FileNotFoundError(uri)
-        content = (
-            committed_content(committed)
-            if committed is not None and requested_layer == "L2"
-            else self.source_store.read_content(layer_uri)
-        )
+        content = self.source_store.read_content(layer_uri)
         return {"object": obj.to_dict(), "layer": requested_layer, "content": content}
 
 

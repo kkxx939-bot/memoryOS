@@ -1,11 +1,12 @@
-"""Compatibility exports for historical session planner imports."""
+"""Cross-domain Session commit planners."""
 
 from memoryos.application.session.planners import (
     ActionPolicyCommitPlanner,
     BehaviorCommitPlanner,
     ContextCommitPlanner,
     MemoryCommitPlanner,
-    RuleMemoryCommitPlanner,
+    MemoryDocumentPlanningResult,
+    PlannedMemoryEdit,
 )
 
 __all__ = [
@@ -13,5 +14,6 @@ __all__ = [
     "BehaviorCommitPlanner",
     "ContextCommitPlanner",
     "MemoryCommitPlanner",
-    "RuleMemoryCommitPlanner",
+    "MemoryDocumentPlanningResult",
+    "PlannedMemoryEdit",
 ]

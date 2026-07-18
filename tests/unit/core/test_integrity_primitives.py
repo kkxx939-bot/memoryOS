@@ -7,14 +7,10 @@ import pytest
 
 from memoryos.core.durable_io import ImmutableArtifactConflictError, atomic_create_json
 from memoryos.core.integrity import canonical_digest, canonical_json
-from memoryos.memory.canonical.event import (
-    canonical_digest as legacy_canonical_digest,
-)
-from memoryos.memory.canonical.event import canonical_json as legacy_canonical_json
 from memoryos.operations.commit.effect_marker import atomic_create_json as legacy_atomic_create_json
 
 
-def test_canonical_json_bytes_and_digest_are_unchanged_at_new_owner() -> None:
+def test_integrity_json_bytes_and_digest_are_deterministic() -> None:
     payload = {
         "z": {3, 1, 2},
         "unicode": "记忆",
@@ -24,8 +20,6 @@ def test_canonical_json_bytes_and_digest_are_unchanged_at_new_owner() -> None:
     encoded = '{"at":"2026-07-17T01:02:03.456789Z","unicode":"记忆","z":[1,2,3]}'
     assert canonical_json(payload) == encoded
     assert canonical_digest(payload) == "ca8e9a4141cfcf6ad8c2d40eeab813f707ced4c1b6bb841045c6d59450031cb4"
-    assert legacy_canonical_json is canonical_json
-    assert legacy_canonical_digest is canonical_digest
 
 
 def test_atomic_json_legacy_export_preserves_create_only_identity(tmp_path: Path) -> None:

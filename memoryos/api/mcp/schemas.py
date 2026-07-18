@@ -6,6 +6,7 @@ from typing import Any
 
 from memoryos.api.mcp.config import MCPServerConfig
 from memoryos.api.mcp.errors import ToolValidationError
+from memoryos.api.memory_contract import memory_request_schema
 from memoryos.api.retrieval_contract import retrieval_options_json_schema
 from memoryos.connect import CapabilityProfile, ConnectMetadata, ConnectType, PipelineMode
 from memoryos.security.trusted_context import AUTHORITATIVE_FORGET, AUTHORITATIVE_REMEMBER
@@ -40,10 +41,9 @@ TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "retrieval_views": {"type": "array", "items": {"type": "string"}},
             "tenant_id": {"type": "string"},
             "applicability_scopes": {"type": "array", "items": {"type": "object"}},
-            "memory_states": {"type": "array", "items": {"type": "string"}},
-            "memory_types": {"type": "array", "items": {"type": "string"}},
-            "claim_uris": {"type": "array", "items": {"type": "string"}},
-            "slot_uris": {"type": "array", "items": {"type": "string"}},
+            "record_kinds": {"type": "array", "items": {"type": "string"}},
+            "document_ids": {"type": "array", "items": {"type": "string"}},
+            "document_kinds": {"type": "array", "items": {"type": "string"}},
             "query_intent": {"type": "string"},
             "connect_metadata": {"type": "object"},
         },
@@ -63,10 +63,9 @@ TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "retrieval_views": {"type": "array", "items": {"type": "string"}},
             "tenant_id": {"type": "string"},
             "applicability_scopes": {"type": "array", "items": {"type": "object"}},
-            "memory_states": {"type": "array", "items": {"type": "string"}},
-            "memory_types": {"type": "array", "items": {"type": "string"}},
-            "claim_uris": {"type": "array", "items": {"type": "string"}},
-            "slot_uris": {"type": "array", "items": {"type": "string"}},
+            "record_kinds": {"type": "array", "items": {"type": "string"}},
+            "document_ids": {"type": "array", "items": {"type": "string"}},
+            "document_kinds": {"type": "array", "items": {"type": "string"}},
             "query_intent": {"type": "string"},
             "connect_metadata": {"type": "object"},
         },
@@ -95,58 +94,18 @@ TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
         "properties": {"uri": {"type": "string"}, "layer": {"type": "string"}},
         "required": ["uri"],
     },
-    "memoryos_remember": {
-        "type": "object",
-        "properties": {
-            "user_id": {"type": "string"},
-            "content": {"type": "string"},
-            "title": {"type": "string"},
-            "memory_type": {"type": "string"},
-            "identity_fields": {"type": "object"},
-            "project_id": {"type": "string"},
-            "constraint_polarity": {"type": "string"},
-            "condition": {"type": "string"},
-            "exception": {"type": "string"},
-            "connect_metadata": {"type": "object"},
-        },
-        "required": ["content"],
-    },
-    "memoryos_list_pending": {
-        "type": "object",
-        "properties": {
-            "user_id": {"type": "string"},
-            "tenant_id": {"type": "string"},
-            "lifecycle_states": {"type": "array", "items": {"type": "string"}},
-            "project_id": {"type": "string"},
-        },
-        "required": [],
-    },
-    "memoryos_review_pending": {
-        "type": "object",
-        "properties": {
-            "user_id": {"type": "string"},
-            "tenant_id": {"type": "string"},
-            "pending_uri": {"type": "string"},
-            "decision": {"type": "string"},
-            "expected_lifecycle_revision": {"type": "integer"},
-            "expected_proposal_fingerprint": {"type": "string"},
-            "command_id": {"type": "string"},
-            "reason": {"type": "string"},
-            "corrected_proposal": {"type": "object"},
-        },
-        "required": [
-            "pending_uri",
-            "decision",
-            "expected_lifecycle_revision",
-            "expected_proposal_fingerprint",
-            "command_id",
-        ],
-    },
-    "memoryos_forget": {
-        "type": "object",
-        "properties": {"user_id": {"type": "string"}, "uri": {"type": "string"}},
-        "required": ["uri"],
-    },
+    "memoryos_adopt_memory_document": memory_request_schema("adopt"),
+    "memoryos_remember": memory_request_schema("remember"),
+    "memoryos_edit_memory_document": memory_request_schema("edit"),
+    "memoryos_rename_memory_document": memory_request_schema("rename"),
+    "memoryos_merge_memory_documents": memory_request_schema("merge"),
+    "memoryos_propose_memory_consolidation": memory_request_schema("merge_propose"),
+    "memoryos_resume_memory_consolidation": memory_request_schema("merge_resume"),
+    "memoryos_forget": memory_request_schema("forget"),
+    "memoryos_memory_history": memory_request_schema("history"),
+    "memoryos_restore_memory_revision": memory_request_schema("restore"),
+    "memoryos_review_memory_edit": memory_request_schema("review"),
+    "memoryos_preview_memory_edit": memory_request_schema("review_preview"),
     "memoryos_archive_search": {
         "type": "object",
         "properties": {
@@ -205,10 +164,24 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "memoryos_commit_session": "Commit a sanitized agent session archive.",
     "memoryos_health": "Check MemoryOS availability.",
     "memoryos_read": "Read one exact MemoryOS URI at L0, L1, or L2.",
-    "memoryos_remember": "Store an explicit confirmed memory.",
-    "memoryos_list_pending": "List only committed pending-memory proposals.",
-    "memoryos_review_pending": "Review one committed pending-memory proposal with lifecycle CAS.",
-    "memoryos_forget": "Forget one exact MemoryOS URI.",
+    "memoryos_adopt_memory_document": (
+        "Explicitly adopt one safe caller-owned UNMANAGED Markdown file by relative path and exact raw digest."
+    ),
+    "memoryos_remember": "Commit explicit content to a managed Markdown memory document.",
+    "memoryos_edit_memory_document": "CAS replace one managed Markdown memory document body.",
+    "memoryos_rename_memory_document": (
+        "CAS rename, with an optional same-effect body edit, while preserving the document URI and ID."
+    ),
+    "memoryos_merge_memory_documents": "Roll forward a bounded exact-digest multi-document merge.",
+    "memoryos_propose_memory_consolidation": (
+        "Seal and preview a copy-on-write exact-digest multi-document consolidation without mutating live Markdown."
+    ),
+    "memoryos_resume_memory_consolidation": "Resume a sealed multi-document merge after projection or restart.",
+    "memoryos_forget": "Soft-forget or hard-erase one exact memory document URI.",
+    "memoryos_memory_history": "List retained revisions for one memory document URI.",
+    "memoryos_restore_memory_revision": "Restore one retained memory document revision with CAS.",
+    "memoryos_review_memory_edit": "Approve, reject or correct one sealed document edit proposal.",
+    "memoryos_preview_memory_edit": "Read the bounded proposed diff for one caller-owned edit proposal.",
     "memoryos_archive_search": "Search archived coding-agent sessions.",
     "memoryos_archive_read": "Read one exact archived session.",
     "memoryos_recall_trace": "Explain a recall trace.",
@@ -221,9 +194,22 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
 def tool_definitions(config: MCPServerConfig | None = None) -> list[dict[str, Any]]:
     action_tools = {"memoryos_predict", "memoryos_process_observation"}
     authoritative_tools = {
-        "memoryos_remember": AUTHORITATIVE_REMEMBER,
-        "memoryos_review_pending": AUTHORITATIVE_REMEMBER,
-        "memoryos_forget": AUTHORITATIVE_FORGET,
+        "memoryos_adopt_memory_document": frozenset({AUTHORITATIVE_REMEMBER}),
+        "memoryos_remember": frozenset({AUTHORITATIVE_REMEMBER}),
+        "memoryos_edit_memory_document": frozenset({AUTHORITATIVE_REMEMBER}),
+        "memoryos_rename_memory_document": frozenset({AUTHORITATIVE_REMEMBER}),
+        "memoryos_merge_memory_documents": frozenset(
+            {AUTHORITATIVE_REMEMBER, AUTHORITATIVE_FORGET}
+        ),
+        "memoryos_propose_memory_consolidation": frozenset(
+            {AUTHORITATIVE_REMEMBER, AUTHORITATIVE_FORGET}
+        ),
+        "memoryos_resume_memory_consolidation": frozenset(
+            {AUTHORITATIVE_REMEMBER, AUTHORITATIVE_FORGET}
+        ),
+        "memoryos_restore_memory_revision": frozenset({AUTHORITATIVE_REMEMBER}),
+        "memoryos_review_memory_edit": frozenset({AUTHORITATIVE_REMEMBER}),
+        "memoryos_forget": frozenset({AUTHORITATIVE_FORGET}),
     }
     action_enabled = config.enable_action_tools if config is not None else False
     capabilities = config.capabilities if config is not None else frozenset()
@@ -235,7 +221,7 @@ def tool_definitions(config: MCPServerConfig | None = None) -> list[dict[str, An
         }
         for name, schema in TOOL_INPUT_SCHEMAS.items()
         if (action_enabled or name not in action_tools)
-        and (name not in authoritative_tools or authoritative_tools[name] in capabilities)
+        and (name not in authoritative_tools or authoritative_tools[name].issubset(capabilities))
     ]
 
 

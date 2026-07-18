@@ -13,7 +13,7 @@ class ActionPolicyEvidence:
     user_id: str
     scene_key: str
     action: str
-    memory_anchor_uri: str
+    support_anchor_uri: str
     positive_count: int = 0
     negative_count: int = 0
     neutral_count: int = 0
@@ -23,7 +23,7 @@ class ActionPolicyEvidence:
     explicit_authorized: bool = False
     evidence_refs: list[str] = field(default_factory=list)
     supported_behavior_pattern_uris: list[str] = field(default_factory=list)
-    constrained_by_memory_uris: list[str] = field(default_factory=list)
+    constrained_by_support_uris: list[str] = field(default_factory=list)
     required_resource_uris: list[str] = field(default_factory=list)
     required_skill_uris: list[str] = field(default_factory=list)
 
@@ -56,7 +56,7 @@ class ActionPolicyFactory:
                 user_id=existing.user_id,
                 scene_key=existing.scene_key,
                 action=existing.action,
-                memory_anchor_uri=existing.memory_anchor_uri or evidence.memory_anchor_uri,
+                support_anchor_uri=existing.support_anchor_uri or evidence.support_anchor_uri,
                 policy_id=existing.policy_id,
                 q_value=max(existing.q_value, q_value) if failure_count == 0 else min(existing.q_value, q_value),
                 confidence=max(existing.confidence, confidence),
@@ -77,7 +77,10 @@ class ActionPolicyFactory:
                 required_resource_uris=self._merge(existing.required_resource_uris, evidence.required_resource_uris),
                 required_skill_uris=self._merge(existing.required_skill_uris, evidence.required_skill_uris),
                 supported_behavior_pattern_uris=self._merge(existing.supported_behavior_pattern_uris, evidence.supported_behavior_pattern_uris),
-                constrained_by_memory_uris=self._merge(existing.constrained_by_memory_uris, evidence.constrained_by_memory_uris),
+                constrained_by_support_uris=self._merge(
+                    existing.constrained_by_support_uris,
+                    evidence.constrained_by_support_uris,
+                ),
                 applied_operation_ids=existing.applied_operation_ids,
                 last_opportunity_at=existing.last_opportunity_at,
                 last_activated_at=existing.last_activated_at,
@@ -87,7 +90,7 @@ class ActionPolicyFactory:
             user_id=evidence.user_id,
             scene_key=evidence.scene_key,
             action=evidence.action,
-            memory_anchor_uri=evidence.memory_anchor_uri,
+            support_anchor_uri=evidence.support_anchor_uri,
             q_value=q_value,
             confidence=confidence,
             reward_score=reward_score,
@@ -105,7 +108,7 @@ class ActionPolicyFactory:
             required_resource_uris=evidence.required_resource_uris,
             required_skill_uris=evidence.required_skill_uris,
             supported_behavior_pattern_uris=evidence.supported_behavior_pattern_uris,
-            constrained_by_memory_uris=evidence.constrained_by_memory_uris,
+            constrained_by_support_uris=evidence.constrained_by_support_uris,
         )
 
     def _merge(self, left: list[str], right: list[str]) -> list[str]:

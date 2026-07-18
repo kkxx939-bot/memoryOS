@@ -70,13 +70,16 @@ def test_behavior_to_action_policy_auto_flow(tmp_path) -> None:
 
     policy_uri = f"memoryos://user/u1/action_policies/{obs.scene_key}/turn_on_ac"
     policy = client.context_db.read_object(policy_uri)
-    assert policy.metadata["memory_anchor_uri"]
+    assert policy.metadata["support_anchor_uri"]
     assert policy.metadata["supported_behavior_pattern_uris"]
     assert policy.metadata["required_resource_uris"] == [resource_uri]
     assert policy.metadata["required_skill_uris"] == [skill_uri]
     assert client.context_db.search(obs.scene_key, owner_user_id="u1", context_type=ContextType.BEHAVIOR_CLUSTER)
     assert client.context_db.search(obs.scene_key, owner_user_id="u1", context_type=ContextType.BEHAVIOR_PATTERN)
-    assert client.context_db.read_object(policy.metadata["memory_anchor_uri"]).context_type == ContextType.MEMORY
+    assert (
+        client.context_db.read_object(policy.metadata["support_anchor_uri"]).context_type
+        == ContextType.BEHAVIOR_SUPPORT
+    )
 
     prediction = client.predict(
         PredictionRequest(
@@ -92,14 +95,21 @@ def test_behavior_to_action_policy_auto_flow(tmp_path) -> None:
     assert prediction.decision.mode in {"execute", "ask_user"}
     assert prediction.memory_operations == []
     source_uris = set(prediction.action_context.source_uris)
-    assert policy.metadata["memory_anchor_uri"] in source_uris
+    assert policy.metadata["support_anchor_uri"] in source_uris
     assert policy.metadata["supported_behavior_pattern_uris"][0] in source_uris
     assert resource_uri in source_uris
     assert skill_uri in source_uris
 
     persisted = client.session_archive_store.read_archive(archive.archive_uri)
     outputs = client.session_archive_store.read_async_outputs(persisted)
-    for output_name in ("memory_diff", "behavior_diff", "action_policy_diff", "context_diff"):
+    memory_output = outputs["memory_diff"]
+    assert memory_output["status"] == "committed"
+    assert set(memory_output) >= {
+        "edit_proposal_count",
+        "memory_document_change_count",
+        "effects",
+    }
+    for output_name in ("behavior_diff", "action_policy_diff", "context_diff"):
         payload = outputs[output_name]
         assert payload["status"] == "committed"
-        assert "operations" in payload
+        assert "operation_ids" in payload

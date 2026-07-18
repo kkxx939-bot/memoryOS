@@ -25,7 +25,6 @@ class EmbeddingWorker:
         embedding_provider: EmbeddingProvider | None = None,
         namespace_builder: Callable[[str], str] | None = None,
         worker_id: str | None = None,
-        migration_gate=None,  # noqa: ANN001
     ) -> None:
         self.source_store = source_store
         self.queue_store = queue_store
@@ -33,7 +32,6 @@ class EmbeddingWorker:
         self.embedding_provider = embedding_provider or HashingEmbeddingProvider()
         self.namespace_builder = namespace_builder
         self.worker_id = worker_id or f"embedding:{os.getpid()}:{uuid.uuid4().hex}"
-        self.migration_gate = migration_gate or getattr(source_store, "migration_gate", None)
         self.domain_classifier = getattr(source_store, "domain_classifier", None) or NoDomainOverlay()
         self.sanitizer = ContextProjectionSanitizer()
 
@@ -44,18 +42,11 @@ class EmbeddingWorker:
         lease_seconds: int = 60,
         max_retries: int = 3,
     ) -> dict:
-        acquire = getattr(self.migration_gate, "acquire_projection_fence", None)
-        release = getattr(self.migration_gate, "release_projection_fence", None)
-        fence = acquire() if callable(acquire) else None
-        try:
-            return self._process_pending_unfenced(
-                limit,
-                lease_seconds=lease_seconds,
-                max_retries=max_retries,
-            )
-        finally:
-            if callable(release):
-                release(fence)
+        return self._process_pending_unfenced(
+            limit,
+            lease_seconds=lease_seconds,
+            max_retries=max_retries,
+        )
 
     def _process_pending_unfenced(
         self,
@@ -78,13 +69,13 @@ class EmbeddingWorker:
         for job in jobs:
             try:
                 if self.domain_classifier.owns_uri(job.target_uri):
-                    self.queue_store.quarantine(job, "canonical_requires_projector")
+                    self.queue_store.quarantine(job, "domain_owned_requires_projector")
                     failed.append(job.job_id)
                     quarantine.append(job.job_id)
                     continue
                 obj = self.source_store.read_object(job.target_uri)
                 if self.domain_classifier.owns_object(obj):
-                    self.queue_store.quarantine(job, "canonical_requires_projector")
+                    self.queue_store.quarantine(job, "domain_owned_requires_projector")
                     failed.append(job.job_id)
                     quarantine.append(job.job_id)
                     continue

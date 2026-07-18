@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TypeGuard, cast
 
 from memoryos.behavior.model.observation import Observation
@@ -57,7 +58,8 @@ class SimilarBehaviorRetriever:
         trace: dict[str, dict] = {}
         patterns = self._fallback_hits(user_id, search_query, ContextType.BEHAVIOR_PATTERN, limit, trace, weight=1.0, namespace=namespace)
         clusters = self._fallback_hits(user_id, search_query, ContextType.BEHAVIOR_CLUSTER, limit, trace, weight=0.75, namespace=namespace)
-        memory_anchors: list[dict] = []
+        support_anchors: list[dict] = []
+        support_rules: list[dict] = []
         policy_refs: list[dict] = []
         relation_cases: list[dict] = []
         relation_uris = [item["uri"] for item in [*patterns, *clusters]]
@@ -68,19 +70,29 @@ class SimilarBehaviorRetriever:
                 tenant_id=tenant_id,
                 trace=trace,
             )
-            memory_anchors.extend(related["memory_anchors"])
+            support_anchors.extend(related["support_anchors"])
+            support_rules.extend(related["support_rules"])
             policy_refs.extend(related["policy_refs"])
             relation_cases.extend(related["cases"])
-        if not memory_anchors:
-            memory_anchors = self._fallback_hits(user_id, observation.scene_key or search_query, ContextType.MEMORY, limit, trace, weight=0.65, namespace=namespace)
+        if not support_anchors:
+            support_anchors = self._fallback_hits(
+                user_id,
+                observation.scene_key or search_query,
+                ContextType.BEHAVIOR_SUPPORT,
+                limit,
+                trace,
+                weight=0.65,
+                namespace=namespace,
+            )
         case_hits = relation_cases + self._fallback_hits(user_id, search_query, ContextType.BEHAVIOR_CASE, limit, trace, weight=0.45, namespace=namespace)
         representative_cases = self._representative_cases(case_hits)
         indexed_policy_refs = self._fallback_hits(user_id, observation.scene_key or search_query, ContextType.ACTION_POLICY, limit, trace, weight=0.55, namespace=namespace)
         policy_refs = self._dedupe([*policy_refs, *indexed_policy_refs])
         patterns = self._dedupe(patterns)
         clusters = self._dedupe(clusters)
-        memory_anchors = self._dedupe(memory_anchors)
-        hits = [*patterns, *clusters, *representative_cases, *memory_anchors]
+        support_anchors = self._dedupe(support_anchors)
+        support_rules = self._dedupe(support_rules)
+        hits = [*patterns, *clusters, *representative_cases, *support_anchors, *support_rules]
         similarity_scores: dict[str, float] = {}
         for item in patterns:
             similarity_scores[item["uri"]] = max(similarity_scores.get(item["uri"], 0.0), float(item.get("score", 0.0)) * 1.0)
@@ -96,7 +108,8 @@ class SimilarBehaviorRetriever:
             "patterns": patterns[:limit],
             "clusters": clusters[:limit],
             "representative_cases": representative_cases[:3],
-            "memory_anchors": memory_anchors[:limit],
+            "support_anchors": support_anchors[:limit],
+            "support_rules": support_rules[:limit],
             "policy_refs": policy_refs[:limit],
             "hits": hits[:limit],
             "similarity_scores": {uri: min(1.0, score) for uri, score in similarity_scores.items()},
@@ -113,7 +126,7 @@ class SimilarBehaviorRetriever:
         weight: float,
         namespace: str,
     ) -> list[dict]:
-        if context_type == ContextType.MEMORY and self.source_store is None:
+        if context_type in {ContextType.BEHAVIOR_SUPPORT, ContextType.ACTION_POLICY_SUPPORT} and self.source_store is None:
             return []
         if self.hybrid_search is not None:
             hybrid_hits = self.hybrid_search.search(
@@ -137,6 +150,7 @@ class SimilarBehaviorRetriever:
         else:
             index_hits = self.index_store.search(
                 query,
+                tenant_id=self._tenant_id(),
                 filters={
                     "tenant_id": self._tenant_id(),
                     "owner_user_id": user_id,
@@ -167,8 +181,8 @@ class SimilarBehaviorRetriever:
             return False
         if obj.owner_user_id != user_id:
             return False
-        if obj.context_type == ContextType.MEMORY:
-            return self._is_active_authoritative_memory(obj)
+        if obj.context_type in {ContextType.BEHAVIOR_SUPPORT, ContextType.ACTION_POLICY_SUPPORT}:
+            return self._is_active_support_object(obj)
         return obj.lifecycle_state not in {
             LifecycleState.DELETED,
             LifecycleState.OBSOLETE,
@@ -182,7 +196,12 @@ class SimilarBehaviorRetriever:
         tenant_id: str,
         trace: dict[str, dict],
     ) -> dict[str, list[dict]]:
-        result: dict[str, list[dict]] = {"memory_anchors": [], "policy_refs": [], "cases": []}
+        result: dict[str, list[dict]] = {
+            "support_anchors": [],
+            "support_rules": [],
+            "policy_refs": [],
+            "cases": [],
+        }
         if self.relation_store is None:
             return result
         for relation in self.relation_store.relations_of(
@@ -210,8 +229,10 @@ class SimilarBehaviorRetriever:
                 result["policy_refs"].append(item)
             elif item.get("context_type") == ContextType.BEHAVIOR_CASE.value or relation.relation_type == "aggregated_from":
                 result["cases"].append(item)
-            elif item.get("context_type") == ContextType.MEMORY.value or relation.relation_type in {"anchored_by", "constrained_by"}:
-                result["memory_anchors"].append(item)
+            elif item.get("context_type") == ContextType.BEHAVIOR_SUPPORT.value:
+                result["support_anchors"].append(item)
+            elif item.get("context_type") == ContextType.ACTION_POLICY_SUPPORT.value:
+                result["support_rules"].append(item)
         return result
 
     def _hit_item(self, hit: IndexHit, source: str, weight: float) -> dict:
@@ -236,7 +257,10 @@ class SimilarBehaviorRetriever:
             return None
         if obj.lifecycle_state in {LifecycleState.DELETED, LifecycleState.OBSOLETE, LifecycleState.ARCHIVED}:
             return None
-        if obj.context_type == ContextType.MEMORY and not self._is_active_authoritative_memory(obj):
+        if obj.context_type in {
+            ContextType.BEHAVIOR_SUPPORT,
+            ContextType.ACTION_POLICY_SUPPORT,
+        } and not self._is_active_support_object(obj):
             return None
         return {
             "uri": obj.uri,
@@ -272,28 +296,14 @@ class SimilarBehaviorRetriever:
     def _tenant_id(self) -> str:
         return str(getattr(self.source_store, "tenant_id", "default") or "default")
 
-    def _is_active_authoritative_memory(self, obj) -> bool:  # noqa: ANN001
-        if obj.lifecycle_state != LifecycleState.ACTIVE:
+    def _is_active_support_object(self, obj) -> bool:  # noqa: ANN001
+        if obj.lifecycle_state != LifecycleState.ACTIVE or not isinstance(obj.metadata, Mapping):
             return False
-        metadata = dict(obj.metadata or {})
-        admission = dict(metadata.get("admission", {}) or {})
-        if admission.get("decision") in {"pending", "restricted", "archive_only", "reject"}:
-            return False
-        if metadata.get("memory_kind") == "memory_candidate":
-            return False
-        canonical_kind = str(metadata.get("canonical_kind") or "")
-        if canonical_kind == "pending_proposal":
-            return False
-        if canonical_kind and canonical_kind != "claim":
-            return False
-        claim_state = str(metadata.get("state") or metadata.get("claim_state") or "")
-        if claim_state and claim_state != "ACTIVE":
-            return False
-        if canonical_kind == "claim":
-            authority = dict(dict(metadata.get("scope", {}) or {}).get("authority", {}) or {})
-            if not authority or bool(authority.get("inferred", False)):
-                return False
-        return True
+        expected_kind = {
+            ContextType.BEHAVIOR_SUPPORT: "behavior",
+            ContextType.ACTION_POLICY_SUPPORT: "action_policy",
+        }.get(obj.context_type)
+        return bool(expected_kind) and str(obj.metadata.get("support_anchor_kind") or "") == expected_kind
 
     def _representative_cases(self, cases: list[dict]) -> list[dict]:
         deduped = self._dedupe(cases)

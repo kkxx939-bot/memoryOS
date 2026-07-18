@@ -13,6 +13,7 @@ COMMIT_SESSION = "session.commit"
 ATTEST_USER_INPUT = "session.attest_user_input"
 AUTHORITATIVE_REMEMBER = "memory.authoritative.remember"
 AUTHORITATIVE_FORGET = "memory.authoritative.forget"
+HARD_ERASE_MEMORY = "memory.hard_erase"
 
 DEFAULT_AGENT_CAPABILITIES = frozenset({READ_CONTEXT, COMMIT_SESSION})
 PRINCIPAL_ONLY_WORKSPACE = "__memoryos_principal_only__"
@@ -23,6 +24,7 @@ KNOWN_CAPABILITIES = frozenset(
         ATTEST_USER_INPUT,
         AUTHORITATIVE_REMEMBER,
         AUTHORITATIVE_FORGET,
+        HARD_ERASE_MEMORY,
     }
 )
 

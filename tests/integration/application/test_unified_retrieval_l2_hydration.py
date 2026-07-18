@@ -9,11 +9,7 @@ from memoryos.contextdb.catalog import CatalogRecord
 from memoryos.contextdb.model.context_layer import ContextLayers
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.retrieval.query_plan import (
-    CanonicalResolutionMode,
-    RetrievalOptions,
-    RetrievalQueryIntent,
-)
+from memoryos.contextdb.retrieval.query_plan import RetrievalOptions, RetrievalQueryIntent
 from memoryos.contextdb.store.sqlite_index_store import SQLiteIndexStore
 
 
@@ -25,7 +21,6 @@ def _resource_options(*, token_budget: int) -> RetrievalOptions:
         owner_user_id="u1",
         workspace_ids=("project-a",),
         query_intent=RetrievalQueryIntent.OPEN_RECALL,
-        canonical_resolution_mode=CanonicalResolutionMode.DISABLED,
         candidate_limit=10,
         final_limit=1,
         token_budget=token_budget,
@@ -76,7 +71,8 @@ def test_public_sdk_hydrates_only_bounded_resource_l2_and_degrades_by_budget(tmp
     # L2 while the rebuildable Catalog holds bounded L0/L1 serving text.
     record = CatalogRecord.from_context_object(obj, content=content)
     cast(SQLiteIndexStore, client.index_store).upsert_catalog(
-        replace(record, l0_text=l0_text, l1_text=l1_text)
+        replace(record, l0_text=l0_text, l1_text=l1_text),
+        tenant_id="tenant-a",
     )
 
     l2 = _assemble_resource(client, token_budget=1_000)
@@ -85,7 +81,6 @@ def test_public_sdk_hydrates_only_bounded_resource_l2_and_degrades_by_budget(tmp
     assert full_only_marker in l2["contexts"][0]["content"]
     assert "must-not-leak" not in l2["contexts"][0]["content"]
     assert "/Users/u1" not in l2["contexts"][0]["content"]
-    assert l2["contexts"][0]["metadata"]["l2_hydrated"] is True
     assert l2["metrics"]["source_reads"] == 2
     assert l2["metrics"]["source_reads"] <= l2["query_plan"]["candidate_limit"] + 2
 
@@ -105,7 +100,8 @@ def test_public_sdk_hydrates_only_bounded_resource_l2_and_degrades_by_budget(tmp
     # bounded L2 attempt must still finish at the final URI reference when the
     # full sanitized content does not fit.
     cast(SQLiteIndexStore, client.index_store).upsert_catalog(
-        replace(record, l0_text="", l1_text="")
+        replace(record, l0_text="", l1_text=""),
+        tenant_id="tenant-a",
     )
     uri_only = _assemble_resource(client, token_budget=40)
     assert len(uri_only["contexts"]) == 1
@@ -163,7 +159,6 @@ def test_message_and_tool_result_never_read_raw_source_or_archive_during_recall(
                 owner_user_id="u1",
                 workspace_ids=("project-a",),
                 query_intent=RetrievalQueryIntent.OPEN_RECALL,
-                canonical_resolution_mode=CanonicalResolutionMode.DISABLED,
                 candidate_limit=10,
                 final_limit=2,
                 token_budget=256,

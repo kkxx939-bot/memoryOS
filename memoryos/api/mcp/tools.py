@@ -20,6 +20,7 @@ from memoryos.api.mcp.schemas import (
     require_process_observation_metadata,
     required_str,
 )
+from memoryos.api.memory_contract import validate_memory_request, validate_memory_response
 from memoryos.api.retrieval_contract import parse_retrieval_options
 from memoryos.application.context.query_planner import merge_retrieval_options, retrieval_options_from_legacy
 from memoryos.contextdb.model.context_uri import ContextURI
@@ -35,6 +36,7 @@ from memoryos.security.trusted_context import (
     AUTHORITATIVE_FORGET,
     AUTHORITATIVE_REMEMBER,
     COMMIT_SESSION,
+    HARD_ERASE_MEMORY,
     READ_CONTEXT,
     TrustedRequestContext,
 )
@@ -69,83 +71,91 @@ class MCPToolRouter:
                         **self._local_caller_kwargs(),
                     )
                 )
+            if name == "memoryos_adopt_memory_document":
+                return self._memory_command(
+                    "adopt",
+                    "adopt_memory_document",
+                    args,
+                    AUTHORITATIVE_REMEMBER,
+                )
             if name == "memoryos_remember":
-                self.caller.require(AUTHORITATIVE_REMEMBER)
-                if self.caller.actor_kind != "user":
-                    raise PermissionError("authoritative remember requires a trusted user actor")
-                self._assert_identity(args)
-                if "identity_fields" in args and not isinstance(args["identity_fields"], dict):
-                    raise ValueError("identity_fields must be an object")
-                metadata = normalize_agent_metadata(args.get("connect_metadata"), self.config)
-                return _client_payload(
-                    self.client.remember(
-                        user_id=self.caller.user_id,
-                        content=required_str(args, "content"),
-                        title=str(args.get("title") or ""),
-                        memory_type=str(args.get("memory_type") or "project_decision"),
-                        project_id=str(args.get("project_id") or ""),
-                        constraint_polarity=str(args.get("constraint_polarity") or ""),
-                        condition=str(args.get("condition") or ""),
-                        exception=str(args.get("exception") or ""),
-                        identity_fields=(dict(args["identity_fields"]) if "identity_fields" in args else None),
-                        connect_metadata=metadata,
-                        tenant_id=self.caller.tenant_id,
-                        **self._local_caller_kwargs(),
-                    )
+                return self._memory_command("remember", "remember", args, AUTHORITATIVE_REMEMBER)
+            if name == "memoryos_edit_memory_document":
+                return self._memory_command(
+                    "edit",
+                    "edit_memory_document",
+                    args,
+                    AUTHORITATIVE_REMEMBER,
                 )
-            if name == "memoryos_list_pending":
-                self.caller.require(READ_CONTEXT)
-                self._assert_identity(args)
-                return ok_payload(
-                    {
-                        "results": self.client.list_pending(
-                            user_id=self.caller.user_id,
-                            tenant_id=self.caller.tenant_id,
-                            lifecycle_states=([str(item) for item in optional_list(args, "lifecycle_states") or []]),
-                            project_id=str(args.get("project_id") or ""),
-                            **self._local_caller_kwargs(),
-                        )
-                    }
+            if name == "memoryos_rename_memory_document":
+                return self._memory_command(
+                    "rename",
+                    "rename_memory_document",
+                    args,
+                    AUTHORITATIVE_REMEMBER,
                 )
-            if name == "memoryos_review_pending":
-                self.caller.require(AUTHORITATIVE_REMEMBER)
-                if self.caller.actor_kind != "user":
-                    raise PermissionError("pending review requires a trusted user actor")
-                self._assert_identity(args)
-                if "corrected_proposal" in args and not isinstance(args["corrected_proposal"], dict):
-                    raise ValueError("corrected_proposal must be an object")
-                return _client_payload(
-                    self.client.review_pending(
-                        user_id=self.caller.user_id,
-                        pending_uri=required_str(args, "pending_uri"),
-                        decision=required_str(args, "decision"),
-                        expected_lifecycle_revision=optional_int(
-                            args,
-                            "expected_lifecycle_revision",
-                            0,
-                            minimum=1,
-                        ),
-                        expected_proposal_fingerprint=required_str(
-                            args,
-                            "expected_proposal_fingerprint",
-                        ),
-                        command_id=required_str(args, "command_id"),
-                        tenant_id=self.caller.tenant_id,
-                        reason=str(args.get("reason") or ""),
-                        corrected_proposal=(dict(args["corrected_proposal"]) if "corrected_proposal" in args else None),
-                        **self._local_caller_kwargs(),
-                    )
+            if name == "memoryos_merge_memory_documents":
+                self.caller.require(AUTHORITATIVE_FORGET)
+                return self._memory_command(
+                    "merge",
+                    "merge_memory_documents",
+                    args,
+                    AUTHORITATIVE_REMEMBER,
+                )
+            if name == "memoryos_propose_memory_consolidation":
+                self.caller.require(AUTHORITATIVE_FORGET)
+                return self._memory_command(
+                    "merge_propose",
+                    "propose_memory_consolidation",
+                    args,
+                    AUTHORITATIVE_REMEMBER,
+                )
+            if name == "memoryos_resume_memory_consolidation":
+                self.caller.require(AUTHORITATIVE_FORGET)
+                return self._memory_command(
+                    "merge_resume",
+                    "resume_memory_consolidation",
+                    args,
+                    AUTHORITATIVE_REMEMBER,
                 )
             if name == "memoryos_forget":
-                self.caller.require(AUTHORITATIVE_FORGET)
-                self._assert_identity(args)
-                return _client_payload(
-                    self.client.forget(
-                        user_id=self.caller.user_id,
-                        uri=required_str(args, "uri"),
-                        tenant_id=self.caller.tenant_id,
-                        **self._local_caller_kwargs(),
-                    )
+                request = validate_memory_request("forget", args)
+                if request["mode"] == "HARD_ERASE":
+                    self.caller.require(HARD_ERASE_MEMORY)
+                return self._memory_command(
+                    "forget",
+                    "forget",
+                    request,
+                    AUTHORITATIVE_FORGET,
+                    already_validated=True,
+                )
+            if name == "memoryos_memory_history":
+                self.caller.require(READ_CONTEXT)
+                request = validate_memory_request("history", args)
+                return _validated_memory_payload(
+                    "history",
+                    self.client.list_memory_history(**request, **self._local_caller_kwargs()),
+                )
+            if name == "memoryos_restore_memory_revision":
+                return self._memory_command(
+                    "restore",
+                    "restore_memory_revision",
+                    args,
+                    AUTHORITATIVE_REMEMBER,
+                )
+            if name == "memoryos_review_memory_edit":
+                return self._memory_command(
+                    "review",
+                    "review_memory_edit",
+                    args,
+                    AUTHORITATIVE_REMEMBER,
+                )
+            if name == "memoryos_preview_memory_edit":
+                self.caller.require(READ_CONTEXT)
+                request = validate_memory_request("review_preview", args)
+                return _validated_memory_payload(
+                    "review_preview",
+                    self.client.preview_memory_edit(**request, **self._local_caller_kwargs()),
                 )
             if name == "memoryos_archive_search":
                 self.caller.require(READ_CONTEXT)
@@ -192,6 +202,25 @@ class MCPToolRouter:
         except Exception as exc:  # 工具层是外部 Agent 的最后一道安全边界。
             return exception_payload(exc)
 
+    def _memory_command(
+        self,
+        operation: str,
+        method_name: str,
+        args: dict[str, Any],
+        capability: str,
+        *,
+        already_validated: bool = False,
+    ) -> dict[str, Any]:
+        self.caller.require(capability)
+        if self.caller.actor_kind != "user":
+            raise PermissionError("memory document commands require a trusted user actor")
+        request = args if already_validated else validate_memory_request(operation, args)
+        method = getattr(self.client, method_name)
+        return _validated_memory_payload(
+            operation,
+            method(**request, **self._local_caller_kwargs()),
+        )
+
     def search_context(self, args: dict[str, Any]) -> dict[str, Any]:
         self.caller.require(READ_CONTEXT)
         query = required_str(args, "query")
@@ -227,10 +256,9 @@ class MCPToolRouter:
             project_id=project_id,
             tenant_id=self._bound_tenant(args),
             applicability_scopes=[dict(item) for item in optional_list(args, "applicability_scopes") or []],
-            memory_states=[str(item) for item in optional_list(args, "memory_states") or []],
-            memory_types=[str(item) for item in optional_list(args, "memory_types") or []],
-            claim_uris=[str(item) for item in optional_list(args, "claim_uris") or []],
-            slot_uris=[str(item) for item in optional_list(args, "slot_uris") or []],
+            record_kinds=[str(item) for item in optional_list(args, "record_kinds") or []],
+            document_ids=[str(item) for item in optional_list(args, "document_ids") or []],
+            document_kinds=[str(item) for item in optional_list(args, "document_kinds") or []],
             query_intent=str(args.get("query_intent")) if args.get("query_intent") else None,
             **self._local_caller_kwargs(),
         )
@@ -292,10 +320,9 @@ class MCPToolRouter:
             project_id=project_id,
             tenant_id=self._bound_tenant(args),
             applicability_scopes=[dict(item) for item in optional_list(args, "applicability_scopes") or []],
-            memory_states=[str(item) for item in optional_list(args, "memory_states") or []],
-            memory_types=[str(item) for item in optional_list(args, "memory_types") or []],
-            claim_uris=[str(item) for item in optional_list(args, "claim_uris") or []],
-            slot_uris=[str(item) for item in optional_list(args, "slot_uris") or []],
+            record_kinds=[str(item) for item in optional_list(args, "record_kinds") or []],
+            document_ids=[str(item) for item in optional_list(args, "document_ids") or []],
+            document_kinds=[str(item) for item in optional_list(args, "document_kinds") or []],
             query_intent=str(args.get("query_intent")) if args.get("query_intent") else None,
             **self._local_caller_kwargs(),
         )
@@ -402,7 +429,6 @@ class MCPToolRouter:
                 "candidate_limit": max(DEFAULT_CANDIDATE_LIMIT, limit),
                 "limit": limit,
                 "token_budget": token_budget if token_budget is not None else DEFAULT_TOKEN_BUDGET,
-                "memory_states": args.get("memory_states"),
                 "query_intent": args.get("query_intent"),
             }
         )
@@ -499,6 +525,14 @@ def _client_payload(value: dict[str, Any]) -> dict[str, Any]:
     if value.get("error"):
         return value
     return ok_payload(value)
+
+
+def _validated_memory_payload(operation: str, value: dict[str, Any]) -> dict[str, Any]:
+    """Preserve a structured remote error; validate only successful payloads."""
+
+    if value.get("error"):
+        return _client_payload(value)
+    return _client_payload(validate_memory_response(operation, value))
 
 
 def _to_payload(value: Any) -> Any:

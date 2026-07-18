@@ -12,23 +12,13 @@ class SkillRegistry:
         self,
         source_store: SourceStore | None = None,
         index_store: IndexStore | None = None,
-        *,
-        migration_gate=None,  # noqa: ANN001
     ) -> None:
         self.skills: dict[str, Skill] = {}
         self.source_store = source_store
         self.index_store = index_store
-        self.migration_gate = migration_gate or getattr(source_store, "migration_gate", None)
 
     def register(self, skill: Skill, content: str | None = None) -> None:
-        acquire = getattr(self.migration_gate, "acquire_projection_fence", None)
-        release = getattr(self.migration_gate, "release_projection_fence", None)
-        fence = acquire() if callable(acquire) else None
-        try:
-            self._register_unfenced(skill, content=content)
-        finally:
-            if callable(release):
-                release(fence)
+        self._register_unfenced(skill, content=content)
 
     def _register_unfenced(self, skill: Skill, content: str | None = None) -> None:
         self.skills[skill.uri] = skill
@@ -36,7 +26,11 @@ class SkillRegistry:
         if self.source_store is not None:
             self.source_store.write_object(obj, content=content or skill.title)
         if self.index_store is not None:
-            self.index_store.upsert_index(obj, content=content or skill.title)
+            self.index_store.upsert_index(
+                obj,
+                content=content or skill.title,
+                tenant_id=str(obj.tenant_id or "default"),
+            )
 
     def get(self, uri: str) -> Skill | None:
         return self.skills.get(uri)

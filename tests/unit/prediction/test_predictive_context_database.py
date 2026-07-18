@@ -11,26 +11,25 @@ from memoryos.behavior.update import BehaviorLifecycleService, OpportunityAwareD
 from memoryos.contextdb.model import ContextObject, ContextType
 from memoryos.contextdb.session import SessionArchive, SessionArchiveStore, SessionCommitService
 from memoryos.contextdb.store import FileSystemSourceStore, InMemoryIndexStore, InMemoryQueueStore
-from memoryos.memory.lifecycle.memory_cooling import MemoryCoolingPolicy
-from memoryos.memory.model import MemoryAnchor
 from memoryos.operations.model import OperationAction
 from memoryos.prediction.model import ActionContext, PredictionLedger, PredictionRequest
 from memoryos.prediction.pipeline import PolicyGate, PredictionEngine
+from memoryos.support import SupportAnchor
 
 
 class PredictiveContextDatabaseTest(unittest.TestCase):
-    def test_behavior_pattern_and_action_policy_require_memory_anchor(self) -> None:
+    def test_behavior_pattern_and_action_policy_require_support_anchor(self) -> None:
         with self.assertRaises(ValueError):
             BehaviorPattern(
                 user_id="gulf",
                 scene_key="hot",
                 trigger_conditions={},
-                memory_anchor_uri="",
+                support_anchor_uri="",
                 case_refs=[],
                 action_distribution=[],
             )
         with self.assertRaises(ValueError):
-            ActionPolicy(user_id="gulf", scene_key="hot", action="turn_on_ac", memory_anchor_uri="")
+            ActionPolicy(user_id="gulf", scene_key="hot", action="turn_on_ac", support_anchor_uri="")
 
     def test_behavior_lifecycle_creates_anchor_cluster_and_pattern(self) -> None:
         cases = [
@@ -39,19 +38,19 @@ class PredictiveContextDatabaseTest(unittest.TestCase):
             BehaviorCase(user_id="gulf", scene_key="hot", observation={}, user_actual_action="turn_on_fan"),
         ]
         result = BehaviorLifecycleService().evaluate("gulf", "hot", cases)
-        self.assertIsInstance(result.memory_anchor, MemoryAnchor)
+        self.assertIsInstance(result.support_anchor, SupportAnchor)
         self.assertIsNotNone(result.cluster)
         self.assertIsNotNone(result.pattern)
-        assert result.memory_anchor is not None
+        assert result.support_anchor is not None
         assert result.pattern is not None
-        self.assertTrue(result.memory_candidate_required)
-        self.assertEqual(result.pattern.memory_anchor_uri, result.memory_anchor.uri)
+        self.assertTrue(result.support_candidate_required)
+        self.assertEqual(result.pattern.support_anchor_uri, result.support_anchor.uri)
 
     def test_single_short_behavior_remains_temporary_case_only(self) -> None:
         case = BehaviorCase(user_id="gulf", scene_key="hot", observation={}, user_actual_action="turn_on_ac")
         result = BehaviorLifecycleService().evaluate("gulf", "hot", [case])
         self.assertEqual(result.temporary_cases, [case])
-        self.assertIsNone(result.memory_anchor)
+        self.assertIsNone(result.support_anchor)
         self.assertIsNone(result.cluster)
         self.assertIsNone(result.pattern)
 
@@ -60,7 +59,7 @@ class PredictiveContextDatabaseTest(unittest.TestCase):
             user_id="gulf",
             scene_key="hot",
             trigger_conditions={"context_tags": ["hot_environment"]},
-            memory_anchor_uri="memoryos://user/gulf/memories/anchors/hot",
+            support_anchor_uri="memoryos://user/gulf/support/behavior/hot",
             case_refs=["c1"],
             action_distribution=[{"action": "turn_on_ac", "probability": 1.0}],
             opportunity=OpportunityStats(activation_count=1, missed_opportunity_count=0),
@@ -78,7 +77,7 @@ class PredictiveContextDatabaseTest(unittest.TestCase):
             user_id="gulf",
             scene_key="hot",
             action="turn_on_ac",
-            memory_anchor_uri="memoryos://user/gulf/memories/anchors/hot",
+            support_anchor_uri="memoryos://user/gulf/support/behavior/hot",
             auto_execute_allowed=True,
         )
         updater = ActionPolicyUpdater()
@@ -88,57 +87,45 @@ class PredictiveContextDatabaseTest(unittest.TestCase):
         self.assertEqual(policy.status, ActionPolicyStatus.DISABLED_AUTO_EXECUTE)
         self.assertFalse(policy.auto_execute_allowed)
 
-    def test_explicit_negative_rule_writes_policy_memory_and_disables_policy(self) -> None:
+    def test_explicit_negative_rule_writes_policy_support_and_disables_policy(self) -> None:
         policy = ActionPolicy(
             user_id="gulf",
             scene_key="hot",
             action="turn_on_ac",
-            memory_anchor_uri="memoryos://user/gulf/memories/anchors/hot",
+            support_anchor_uri="memoryos://user/gulf/support/behavior/hot",
         )
         ops = FeedbackCommitPlanner().explicit_negative_rule_operations(
             policy,
             PenaltySignal(penalty=1.0, explicit_rule="以后别自动开空调"),
         )
         self.assertEqual([op.action for op in ops], [OperationAction.ADD, OperationAction.DISABLE])
-        self.assertEqual(ops[0].context_type, ContextType.MEMORY)
+        self.assertEqual(ops[0].context_type, ContextType.ACTION_POLICY_SUPPORT)
         self.assertEqual(ops[1].context_type, ContextType.ACTION_POLICY)
-
-    def test_memory_with_behavior_support_is_compressed_not_deleted(self) -> None:
-        memory = ContextObject(
-            uri="memoryos://user/gulf/memories/preferences/temperature",
-            context_type=ContextType.MEMORY,
-            title="Temperature preference",
-            owner_user_id="gulf",
-            behavior_support_hotness=0.8,
-        )
-        op = MemoryCoolingPolicy().cool(memory)
-        self.assertEqual(op.action, OperationAction.COMPRESS)
-        self.assertFalse(op.payload["delete"])
 
     def test_policy_gate_allows_auto_execute_only_after_gate(self) -> None:
         policy = ActionPolicy(
             user_id="gulf",
             scene_key="hot",
             action="turn_on_ac",
-            memory_anchor_uri="memoryos://user/gulf/memories/anchors/hot",
+            support_anchor_uri="memoryos://user/gulf/support/behavior/hot",
             auto_execute_allowed=True,
             confidence=0.9,
             q_value=0.9,
         )
         candidate = ActionPolicyRanker().rank(
             [policy],
-            verified_memory_anchor_uris={policy.memory_anchor_uri},
+            verified_support_anchor_uris={policy.support_anchor_uri},
         )[0]
         action_context = ActionContext(
             user_id="gulf",
             candidate_actions=[candidate.action],
             packed_context={
                 "slices": {
-                    "memory_anchor": {
+                    "support_anchor": {
                         "items": [
                             {
-                                "uri": policy.memory_anchor_uri,
-                                "context_type": "memory",
+                                "uri": policy.support_anchor_uri,
+                                "context_type": "behavior_support",
                                 "verified_exact_anchor": True,
                             }
                         ]
@@ -154,34 +141,35 @@ class PredictiveContextDatabaseTest(unittest.TestCase):
             user_id="gulf",
             scene_key="hot",
             action="turn_on_ac",
-            memory_anchor_uri="memoryos://user/gulf/memories/anchors/hot",
+            support_anchor_uri="memoryos://user/gulf/support/behavior/hot",
         )
 
         unverified = ActionPolicyRanker().rank([policy])[0]
         verified = ActionPolicyRanker().rank(
             [policy],
-            verified_memory_anchor_uris={policy.memory_anchor_uri},
+            verified_support_anchor_uris={policy.support_anchor_uri},
         )[0]
 
-        self.assertEqual(unverified.features["memory_anchor_match"], 0.0)
-        self.assertEqual(verified.features["memory_anchor_match"], 1.0)
+        self.assertEqual(unverified.features["support_anchor_match"], 0.0)
+        self.assertEqual(verified.features["support_anchor_match"], 1.0)
         self.assertGreater(verified.score, unverified.score)
 
     def test_prediction_engine_records_ledger_and_does_not_write_memory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             index = InMemoryIndexStore()
             anchor_obj = ContextObject(
-                uri="memoryos://user/gulf/memories/anchors/hot",
-                context_type=ContextType.MEMORY,
+                uri="memoryos://user/gulf/support/behavior/hot",
+                context_type=ContextType.BEHAVIOR_SUPPORT,
                 title="hot weather anchor",
                 owner_user_id="gulf",
+                metadata={"support_anchor_kind": "behavior"},
             )
-            index.upsert_index(anchor_obj, "hot weather home comfort")
+            index.upsert_index(anchor_obj, "hot weather home comfort", tenant_id="default")
             policy = ActionPolicy(
                 user_id="gulf",
                 scene_key="hot",
                 action="turn_on_ac",
-                memory_anchor_uri=anchor_obj.uri,
+                support_anchor_uri=anchor_obj.uri,
                 auto_execute_allowed=True,
                 q_value=0.9,
                 confidence=0.9,
@@ -203,8 +191,8 @@ class PredictiveContextDatabaseTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             source = FileSystemSourceStore(tmp)
             index = InMemoryIndexStore()
-            anchor = MemoryAnchor(
-                uri="memoryos://user/gulf/memories/anchors/hot",
+            anchor = SupportAnchor(
+                uri="memoryos://user/gulf/support/behavior/hot",
                 user_id="gulf",
                 title="hot anchor",
                 content="verified hot-room anchor",
@@ -215,7 +203,7 @@ class PredictiveContextDatabaseTest(unittest.TestCase):
                 user_id="gulf",
                 scene_key="hot",
                 action="turn_on_ac",
-                memory_anchor_uri=anchor.uri,
+                support_anchor_uri=anchor.uri,
                 auto_execute_allowed=True,
                 q_value=1.0,
                 confidence=1.0,
@@ -236,8 +224,8 @@ class PredictiveContextDatabaseTest(unittest.TestCase):
                 policies=[policy],
             )
 
-            self.assertEqual(result.candidates[0].features["memory_anchor_match"], 1.0)
-            anchor_items = result.action_context.packed_context["slices"]["memory_anchor"]["items"]
+            self.assertEqual(result.candidates[0].features["support_anchor_match"], 1.0)
+            anchor_items = result.action_context.packed_context["slices"]["support_anchor"]["items"]
             self.assertEqual([item["uri"] for item in anchor_items], [anchor.uri])
             self.assertIs(anchor_items[0]["verified_exact_anchor"], True)
             self.assertEqual(result.decision.mode, "execute")
@@ -248,7 +236,7 @@ class PredictiveContextDatabaseTest(unittest.TestCase):
                 user_id="other-user",
                 scene_key="hot",
                 action="turn_on_ac",
-                memory_anchor_uri="memoryos://user/other-user/memories/anchors/hot",
+                support_anchor_uri="memoryos://user/other-user/support/behavior/hot",
                 auto_execute_allowed=True,
                 q_value=1.0,
                 confidence=1.0,
@@ -276,10 +264,17 @@ class PredictiveContextDatabaseTest(unittest.TestCase):
                 archive_uri="memoryos://user/gulf/sessions/history/archive_001",
                 messages=[{"role": "user", "content": "room is hot"}],
                 observations=[{"raw_text": "temperature 30"}],
+                metadata={
+                    "connect": {
+                        "adapter_id": "codex",
+                        "connect_type": "agent",
+                        "run_mode": "context_reduction",
+                    }
+                },
             )
             queue = InMemoryQueueStore()
             store = SessionArchiveStore(tmp)
-            service = SessionCommitService(store, queue, allow_plan_only=True)
+            service = SessionCommitService(store, queue)
             queued = service.sync_archive(archive)
             self.assertEqual(queued.status, "queued")
             done = service.async_commit(archive)

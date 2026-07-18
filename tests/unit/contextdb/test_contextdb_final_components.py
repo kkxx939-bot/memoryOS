@@ -7,8 +7,6 @@ from memoryos.adapters.sqlite import SqliteIndexStore, SqliteQueueStore, SqliteR
 from memoryos.contextdb.layers import LayerRefresher
 from memoryos.contextdb.model import ContextObject, ContextRelation, ContextType
 from memoryos.contextdb.resource import ResourceImporter
-from memoryos.contextdb.retrieval import QueryPlan
-from memoryos.contextdb.retrieval.hierarchical_retriever import OfflineHierarchicalRetriever
 from memoryos.contextdb.skill import Skill, SkillContextBuilder, SkillRegistry
 from memoryos.contextdb.store import FileSystemSourceStore
 from memoryos.contextdb.store.vector_store import InMemoryVectorStore
@@ -19,8 +17,8 @@ class ContextDBFinalComponentsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             source = FileSystemSourceStore(tmp)
             obj = ContextObject(
-                uri="memoryos://user/gulf/memories/anchors/home-comfort",
-                context_type=ContextType.MEMORY,
+                uri="memoryos://user/gulf/resources/home-comfort",
+                context_type=ContextType.RESOURCE,
                 title="Home comfort",
                 owner_user_id="gulf",
             )
@@ -36,15 +34,32 @@ class ContextDBFinalComponentsTest(unittest.TestCase):
             relation = SqliteRelationStore(f"{tmp}/relation.sqlite3")
             queue = SqliteQueueStore(f"{tmp}/queue.sqlite3")
             obj = ContextObject(
-                uri="memoryos://user/gulf/memories/anchors/hot",
-                context_type=ContextType.MEMORY,
+                uri="memoryos://user/gulf/resources/hot",
+                context_type=ContextType.RESOURCE,
                 title="Hot anchor",
                 owner_user_id="gulf",
             )
-            index.upsert_index(obj, "hot weather comfort")
-            self.assertEqual(index.search("hot", {"owner_user_id": "gulf"})[0].uri, obj.uri)
-            relation.add_relation(ContextRelation(source_uri=obj.uri, relation_type="requires_skill", target_uri="memoryos://skills/ac/control"))
-            self.assertEqual(relation.relations_of(obj.uri)[0].relation_type, "requires_skill")
+            index.upsert_index(obj, "hot weather comfort", tenant_id="default")
+            self.assertEqual(
+                index.search(
+                    "hot",
+                    tenant_id="default",
+                    filters={"owner_user_id": "gulf"},
+                )[0].uri,
+                obj.uri,
+            )
+            relation.add_relation(
+                ContextRelation(
+                    source_uri=obj.uri,
+                    relation_type="requires_skill",
+                    target_uri="memoryos://skills/ac/control",
+                ),
+                tenant_id="default",
+            )
+            self.assertEqual(
+                relation.relations_of(obj.uri, tenant_id="default")[0].relation_type,
+                "requires_skill",
+            )
             from memoryos.contextdb.store import QueueJob
 
             queue.enqueue(QueueJob(job_id="j1", queue_name="semantic", action="refresh", target_uri=obj.uri))
@@ -53,7 +68,7 @@ class ContextDBFinalComponentsTest(unittest.TestCase):
             queue.ack(leased[0])
             self.assertEqual(queue.lease("semantic", lease_owner="test", limit=1), [])
 
-    def test_resource_skill_hierarchical_retrieval_and_vector_store(self) -> None:
+    def test_resource_skill_and_vector_store(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             source = FileSystemSourceStore(tmp)
             resource = ResourceImporter(source).import_text(
@@ -67,18 +82,11 @@ class ContextDBFinalComponentsTest(unittest.TestCase):
             skill = Skill(uri="memoryos://skills/smart_home/ac-control", title="AC Control", tool_name="ac.set_temperature")
             registry.register(skill)
             self.assertEqual(SkillContextBuilder(registry).build([skill.uri])[0]["context_type"], "skill")
-            index = SqliteIndexStore(f"{tmp}/index.sqlite3")
             obj = ContextObject(
                 uri="memoryos://user/gulf/behavior/patterns/hot-weather",
                 context_type=ContextType.BEHAVIOR_PATTERN,
                 title="hot weather home behavior",
                 owner_user_id="gulf",
-            )
-            index.upsert_index(obj, "hot weather AC")
-            plan = QueryPlan("hot weather", "gulf", [ContextType.BEHAVIOR_PATTERN], 1000)
-            self.assertEqual(
-                OfflineHierarchicalRetriever(index, offline_admin=True).retrieve(plan).l2_uris,
-                [obj.uri],
             )
             vector = InMemoryVectorStore()
             vector.upsert_vector(obj.uri, [1.0, 0.0])

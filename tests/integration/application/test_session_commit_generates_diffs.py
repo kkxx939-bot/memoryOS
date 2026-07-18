@@ -6,75 +6,19 @@ import unittest
 from pathlib import Path
 
 from memoryos.action_policy.model.action_policy import ActionPolicy
-from memoryos.contextdb.session.planners.memory_commit_planner import MemoryCommitPlanner
-from memoryos.contextdb.session.session_archive import SessionArchiveStore
-from memoryos.contextdb.session.session_commit import SessionCommitService
+from memoryos.api.sdk.client import MemoryOSClient
 from memoryos.contextdb.session.session_model import SessionArchive
-from memoryos.contextdb.store.local_stores import (
-    FileSystemSourceStore,
-    InMemoryIndexStore,
-    InMemoryQueueStore,
-    InMemoryRelationStore,
-)
-from memoryos.memory.extraction import FakeMemoryModelProvider, LLMMemoryExtractorBackend
-from memoryos.operations.commit.operation_committer import OperationCommitter
-
-
-def _preference_response(source_text: str) -> str:
-    ref = {"event_id": "message:0", "span_start": 0, "span_end": len(source_text)}
-    identity_fields = {"subject": "我", "dimension": "空调直吹"}
-    value_fields = {"canonical_value": "不喜欢空调直吹"}
-    semantic = {
-        "speech_act": "confirmation",
-        "commitment": "confirmed",
-        "temporal_scope": "current",
-        "relation_to_existing": "unrelated",
-        "utterance_mode": "assertion",
-        "attribution": "source_actor",
-        "durability": "durable",
-        "modal_force": "prefer",
-        "atomicity": "atomic",
-    }
-    candidate = {
-        "proposal_id": "preference-airflow",
-        "memory_type": "preference",
-        "identity_fields": identity_fields,
-        "value_fields": value_fields,
-        "semantic": semantic,
-        "epistemic_status": "EXPLICIT",
-        "suggested_scope_refs": [],
-        "related_candidate_refs": [],
-        "evidence_refs": [ref],
-        "atomic_evidence_ref": ref,
-        "field_evidence_refs": {
-            **{f"identity.{key}": [ref] for key in identity_fields},
-            **{f"value.{key}": [ref] for key in value_fields},
-            **{f"semantic.{key}": [ref] for key in semantic},
-            "transition": [ref],
-        },
-        "confidence": 0.98,
-        "source_role": "user",
-    }
-    return json.dumps({"candidates": [candidate]}, ensure_ascii=False)
 
 
 class SessionCommitGeneratesDiffsTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self.store = SessionArchiveStore(self.root)
-        self.queue = InMemoryQueueStore()
-        self.source = FileSystemSourceStore(self.root)
-        self.index = InMemoryIndexStore()
-        self.relations = InMemoryRelationStore()
-        self.committer = OperationCommitter(self.source, self.index, str(self.root), relation_store=self.relations)
-        extractor = LLMMemoryExtractorBackend(FakeMemoryModelProvider(_preference_response("记住我不喜欢空调直吹")))
-        self.service = SessionCommitService(
-            self.store,
-            self.queue,
-            committer=self.committer,
-            memory_planner=MemoryCommitPlanner(extractor=extractor),
-        )
+        self.client = MemoryOSClient(str(self.root))
+        self.store = self.client.session_archive_store
+        self.source = self.client.source_store
+        self.index = self.client.index_store
+        self.service = self.client.session_commit_service
         self.archive_uri = "memoryos://user/u1/sessions/history/archive_001"
 
     def tearDown(self) -> None:
@@ -85,10 +29,14 @@ class SessionCommitGeneratesDiffsTest(unittest.TestCase):
             user_id="u1",
             scene_key="hot_room",
             action="turn_on_ac",
-            memory_anchor_uri="memoryos://user/u1/memories/anchors/hot_room_anchor",
+            support_anchor_uri="memoryos://user/u1/support/behavior/hot_room_anchor",
         )
         self.source.write_object(policy.to_context_object(), content=json.dumps(policy.to_dict()))
-        self.index.upsert_index(policy.to_context_object(), content="hot_room turn_on_ac")
+        self.index.upsert_index(
+            policy.to_context_object(),
+            content="hot_room turn_on_ac",
+            tenant_id="default",
+        )
         archive = SessionArchive(
             user_id="u1",
             session_id="s1",
@@ -127,16 +75,21 @@ class SessionCommitGeneratesDiffsTest(unittest.TestCase):
         self.assertEqual(memory_diff["status"], "committed")
         self.assertEqual(behavior_diff["status"], "committed")
         self.assertEqual(action_policy_diff["status"], "committed")
-        self.assertTrue(any(op["context_type"] == "memory" and op["action"] == "add" for op in memory_diff["operations"]))
-        self.assertTrue(any(op["context_type"] == "behavior_case" and op["action"] == "add" for op in behavior_diff["operations"]))
-        self.assertTrue(any(op["context_type"] == "behavior_cluster" and op["action"] == "add" for op in behavior_diff["operations"]))
-        self.assertTrue(any(op["context_type"] == "behavior_pattern" and op["action"] == "add" for op in behavior_diff["operations"]))
-        pattern_ops = [op for op in behavior_diff["operations"] if op["context_type"] == "behavior_pattern"]
-        self.assertTrue(pattern_ops[0]["payload"]["context_object"]["metadata"]["memory_anchor_uri"])
-        self.assertTrue(any(op["action"] == "reward" for op in action_policy_diff["operations"]))
-        self.assertTrue(any(op["action"] == "penalize" for op in action_policy_diff["operations"]))
-        self.assertTrue(any(op["context_type"] == "memory" and op["action"] == "add" for op in action_policy_diff["operations"]))
-        self.assertTrue(any(op["context_type"] == "action_policy" and op["action"] == "disable" for op in action_policy_diff["operations"]))
+        self.assertEqual(memory_diff["edit_proposal_count"], 0)
+        self.assertEqual(memory_diff["edit_proposal_ids"], [])
+        self.assertGreaterEqual(memory_diff["memory_document_change_count"], 1)
+        self.assertTrue(memory_diff["effects"])
+        self.assertNotIn("operations", memory_diff)
+        self.assertGreater(behavior_diff["operation_count"], 0)
+        self.assertGreater(action_policy_diff["operation_count"], 0)
+        self.assertTrue(behavior_diff["operation_ids"])
+        self.assertTrue(action_policy_diff["operation_ids"])
+        preference = self.client.memory_document_store.read_raw(
+            "default",
+            "u1",
+            relative_path="preferences.md",
+        )
+        self.assertIn("不喜欢空调直吹".encode(), preference)
 
 
 if __name__ == "__main__":

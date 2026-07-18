@@ -194,32 +194,6 @@ def validate_marker(
     object_uris: set[str] | None = None,
 ) -> dict[str, Any]:
     payload = load_marker(path)
-    # Canonical and pending-memory paths use immutable receipts.  Keep this
-    # dispatcher for callers migrating from the old marker API, but never
-    # compare a receipt with live SourceStore state.
-    from memoryos.operations.commit.receipt import (
-        TRANSACTION_RECEIPT_SCHEMA_VERSION,
-        ReceiptIntegrityError,
-        receipt_snapshot,
-        validate_transaction_receipt,
-    )
-
-    if payload.get("schema_version") == TRANSACTION_RECEIPT_SCHEMA_VERSION:
-        try:
-            receipt = validate_transaction_receipt(
-                payload,
-                transaction_id=transaction_id,
-                idempotency_key=idempotency_key,
-                tenant_id=tenant_id,
-                user_id=user_id,
-                operation_ids=operation_ids,
-            )
-            if object_uris is not None:
-                for uri in object_uris:
-                    receipt_snapshot(receipt, uri)
-        except ReceiptIntegrityError as exc:
-            raise EffectProofError(str(exc)) from exc
-        return receipt
     if payload.get("schema_version") != EFFECT_MARKER_SCHEMA_VERSION:
         raise EffectProofError("transaction marker schema is unsupported")
     if payload.get("status") != "committed":
@@ -351,11 +325,6 @@ def _validate_relation_effect(
 
 
 def marker_proves_object(payload: dict[str, Any], uri: str) -> bool:
-    if payload.get("schema_version") == "memory_transaction_receipt_v2":
-        return any(
-            isinstance(effect, dict) and effect.get("uri") == uri and effect.get("expected_exists") is True
-            for effect in payload.get("effect_snapshots", []) or []
-        )
     return any(
         isinstance(effect, dict) and effect.get("uri") == uri and effect.get("expected_exists") is True
         for effect in payload.get("object_effects", []) or []
@@ -366,29 +335,6 @@ def marker_proves_relation(payload: dict[str, Any], relation: ContextRelation) -
     desired = normalized_relation(relation)
     desired_identity = relation_identity(desired)
     desired_digest = canonical_digest(desired)
-    if payload.get("schema_version") == "memory_transaction_receipt_v2":
-        snapshot_proves = any(
-            isinstance(snapshot, dict)
-            and any(
-                isinstance(item, dict)
-                and relation_identity(item) == desired_identity
-                and canonical_digest(normalized_relation(item)) == desired_digest
-                for item in snapshot.get("relations", []) or []
-            )
-            for snapshot in payload.get("effect_snapshots", []) or []
-        )
-        if snapshot_proves:
-            return True
-        # System-managed canonical relations (for example belongs_to_slot)
-        # are persisted in the immutable relation effect set even when they
-        # are not authored fields of the ContextObject itself.
-        return any(
-            isinstance(effect, dict)
-            and effect.get("expected_exists") is True
-            and effect.get("identity") == desired_identity
-            and effect.get("relation_digest") == desired_digest
-            for effect in payload.get("relation_effects", []) or []
-        )
     return any(
         isinstance(effect, dict)
         and effect.get("expected_exists") is True

@@ -26,18 +26,17 @@ def _seed_client(tmp_path, handler):
     )
     client = MemoryOSClient(str(tmp_path), tool_registry=registry)
     observation = Observation(user_id="u1", raw_text="hot room", location="home", environment={"temperature": 30})
-    anchor_uri = "memoryos://user/u1/memories/anchors/hot"
+    anchor_uri = "memoryos://user/u1/support/behavior/hot"
     resource_uri = "memoryos://resources/ac"
     skill_uri = "memoryos://skills/ac"
     client.context_db.seed_object(
         ContextObject(
             uri=anchor_uri,
-            context_type=ContextType.MEMORY,
+            context_type=ContextType.BEHAVIOR_SUPPORT,
             title="hot anchor",
             owner_user_id="u1",
             metadata={
-                "memory_kind": "anchor_memory",
-                "admission": {"decision": "accept"},
+                "support_anchor_kind": "behavior",
             },
         ),
         content="hot anchor",
@@ -74,7 +73,7 @@ def _seed_client(tmp_path, handler):
         user_id="u1",
         scene_key=observation.scene_key,
         action="turn_on_ac",
-        memory_anchor_uri=anchor_uri,
+        support_anchor_uri=anchor_uri,
         q_value=0.95,
         confidence=0.95,
         reward_score=10.0,
@@ -148,7 +147,12 @@ def test_execute_failure_writes_failed_action_result_and_penalizes_policy(tmp_pa
 
 def test_missing_required_skill_keeps_policy_gate_from_execute(tmp_path) -> None:
     client, policy, request = _seed_client(tmp_path, lambda payload: {"ok": True})
-    client.relation_store.delete_relation(policy.uri, "requires_skill", policy.required_skill_uris[0])
+    client.relation_store.delete_relation(
+        policy.uri,
+        "requires_skill",
+        policy.required_skill_uris[0],
+        tenant_id="default",
+    )
 
     result = client.process_observation(request, archive_session=True, async_commit=True)
 

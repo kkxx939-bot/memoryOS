@@ -41,9 +41,23 @@ class FakeContextDB:
         self.committed: list[tuple[SessionArchive, bool]] = []
         self.fail_commit = False
 
-    def search(self, query: str, *, owner_user_id=None, context_type=None, limit: int = 10):  # noqa: ANN001
+    def search(
+        self,
+        query: str,
+        *,
+        tenant_id: str,
+        owner_user_id: str | None = None,
+        context_type: object | None = None,
+        limit: int = 10,
+    ) -> list[IndexHit]:
         self.search_calls.append(
-            {"query": query, "owner_user_id": owner_user_id, "context_type": context_type, "limit": limit}
+            {
+                "query": query,
+                "tenant_id": tenant_id,
+                "owner_user_id": owner_user_id,
+                "context_type": context_type,
+                "limit": limit,
+            }
         )
         return self.hits[:limit]
 
@@ -172,9 +186,9 @@ def test_session_archive_metadata_manifest_defaults() -> None:
 def test_context_object_preserves_connect_metadata_roundtrip() -> None:
     connect = ConnectMetadata.default_agent("codex").to_dict()
     obj = ContextObject(
-        uri="memoryos://user/u1/memories/anchors/m1",
-        context_type=ContextType.MEMORY,
-        title="Memory",
+        uri="memoryos://user/u1/resources/connect-metadata",
+        context_type=ContextType.RESOURCE,
+        title="Resource",
         metadata={"connect": connect},
     )
 

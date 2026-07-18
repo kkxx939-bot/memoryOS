@@ -18,9 +18,9 @@ def test_recovery_source_written_missing_source_is_quarantined_once(tmp_path) ->
     redo = RedoLog(tmp_path)
     operation = ContextOperation(
         user_id="u1",
-        context_type=ContextType.MEMORY,
+        context_type=ContextType.BEHAVIOR_CASE,
         action=OperationAction.REFRESH_LAYERS,
-        target_uri="memoryos://user/u1/memories/missing",
+        target_uri="memoryos://user/u1/behavior_cases/missing",
         payload={"reason": "test"},
         operation_id="op_missing_source",
     )

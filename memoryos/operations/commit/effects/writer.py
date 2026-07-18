@@ -47,8 +47,7 @@ class StoreEffectWriter:
                 obj = committer._materialize_action_policy_source_relations(obj)
                 content = str(operation.payload.get("content", ""))
                 committer.source_store.write_object(obj, content=content)
-                canonical_kind = str(dict(obj.metadata or {}).get("canonical_kind") or "")
-                if content and canonical_kind not in {"slot", "claim", "pending_proposal"}:
+                if content:
                     LayerRefresher(committer.source_store).refresh(obj, content)
                     operation.payload["context_object"] = obj.to_dict()
                 committer._apply_relations(obj, operation)
@@ -114,7 +113,11 @@ class StoreEffectWriter:
             object_payload = operation.payload.get("context_object")
             if isinstance(object_payload, dict):
                 obj = ContextObject.from_dict(object_payload)
-                committer.index_store.upsert_index(obj, content=str(operation.payload.get("content", "")))
+                committer.index_store.upsert_index(
+                    obj,
+                    content=str(operation.payload.get("content", "")),
+                    tenant_id=committer.tenant_id,
+                )
             return
         if operation.action == OperationAction.DELETE and operation.target_uri:
             if committer._delete_tombstone_ids(operation):
@@ -123,7 +126,10 @@ class StoreEffectWriter:
                 # would make the Source transaction look complete while
                 # external derived state remained searchable.
                 return
-            committer.index_store.delete_index(operation.target_uri)
+            committer.index_store.delete_index(
+                operation.target_uri,
+                tenant_id=committer.tenant_id,
+            )
             return
         if operation.target_uri and operation.action in {
             OperationAction.REWARD,
@@ -137,10 +143,17 @@ class StoreEffectWriter:
             OperationAction.REINDEX,
         }:
             if operation.action == OperationAction.DISABLE and operation.context_type != ContextType.ACTION_POLICY:
-                committer.index_store.delete_index(operation.target_uri)
+                committer.index_store.delete_index(
+                    operation.target_uri,
+                    tenant_id=committer.tenant_id,
+                )
                 return
             obj = committer.source_store.read_object(operation.target_uri)
-            committer.index_store.upsert_index(obj, content=committer._read_content_or_empty(operation.target_uri))
+            committer.index_store.upsert_index(
+                obj,
+                content=committer._read_content_or_empty(operation.target_uri),
+                tenant_id=committer.tenant_id,
+            )
 
     @staticmethod
     def _apply_supersede_source(committer, operation: ContextOperation) -> None:
@@ -178,14 +191,22 @@ class StoreEffectWriter:
         if not operation.target_uri:
             return
         old_obj = committer.source_store.read_object(operation.target_uri)
-        committer.index_store.upsert_index(old_obj, content=committer._read_content_or_empty(operation.target_uri))
+        committer.index_store.upsert_index(
+            old_obj,
+            content=committer._read_content_or_empty(operation.target_uri),
+            tenant_id=committer.tenant_id,
+        )
         object_payload = operation.payload.get("context_object")
         if isinstance(object_payload, dict):
             new_uri = object_payload.get("uri")
             if not new_uri:
                 return
             new_obj = committer.source_store.read_object(str(new_uri))
-            committer.index_store.upsert_index(new_obj, content=str(operation.payload.get("content", "")))
+            committer.index_store.upsert_index(
+                new_obj,
+                content=str(operation.payload.get("content", "")),
+                tenant_id=committer.tenant_id,
+            )
 
     @staticmethod
     def _add_supersede_relations(committer, old_obj: ContextObject, new_obj: ContextObject) -> None:
@@ -243,20 +264,16 @@ class StoreEffectWriter:
                 ),
                 None,
             )
-            domain_owned = committer.domain_overlay is not None and committer.domain_overlay.owns_uri(
-                str(spec["source_uri"])
-            )
-            if not domain_owned:
-                eligibility = committer._ordinary_relation_eligibility(spec)
-                if not eligibility.allowed:
-                    if matching_key is not None:
-                        committer.relation_store.delete_relation(
-                            matching_key.source_uri,
-                            matching_key.relation_type,
-                            matching_key.target_uri,
-                            tenant_id=tenant_id,
-                        )
-                    continue
+            eligibility = committer._ordinary_relation_eligibility(spec)
+            if not eligibility.allowed:
+                if matching_key is not None:
+                    committer.relation_store.delete_relation(
+                        matching_key.source_uri,
+                        matching_key.relation_type,
+                        matching_key.target_uri,
+                        tenant_id=tenant_id,
+                    )
+                continue
             if matching_key is not None and committer._relation_effect_spec(matching_key) == spec:
                 continue
             if matching_key is not None:
@@ -273,7 +290,8 @@ class StoreEffectWriter:
                     target_uri=str(spec["target_uri"]),
                     weight=float(spec.get("weight", 1.0)),
                     metadata=dict(spec.get("metadata", {}) or {}),
-                )
+                ),
+                tenant_id=tenant_id,
             )
 
     @staticmethod

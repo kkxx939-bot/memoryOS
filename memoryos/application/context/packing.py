@@ -23,7 +23,7 @@ class PackedContext:
     selected_layer: str
     source_uri: str
     token_estimate: int
-    canonical_validation_status: str
+    source_validation_status: str
     projection_lag: int
     degraded_mode: str
     score: float
@@ -44,11 +44,19 @@ class ContextPackingPolicy:
     """Safe bounded defaults; deployments may lower, never disable, quotas."""
 
     max_per_session: int = 5
+    max_per_document: int = 3
+    max_blocks_per_document: int = 3
     max_per_resource_branch: int = 3
     max_l2_items: int = 3
 
     def __post_init__(self) -> None:
-        for name in ("max_per_session", "max_per_resource_branch", "max_l2_items"):
+        for name in (
+            "max_per_session",
+            "max_per_document",
+            "max_blocks_per_document",
+            "max_per_resource_branch",
+            "max_l2_items",
+        ):
             value = int(getattr(self, name))
             if value < 0 or value > 100:
                 raise ValueError(f"{name} must be between 0 and 100")
@@ -93,7 +101,7 @@ class LayerSelector:
 
 
 class ContextPacker:
-    """Pack one fused stream with type/session/slot/resource diversity quotas."""
+    """Pack one fused stream with type/session/document/resource diversity quotas."""
 
     def __init__(
         self,
@@ -113,11 +121,11 @@ class ContextPacker:
     ) -> tuple[str, ...]:
         """Choose the bounded ordinary Resource prefix that may receive L2.
 
-        L2 is hydrated after fusion, rerank, and canonical resolution.  A
+        L2 is hydrated after fusion and rerank. A
         preview pack reuses the exact final-limit, intent, token, session,
         type, and resource-branch quotas instead of turning every generated
-        candidate into a Source read.  Canonical projections and Session
-        evidence nodes are deliberately ineligible: their authoritative or
+        candidate into a Source read. Memory document projections and Session
+        evidence nodes are deliberately ineligible: their source-specific
         archive-specific readers own those paths.
         """
 
@@ -146,9 +154,9 @@ class ContextPacker:
         dropped: list[dict[str, Any]] = []
         type_counts: Counter[str] = Counter()
         session_counts: Counter[str] = Counter()
+        document_counts: Counter[tuple[str, str, str]] = Counter()
+        block_counts: Counter[tuple[str, str, str]] = Counter()
         resource_counts: Counter[str] = Counter()
-        seen_slots: set[str] = set()
-        seen_claim_revisions: set[tuple[str, int]] = set()
         l2_count = 0
         type_quotas = self._type_quotas(plan)
 
@@ -164,26 +172,16 @@ class ContextPacker:
             if len(selected) >= plan.final_limit:
                 dropped.append(self._drop(item, "final_limit"))
                 continue
-            if plan.query_intent == RetrievalQueryIntent.CURRENT and item.canonical_slot_id:
-                if item.canonical_slot_id in seen_slots:
-                    dropped.append(self._drop(item, "slot_quota"))
-                    continue
-            if (
-                plan.query_intent
-                in {
-                    RetrievalQueryIntent.HISTORY,
-                    RetrievalQueryIntent.AS_OF,
-                    RetrievalQueryIntent.CONFLICTS,
-                    RetrievalQueryIntent.OPTIONS,
-                }
-                and item.canonical_claim_id
-            ):
-                claim_revision = (item.canonical_claim_id, item.canonical_revision)
-                if claim_revision in seen_claim_revisions:
-                    dropped.append(self._drop(item, "claim_revision_quota"))
-                    continue
-            if item.session_id and session_counts[item.session_id] >= self.policy.max_per_session:
+            session_key = item.manifest_digest or item.archive_digest or item.session_id
+            if session_key and session_counts[session_key] >= self.policy.max_per_session:
                 dropped.append(self._drop(item, "session_quota"))
+                continue
+            document_key = (item.tenant_id, item.owner_user_id, item.document_id)
+            if item.document_id and document_counts[document_key] >= self.policy.max_per_document:
+                dropped.append(self._drop(item, "document_quota"))
+                continue
+            if item.block_id and block_counts[document_key] >= self.policy.max_blocks_per_document:
+                dropped.append(self._drop(item, "document_block_quota"))
                 continue
             quota = type_quotas.get(item.context_type, type_quotas.get("*", plan.final_limit))
             if type_counts[item.context_type] >= quota:
@@ -203,7 +201,7 @@ class ContextPacker:
                 dropped.append(self._drop(item, "token_budget"))
                 continue
             layer, content, estimate = choice
-            validation = str(item.metadata.get("canonical_validation_status") or "not_applicable")
+            validation = str(item.metadata.get("source_validation_status") or "verified")
             lag = self._integer(item.metadata.get("projection_lag"))
             degraded = str(item.metadata.get("degraded_mode") or item.metadata.get("vector_degraded_mode") or "")
             selected.append(
@@ -215,7 +213,7 @@ class ContextPacker:
                     selected_layer=layer,
                     source_uri=item.source_uri or item.uri,
                     token_estimate=estimate,
-                    canonical_validation_status=validation,
+                    source_validation_status=validation,
                     projection_lag=lag,
                     degraded_mode=degraded,
                     score=item.score.final_score,
@@ -230,21 +228,12 @@ class ContextPacker:
             )
             remaining -= estimate
             type_counts[item.context_type] += 1
-            if item.session_id:
-                session_counts[item.session_id] += 1
-            if plan.query_intent == RetrievalQueryIntent.CURRENT and item.canonical_slot_id:
-                seen_slots.add(item.canonical_slot_id)
-            if (
-                plan.query_intent
-                in {
-                    RetrievalQueryIntent.HISTORY,
-                    RetrievalQueryIntent.AS_OF,
-                    RetrievalQueryIntent.CONFLICTS,
-                    RetrievalQueryIntent.OPTIONS,
-                }
-                and item.canonical_claim_id
-            ):
-                seen_claim_revisions.add((item.canonical_claim_id, item.canonical_revision))
+            if session_key:
+                session_counts[session_key] += 1
+            if item.document_id:
+                document_counts[document_key] += 1
+            if item.block_id:
+                block_counts[document_key] += 1
             if resource_branch:
                 resource_counts[resource_branch] += 1
             if layer == "L2":
@@ -265,7 +254,7 @@ class ContextPacker:
                     "selected_layer": item.selected_layer,
                     "source_uri": item.source_uri,
                     "token_estimate": item.token_estimate,
-                    "canonical_validation_status": item.canonical_validation_status,
+                    "source_validation_status": item.source_validation_status,
                     "projection_lag": item.projection_lag,
                     "degraded_mode": item.degraded_mode,
                 }
@@ -275,41 +264,39 @@ class ContextPacker:
 
     @staticmethod
     def _priority(item: RetrievalCandidate, plan: RetrievalQueryPlan) -> int:
-        memory_type = str(item.metadata.get("memory_type") or "")
+        document_kind = item.document_kind or str(item.metadata.get("document_kind") or "")
         record_kind = item.record_kind
         source_kind = item.source_kind
         if ContextPacker._is_coding_agent(plan):
-            if memory_type == "project_rule":
+            if document_kind in {"preferences", "profile"}:
                 return 0
-            if memory_type == "project_decision":
+            if document_kind in {"entity", "topic"}:
                 return 1
             if record_kind == "resource_reference" or source_kind in {"resource", "resource_reference"}:
                 return 2
             if record_kind in {"session_root", "session_l0", "session_l1", "semantic_segment"}:
                 return 3 if item.session_id and item.session_id in plan.session_ids else 5
-            if memory_type == "agent_experience":
+            if document_kind == "experience":
                 return 4
         if plan.query_intent == RetrievalQueryIntent.CURRENT:
             order = {
-                "current_slot": 0,
-                "project_rule": 1,
-                "project_decision": 2,
-                "preference": 3,
-                "profile": 4,
+                "memory_document": 0,
+                "memory_block": 1,
                 "resource": 5,
             }
-            return order.get(record_kind, order.get(source_kind, order.get(memory_type, 8)))
+            return order.get(record_kind, order.get(source_kind, 8))
         if plan.query_intent in {RetrievalQueryIntent.OPEN_RECALL, RetrievalQueryIntent.HISTORY}:
             order = {
                 "session_root": 0,
                 "session_l0": 0,
                 "session_l1": 0,
                 "semantic_segment": 0,
+                "memory_block": 1,
+                "memory_document": 1,
                 "event": 1,
                 "resource": 2,
                 "resource_reference": 2,
                 "tool_result": 3,
-                "claim_revision": 4,
             }
             return order.get(record_kind, order.get(source_kind, 6))
         return 4
@@ -320,8 +307,7 @@ class ContextPacker:
             item.context_type == ContextType.RESOURCE.value
             and item.record_kind == CatalogRecordKind.CONTEXT.value
             and item.source_kind in {"context", "resource"}
-            and not item.canonical_slot_id
-            and not item.canonical_claim_id
+            and not item.document_id
             and (item.l2_uri or item.source_uri or item.uri)
         )
 
@@ -350,7 +336,7 @@ class ContextPacker:
             "selected_layer": "",
             "drop_reason": reason,
             "token_estimate": 0,
-            "canonical_validation_status": str(item.metadata.get("canonical_validation_status") or "not_applicable"),
+            "source_validation_status": str(item.metadata.get("source_validation_status") or "verified"),
             "projection_lag": ContextPacker._integer(item.metadata.get("projection_lag")),
             "degraded_mode": str(item.metadata.get("degraded_mode") or ""),
         }

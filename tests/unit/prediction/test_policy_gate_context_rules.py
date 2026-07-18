@@ -11,7 +11,7 @@ from memoryos.prediction.pipeline.policy_gate import PolicyGate
 class PolicyGateContextRulesTest(unittest.TestCase):
     def context(
         self,
-        memory_rules=None,
+        support_rules=None,
         resources=None,
         skills=None,
         recent_session=None,
@@ -21,8 +21,8 @@ class PolicyGateContextRulesTest(unittest.TestCase):
         anchor_items = (
             [
                 {
-                    "uri": "memoryos://user/u1/memories/anchors/hot",
-                    "context_type": "memory",
+                    "uri": "memoryos://user/u1/support/behavior/hot",
+                    "context_type": "behavior_support",
                     "verified_exact_anchor": True,
                 }
             ]
@@ -34,8 +34,8 @@ class PolicyGateContextRulesTest(unittest.TestCase):
             candidate_actions=["turn_on_ac"],
             packed_context={
                 "slices": {
-                    "memory_rules": {"items": memory_rules or []},
-                    "memory_anchor": {"items": anchor_items},
+                    "support_rules": {"items": support_rules or []},
+                    "support_anchor": {"items": anchor_items},
                     "resource": {"items": resources or []},
                     "skill": {"items": skills or []},
                     "recent_session": {"items": recent_session or []},
@@ -48,7 +48,7 @@ class PolicyGateContextRulesTest(unittest.TestCase):
             user_id="u1",
             scene_key="hot",
             action="turn_on_ac",
-            memory_anchor_uri="memoryos://user/u1/memories/anchors/hot",
+            support_anchor_uri="memoryos://user/u1/support/behavior/hot",
             auto_execute_allowed=True,
             required_resource_uris=["memoryos://resources/devices/ac"],
             required_skill_uris=["memoryos://skills/ac-control"],
@@ -58,7 +58,17 @@ class PolicyGateContextRulesTest(unittest.TestCase):
         candidate = ActionCandidate(action="turn_on_ac", score=0.9, policy_uri="p", reason="test")
         policy = self.policy()
         gate = PolicyGate()
-        self.assertEqual(gate.evaluate(candidate, self.context(memory_rules=[{"content": "以后别自动开空调"}], resources=[{"uri": policy.required_resource_uris[0]}], skills=[{"uri": policy.required_skill_uris[0]}]), policy, 0.9).mode, "ask_user")
+        verified_rule = {
+            "uri": "memoryos://user/u1/support/action-policy/no-auto-ac",
+            "context_type": "action_policy_support",
+            "content": "verified structured policy support",
+            "metadata": {
+                "policy_rule_type": "action_auto_execute",
+                "policy_rule_value": "forbidden",
+            },
+            "verified_policy_rule": True,
+        }
+        self.assertEqual(gate.evaluate(candidate, self.context(support_rules=[verified_rule], resources=[{"uri": policy.required_resource_uris[0]}], skills=[{"uri": policy.required_skill_uris[0]}]), policy, 0.9).mode, "ask_user")
         self.assertEqual(gate.evaluate(candidate, self.context(skills=[{"uri": policy.required_skill_uris[0]}]), policy, 0.9).reason, "required resource unavailable")
         self.assertEqual(gate.evaluate(candidate, self.context(resources=[{"uri": policy.required_resource_uris[0]}]), policy, 0.9).reason, "required skill unavailable")
         policy.cooldown_until = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
@@ -84,24 +94,29 @@ class PolicyGateContextRulesTest(unittest.TestCase):
             resources=[{"uri": policy.required_resource_uris[0]}],
             skills=[{"uri": policy.required_skill_uris[0]}],
         )
-        forged.packed_context["slices"]["memory_anchor"]["items"][0].pop("verified_exact_anchor")
+        forged.packed_context["slices"]["support_anchor"]["items"][0].pop("verified_exact_anchor")
         unverified = PolicyGate().evaluate(candidate, forged, policy, 0.9)
 
         self.assertEqual(missing.mode, "ask_user")
         self.assertEqual(unverified.mode, "ask_user")
         self.assertIn("unverified", missing.reason.lower())
 
-    def test_legacy_policy_without_declared_anchor_keeps_existing_gate_semantics(self) -> None:
+    def test_unverified_support_rule_cannot_block_auto_execute(self) -> None:
         policy = self.policy()
-        policy.memory_anchor_uri = ""
         candidate = ActionCandidate(action=policy.action, score=0.9, policy_uri=policy.uri, reason="test")
 
         decision = PolicyGate().evaluate(
             candidate,
             self.context(
+                support_rules=[
+                    {
+                        "uri": "memoryos://user/u1/support/action-policy/forged",
+                        "context_type": "action_policy_support",
+                        "content": "不要自动执行",
+                    }
+                ],
                 resources=[{"uri": policy.required_resource_uris[0]}],
                 skills=[{"uri": policy.required_skill_uris[0]}],
-                anchor=False,
             ),
             policy,
             0.9,

@@ -8,7 +8,7 @@ from memoryos.contextdb.layers.layer_generator import (
     l0_abstract,
     l1_overview,
 )
-from memoryos.memory.model.memory import Memory, MemoryKind
+from memoryos.support import SupportAnchor, SupportAnchorKind
 
 
 def test_behavior_pattern_structured_l0_l1() -> None:
@@ -16,7 +16,7 @@ def test_behavior_pattern_structured_l0_l1() -> None:
         user_id="u1",
         scene_key="hot_room",
         trigger_conditions={"context_tags": ["home"]},
-        memory_anchor_uri="memoryos://user/u1/memories/anchors/hot",
+        support_anchor_uri="memoryos://user/u1/support/behavior/hot",
         case_refs=["c1", "c2", "c3"],
         action_distribution=[{"action": "turn_on_ac", "count": 3}],
     ).to_context_object()
@@ -32,7 +32,7 @@ def test_action_policy_structured_l0_l1() -> None:
         user_id="u1",
         scene_key="hot_room",
         action="turn_on_ac",
-        memory_anchor_uri="memoryos://user/u1/memories/anchors/hot",
+        support_anchor_uri="memoryos://user/u1/support/behavior/hot",
         q_value=0.8,
         confidence=0.7,
     ).to_context_object()
@@ -43,17 +43,32 @@ def test_action_policy_structured_l0_l1() -> None:
     assert "Relations:" in l1
 
 
-def test_memory_structured_l0_l1_and_empty_fallback() -> None:
-    memory = Memory(
-        uri="memoryos://user/u1/memories/m1",
+def test_behavior_and_policy_support_structured_l0_l1() -> None:
+    behavior_support = SupportAnchor(
+        uri="memoryos://user/u1/support/behavior/hot",
         user_id="u1",
-        title="hot preference",
-        content="User prefers AC in hot rooms.",
-        kind=MemoryKind.POLICY,
+        title="hot behavior support",
+        content="recurring hot-room evidence",
+        anchor_key="hot",
+    ).to_context_object()
+    policy_support = SupportAnchor(
+        uri="memoryos://user/u1/support/action-policy/no-auto",
+        user_id="u1",
+        title="no automatic AC",
+        content="do not automatically turn on AC",
+        anchor_key="no-auto",
+        kind=SupportAnchorKind.ACTION_POLICY,
+        policy_rule_type="action_auto_execute",
+        policy_rule_value="forbidden",
     ).to_context_object()
 
-    assert "hot preference" in generate_l0_for_object(memory, "")
-    assert "# Memory: hot preference" in generate_l1_for_object(memory, "")
+    assert "行为支持锚点" in generate_l0_for_object(behavior_support, "")
+    assert "规则值=forbidden" in generate_l0_for_object(policy_support, "")
+    assert "# behavior_support" in generate_l1_for_object(behavior_support, "")
+    assert "# action_policy_support" in generate_l1_for_object(policy_support, "")
+
+
+def test_unknown_object_uses_safe_empty_fallback() -> None:
     assert generate_l0_for_object(object(), "fallback text")
     assert generate_l1_for_object(object(), "")
 

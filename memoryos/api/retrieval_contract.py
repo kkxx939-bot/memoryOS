@@ -14,7 +14,6 @@ from memoryos.contextdb.retrieval.query_plan import (
     MAX_TARGET_PATHS,
     MAX_TARGET_URIS,
     MAX_TOKEN_BUDGET,
-    CanonicalResolutionMode,
     RetrievalOptions,
     RetrievalQueryIntent,
 )
@@ -37,6 +36,9 @@ RETRIEVAL_OPTIONS_JSON_SCHEMA: dict[str, Any] = {
             "items": {"type": "string", "enum": [item.value for item in ContextType]},
         },
         "source_kinds": _STRING_ARRAY,
+        "record_kinds": _STRING_ARRAY,
+        "document_ids": _STRING_ARRAY,
+        "document_kinds": _STRING_ARRAY,
         "tenant_id": {"type": ["string", "null"]},
         "owner_user_id": {"type": ["string", "null"]},
         "workspace_ids": _STRING_ARRAY,
@@ -48,25 +50,16 @@ RETRIEVAL_OPTIONS_JSON_SCHEMA: dict[str, Any] = {
         "transaction_time_to": {"type": ["string", "null"]},
         "updated_at_from": {"type": ["string", "null"]},
         "updated_at_to": {"type": ["string", "null"]},
-        "valid_at": {"type": ["string", "null"]},
         "timezone": {"type": "string", "minLength": 1},
         "query_intent": {
             "type": "string",
             "enum": [item.value for item in RetrievalQueryIntent],
-        },
-        "canonical_resolution_mode": {
-            "type": "string",
-            "enum": [item.value for item in CanonicalResolutionMode],
         },
         "relation_expansion": {"type": "boolean"},
         "candidate_limit": {"type": "integer", "minimum": 1, "maximum": MAX_CANDIDATE_LIMIT},
         "final_limit": {"type": "integer", "minimum": 1, "maximum": MAX_FINAL_LIMIT},
         "token_budget": {"type": "integer", "minimum": 1, "maximum": MAX_TOKEN_BUDGET},
         "metadata_filters": {"type": "object"},
-        # These two fields only preserve old call semantics during migration;
-        # new callers should use structured paths/types/scopes above.
-        "legacy_search_scope": {"type": ["string", "null"]},
-        "legacy_retrieval_views": _STRING_ARRAY,
     },
 }
 

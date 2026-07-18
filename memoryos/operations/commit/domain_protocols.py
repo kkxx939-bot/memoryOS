@@ -1,20 +1,15 @@
-"""Narrow domain values consumed by the generic commit facade."""
+"""Narrow domain protocols used by the generic operation plane."""
 
 from __future__ import annotations
 
-from typing import Any, Protocol
-
-
-class AliasRegistry(Protocol):
-    def resolve(self, namespace: str, value: Any) -> str: ...
-
-
-class PendingMemoryProposal(Protocol):
-    uri: str
+from typing import Protocol
 
 
 class ActionPolicy(Protocol):
-    uri: str
+    """Structural boundary for ActionPolicy-owned mutations."""
+
+    @property
+    def uri(self) -> str: ...
 
 
-__all__ = ["ActionPolicy", "AliasRegistry", "PendingMemoryProposal"]
+__all__ = ["ActionPolicy"]

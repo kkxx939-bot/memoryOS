@@ -33,7 +33,7 @@ class MemoryOSContextRenderer:
         return "\n".join(
             [
                 f"uri: {item.get('uri', '')}",
-                f"context_type: {item.get('context_type', metadata.get('memory_type', 'context'))}",
+                f"context_type: {item.get('context_type', metadata.get('record_kind', 'context'))}",
                 f"project_id: {scope.get('project_id', '')}",
                 f"updated_at: {item.get('updated_at', metadata.get('updated_at', ''))}",
                 f"confidence: {metadata.get('confidence', item.get('score', ''))}",

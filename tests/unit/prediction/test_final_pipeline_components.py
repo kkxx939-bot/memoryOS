@@ -35,12 +35,12 @@ class FinalPipelineComponentsTest(unittest.TestCase):
                 user_id="gulf",
                 scene_key=observation.scene_key,
                 action="turn_on_ac",
-                memory_anchor_uri="memoryos://user/gulf/memories/anchors/hot",
+                support_anchor_uri="memoryos://user/gulf/support/behavior/hot",
                 auto_execute_allowed=True,
                 q_value=0.95,
                 confidence=0.95,
             )
-            client = MemoryOSClient(tmp, InMemoryIndexStore())
+            client = MemoryOSClient(tmp)
             request = PredictionRequest(
                 user_id="gulf",
                 episode_id="ep",
@@ -80,11 +80,11 @@ class FinalPipelineComponentsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             source = FileSystemSourceStore(tmp)
             queue = InMemoryQueueStore()
-            obj_uri = "memoryos://user/gulf/memories/anchors/hot"
+            obj_uri = "memoryos://user/gulf/resources/hot-weather"
             from memoryos.contextdb.model import ContextObject, ContextType
             from memoryos.contextdb.store import QueueJob
 
-            obj = ContextObject(uri=obj_uri, context_type=ContextType.MEMORY, title="Hot", owner_user_id="gulf")
+            obj = ContextObject(uri=obj_uri, context_type=ContextType.RESOURCE, title="Hot", owner_user_id="gulf")
             source.write_object(obj, content="hot weather")
             queue.enqueue(QueueJob(job_id="semantic1", queue_name="semantic", action="refresh", target_uri=obj_uri))
             self.assertEqual(SemanticWorker(source, queue).process_pending()["processed"], ["semantic1"])
@@ -94,14 +94,14 @@ class FinalPipelineComponentsTest(unittest.TestCase):
             archive = SessionArchive(
                 user_id="gulf", session_id="s1", archive_uri="memoryos://user/gulf/sessions/history/s1"
             )
-            service = SessionCommitService(SessionArchiveStore(tmp), queue, allow_plan_only=True)
+            service = SessionCommitService(SessionArchiveStore(tmp), queue)
             self.assertTrue(SessionCommitWorker(service).process_archive(archive)["done"])
 
             index = InMemoryIndexStore()
             committer = OperationCommitter(source, index, tmp)
             op = ContextOperation(
                 user_id="gulf",
-                context_type=ContextType.MEMORY,
+                context_type=ContextType.RESOURCE,
                 action=OperationAction.ADD,
                 target_uri=obj_uri,
                 payload={"context_object": obj.to_dict(), "content": "hot weather"},

@@ -29,6 +29,7 @@ from memoryos.api.mcp.config import MCPServerConfig
 from memoryos.api.mcp.stdio import _build_transport_client
 from memoryos.api.sdk.client import MemoryOSClient
 from memoryos.api.sdk.http_client import HTTPMemoryOSClient
+from memoryos.api.trusted_context import AUTHORITATIVE_REMEMBER, TrustedRequestContext
 
 
 def test_project_identity_and_session_key_are_stable_and_isolated() -> None:
@@ -210,18 +211,53 @@ def test_http_client_exposes_remote_memory_health_and_trace_routes() -> None:
 
         def request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
             self.calls.append((method, path, payload))
+            document = {
+                "document_uri": document_uri,
+                "document_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "document_kind": "topics",
+                "relative_path": "topics/remote-memory.md",
+                "document_revision": 1,
+                "source_digest": digest,
+                "changed": True,
+                "edit_summary": "remote memory fixture",
+                "projection_status": "CURRENT",
+            }
+            if path in {
+                "/v1/memories/remember",
+                "/v1/memories/edit",
+                "/v1/memories/restore",
+            }:
+                return document
+            if path == "/v1/memories/forget":
+                return {**document, "mode": "SOFT_FORGET", "recoverable": True}
+            if path.startswith("/v1/memories/history?"):
+                return {
+                    "document_uri": document_uri,
+                    "document_id": document["document_id"],
+                    "document_kind": document["document_kind"],
+                    "relative_path": document["relative_path"],
+                    "revisions": [],
+                }
+            if path == "/v1/memories/review":
+                return {
+                    "proposal_id": "proposal-1",
+                    "status": "REJECTED",
+                    **document,
+                    "proposed_source_digest": digest,
+                    "proposed_diff_digest": "b" * 64,
+                }
             return {"status": "ok"}
 
     client = FakeHTTPClient()
+    document_uri = "memoryos://user/u1/memory/documents/01ARZ3NDEKTSV4RRFFQ69G5FAV"
+    digest = "a" * 64
     client.health()
-    client.remember(user_id="u1", content="remember")
-    client.forget(user_id="u1", uri="memoryos://user/u1/memories/x")
-    client.list_pending(user_id="u1", lifecycle_states=["PENDING"])
-    client.review_pending(
-        user_id="u1",
-        pending_uri="memoryos://user/u1/memories/pending/p1",
-        decision="REJECT",
-    )
+    client.remember("remember")
+    client.edit_memory_document(document_uri, "updated", digest)
+    client.forget(document_uri, expected_digest=digest)
+    client.list_memory_history(document_uri)
+    client.restore_memory_revision(document_uri, revision=1, expected_digest="")
+    client.review_memory_edit("proposal-1", "REJECT")
     client.read("memoryos://user/u1/memories/x", layer="L1")
     client.recall_trace("trace/id")
     client.checkpoint_session("session-1")
@@ -231,9 +267,11 @@ def test_http_client_exposes_remote_memory_health_and_trace_routes() -> None:
     assert [path for _, path, _ in client.calls] == [
         "/health",
         "/v1/memories/remember",
+        "/v1/memories/edit",
         "/v1/memories/forget",
-        "/v1/memories/pending?user_id=u1&lifecycle_state=PENDING",
-        "/v1/memories/pending/review",
+        "/v1/memories/history?document_uri=memoryos%3A%2F%2Fuser%2Fu1%2Fmemory%2Fdocuments%2F01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "/v1/memories/restore",
+        "/v1/memories/review",
         "/v1/context/read?uri=memoryos%3A%2F%2Fuser%2Fu1%2Fmemories%2Fx&layer=L1",
         "/v1/recall-traces/trace%2Fid",
         "/v1/sessions/session-1/checkpoint",
@@ -270,21 +308,26 @@ def test_http_client_unavailable_returns_structured_retryable_error(monkeypatch:
 def test_token_budget_degrades_l2_to_smaller_layer(tmp_path: Path) -> None:
     client = MemoryOSClient(str(tmp_path))
     client.remember(
-        user_id="u1",
-        project_id="p1",
-        memory_type="project_decision",
-        title="Needle decision",
-        content="needle " + ("implementation detail " * 200),
+        "needle " + ("implementation detail " * 200),
+        target_hint="topic:Needle decision",
+        caller=TrustedRequestContext(
+            tenant_id="default",
+            user_id="u1",
+            actor_kind="user",
+            actor_id="u1",
+            capabilities=frozenset({AUTHORITATIVE_REMEMBER}),
+        ),
     )
+    client.memory_projection_worker.process_pending()
     result = client.assemble_context(
         "needle",
         user_id="u1",
         project_id="p1",
-        search_scope="project_decisions",
+        search_scope="workspace_context",
         token_budget=40,
     )
     assert result["contexts"]
-    assert result["contexts"][0]["selected_layer"] == "URI"
+    assert result["contexts"][0]["selected_layer"] == "L0"
 
 
 def test_claude_installer_is_idempotent_and_uninstalls(tmp_path: Path) -> None:

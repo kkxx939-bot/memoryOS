@@ -67,7 +67,7 @@ class PredictionEngine:
             if policy.user_id == request.user_id and policy.action in available
         ]
         tenant_id = self._tenant_id()
-        verified_anchors = self.action_context_builder.verified_memory_anchor_uris(
+        verified_anchors = self.action_context_builder.verified_support_anchor_uris(
             request.user_id,
             scoped_policies,
             tenant_id=tenant_id,
@@ -75,7 +75,7 @@ class PredictionEngine:
         candidates = self.action_policy_ranker.rank(
             scoped_policies,
             similarity_scores=similar["similarity_scores"],
-            verified_memory_anchor_uris=verified_anchors,
+            verified_support_anchor_uris=verified_anchors,
         )
         action_context = self.action_context_builder.build(
             user_id=request.user_id,
@@ -85,7 +85,7 @@ class PredictionEngine:
             resources=request.resources,
             skills=request.skills,
             tenant_id=tenant_id,
-            verified_memory_anchor_uris=verified_anchors,
+            verified_support_anchor_uris=verified_anchors,
         )
         policy_by_uri = {policy.uri: policy for policy in scoped_policies}
         top = candidates[0] if candidates else None

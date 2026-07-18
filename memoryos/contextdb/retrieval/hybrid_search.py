@@ -1,7 +1,7 @@
 """Internal hybrid candidate primitive, not a public retrieval entrypoint.
 
 The Unified Context orchestrator may use this component only through its
-bounded compatibility adapter.  SDK, HTTP, MCP, and context assembly callers
+bounded internal adapter.  SDK, HTTP, MCP, and context assembly callers
 must not call :meth:`HybridSearch.search` as a second orchestration chain.
 """
 
@@ -78,9 +78,17 @@ class HybridSearch:
         """按给定条件查找匹配结果。"""
 
         filters = dict(filters or {})
+        tenant_id = str(filters.get("tenant_id") or "")
+        if not tenant_id:
+            raise ValueError("HybridSearch requires an explicit tenant_id filter")
         if context_type is not None:
             filters["context_type"] = context_type.value
-        index_hits = self.index_store.search(query, filters=filters, limit=limit)
+        index_hits = self.index_store.search(
+            query,
+            tenant_id=tenant_id,
+            filters=filters,
+            limit=limit,
+        )
         if not isinstance(index_hits, list | tuple):
             index_hits = []
         combined: dict[str, dict] = {}
@@ -135,6 +143,14 @@ class HybridSearch:
                 for vector_hit in vector_hits:
                     normalized_vector_score = self._bounded_score(vector_hit.score)
                     if normalized_vector_score < self.min_vector_similarity:
+                        continue
+                    vector_metadata = self._mapping(vector_hit.metadata)
+                    record_key = str(vector_metadata.get("record_key") or "")
+                    if (
+                        not record_key
+                        or str(vector_metadata.get("tenant_id") or "") != tenant_id
+                        or str(vector_hit.uri) != vector_row_id(tenant_id, record_key)
+                    ):
                         continue
                     public_uri = self._public_vector_uri(vector_hit.uri, vector_hit.metadata)
                     if not public_uri:
@@ -226,9 +242,6 @@ class HybridSearch:
         identifiers: list[str] = []
         getter = getattr(self.index_store, "get_catalog_by_uri", None)
         for public_uri in allowed_uris[: self.MAX_VECTOR_OVERFETCH]:
-            # Preserve unique legacy rows while new projections use the
-            # tenant + Catalog identity below.
-            identifiers.append(public_uri)
             if not callable(getter):
                 continue
             raw_records: Any = getter(public_uri, tenant_id=tenant_id, limit=16)
@@ -243,12 +256,11 @@ class HybridSearch:
     @staticmethod
     def _public_vector_uri(storage_id: object, metadata: Any) -> str:
         values = dict(metadata) if isinstance(metadata, Mapping) else {}
-        for key in ("public_uri", "uri", "claim_uri", "source_uri"):
+        for key in ("public_uri", "uri", "source_uri"):
             value = str(values.get(key) or "")
             if value.startswith("memoryos://"):
                 return value
-        legacy = str(storage_id)
-        return legacy if legacy.startswith("memoryos://") and not legacy.startswith("memoryos-vector://") else ""
+        return ""
 
     def _vector_item(
         self,
@@ -263,38 +275,21 @@ class HybridSearch:
         projected_revision = metadata.get("projection_source_revision")
         if projected_revision is None:
             projected_revision = metadata.get("source_revision")
-        canonical_validation_revision = projected_revision
-        current_slot_projection = str(metadata.get("record_kind") or "") == "current_slot" or str(
-            metadata.get("canonical_kind") or ""
-        ) == "current_slot_projection"
-        if current_slot_projection:
-            canonical_validation_revision = metadata.get("active_claim_revision")
-            if canonical_validation_revision is None:
-                canonical_validation_revision = metadata.get("canonical_revision")
-            if canonical_validation_revision is None:
-                return None
         title = str(metadata.get("title", ""))
         hit_type = str(metadata.get("context_type", ""))
         owner_user_id = metadata.get("owner_user_id")
         tenant_id = metadata.get("tenant_id")
         lifecycle_state = metadata.get("lifecycle_state")
         if self.source_store is not None:
-            source_validation_uri = uri
-            if current_slot_projection:
-                source_validation_uri = str(
-                    metadata.get("active_claim_uri") or metadata.get("canonical_claim_uri") or ""
-                )
-                if not source_validation_uri:
-                    return None
             try:
                 if source_snapshot is not None:
-                    obj = source_snapshot.get(source_validation_uri)
+                    obj = source_snapshot.get(uri)
                     if obj is None:
                         return None
                 else:
                     obj = self.domain_policy.read_serving_object(
                         self.source_store,
-                        source_validation_uri,
+                        uri,
                     )
             except (FileNotFoundError, IsADirectoryError, NotADirectoryError, TypeError, ValueError):
                 return None
@@ -309,11 +304,11 @@ class HybridSearch:
                 return None
             source_metadata = self._mapping(obj.metadata)
             metadata = {**metadata, **source_metadata}
-            canonical_revision = source_metadata.get("revision")
+            source_revision = source_metadata.get("revision")
             if (
-                canonical_validation_revision is not None
-                and canonical_revision is not None
-                and self._revision(canonical_validation_revision) != self._revision(canonical_revision)
+                projected_revision is not None
+                and source_revision is not None
+                and self._revision(projected_revision) != self._revision(source_revision)
             ):
                 return None
         if projected_revision is not None:
@@ -354,28 +349,13 @@ class HybridSearch:
         if scope_keys is None:
             return None
         actual_scopes = set(scope_keys)
-        for filter_name, actual in (
-            ("claim_state", metadata.get("state") or metadata.get("claim_state")),
-            ("slot_id", metadata.get("slot_id")),
-            ("memory_type", metadata.get("memory_type")),
-        ):
-            expected = filters.get(filter_name)
-            if expected is None:
-                continue
-            values = set(expected) if isinstance(expected, list | tuple | set | frozenset) else {expected}
-            if actual not in values:
-                return None
         required_scopes = set(filters.get("applicability_scope_keys", []) or [])
         if required_scopes:
             if not actual_scopes.issubset(required_scopes):
                 return None
         project_id = str(scope.get("project_id") or fields.get("project_id") or "")
-        if filters.get("project_id"):
-            memory_type = str(metadata.get("memory_type") or "")
-            if memory_type in {"project_rule", "project_decision", "agent_experience"} and project_id != str(
-                filters["project_id"]
-            ):
-                return None
+        if filters.get("project_id") and project_id != str(filters["project_id"]):
+            return None
         if filters.get("adapter_id") and str(
             connect.get("adapter_id") or metadata.get("source_adapter_id") or ""
         ) != str(filters["adapter_id"]):
@@ -428,7 +408,7 @@ class HybridSearch:
         return score if math.isfinite(score) and score >= 0 else None
 
 
-# This module remains importable by internal planners and compatibility tests,
-# but it deliberately has no public wildcard surface.  Product callers use
+# This module remains importable by internal planners and focused tests, but it
+# deliberately has no public wildcard surface. Product callers use
 # RetrievalOptions -> QueryPlanner -> UnifiedRetrievalOrchestrator.
 __all__: list[str] = []

@@ -1,10 +1,8 @@
-"""ContextDB authoritative source protocol with historical public exports."""
+"""Authoritative SourceStore protocol for ordinary Context objects."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from importlib import import_module
-from typing import Any, Protocol
+from typing import Protocol
 
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.store.index_store import IndexHit as IndexHit
@@ -18,13 +16,6 @@ from memoryos.contextdb.store.queue_store import QueueJob as QueueJob
 from memoryos.contextdb.store.queue_store import QueueLeaseIdentityError as QueueLeaseIdentityError
 from memoryos.contextdb.store.queue_store import QueueStore as QueueStore
 from memoryos.contextdb.store.relation_store import RelationStore as RelationStore
-
-# Annotation-only declarations keep static public API tooling aware of the
-# historical names while runtime access remains lazy through ``__getattr__``.
-CANONICAL_MEMORY_KINDS: frozenset[str]
-CANONICAL_MEMORY_SCHEMA_VERSIONS: frozenset[str]
-is_canonical_memory_object: Callable[[ContextObject], bool]
-is_canonical_memory_uri: Callable[[str], bool]
 
 
 class SourceStore(Protocol):
@@ -43,29 +34,7 @@ class SourceStore(Protocol):
     def delete_object(self, uri: str) -> None: ...
 
 
-_MEMORY_COMPAT_EXPORTS = frozenset(
-    {
-        "CANONICAL_MEMORY_KINDS",
-        "CANONICAL_MEMORY_SCHEMA_VERSIONS",
-        "is_canonical_memory_object",
-        "is_canonical_memory_uri",
-    }
-)
-
-
-def __getattr__(name: str) -> Any:
-    """Resolve historical Memory classification exports without an eager edge."""
-
-    if name not in _MEMORY_COMPAT_EXPORTS:
-        raise AttributeError(name)
-    classification = import_module("memoryos.memory.integration.classification")
-    value = getattr(classification, name)
-    globals()[name] = value
-    return value
-
 __all__ = [
-    "CANONICAL_MEMORY_KINDS",
-    "CANONICAL_MEMORY_SCHEMA_VERSIONS",
     "IndexHit",
     "IndexStore",
     "LeaseLostError",
@@ -78,6 +47,4 @@ __all__ = [
     "QueueStore",
     "RelationStore",
     "SourceStore",
-    "is_canonical_memory_object",
-    "is_canonical_memory_uri",
 ]

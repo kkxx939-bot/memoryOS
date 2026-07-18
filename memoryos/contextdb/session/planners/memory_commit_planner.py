@@ -1,9 +1,15 @@
-"""Compatibility exports for the historical Memory planner path."""
+"""Session-layer exports for Markdown memory planning."""
 
 from memoryos.application.session.planners.memory_commit_planner import (
     MemoryCommitPlanner,
+    MemoryDocumentPlanningResult,
     MemoryExtractionBackendError,
-    RuleMemoryCommitPlanner,
+    PlannedMemoryEdit,
 )
 
-__all__ = ["MemoryCommitPlanner", "MemoryExtractionBackendError", "RuleMemoryCommitPlanner"]
+__all__ = [
+    "MemoryCommitPlanner",
+    "MemoryDocumentPlanningResult",
+    "MemoryExtractionBackendError",
+    "PlannedMemoryEdit",
+]

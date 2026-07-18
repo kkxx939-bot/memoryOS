@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from pathlib import Path
@@ -87,7 +88,8 @@ class RetrievalService:
         trace = {
             "trace_id": trace_id,
             "created_at": utc_now(),
-            "query": query,
+            "query_digest": hashlib.sha256(query.encode("utf-8")).hexdigest(),
+            "query_utf8_bytes": len(query.encode("utf-8")),
             "scope": {
                 key: kwargs.get(key) for key in ("tenant_id", "user_id", "project_id", "adapter_id", "search_scope")
             },

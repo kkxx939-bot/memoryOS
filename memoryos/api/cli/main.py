@@ -29,7 +29,8 @@ def main(argv: list[str] | None = None) -> int:
         choices=[
             "recovery",
             "session-commit",
-            "memory-proposal",
+            "memory-document-edit",
+            "memory-document-scan",
             "memory-projection",
             "semantic",
             "embedding",

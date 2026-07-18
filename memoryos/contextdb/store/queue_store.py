@@ -64,6 +64,15 @@ class QueueStore(Protocol):
 
     def get(self, job_id: str) -> QueueJob | None: ...
 
+    def purge_target_jobs(
+        self,
+        *,
+        queue_name: str,
+        target_uri: str,
+        tenant_id: str,
+        owner_user_id: str,
+    ) -> int: ...
+
     def recover_expired_leases(self, *, queue_name: str | None = None) -> int: ...
 
     def stats(self, *, queue_name: str | None = None) -> dict[str, int]: ...

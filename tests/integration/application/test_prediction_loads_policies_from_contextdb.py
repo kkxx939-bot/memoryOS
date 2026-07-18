@@ -19,7 +19,11 @@ def _seed_policy(
     client: MemoryOSClient, policy: ActionPolicy, lifecycle: LifecycleState = LifecycleState.ACTIVE
 ) -> None:
     anchor = ContextObject(
-        uri=policy.memory_anchor_uri, context_type=ContextType.MEMORY, title="anchor", owner_user_id=policy.user_id
+        uri=policy.support_anchor_uri,
+        context_type=ContextType.BEHAVIOR_SUPPORT,
+        title="anchor",
+        owner_user_id=policy.user_id,
+        metadata={"support_anchor_kind": "behavior"},
     )
     obj = policy.to_context_object()
     obj.lifecycle_state = lifecycle
@@ -54,7 +58,7 @@ def test_prediction_loads_policy_from_contextdb_without_manual_policies(tmp_path
         user_id="u1",
         scene_key="hot",
         action="turn_on_ac",
-        memory_anchor_uri="memoryos://user/u1/memories/anchors/hot",
+        support_anchor_uri="memoryos://user/u1/support/behavior/hot",
         q_value=0.95,
         confidence=0.95,
     )
@@ -72,13 +76,13 @@ def test_available_actions_and_deleted_obsolete_filtering(tmp_path) -> None:
         user_id="u1",
         scene_key="hot",
         action="turn_on_fan",
-        memory_anchor_uri="memoryos://user/u1/memories/anchors/hot",
+        support_anchor_uri="memoryos://user/u1/support/behavior/hot",
     )
     obsolete_policy = ActionPolicy(
         user_id="u1",
         scene_key="hot",
         action="smoke",
-        memory_anchor_uri="memoryos://user/u1/memories/anchors/hot",
+        support_anchor_uri="memoryos://user/u1/support/behavior/hot",
     )
     _seed_policy(
         client,
@@ -86,7 +90,7 @@ def test_available_actions_and_deleted_obsolete_filtering(tmp_path) -> None:
             user_id="u1",
             scene_key="hot",
             action="turn_on_ac",
-            memory_anchor_uri="memoryos://user/u1/memories/anchors/hot",
+            support_anchor_uri="memoryos://user/u1/support/behavior/hot",
         ),
     )
     _seed_policy(
@@ -107,7 +111,7 @@ def test_available_actions_and_deleted_obsolete_filtering(tmp_path) -> None:
         source = client.source_store.read_object(policy.uri)
         assert any(
             relation.relation_type == "anchored_by"
-            and relation.target_uri == policy.memory_anchor_uri
+            and relation.target_uri == policy.support_anchor_uri
             for relation in source.relations
         )
         assert client.relation_store.relations_of(policy.uri, tenant_id="default") == []
@@ -124,7 +128,7 @@ def test_disabled_auto_execute_policy_ranks_but_gate_asks_user(tmp_path) -> None
         user_id="u1",
         scene_key="hot",
         action="turn_on_ac",
-        memory_anchor_uri="memoryos://user/u1/memories/anchors/hot",
+        support_anchor_uri="memoryos://user/u1/support/behavior/hot",
         q_value=0.95,
         confidence=0.95,
         auto_execute_allowed=True,
@@ -179,7 +183,7 @@ def test_packed_fallback_behavior_hit_enters_source_uris_and_archive_used_contex
         user_id="u1",
         scene_key=scene_key,
         trigger_conditions={"scene_key": scene_key},
-        memory_anchor_uri="memoryos://user/u1/memories/anchors/hot",
+        support_anchor_uri="memoryos://user/u1/support/behavior/hot",
         case_refs=["case-1"],
         action_distribution=[{"action": "turn_on_ac", "count": 1}],
     )
@@ -188,7 +192,7 @@ def test_packed_fallback_behavior_hit_enters_source_uris_and_archive_used_contex
         user_id="u1",
         scene_key=scene_key,
         action="turn_on_ac",
-        memory_anchor_uri="memoryos://user/u1/memories/anchors/hot",
+        support_anchor_uri="memoryos://user/u1/support/behavior/hot",
         auto_execute_allowed=True,
         q_value=0.95,
         confidence=0.95,

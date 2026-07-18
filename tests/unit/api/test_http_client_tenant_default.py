@@ -13,19 +13,24 @@ class _CaptureClient(HTTPMemoryOSClient):
     def request(self, method: str, path: str, payload=None):  # noqa: ANN001, ANN201
         del method, payload
         self.paths.append(path)
+        if path.startswith("/v1/memories/history?"):
+            return {
+                "document_uri": "memoryos://user/u1/memory/documents/01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "document_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "document_kind": "topic",
+                "relative_path": "knowledge/topics/example.md",
+                "revisions": [],
+            }
         return {"results": []}
 
 
-def test_http_pending_tenant_uses_explicit_then_client_and_never_forces_default() -> None:
-    configured = _CaptureClient(tenant_id="tenant-a")
-    configured.list_pending(user_id="u1")
-    configured.list_pending(user_id="u1", tenant_id="tenant-b")
-    implicit = _CaptureClient(tenant_id=None)
-    implicit.list_pending(user_id="u1")
+def test_http_memory_history_uses_exact_document_uri_without_identity_query_fields() -> None:
+    client = _CaptureClient(tenant_id="tenant-a")
+    document_uri = "memoryos://user/u1/memory/documents/01ARZ3NDEKTSV4RRFFQ69G5FAV"
 
-    configured_query = parse_qs(urlsplit(configured.paths[0]).query)
-    explicit_query = parse_qs(urlsplit(configured.paths[1]).query)
-    implicit_query = parse_qs(urlsplit(implicit.paths[0]).query)
-    assert configured_query["tenant_id"] == ["tenant-a"]
-    assert explicit_query["tenant_id"] == ["tenant-b"]
-    assert "tenant_id" not in implicit_query
+    client.list_memory_history(document_uri)
+
+    query = parse_qs(urlsplit(client.paths[0]).query)
+    assert query == {"document_uri": [document_uri]}
+    assert "tenant_id" not in query
+    assert "user_id" not in query

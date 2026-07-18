@@ -32,9 +32,22 @@ class ApplicationRuntime(Protocol):
     context_db: Any
     engine: Any
     executor: Any
+    memory_document_store: Any
+    memory_document_control_store: Any
+    memory_document_revision_store: Any
+    memory_document_planner: Any
+    memory_document_committer: Any
+    memory_document_consolidation_store: Any
+    memory_document_consolidator: Any
+    memory_document_projector: Any
+    memory_document_scanner: Any
+    memory_document_edit_worker: Any
+    memory_document_scan_worker: Any
+    memory_document_eraser: Any
+    memory_command_service: Any
+    memory_review_service: Any
     memory_projection_worker: Any
     readiness: Any
-    _tenant_memory_aliases: Any
 
     def _require_ready(self) -> None: ...
 
@@ -147,16 +160,68 @@ class ApplicationService:
         return self._runtime.executor
 
     @property
+    def memory_document_store(self) -> Any:
+        return self._runtime.memory_document_store
+
+    @property
+    def memory_document_control_store(self) -> Any:
+        return self._runtime.memory_document_control_store
+
+    @property
+    def memory_document_revision_store(self) -> Any:
+        return self._runtime.memory_document_revision_store
+
+    @property
+    def memory_document_planner(self) -> Any:
+        return self._runtime.memory_document_planner
+
+    @property
+    def memory_document_committer(self) -> Any:
+        return self._runtime.memory_document_committer
+
+    @property
+    def memory_document_consolidation_store(self) -> Any:
+        return self._runtime.memory_document_consolidation_store
+
+    @property
+    def memory_document_consolidator(self) -> Any:
+        return self._runtime.memory_document_consolidator
+
+    @property
+    def memory_document_projector(self) -> Any:
+        return self._runtime.memory_document_projector
+
+    @property
+    def memory_document_scanner(self) -> Any:
+        return self._runtime.memory_document_scanner
+
+    @property
+    def memory_document_edit_worker(self) -> Any:
+        return self._runtime.memory_document_edit_worker
+
+    @property
+    def memory_document_scan_worker(self) -> Any:
+        return self._runtime.memory_document_scan_worker
+
+    @property
+    def memory_document_eraser(self) -> Any:
+        return self._runtime.memory_document_eraser
+
+    @property
+    def memory_command_service(self) -> Any:
+        return self._runtime.memory_command_service
+
+    @property
+    def memory_review_service(self) -> Any:
+        return self._runtime.memory_review_service
+
+    @property
     def memory_projection_worker(self) -> Any:
         return self._runtime.memory_projection_worker
 
     @property
     def readiness(self) -> Any:
         return self._runtime.readiness
-
-    @property
-    def _tenant_memory_aliases(self) -> Any:
-        return getattr(self._runtime, "_tenant_memory_aliases", None)
 
     def _require_ready(self) -> None:
         self._runtime._require_ready()

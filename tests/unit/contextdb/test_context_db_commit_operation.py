@@ -11,10 +11,10 @@ from memoryos.operations.model.operation_action import OperationAction
 
 
 def _operation() -> ContextOperation:
-    obj = ContextObject(uri="memoryos://user/u1/memories/profile/a", context_type=ContextType.MEMORY, title="a", owner_user_id="u1")
+    obj = ContextObject(uri="memoryos://user/u1/resources/profile/a", context_type=ContextType.RESOURCE, title="a", owner_user_id="u1")
     return ContextOperation(
         user_id="u1",
-        context_type=ContextType.MEMORY,
+        context_type=ContextType.RESOURCE,
         action=OperationAction.ADD,
         target_uri=obj.uri,
         payload={"context_object": obj.to_dict(), "content": "alpha"},
@@ -29,8 +29,8 @@ def test_commit_operation_calls_operation_committer(tmp_path) -> None:
     result = db.commit_operation(_operation())
 
     assert len(result.operations) == 1
-    assert source.read_object("memoryos://user/u1/memories/profile/a").title == "a"
-    assert index.search("alpha", filters={"owner_user_id": "u1"})
+    assert source.read_object("memoryos://user/u1/resources/profile/a").title == "a"
+    assert index.search("alpha", tenant_id="default", filters={"owner_user_id": "u1"})
 
 
 def test_commit_operation_requires_committer(tmp_path) -> None:
@@ -48,12 +48,12 @@ def test_seed_object_directly_writes_source_and_index_for_seed_data(tmp_path) ->
     source = FileSystemSourceStore(tmp_path)
     index = InMemoryIndexStore()
     db = ContextDB(source, index, InMemoryRelationStore())
-    obj = ContextObject(uri="memoryos://user/u1/memories/profile/seed", context_type=ContextType.MEMORY, title="seed", owner_user_id="u1")
+    obj = ContextObject(uri="memoryos://user/u1/resources/profile/seed", context_type=ContextType.RESOURCE, title="seed", owner_user_id="u1")
 
     db.seed_object(obj, content="seed content")
 
     assert source.read_object(obj.uri).title == "seed"
-    assert index.search("seed", filters={"owner_user_id": "u1"})
+    assert index.search("seed", tenant_id="default", filters={"owner_user_id": "u1"})
 
 
 def test_add_relation_requires_explicit_commit_capability(tmp_path) -> None:
@@ -61,8 +61,8 @@ def test_add_relation_requires_explicit_commit_capability(tmp_path) -> None:
     index = InMemoryIndexStore()
     db = ContextDB(source, index, InMemoryRelationStore())
     obj = ContextObject(
-        uri="memoryos://user/u1/memories/profile/relation-target",
-        context_type=ContextType.MEMORY,
+        uri="memoryos://user/u1/resources/profile/relation-target",
+        context_type=ContextType.RESOURCE,
         title="relation target",
         owner_user_id="u1",
     )

@@ -86,6 +86,30 @@ class InMemoryQueueStore:
     def ack(self, job: QueueJob) -> QueueJob:
         return self._settle(job, status="done")
 
+    def purge_target_jobs(
+        self,
+        *,
+        queue_name: str,
+        target_uri: str,
+        tenant_id: str,
+        owner_user_id: str,
+    ) -> int:
+        if not all(str(value or "").strip() for value in (queue_name, target_uri, tenant_id, owner_user_id)):
+            raise ValueError("queue target purge requires exact queue, URI, tenant and owner")
+        removed = 0
+        with self._guard:
+            for job_id, job in tuple(self.jobs.items()):
+                if job.queue_name != queue_name or job.target_uri != target_uri:
+                    continue
+                if (
+                    str(job.payload.get("tenant_id") or "") != tenant_id
+                    or str(job.payload.get("owner_user_id") or "") != owner_user_id
+                ):
+                    raise QueueLeaseIdentityError("queue target purge encountered a cross-scope job")
+                self.jobs.pop(job_id)
+                removed += 1
+        return removed
+
     def fail(self, job: QueueJob, error: str) -> QueueJob:
         return self._settle(
             job,

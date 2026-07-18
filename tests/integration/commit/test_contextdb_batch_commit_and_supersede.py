@@ -26,15 +26,15 @@ def _context_db(tmp_path):
 def test_commit_operations_batches_same_user_update_delete_for_coalescer(tmp_path) -> None:
     db, source, _, _ = _context_db(tmp_path)
     obj = ContextObject(
-        uri="memoryos://user/u1/memories/profile/temp",
-        context_type=ContextType.MEMORY,
+        uri="memoryos://user/u1/resources/profile/temp",
+        context_type=ContextType.RESOURCE,
         title="temperature",
         owner_user_id="u1",
     )
     db.seed_object(obj, content="old")
     updated = ContextObject(
         uri=obj.uri,
-        context_type=ContextType.MEMORY,
+        context_type=ContextType.RESOURCE,
         title="temperature updated",
         owner_user_id="u1",
     )
@@ -43,14 +43,14 @@ def test_commit_operations_batches_same_user_update_delete_for_coalescer(tmp_pat
         [
             ContextOperation(
                 user_id="u1",
-                context_type=ContextType.MEMORY,
+                context_type=ContextType.RESOURCE,
                 action=OperationAction.UPDATE,
                 target_uri=obj.uri,
                 payload={"context_object": updated.to_dict(), "content": "new"},
             ),
             ContextOperation(
                 user_id="u1",
-                context_type=ContextType.MEMORY,
+                context_type=ContextType.RESOURCE,
                 action=OperationAction.DELETE,
                 target_uri=obj.uri,
                 payload={"reason": "remove"},
@@ -69,7 +69,7 @@ def test_commit_operations_batches_same_user_reward_penalty_for_conflict_resolve
         user_id="u1",
         scene_key="hot_room",
         action="turn_on_ac",
-        memory_anchor_uri="memoryos://user/u1/memories/anchors/hot",
+        support_anchor_uri="memoryos://user/u1/support/behavior/hot",
     )
     db.seed_object(policy.to_context_object(), content=json.dumps(policy.to_dict()))
 
@@ -104,15 +104,15 @@ def test_supersede_marks_old_obsolete_and_action_context_uses_active_replacement
         user_id="u1",
         scene_key="hot_room",
         action="turn_on_ac",
-        memory_anchor_uri="memoryos://user/u1/memories/anchors/hot",
+        support_anchor_uri="memoryos://user/u1/support/behavior/hot",
     )
     db.seed_object(policy.to_context_object(), content=json.dumps(policy.to_dict()))
     old = ContextObject(
-        uri="memoryos://user/u1/memories/rules/old-ac",
-        context_type=ContextType.MEMORY,
+        uri="memoryos://user/u1/support/action-policy/old-ac",
+        context_type=ContextType.ACTION_POLICY_SUPPORT,
         title="old ac rule",
         owner_user_id="u1",
-        metadata={"constrains_policy_uris": [policy.uri]},
+        metadata={"support_anchor_kind": "action_policy", "constrains_policy_uris": [policy.uri]},
     )
     db.seed_object(old, content="old turn_on_ac rule")
     relations.add_relation(
@@ -121,20 +121,21 @@ def test_supersede_marks_old_obsolete_and_action_context_uses_active_replacement
             relation_type="constrained_by",
             target_uri=old.uri,
             metadata={"owner_user_id": "u1"},
-        )
+        ),
+        tenant_id="default",
     )
     new = ContextObject(
-        uri="memoryos://user/u1/memories/rules/new-ac",
-        context_type=ContextType.MEMORY,
+        uri="memoryos://user/u1/support/action-policy/new-ac",
+        context_type=ContextType.ACTION_POLICY_SUPPORT,
         title="new ac rule",
         owner_user_id="u1",
-        metadata={"constrains_policy_uris": [policy.uri]},
+        metadata={"support_anchor_kind": "action_policy", "constrains_policy_uris": [policy.uri]},
     )
 
     db.commit_operation(
         ContextOperation(
             user_id="u1",
-            context_type=ContextType.MEMORY,
+            context_type=ContextType.ACTION_POLICY_SUPPORT,
             action=OperationAction.SUPERSEDE,
             target_uri=old.uri,
             payload={"context_object": new.to_dict(), "content": "new turn_on_ac rule", "reason": "newer user preference"},
@@ -146,10 +147,20 @@ def test_supersede_marks_old_obsolete_and_action_context_uses_active_replacement
     assert old_obj.lifecycle_state == LifecycleState.OBSOLETE
     assert old_obj.metadata["superseded_by"] == new.uri
     assert new_obj.lifecycle_state == LifecycleState.ACTIVE
-    relation_types = {(relation.source_uri, relation.relation_type, relation.target_uri) for relation in relations.relations_of(old.uri)}
+    relation_types = {
+        (relation.source_uri, relation.relation_type, relation.target_uri)
+        for relation in relations.relations_of(old.uri, tenant_id="default")
+    }
     assert (new.uri, "supersedes", old.uri) in relation_types
     assert (old.uri, "superseded_by", new.uri) in relation_types
-    assert old.uri not in [hit.uri for hit in index.search("turn_on_ac", filters={"owner_user_id": "u1", "context_type": "memory"})]
+    assert old.uri not in [
+        hit.uri
+        for hit in index.search(
+            "turn_on_ac",
+            tenant_id="default",
+            filters={"owner_user_id": "u1", "context_type": "action_policy_support"},
+        )
+    ]
 
     context = ActionContextBuilder(index, source_store=source, relation_store=relations).build(
         "u1",

@@ -31,7 +31,12 @@ def test_similar_behavior_retriever_final_semantics(tmp_path) -> None:
             relation_store=relations,
         ),
     )
-    anchor = _object("memoryos://user/u1/memories/anchors/hot", ContextType.MEMORY, "hot anchor")
+    anchor = _object(
+        "memoryos://user/u1/support/behavior/hot",
+        ContextType.BEHAVIOR_SUPPORT,
+        "hot support anchor",
+        {"support_anchor_kind": "behavior"},
+    )
     pattern = _object("memoryos://user/u1/behavior/patterns/hot/p1", ContextType.BEHAVIOR_PATTERN, "hot pattern", {"scene_key": "hot"})
     cluster = _object("memoryos://user/u1/behavior/clusters/hot/c1", ContextType.BEHAVIOR_CLUSTER, "hot cluster", {"scene_key": "hot"})
     policy = _object("memoryos://user/u1/action_policies/hot/turn_on_ac", ContextType.ACTION_POLICY, "policy")
@@ -57,7 +62,7 @@ def test_similar_behavior_retriever_final_semantics(tmp_path) -> None:
     assert result["patterns"]
     assert result["clusters"]
     assert len(result["representative_cases"]) <= 3
-    assert result["memory_anchors"][0]["uri"] == anchor.uri
+    assert result["support_anchors"][0]["uri"] == anchor.uri
     assert result["policy_refs"][0]["uri"] == policy.uri
     assert policy.uri not in {item["uri"] for item in result["representative_cases"]}
     assert result["similarity_scores"][pattern.uri] > result["similarity_scores"][cases[0].uri]
@@ -65,7 +70,7 @@ def test_similar_behavior_retriever_final_semantics(tmp_path) -> None:
     assert result["retrieval_trace"][cases[0].uri]["relation_type"] == "aggregated_from"
 
 
-def test_similar_behavior_retriever_excludes_pending_memory_relations(tmp_path) -> None:  # noqa: ANN001
+def test_similar_behavior_retriever_excludes_inactive_support_relations(tmp_path) -> None:  # noqa: ANN001
     db = ContextDB(FileSystemSourceStore(tmp_path), InMemoryIndexStore(), InMemoryRelationStore())
     pattern = _object(
         "memoryos://user/u1/behavior/patterns/hot/pending-filter",
@@ -74,38 +79,36 @@ def test_similar_behavior_retriever_excludes_pending_memory_relations(tmp_path) 
         {"scene_key": "hot"},
     )
     db.seed_object(pattern, content="hot room")
-    pending_uris = []
+    rejected_uris = []
     for lifecycle_state in (
         LifecycleState.PENDING,
         LifecycleState.RETRYABLE,
         LifecycleState.CONFIRMED,
         LifecycleState.ACTIVE,
     ):
-        pending = _object(
-            f"memoryos://user/u1/memories/pending/{lifecycle_state.value}",
-            ContextType.MEMORY,
-            f"hot {lifecycle_state.value} memory",
-            {
-                "canonical_kind": "pending_proposal",
-                "admission": {"decision": "pending"},
-            },
+        support = _object(
+            f"memoryos://user/u1/support/behavior/{lifecycle_state.value}",
+            ContextType.BEHAVIOR_SUPPORT,
+            f"hot {lifecycle_state.value} support",
+            {"support_anchor_kind": "wrong" if lifecycle_state == LifecycleState.ACTIVE else "behavior"},
         )
-        pending.lifecycle_state = lifecycle_state
-        # Deliberately construct an uncommitted raw pending artifact through
-        # the low-level stores.  The public ContextDB boundary correctly
-        # rejects this bypass; the retriever must still fail closed if such a
-        # crash/migration artifact is present underneath it.
-        db.source_store.write_object(pending, content="hot room unconfirmed memory")
-        db.index_store.upsert_index(pending, content="hot room unconfirmed memory")
+        support.lifecycle_state = lifecycle_state
+        db.source_store.write_object(support, content="hot room invalid support")
+        db.index_store.upsert_index(
+            support,
+            content="hot room invalid support",
+            tenant_id="default",
+        )
         db.relation_store.add_relation(
             ContextRelation(
                 source_uri=pattern.uri,
                 relation_type="anchored_by",
-                target_uri=pending.uri,
+                target_uri=support.uri,
                 metadata={"owner_user_id": "u1"},
-            )
+            ),
+            tenant_id="default",
         )
-        pending_uris.append(pending.uri)
+        rejected_uris.append(support.uri)
 
     result = SimilarBehaviorRetriever(
         db.index_store,
@@ -116,8 +119,8 @@ def test_similar_behavior_retriever_excludes_pending_memory_relations(tmp_path) 
         Observation(user_id="u1", raw_text="hot room", location="home"),
     )
 
-    assert set(pending_uris).isdisjoint(item["uri"] for item in result["memory_anchors"])
-    assert set(pending_uris).isdisjoint(item["uri"] for item in result["hits"])
+    assert set(rejected_uris).isdisjoint(item["uri"] for item in result["support_anchors"])
+    assert set(rejected_uris).isdisjoint(item["uri"] for item in result["hits"])
 
     source_less = SimilarBehaviorRetriever(
         db.index_store,
@@ -126,10 +129,10 @@ def test_similar_behavior_retriever_excludes_pending_memory_relations(tmp_path) 
         "u1",
         Observation(user_id="u1", raw_text="hot room", location="home"),
     )
-    assert set(pending_uris).isdisjoint(item["uri"] for item in source_less["memory_anchors"])
+    assert set(rejected_uris).isdisjoint(item["uri"] for item in source_less["support_anchors"])
 
 
-def test_similar_behavior_retriever_rejects_stale_pending_index_hit(tmp_path) -> None:  # noqa: ANN001
+def test_similar_behavior_retriever_rejects_stale_support_index_hit(tmp_path) -> None:  # noqa: ANN001
     source = FileSystemSourceStore(tmp_path)
     pattern = _object(
         "memoryos://user/u1/behavior/patterns/hot/stale-index",
@@ -137,24 +140,22 @@ def test_similar_behavior_retriever_rejects_stale_pending_index_hit(tmp_path) ->
         "hot stale index pattern",
     )
     pending = _object(
-        "memoryos://user/u1/memories/pending/stale-index",
-        ContextType.MEMORY,
-        "hot stale pending memory",
-        {
-            "canonical_kind": "pending_proposal",
-            "admission": {"decision": "pending"},
-        },
+        "memoryos://user/u1/support/behavior/stale-index",
+        ContextType.BEHAVIOR_SUPPORT,
+        "hot stale pending support",
+        {"support_anchor_kind": "behavior"},
     )
     pending.lifecycle_state = LifecycleState.PENDING
     cross_user = ContextObject(
-        uri="memoryos://user/u2/memories/anchors/cross-user-stale-index",
-        context_type=ContextType.MEMORY,
-        title="hot cross-user memory",
+        uri="memoryos://user/u2/support/behavior/cross-user-stale-index",
+        context_type=ContextType.BEHAVIOR_SUPPORT,
+        title="hot cross-user support",
         owner_user_id="u2",
+        metadata={"support_anchor_kind": "behavior"},
     )
     source.write_object(pattern, content="hot room")
-    source.write_object(pending, content="hot pending memory")
-    source.write_object(cross_user, content="hot private memory")
+    source.write_object(pending, content="hot pending support")
+    source.write_object(cross_user, content="hot private support")
     relations = InMemoryRelationStore()
     relations.add_relation(
         ContextRelation(
@@ -162,11 +163,19 @@ def test_similar_behavior_retriever_rejects_stale_pending_index_hit(tmp_path) ->
             relation_type="anchored_by",
             target_uri=cross_user.uri,
             metadata={"owner_user_id": "u1"},
-        )
+        ),
+        tenant_id="default",
     )
 
     class StalePendingIndex(InMemoryIndexStore):
-        def search(self, query, filters=None, limit=10):  # noqa: ANN001, ANN201, ARG002
+        def search(  # noqa: ANN201
+            self,
+            query,  # noqa: ANN001, ARG002
+            *,
+            tenant_id,  # noqa: ANN001, ARG002
+            filters=None,  # noqa: ANN001
+            limit=10,  # noqa: ARG002
+        ):
             context_type = dict(filters or {}).get("context_type")
             if context_type == ContextType.BEHAVIOR_PATTERN.value:
                 return [
@@ -177,18 +186,18 @@ def test_similar_behavior_retriever_rejects_stale_pending_index_hit(tmp_path) ->
                         title=pattern.title,
                     )
                 ]
-            if context_type == ContextType.MEMORY.value:
+            if context_type == ContextType.BEHAVIOR_SUPPORT.value:
                 return [
                     IndexHit(
                         uri=pending.uri,
                         score=1.0,
-                        context_type=ContextType.MEMORY.value,
+                        context_type=ContextType.BEHAVIOR_SUPPORT.value,
                         title=pending.title,
                     ),
                     IndexHit(
                         uri=cross_user.uri,
                         score=1.0,
-                        context_type=ContextType.MEMORY.value,
+                        context_type=ContextType.BEHAVIOR_SUPPORT.value,
                         title=cross_user.title,
                     ),
                 ]
@@ -203,7 +212,7 @@ def test_similar_behavior_retriever_rejects_stale_pending_index_hit(tmp_path) ->
         Observation(user_id="u1", raw_text="hot room", location="home"),
     )
 
-    assert pending.uri not in {item["uri"] for item in result["memory_anchors"]}
+    assert pending.uri not in {item["uri"] for item in result["support_anchors"]}
     assert pending.uri not in {item["uri"] for item in result["hits"]}
-    assert cross_user.uri not in {item["uri"] for item in result["memory_anchors"]}
+    assert cross_user.uri not in {item["uri"] for item in result["support_anchors"]}
     assert cross_user.uri not in {item["uri"] for item in result["hits"]}

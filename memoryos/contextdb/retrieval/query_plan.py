@@ -43,20 +43,8 @@ class RetrievalQueryIntent(str, Enum):
 
     CURRENT = "CURRENT"
     HISTORY = "HISTORY"
-    AS_OF = "AS_OF"
-    CONFLICTS = "CONFLICTS"
-    OPTIONS = "OPTIONS"
     OPEN_RECALL = "OPEN_RECALL"
     EXACT = "EXACT"
-
-
-class CanonicalResolutionMode(str, Enum):
-    """How canonical candidates are handled after bounded candidate generation."""
-
-    AUTO = "AUTO"
-    DISABLED = "DISABLED"
-    VALIDATE = "VALIDATE"
-    REQUIRE = "REQUIRE"
 
 
 @dataclass(frozen=True)
@@ -73,6 +61,9 @@ class RetrievalOptions:
     target_paths: tuple[str, ...] = ()
     context_types: tuple[ContextType, ...] = ()
     source_kinds: tuple[str, ...] = ()
+    record_kinds: tuple[str, ...] = ()
+    document_ids: tuple[str, ...] = ()
+    document_kinds: tuple[str, ...] = ()
 
     tenant_id: str | None = None
     owner_user_id: str | None = None
@@ -86,11 +77,9 @@ class RetrievalOptions:
     transaction_time_to: str | date | datetime | None = None
     updated_at_from: str | date | datetime | None = None
     updated_at_to: str | date | datetime | None = None
-    valid_at: str | date | datetime | None = None
     timezone: str = "UTC"
 
     query_intent: RetrievalQueryIntent = RetrievalQueryIntent.CURRENT
-    canonical_resolution_mode: CanonicalResolutionMode = CanonicalResolutionMode.AUTO
     relation_expansion: bool = False
 
     candidate_limit: int = DEFAULT_CANDIDATE_LIMIT
@@ -130,6 +119,17 @@ class RetrievalOptions:
             "source_kinds",
             _normalize_source_kinds(self.source_kinds),
         )
+        for field_name in ("record_kinds", "document_ids", "document_kinds"):
+            object.__setattr__(
+                self,
+                field_name,
+                _normalize_strings(
+                    getattr(self, field_name),
+                    label=field_name,
+                    maximum=MAX_FILTER_VALUES,
+                    max_chars=_MAX_IDENTIFIER_CHARS,
+                ),
+            )
 
         for field_name in ("tenant_id", "owner_user_id", "adapter_id"):
             object.__setattr__(self, field_name, _normalize_optional_identifier(getattr(self, field_name), field_name))
@@ -193,12 +193,6 @@ class RetrievalOptions:
             caller_timezone=resolved_timezone,
             date_is_upper_bound=True,
         )
-        valid_at = _normalize_timestamp(
-            self.valid_at,
-            label="valid_at",
-            caller_timezone=resolved_timezone,
-            date_is_upper_bound=False,
-        )
         _validate_time_range(event_from, event_to, "event_time")
         _validate_time_range(transaction_from, transaction_to, "transaction_time")
         _validate_time_range(updated_from, updated_to, "updated_at")
@@ -208,14 +202,8 @@ class RetrievalOptions:
         object.__setattr__(self, "transaction_time_to", transaction_to)
         object.__setattr__(self, "updated_at_from", updated_from)
         object.__setattr__(self, "updated_at_to", updated_to)
-        object.__setattr__(self, "valid_at", valid_at)
 
         object.__setattr__(self, "query_intent", _normalize_query_intent(self.query_intent))
-        object.__setattr__(
-            self,
-            "canonical_resolution_mode",
-            _normalize_canonical_resolution_mode(self.canonical_resolution_mode),
-        )
         if not isinstance(self.relation_expansion, bool):
             raise TypeError("relation_expansion must be a bool")
 
@@ -255,6 +243,9 @@ class RetrievalOptions:
             "target_paths": list(self.target_paths),
             "context_types": [item.value for item in self.context_types],
             "source_kinds": list(self.source_kinds),
+            "record_kinds": list(self.record_kinds),
+            "document_ids": list(self.document_ids),
+            "document_kinds": list(self.document_kinds),
             "tenant_id": self.tenant_id,
             "owner_user_id": self.owner_user_id,
             "workspace_ids": list(self.workspace_ids),
@@ -266,10 +257,8 @@ class RetrievalOptions:
             "transaction_time_to": self.transaction_time_to,
             "updated_at_from": self.updated_at_from,
             "updated_at_to": self.updated_at_to,
-            "valid_at": self.valid_at,
             "timezone": self.timezone,
             "query_intent": self.query_intent.value,
-            "canonical_resolution_mode": self.canonical_resolution_mode.value,
             "relation_expansion": self.relation_expansion,
             "candidate_limit": self.candidate_limit,
             "final_limit": self.final_limit,
@@ -311,8 +300,6 @@ class RetrievalQueryPlan(RetrievalOptions):
             "service_id",
             _normalize_optional_identifier(self.service_id, "service_id"),
         )
-        if self.query_intent == RetrievalQueryIntent.AS_OF and not self.valid_at:
-            raise ValueError("AS_OF retrieval requires valid_at")
 
     def to_dict(self) -> dict[str, Any]:
         return {"semantic_query": self.semantic_query, "service_id": self.service_id, **super().to_dict()}
@@ -356,21 +343,6 @@ def _normalize_query_intent(value: RetrievalQueryIntent | str) -> RetrievalQuery
     except ValueError as exc:
         allowed = ", ".join(item.value for item in RetrievalQueryIntent)
         raise ValueError(f"query_intent must be one of: {allowed}") from exc
-
-
-def _normalize_canonical_resolution_mode(
-    value: CanonicalResolutionMode | str,
-) -> CanonicalResolutionMode:
-    if isinstance(value, CanonicalResolutionMode):
-        return value
-    normalized = str(value).strip().upper()
-    if normalized in {"NONE", "OFF"}:
-        normalized = CanonicalResolutionMode.DISABLED.value
-    try:
-        return CanonicalResolutionMode(normalized)
-    except ValueError as exc:
-        allowed = ", ".join(item.value for item in CanonicalResolutionMode)
-        raise ValueError(f"canonical_resolution_mode must be one of: {allowed}") from exc
 
 
 def _normalize_context_types(values: Sequence[ContextType | str] | ContextType | str | None) -> tuple[ContextType, ...]:

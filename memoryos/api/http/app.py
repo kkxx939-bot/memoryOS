@@ -12,6 +12,7 @@ from typing import Any
 from urllib.parse import parse_qs
 
 from memoryos.action_policy.model.action_policy import ActionPolicy
+from memoryos.api.memory_contract import validate_memory_request, validate_memory_response
 from memoryos.api.retrieval_contract import parse_retrieval_options
 from memoryos.api.sdk.client import MemoryOSClient
 from memoryos.application.context.orchestrator import RetrievalUnavailableError
@@ -24,6 +25,7 @@ from memoryos.security.trusted_context import (
     AUTHORITATIVE_FORGET,
     AUTHORITATIVE_REMEMBER,
     COMMIT_SESSION,
+    HARD_ERASE_MEMORY,
     READ_CONTEXT,
     AuthenticationError,
     TrustedRequestContext,
@@ -81,10 +83,9 @@ def handle(
             project_id=str(payload.get("project_id") or ""),
             tenant_id=(str(payload["tenant_id"]) if payload.get("tenant_id") is not None else None),
             applicability_scopes=payload.get("applicability_scopes"),
-            memory_states=payload.get("memory_states"),
-            memory_types=payload.get("memory_types"),
-            claim_uris=payload.get("claim_uris"),
-            slot_uris=payload.get("slot_uris"),
+            record_kinds=payload.get("record_kinds"),
+            document_ids=payload.get("document_ids"),
+            document_kinds=payload.get("document_kinds"),
             query_intent=payload.get("query_intent"),
             caller=caller,
         )
@@ -114,7 +115,13 @@ def handle(
             "done": result.done,
             "state": result.state.value,
             "commit_group_id": result.commit_group_id,
-            "canonical_committed": result.canonical_committed,
+            "memory_committed": result.memory_committed,
+            "memory_document_change_count": result.memory_document_change_count,
+            "edit_proposal_count": result.edit_proposal_count,
+            "edit_proposal_ids": list(result.edit_proposal_ids),
+            "archive_committed": result.archive_committed,
+            "session_projection_status": result.session_projection_status,
+            "session_projected_count": result.session_projected_count,
             "commit_group_status": result.commit_group_status,
         }
     raise KeyError(f"Unknown route: {route}")
@@ -184,8 +191,8 @@ class MemoryOSASGI:
     ) -> dict[str, Any]:
         if method == "GET" and path == "/health":
             return self.client.health()
-        # Health is the only public endpoint that remains available while
-        # startup/recovery has not established the canonical-memory closure.
+        # Health is the only public endpoint available before startup recovery
+        # has established a complete document and projection serving state.
         # Session event/checkpoint routes write durable staging files directly
         # through AgentSessionService, so relying only on SDK method-level
         # gates would let those routes mutate state while NOT_READY.
@@ -247,71 +254,108 @@ class MemoryOSASGI:
             return result
         if method == "POST" and path == "/v1/memories/remember":
             caller.require(AUTHORITATIVE_REMEMBER)
-            caller.assert_identity(user_id=payload.get("user_id"), tenant_id=payload.get("tenant_id"))
-            if "identity_fields" in payload and not isinstance(payload["identity_fields"], dict):
-                raise ValueError("identity_fields must be an object")
-            return self.client.remember(
-                user_id=caller.user_id,
-                content=_required_str(payload, "content", path),
-                title=str(payload.get("title") or ""),
-                memory_type=str(payload.get("memory_type") or "project_decision"),
-                project_id=str(payload.get("project_id") or ""),
-                constraint_polarity=str(payload.get("constraint_polarity") or ""),
-                condition=str(payload.get("condition") or ""),
-                exception=str(payload.get("exception") or ""),
-                identity_fields=(dict(payload["identity_fields"]) if "identity_fields" in payload else None),
-                connect_metadata=caller.bind_agent_connect_metadata(payload.get("connect_metadata")),
-                tenant_id=caller.tenant_id,
-                caller=caller,
+            request = validate_memory_request("remember", payload)
+            return validate_memory_response(
+                "remember",
+                self.client.remember(**request, tenant_id=caller.tenant_id, caller=caller),
+            )
+        if method == "POST" and path == "/v1/memories/adopt":
+            caller.require(AUTHORITATIVE_REMEMBER)
+            request = validate_memory_request("adopt", payload)
+            return validate_memory_response(
+                "adopt",
+                self.client.adopt_memory_document(
+                    **request,
+                    tenant_id=caller.tenant_id,
+                    caller=caller,
+                ),
+            )
+        if method == "POST" and path == "/v1/memories/edit":
+            caller.require(AUTHORITATIVE_REMEMBER)
+            request = validate_memory_request("edit", payload)
+            return validate_memory_response(
+                "edit",
+                self.client.edit_memory_document(**request, tenant_id=caller.tenant_id, caller=caller),
+            )
+        if method == "POST" and path == "/v1/memories/rename":
+            caller.require(AUTHORITATIVE_REMEMBER)
+            request = validate_memory_request("rename", payload)
+            return validate_memory_response(
+                "rename",
+                self.client.rename_memory_document(**request, tenant_id=caller.tenant_id, caller=caller),
+            )
+        if method == "POST" and path == "/v1/memories/merge/propose":
+            caller.require(AUTHORITATIVE_REMEMBER)
+            caller.require(AUTHORITATIVE_FORGET)
+            request = validate_memory_request("merge_propose", payload)
+            return validate_memory_response(
+                "merge_propose",
+                self.client.propose_memory_consolidation(
+                    **request,
+                    tenant_id=caller.tenant_id,
+                    caller=caller,
+                ),
+            )
+        if method == "POST" and path == "/v1/memories/merge":
+            caller.require(AUTHORITATIVE_REMEMBER)
+            caller.require(AUTHORITATIVE_FORGET)
+            request = validate_memory_request("merge", payload)
+            return validate_memory_response(
+                "merge",
+                self.client.merge_memory_documents(**request, tenant_id=caller.tenant_id, caller=caller),
+            )
+        if method == "POST" and path == "/v1/memories/merge/resume":
+            caller.require(AUTHORITATIVE_REMEMBER)
+            caller.require(AUTHORITATIVE_FORGET)
+            request = validate_memory_request("merge_resume", payload)
+            return validate_memory_response(
+                "merge_resume",
+                self.client.resume_memory_consolidation(
+                    **request,
+                    tenant_id=caller.tenant_id,
+                    caller=caller,
+                ),
             )
         if method == "POST" and path == "/v1/memories/forget":
             caller.require(AUTHORITATIVE_FORGET)
-            caller.assert_identity(user_id=payload.get("user_id"), tenant_id=payload.get("tenant_id"))
-            return self.client.forget(
-                user_id=caller.user_id,
-                uri=_required_str(payload, "uri", path),
-                tenant_id=caller.tenant_id,
-                caller=caller,
+            request = validate_memory_request("forget", payload)
+            if request["mode"] == "HARD_ERASE":
+                caller.require(HARD_ERASE_MEMORY)
+            return validate_memory_response(
+                "forget",
+                self.client.forget(**request, tenant_id=caller.tenant_id, caller=caller),
             )
-        if method == "GET" and path == "/v1/memories/pending":
+        if method == "GET" and path == "/v1/memories/history":
             caller.require(READ_CONTEXT)
             query = parse_qs(scope.get("query_string", b"").decode())
-            lifecycle_states = [
-                item for value in query.get("lifecycle_state", []) for item in str(value).split(",") if item
-            ]
-            caller.assert_identity(
-                user_id=str(query.get("user_id", [caller.user_id])[0]),
-                tenant_id=str(query.get("tenant_id", [caller.tenant_id])[0]),
+            request = validate_memory_request(
+                "history",
+                {"document_uri": str(query.get("document_uri", [""])[0])},
             )
-            return {
-                "results": self.client.list_pending(
-                    user_id=caller.user_id,
-                    tenant_id=caller.tenant_id,
-                    lifecycle_states=lifecycle_states,
-                    project_id=caller.bind_read_workspace(query.get("project_id", [None])[0]),
-                    caller=caller,
-                )
-            }
-        if method == "POST" and path == "/v1/memories/pending/review":
+            return validate_memory_response(
+                "history",
+                self.client.list_memory_history(**request, tenant_id=caller.tenant_id, caller=caller),
+            )
+        if method == "POST" and path == "/v1/memories/restore":
             caller.require(AUTHORITATIVE_REMEMBER)
-            caller.assert_identity(user_id=payload.get("user_id"), tenant_id=payload.get("tenant_id"))
-            if "corrected_proposal" in payload and not isinstance(payload["corrected_proposal"], dict):
-                raise ValueError("corrected_proposal must be an object")
-            return self.client.review_pending(
-                user_id=caller.user_id,
-                pending_uri=_required_str(payload, "pending_uri", path),
-                decision=_required_str(payload, "decision", path),
-                expected_lifecycle_revision=int(payload.get("expected_lifecycle_revision", 0) or 0),
-                expected_proposal_fingerprint=_required_str(
-                    payload,
-                    "expected_proposal_fingerprint",
-                    path,
-                ),
-                command_id=_required_str(payload, "command_id", path),
-                tenant_id=caller.tenant_id,
-                reason=str(payload.get("reason") or ""),
-                corrected_proposal=(dict(payload["corrected_proposal"]) if "corrected_proposal" in payload else None),
-                caller=caller,
+            request = validate_memory_request("restore", payload)
+            return validate_memory_response(
+                "restore",
+                self.client.restore_memory_revision(**request, tenant_id=caller.tenant_id, caller=caller),
+            )
+        if method == "POST" and path == "/v1/memories/review":
+            caller.require(AUTHORITATIVE_REMEMBER)
+            request = validate_memory_request("review", payload)
+            return validate_memory_response(
+                "review",
+                self.client.review_memory_edit(**request, tenant_id=caller.tenant_id, caller=caller),
+            )
+        if method == "POST" and path == "/v1/memories/review/preview":
+            caller.require(READ_CONTEXT)
+            request = validate_memory_request("review_preview", payload)
+            return validate_memory_response(
+                "review_preview",
+                self.client.preview_memory_edit(**request, tenant_id=caller.tenant_id, caller=caller),
             )
         if method == "GET" and path == "/v1/context/read":
             query = parse_qs(scope.get("query_string", b"").decode())
@@ -478,10 +522,9 @@ def _search_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
         "project_id": str(payload.get("project_id") or ""),
         "tenant_id": (str(payload["tenant_id"]) if payload.get("tenant_id") is not None else None),
         "applicability_scopes": payload.get("applicability_scopes"),
-        "memory_states": payload.get("memory_states"),
-        "memory_types": payload.get("memory_types"),
-        "claim_uris": payload.get("claim_uris"),
-        "slot_uris": payload.get("slot_uris"),
+        "record_kinds": payload.get("record_kinds"),
+        "document_ids": payload.get("document_ids"),
+        "document_kinds": payload.get("document_kinds"),
         "query_intent": payload.get("query_intent"),
     }
 

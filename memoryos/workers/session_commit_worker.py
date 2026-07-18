@@ -1,81 +1,80 @@
-"""后台任务里的会话提交任务。"""
+"""Lease and replay exact archived Session commit tasks."""
 
 from __future__ import annotations
 
 import os
 import uuid
-from collections.abc import Iterator
-from contextlib import contextmanager
 from typing import Any
 
-from memoryos.application.session.commit_service import SessionCommitService
+from memoryos.application.session.commit_group import CommitGroupIntegrityError
+from memoryos.application.session.commit_service import DerivedConsumerError, SessionCommitService
+from memoryos.contextdb.session.errors import EvidenceArchiveError
 from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.contextdb.store.queue_store import QueueJob
 from memoryos.core.readiness import require_session_service_ready, session_service_is_ready
-from memoryos.memory.canonical.salience_ledger import SalienceLedgerIntegrityError
-from memoryos.memory.integration.planning_envelope import PlanningEnvelopeIntegrityError
-from memoryos.operations.commit.commit_group import CommitGroupIntegrityError
+from memoryos.memory.documents import (
+    DocumentCommitConflict,
+    DocumentConflictError,
+    DocumentControlIntegrityError,
+)
 from memoryos.workers.tenant_boundary import require_bound_job_tenant
 
 
 class SessionCommitWorker:
+    """Recover commit groups first, then settle exact ``session_commit`` jobs."""
+
     def __init__(self, service: SessionCommitService, *, worker_id: str | None = None) -> None:
         self.service = service
         self.worker_id = worker_id or f"session-commit:{os.getpid()}:{uuid.uuid4().hex}"
 
-    def process_archive(self, archive: SessionArchive) -> dict:
+    def process_archive(self, archive: SessionArchive) -> dict[str, object]:
         require_session_service_ready(self.service)
         result = self.service.async_commit(archive)
-        return {"task_id": result.task_id, "status": result.status, "done": result.done}
+        if not result.done or not result.memory_committed:
+            raise RuntimeError("Session commit did not complete its memory consumer")
+        return {
+            "task_id": result.task_id,
+            "status": result.status,
+            "done": result.done,
+            "memory_committed": result.memory_committed,
+        }
 
-    @contextmanager
-    def _migration_projection_fence(self) -> Iterator[None]:
-        gate: Any | None = getattr(self.service, "migration_gate", None)
-        acquire = getattr(gate, "acquire_projection_fence", None)
-        release = getattr(gate, "release_projection_fence", None)
-        fence = acquire() if callable(acquire) else None
-        try:
-            yield
-        finally:
-            if callable(release):
-                release(fence)
-
-    def process_pending(self, *, batch_size: int = 10, lease_seconds: int = 60, max_retries: int = 3) -> dict:
-        with self._migration_projection_fence():
-            return self._process_pending_unfenced(
-                batch_size=batch_size,
-                lease_seconds=lease_seconds,
-                max_retries=max_retries,
-            )
-
-    def _process_pending_unfenced(
+    def process_pending(
         self,
         *,
-        batch_size: int,
-        lease_seconds: int,
-        max_retries: int,
-    ) -> dict:
-        # The readiness check precedes commit-group recovery and queue leasing:
-        # a NOT_READY runtime must not call the extractor or mutate durable work.
+        batch_size: int = 10,
+        lease_seconds: int = 60,
+        max_retries: int = 3,
+    ) -> dict[str, object]:
+        # Readiness precedes both commit-group recovery and queue leasing.  A
+        # non-ready runtime may neither extract memory nor mutate durable work.
         require_session_service_ready(self.service)
-        committed = failed = dead_letter = recovered = 0
+        committed = failed = dead_letter = recovered = deferred = 0
         released: list[str] = []
         self.service.commit_group_store.recover_expired_consumers()
-        for group in self.service.commit_group_store.pending()[:batch_size]:
+        self.service.commit_group_store.recover_abandoned_leases()
+
+        for group in self.service.resumable_commit_groups(limit=batch_size):
             require_session_service_ready(self.service)
+            # Expired and abandoned leases were released above.  Any remaining
+            # RUNNING attempt belongs to a live worker and must not be raced.
+            if any(item.status == "running" for item in group.consumers.values()):
+                deferred += 1
+                continue
             try:
                 archive = self.service.archive_store.read_archive_at_manifest(
                     group.archive_uri,
                     group.manifest_digest,
                     tenant_id=group.tenant_id,
                 )
-                result = self.service.async_commit(archive)
-                recovered += int(result.done)
-            except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-                failed += 1
+                result = self.service.resume_startup_commit_group(
+                    archive,
+                    group_id=group.group_id,
+                )
+                if not result.done or not result.memory_committed:
+                    raise RuntimeError("recovered Session group is incomplete")
+                recovered += 1
             except Exception:
-                # SessionCommitService terminalizes unclassified canonical
-                # attempts; keep the recovery scan moving to queued work.
                 failed += 1
             if not session_service_is_ready(self.service):
                 return {
@@ -84,11 +83,13 @@ class SessionCommitWorker:
                     "failed": failed,
                     "dead_letter": dead_letter,
                     "recovered": recovered,
+                    "deferred": deferred,
                     "released": released,
                     "status": "not_ready",
                 }
-        # A group scan may have changed readiness without raising.  Never
-        # lease queue work unless the post-scan state is still exactly READY.
+
+        # A recovery action may have flipped readiness without raising.  Never
+        # acquire independent queue leases after that transition.
         require_session_service_ready(self.service)
         jobs = self.service.queue_store.lease(
             "session_commit",
@@ -104,42 +105,40 @@ class SessionCommitWorker:
                     raise
                 released.extend(self._release_unattempted(jobs[position:]))
                 break
+
             try:
-                tenant_id = require_bound_job_tenant(
-                    job.payload,
-                    bound_tenant_id=self.service.archive_store.tenant_id,
-                )
-                archive = self.service.archive_store.read_archive(
-                    job.target_uri,
-                    tenant_id=tenant_id,
-                    manifest_digest=str(job.payload.get("manifest_digest") or "") or None,
-                )
+                archive = self._archive_for_job(job)
                 result = self.service.async_commit(archive)
-                if result.done:
+                if result.done and result.memory_committed:
                     if not session_service_is_ready(self.service):
                         failed += 1
                         released.extend(self._release_unattempted(jobs[position:]))
                         break
                     self.service.queue_store.ack(job)
                     committed += 1
-                else:
-                    if not session_service_is_ready(self.service):
-                        failed += 1
-                        released.extend(self._release_unattempted(jobs[position:]))
-                        break
-                    retryable = self._result_retryable(result.commit_group_status)
-                    status = self._retry(
-                        job,
-                        RuntimeError(result.status),
-                        max_retries=max_retries,
-                        retryable=retryable,
-                    )
-                    dead_letter += int(status == "dead_letter")
+                    continue
+                if not session_service_is_ready(self.service):
                     failed += 1
+                    released.extend(self._release_unattempted(jobs[position:]))
+                    break
+                status = self._retry(
+                    job,
+                    RuntimeError(result.status),
+                    max_retries=max_retries,
+                    retryable=self._result_retryable(result.commit_group_status),
+                )
+            except DerivedConsumerError as exc:
+                if not session_service_is_ready(self.service):
+                    failed += 1
+                    released.extend(self._release_unattempted(jobs[position:]))
+                    break
+                status = self._retry(job, exc, max_retries=max_retries, retryable=exc.retryable)
             except (
                 CommitGroupIntegrityError,
-                PlanningEnvelopeIntegrityError,
-                SalienceLedgerIntegrityError,
+                EvidenceArchiveError,
+                DocumentCommitConflict,
+                DocumentControlIntegrityError,
+                PermissionError,
                 ValueError,
                 KeyError,
                 TypeError,
@@ -149,32 +148,39 @@ class SessionCommitWorker:
                     released.extend(self._release_unattempted(jobs[position:]))
                     break
                 status = self._retry(job, exc, max_retries=max_retries, retryable=False)
-                dead_letter += int(status == "dead_letter")
-                failed += 1
-            except (OSError, RuntimeError) as exc:
+            except DocumentConflictError as exc:
                 if not session_service_is_ready(self.service):
                     failed += 1
                     released.extend(self._release_unattempted(jobs[position:]))
                     break
                 status = self._retry(job, exc, max_retries=max_retries, retryable=True)
-                dead_letter += int(status == "dead_letter")
-                failed += 1
-            except Exception as exc:
-                # Unclassified failures must still surrender their fenced
-                # queue lease and are terminal unless explicitly typed above.
+            except OSError as exc:
                 if not session_service_is_ready(self.service):
                     failed += 1
                     released.extend(self._release_unattempted(jobs[position:]))
                     break
-                status = self._retry(job, exc, max_retries=max_retries, retryable=False)
-                dead_letter += int(status == "dead_letter")
-                failed += 1
+                status = self._retry(job, exc, max_retries=max_retries, retryable=True)
+            except Exception as exc:
+                if not session_service_is_ready(self.service):
+                    failed += 1
+                    released.extend(self._release_unattempted(jobs[position:]))
+                    break
+                status = self._retry(
+                    job,
+                    exc,
+                    max_retries=max_retries,
+                    retryable=self._exception_retryable(exc),
+                )
+            failed += 1
+            dead_letter += int(status == "dead_letter")
+
         summary: dict[str, object] = {
             "claimed": len(jobs),
             "committed": committed,
             "failed": failed,
             "dead_letter": dead_letter,
             "recovered": recovered,
+            "deferred": deferred,
         }
         if released:
             summary["released"] = released
@@ -182,8 +188,46 @@ class SessionCommitWorker:
             summary["status"] = "not_ready"
         return summary
 
+    def _archive_for_job(self, job: QueueJob) -> SessionArchive:
+        expected_keys = {
+            "user_id",
+            "session_id",
+            "tenant_id",
+            "archive_digest",
+            "manifest_digest",
+        }
+        if job.queue_name != "session_commit" or job.action != "async_session_commit":
+            raise ValueError("queued Session commit action is unsupported")
+        if set(job.payload) != expected_keys:
+            raise ValueError("queued Session commit payload has unsupported fields")
+        tenant_id = require_bound_job_tenant(
+            job.payload,
+            bound_tenant_id=self.service.archive_store.tenant_id,
+        )
+        manifest_digest = self._required_string(job.payload, "manifest_digest")
+        archive = self.service.archive_store.read_archive_at_manifest(
+            job.target_uri,
+            manifest_digest,
+            tenant_id=tenant_id,
+        )
+        durable = {
+            "user_id": archive.user_id,
+            "session_id": archive.session_id,
+            "tenant_id": tenant_id,
+            "archive_digest": archive.archive_digest,
+            "manifest_digest": archive.manifest_digest,
+        }
+        claimed = {key: self._required_string(job.payload, key) for key in expected_keys}
+        if (
+            claimed != durable
+            or job.job_id != archive.task_id
+            or job.target_uri != archive.archive_uri
+        ):
+            raise ValueError("queued Session commit identity differs from immutable evidence")
+        return archive
+
     def _release_unattempted(self, jobs: list[QueueJob]) -> list[str]:
-        """Fenced release for a batch aborted by a global readiness failure."""
+        """Release a batch without changing retry counts after readiness loss."""
 
         released: list[str] = []
         for job in jobs:
@@ -194,19 +238,34 @@ class SessionCommitWorker:
                 or settled.lease_token
                 or settled.lease_owner
             ):
-                raise RuntimeError("session commit batch release did not preserve queue state")
+                raise RuntimeError("Session commit batch release did not preserve queue state")
             released.append(job.job_id)
         return released
 
-    def _result_retryable(self, payload: dict) -> bool:  # noqa: ANN001
-        if not payload:
-            return True
-        if payload.get("canonical_status") != "completed":
-            return bool(payload.get("canonical_retryable", True))
-        return any(
-            item.get("status") != "completed" and item.get("retryable", True)
-            for item in dict(payload.get("consumers", {}) or {}).values()
-        )
+    @staticmethod
+    def _required_string(payload: dict[str, Any], key: str) -> str:
+        value = payload.get(key)
+        if not isinstance(value, str) or not value:
+            raise TypeError(f"queued Session commit {key} must be a non-empty string")
+        return value
+
+    @staticmethod
+    def _result_retryable(payload: dict[str, Any]) -> bool:
+        consumers = payload.get("consumers")
+        if not isinstance(consumers, dict):
+            return False
+        incomplete: list[dict[str, Any]] = []
+        for item in consumers.values():
+            if not isinstance(item, dict):
+                return False
+            if item.get("status") != "completed":
+                incomplete.append(item)
+        return bool(incomplete) and all(item.get("retryable") is True for item in incomplete)
+
+    @staticmethod
+    def _exception_retryable(exc: Exception) -> bool:
+        explicit = getattr(exc, "retryable", None)
+        return explicit if isinstance(explicit, bool) else False
 
     def _retry(self, job: QueueJob, exc: Exception, *, max_retries: int, retryable: bool) -> str:
         settled = self.service.queue_store.retry(
@@ -216,3 +275,6 @@ class SessionCommitWorker:
             retryable=retryable,
         )
         return settled.status
+
+
+__all__ = ["SessionCommitWorker"]

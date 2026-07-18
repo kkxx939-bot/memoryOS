@@ -1,42 +1,26 @@
-"""Stable, lazily resolved Memory domain exports."""
+"""Stable lazy exports for user-editable Markdown memory."""
 
 from __future__ import annotations
 
 from importlib import import_module
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 _PUBLIC_ATTRS = {
-    "MemoryAdmissionGate": ("memoryos.memory.admission", "MemoryAdmissionGate"),
+    "DocumentChangeEvent": ("memoryos.memory.documents", "DocumentChangeEvent"),
+    "DocumentCommitResult": ("memoryos.memory.documents", "DocumentCommitResult"),
+    "DocumentEditKind": ("memoryos.memory.documents", "DocumentEditKind"),
+    "DocumentEditPlan": ("memoryos.memory.documents", "DocumentEditPlan"),
+    "MemoryCandidateKind": ("memoryos.memory.documents", "MemoryCandidateKind"),
+    "MemoryCandidateRegistry": ("memoryos.memory.schema", "MemoryCandidateRegistry"),
+    "MemoryCandidateSchema": ("memoryos.memory.schema", "MemoryCandidateSchema"),
+    "MemoryDocument": ("memoryos.memory.documents", "MemoryDocument"),
+    "MemoryDocumentCommitter": ("memoryos.memory.documents", "MemoryDocumentCommitter"),
+    "MemoryDocumentKind": ("memoryos.memory.documents", "MemoryDocumentKind"),
+    "MemoryDocumentPlanner": ("memoryos.memory.documents", "MemoryDocumentPlanner"),
+    "MemoryEditProposal": ("memoryos.memory.documents", "MemoryEditProposal"),
     "MemoryExtractorBackend": ("memoryos.memory.extraction", "MemoryExtractorBackend"),
     "RuleFallbackExtractor": ("memoryos.memory.extraction", "RuleFallbackExtractor"),
-    "MemoryCoolingPolicy": ("memoryos.memory.lifecycle", "MemoryCoolingPolicy"),
-    "Memory": ("memoryos.memory.model", "Memory"),
-    "MemoryAnchor": ("memoryos.memory.model", "MemoryAnchor"),
-    "MemoryCandidate": ("memoryos.memory.model", "MemoryCandidate"),
-    "MemoryKind": ("memoryos.memory.model", "MemoryKind"),
-    "AdmissionDecision": ("memoryos.memory.schema", "AdmissionDecision"),
-    "MemoryCandidateDraft": ("memoryos.memory.schema", "MemoryCandidateDraft"),
-    "MemoryOperationGroup": ("memoryos.memory.schema", "MemoryOperationGroup"),
-    "MemoryType": ("memoryos.memory.schema", "MemoryType"),
-    "MemoryTypeRegistry": ("memoryos.memory.schema", "MemoryTypeRegistry"),
-    "MemoryTypeSchema": ("memoryos.memory.schema", "MemoryTypeSchema"),
-    "MemoryUpdater": ("memoryos.memory.service", "MemoryUpdater"),
 }
-
-if TYPE_CHECKING:
-    from memoryos.memory.admission import MemoryAdmissionGate
-    from memoryos.memory.extraction import MemoryExtractorBackend, RuleFallbackExtractor
-    from memoryos.memory.lifecycle import MemoryCoolingPolicy
-    from memoryos.memory.model import Memory, MemoryAnchor, MemoryCandidate, MemoryKind
-    from memoryos.memory.schema import (
-        AdmissionDecision,
-        MemoryCandidateDraft,
-        MemoryOperationGroup,
-        MemoryType,
-        MemoryTypeRegistry,
-        MemoryTypeSchema,
-    )
-    from memoryos.memory.service import MemoryUpdater
 
 
 def __getattr__(name: str) -> Any:
@@ -52,20 +36,4 @@ def __dir__() -> list[str]:
     return sorted({*globals(), *__all__})
 
 
-__all__ = [
-    "AdmissionDecision",
-    "Memory",
-    "MemoryAnchor",
-    "MemoryAdmissionGate",
-    "MemoryCandidateDraft",
-    "MemoryCandidate",
-    "MemoryCoolingPolicy",
-    "MemoryExtractorBackend",
-    "MemoryKind",
-    "MemoryOperationGroup",
-    "MemoryType",
-    "MemoryTypeRegistry",
-    "MemoryTypeSchema",
-    "MemoryUpdater",
-    "RuleFallbackExtractor",
-]
+__all__ = sorted(_PUBLIC_ATTRS)

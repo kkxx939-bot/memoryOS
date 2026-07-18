@@ -79,12 +79,14 @@ class RegularOperationValidator:
                 current_target = committer.source_store.read_object(operation.target_uri)
             except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
                 current_target = None
-        committer._validate_regular_canonical_boundary(
-            operation,
-            current_target,
-            desired_obj,
-            allow_existing_add=allow_existing_add,
-        )
+        if desired_obj is not None:
+            committer._reject_document_owned_uri(desired_obj.uri)
+            if desired_obj.owner_user_id not in {None, "", operation.user_id}:
+                raise ValueError("regular operation context_object owner mismatch")
+            if str(desired_obj.tenant_id or "default") != committer.tenant_id:
+                raise ValueError("regular operation context_object tenant mismatch")
+        if operation.action == OperationAction.ADD and current_target is not None and not allow_existing_add:
+            raise ValueError("add operation target already exists")
         if validate_target_state and operation.action in target_actions:
             if not operation.target_uri:
                 raise ValueError(f"{operation.action.value} operation requires a target URI")

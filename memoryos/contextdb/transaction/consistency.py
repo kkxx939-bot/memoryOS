@@ -58,6 +58,7 @@ class ConsistencyVerifier:
         for obj in objects:
             hits = self.index_store.search(
                 obj.title or obj.uri,
+                tenant_id=tenant_id,
                 filters={
                     "tenant_id": tenant_id,
                     "context_type": obj.context_type.value,
@@ -72,11 +73,11 @@ class ConsistencyVerifier:
                 deleted_in_default_search.append(obj.uri)
         indexed_uris = {
             uri
-            for uri in getattr(self.index_store, "indexed_uris", lambda: [])()
+            for uri in self.index_store.indexed_uris(tenant_id=tenant_id)
             if not self.index_policy.owns_index_entry(
                 self.source_store,
                 uri,
-                self.index_store.get_index_metadata(uri),
+                self.index_store.get_index_metadata(uri, tenant_id=tenant_id),
             )
         }
         orphan_index = sorted(uri for uri in indexed_uris if uri not in source_uris)

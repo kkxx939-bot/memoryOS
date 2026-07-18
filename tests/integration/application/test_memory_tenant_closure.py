@@ -1,78 +1,111 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 import pytest
 
+from memoryos.adapters.persistence.sqlite import SQLiteIndexStore
 from memoryos.api.sdk.client import MemoryOSClient
+from memoryos.api.trusted_context import (
+    AUTHORITATIVE_REMEMBER,
+    READ_CONTEXT,
+    TrustedRequestContext,
+)
 from memoryos.connect import ConnectMetadata
 from memoryos.contextdb.session import SessionArchive, SessionArchiveStore, SessionCommitService
 from memoryos.contextdb.session.session_archive import EvidenceArchiveIntegrityError
 from memoryos.contextdb.store.local_stores import InMemoryQueueStore
+from memoryos.memory.documents.layout import user_memory_root
 from memoryos.prediction.model.prediction_request import PredictionRequest
 from memoryos.runtime.readiness import RuntimeReadinessState
 
 
-def _remember(client: MemoryOSClient, value: str) -> dict:
-    return client.remember(
+def _caller(tenant_id: str) -> TrustedRequestContext:
+    return TrustedRequestContext(
+        tenant_id=tenant_id,
         user_id="same-user",
-        content=value,
-        memory_type="project_decision",
-        project_id="memoryos",
-        identity_fields={"decision_topic": "primary storage backend"},
+        actor_kind="user",
+        actor_id="same-user",
+        capabilities=frozenset({READ_CONTEXT, AUTHORITATIVE_REMEMBER}),
     )
 
 
-def test_callerless_sdk_keeps_all_memory_closure_artifacts_tenant_local(tmp_path: Path) -> None:
+def _remember(client: MemoryOSClient, tenant_id: str, value: str) -> dict:
+    return client.remember(
+        f"The primary storage backend is {value}.",
+        target_hint="topic:primary storage backend",
+        caller=_caller(tenant_id),
+    )
+
+
+def test_document_memory_closure_is_tenant_local_and_rebuild_verifies_each_owner(tmp_path: Path) -> None:
     tenant_a = MemoryOSClient(str(tmp_path), tenant_id="tenant-a")
     tenant_b = MemoryOSClient(str(tmp_path), tenant_id="tenant-b")
     assert tenant_a.readiness.state == tenant_b.readiness.state == RuntimeReadinessState.READY
-    a = _remember(tenant_a, "PostgreSQL")
-    b = _remember(tenant_b, "SQLite")
+    a = _remember(tenant_a, "tenant-a", "PostgreSQL")
+    b = _remember(tenant_b, "tenant-b", "SQLite")
 
-    a_rows = tenant_a.search_context(
-        "storage",
-        user_id="same-user",
-        project_id="memoryos",
-        context_type="memory",
-    )
-    b_rows = tenant_b.search_context(
-        "storage",
-        user_id="same-user",
-        project_id="memoryos",
-        context_type="memory",
-    )
-    assert {item["metadata"]["canonical_value"] for item in a_rows} == {"PostgreSQL"}
-    assert {item["metadata"]["canonical_value"] for item in b_rows} == {"SQLite"}
-    assert a["uri"] != b["uri"]
+    projected_a = tenant_a.memory_projection_worker.process_pending(limit=20)
+    projected_b = tenant_b.memory_projection_worker.process_pending(limit=20)
+    assert projected_a.processed and projected_a.failed == ()
+    assert projected_b.processed and projected_b.failed == ()
 
-    pending = _remember(tenant_a, "MySQL")
-    assert pending["status"] == "PENDING"
-    reviewable = tenant_a.list_pending(user_id="same-user")[0]
-    assert tenant_b.list_pending(user_id="same-user") == []
+    root_a = user_memory_root(tmp_path, "tenant-a", "same-user")
+    root_b = user_memory_root(tmp_path, "tenant-b", "same-user")
+    raw_a = (root_a / a["relative_path"]).read_text(encoding="utf-8")
+    raw_b = (root_b / b["relative_path"]).read_text(encoding="utf-8")
+    assert "PostgreSQL" in raw_a and "SQLite" not in raw_a
+    assert "SQLite" in raw_b and "PostgreSQL" not in raw_b
+    assert a["document_uri"] != b["document_uri"]
+
+    index_a = cast(SQLiteIndexStore, tenant_a.index_store)
+    index_b = cast(SQLiteIndexStore, tenant_b.index_store)
+    a_records = index_a.list_catalog(
+        tenant_id="tenant-a",
+        filters={
+            "owner_user_id": "same-user",
+            "document_ids": (a["document_id"],),
+            "include_inactive": True,
+        },
+        limit=100,
+    )
+    b_records = index_b.list_catalog(
+        tenant_id="tenant-b",
+        filters={
+            "owner_user_id": "same-user",
+            "document_ids": (b["document_id"],),
+            "include_inactive": True,
+        },
+        limit=100,
+    )
+    assert {record.record_kind for record in a_records} >= {"memory_document", "memory_block"}
+    assert {record.record_kind for record in b_records} >= {"memory_document", "memory_block"}
+    assert {record.source_digest for record in a_records} == {a["source_digest"]}
+    assert {record.source_digest for record in b_records} == {b["source_digest"]}
+    assert index_b.list_catalog(
+        tenant_id="tenant-b",
+        filters={"owner_user_id": "same-user", "document_ids": (a["document_id"],)},
+        limit=100,
+    ) == []
+
+    assert "PostgreSQL" in tenant_a.read(a["document_uri"], caller=_caller("tenant-a"))["content"]
     with pytest.raises(FileNotFoundError):
-        tenant_b.review_pending(
-            user_id="same-user",
-            pending_uri=reviewable["uri"],
-            decision="REJECT",
-            expected_lifecycle_revision=reviewable["lifecycle_revision"],
-            expected_proposal_fingerprint=reviewable["proposal_fingerprint"],
-            command_id="cross-tenant-review",
-        )
+        tenant_b.read(a["document_uri"], caller=_caller("tenant-b"))
 
     assert tenant_b.recovery_worker.process_all()["recovered_count"] == 0
-    assert tenant_a.memory_projection_worker.verify_current_projections()["verified"] == 1
-    assert tenant_b.memory_projection_worker.verify_current_projections()["verified"] == 1
-    tenant_a.context_db.rebuild_index()
-    tenant_b.context_db.rebuild_index()
-    assert a["uri"] in tenant_a.index_store.indexed_uris()
-    assert a["uri"] not in tenant_b.index_store.indexed_uris()
-    assert b["uri"] in tenant_b.index_store.indexed_uris()
-    assert b["uri"] not in tenant_a.index_store.indexed_uris()
+    rebuilt_a = tenant_a.memory_projection_worker.rebuild_owner("tenant-a", "same-user")
+    rebuilt_b = tenant_b.memory_projection_worker.rebuild_owner("tenant-b", "same-user")
+    verified_a = tenant_a.memory_projection_worker.verify_owner("tenant-a", "same-user")
+    verified_b = tenant_b.memory_projection_worker.verify_owner("tenant-b", "same-user")
+    assert rebuilt_a["documents"] == verified_a["verified"] == verified_a["projected"]
+    assert rebuilt_b["documents"] == verified_b["verified"] == verified_b["projected"]
+    assert rebuilt_a["skipped"] >= 1 and rebuilt_b["skipped"] >= 1
 
     for tenant_id in ("tenant-a", "tenant-b"):
         artifact_root = tmp_path / "tenants" / tenant_id
-        assert (artifact_root / "system" / "migrations" / "memory-closure-v1.json").exists()
+        assert (artifact_root / "system" / "runtime-layout.json").exists()
+        assert not (artifact_root / "system" / "migrations").exists()
         assert not list((artifact_root / "system" / "redo").glob("*.json"))
 
 
@@ -117,37 +150,23 @@ def test_process_observation_persists_and_queues_in_client_tenant(tmp_path: Path
     assert not default_head.exists()
 
 
-def test_callerless_explicit_tenant_override_routes_to_a_tenant_bound_runtime(tmp_path: Path) -> None:
+def test_trusted_caller_rejects_explicit_cross_tenant_override_before_document_write(
+    tmp_path: Path,
+) -> None:
     client = MemoryOSClient(str(tmp_path), tenant_id="tenant-a")
+    caller = _caller("tenant-a")
 
-    committed = client.remember(
-        user_id="same-user",
-        content="CockroachDB",
-        memory_type="project_decision",
-        project_id="memoryos",
-        identity_fields={"decision_topic": "distributed storage backend"},
-        tenant_id="tenant-b",
-    )
-
-    assert (
-        client.search_context(
-            "CockroachDB",
-            user_id="same-user",
-            project_id="memoryos",
-            context_type="memory",
+    with pytest.raises(PermissionError, match="tenant_id does not match trusted caller"):
+        client.remember(
+            "The distributed storage backend is CockroachDB.",
+            target_hint="topic:distributed storage backend",
+            tenant_id="tenant-b",
+            caller=caller,
         )
-        == []
-    )
-    routed = client.search_context(
-        "CockroachDB",
-        user_id="same-user",
-        project_id="memoryos",
-        context_type="memory",
-        tenant_id="tenant-b",
-    )
-    assert [item["uri"] for item in routed] == [committed["uri"]]
-    tenant_b = MemoryOSClient(str(tmp_path), tenant_id="tenant-b")
-    assert tenant_b.read(committed["uri"])["object"]["tenant_id"] == "tenant-b"
+
+    assert not user_memory_root(tmp_path, "tenant-a", "same-user").exists()
+    assert not user_memory_root(tmp_path, "tenant-b", "same-user").exists()
+    assert client.queue_store.stats(queue_name="memory_projection").get("pending", 0) == 0
 
 
 @pytest.mark.parametrize(
@@ -165,7 +184,7 @@ def test_session_commit_rejects_cross_tenant_archive_before_any_artifact(
 ) -> None:
     store = SessionArchiveStore(tmp_path, tenant_id="tenant-a")
     queue = InMemoryQueueStore()
-    service = SessionCommitService(store, queue, allow_plan_only=True)
+    service = SessionCommitService(store, queue)
     archive = SessionArchive(
         user_id="same-user",
         session_id="cross-tenant",
@@ -175,7 +194,7 @@ def test_session_commit_rejects_cross_tenant_archive_before_any_artifact(
     )
     before = sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*"))
 
-    with pytest.raises(PermissionError, match="bound archive store"):
+    with pytest.raises(PermissionError, match="bound store"):
         getattr(service, method)(archive)
 
     assert sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*")) == before
@@ -185,7 +204,7 @@ def test_session_commit_rejects_cross_tenant_archive_before_any_artifact(
 def test_session_commit_materializes_missing_tenant_from_bound_store(tmp_path: Path) -> None:
     store = SessionArchiveStore(tmp_path, tenant_id="tenant-a")
     queue = InMemoryQueueStore()
-    service = SessionCommitService(store, queue, allow_plan_only=True)
+    service = SessionCommitService(store, queue)
     archive = SessionArchive(
         user_id="same-user",
         session_id="bound-default",

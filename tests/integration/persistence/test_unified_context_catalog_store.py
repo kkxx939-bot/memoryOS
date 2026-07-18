@@ -1,1621 +1,790 @@
 from __future__ import annotations
 
-import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import datetime, timezone
-from typing import Any
 
 import pytest
 
+from memoryos.adapters.vector.in_memory.store import InMemoryVectorStore
 from memoryos.contextdb.catalog import CatalogRecord, CatalogRecordKind
-from memoryos.contextdb.model.context_relation import ContextRelation
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.retrieval.candidate_generator import CandidateGenerator
-from memoryos.contextdb.retrieval.query_plan import RetrievalOptions, RetrievalQueryIntent
-from memoryos.contextdb.retrieval.query_planner import QueryPlanner
-from memoryos.contextdb.store.local_stores import InMemoryRelationStore
 from memoryos.contextdb.store.sqlite_index_store import SQLiteIndexStore
+from memoryos.contextdb.store.vector import vector_row_id
+
+_NOW = "2026-07-17T02:00:00+00:00"
 
 
-def _session_record(
-    record_key: str,
+def _ordinary_record(
+    tenant_id: str,
     *,
-    uri: str = "memoryos://user/u1/sessions/history/s1",
-    metadata: dict | None = None,
-    source_revision: int = 1,
-) -> CatalogRecord:
-    timestamp = "2026-07-14T03:30:00+00:00"
-    return CatalogRecord(
-        record_key=record_key,
-        uri=uri,
-        tenant_id="tenant-a",
-        owner_user_id="u1",
-        workspace_id="workspace-a",
-        session_id="s1",
-        adapter_id="codex",
-        context_type="session",
-        source_kind="tool_result",
-        record_kind=CatalogRecordKind.TOOL_RESULT.value,
-        primary_tree_path="timeline/2026/07/14",
-        tree_paths=("timeline/2026/07/14", "sessions/s1", "resources/desktop"),
-        created_at=timestamp,
-        updated_at=timestamp,
-        event_time=timestamp,
-        ingested_at=timestamp,
-        transaction_time=timestamp,
-        title="Desktop report result",
-        l0_text="Read a desktop report",
-        l1_text=("Authorization: Bearer private-token-123456; opened /Users/gulf/Desktop/quarterly-report.txt"),
-        l2_uri="memoryos://user/u1/sessions/history/s1/tool-results/1",
-        source_uri="memoryos://user/u1/sessions/history/s1/tool-results/1",
-        source_digest="digest-1",
-        source_revision=source_revision,
-        metadata={
-            "summary": "quarterly report",
-            "api_key": "sk-production-secret",
-            "file_path": "/Users/gulf/Desktop/quarterly-report.txt",
-            **(metadata or {}),
-        },
-    )
-
-
-def _current_slot_record(
-    record_key: str,
-    *,
+    title: str,
     owner_user_id: str,
-    slot_id: str,
-    claim_id: str,
-    canonical_slot_uri: str,
-    canonical_claim_uri: str,
-    updated_at: str,
+    record_key: str = "shared-record-key",
 ) -> CatalogRecord:
     return CatalogRecord(
         record_key=record_key,
-        uri=f"{canonical_slot_uri}/serving/current/{slot_id}",
-        tenant_id="tenant-a",
+        uri="memoryos://contexts/shared",
+        tenant_id=tenant_id,
         owner_user_id=owner_user_id,
-        context_type="memory",
-        source_kind="canonical_current_slot",
-        record_kind=CatalogRecordKind.CURRENT_SLOT.value,
-        primary_tree_path="memories/preferences/food/flavor",
-        tree_paths=("memories/preferences/food/flavor",),
-        created_at=updated_at,
-        updated_at=updated_at,
-        event_time=updated_at,
-        ingested_at=updated_at,
-        transaction_time=updated_at,
-        valid_from=updated_at,
-        title=f"Current preference {slot_id}",
-        l0_text="Current preference",
-        l1_text=f"Current preference {claim_id}",
-        source_uri=canonical_claim_uri,
-        source_digest=f"digest-{claim_id}",
-        source_revision=1,
-        canonical_slot_id=slot_id,
-        canonical_slot_uri=canonical_slot_uri,
-        canonical_claim_id=claim_id,
-        canonical_claim_uri=canonical_claim_uri,
-        canonical_revision=1,
-        canonical_state="ACTIVE",
-        metadata={
-            "scope": {
-                "visibility": {
-                    "tenant_id": "tenant-a",
-                    "private": True,
-                    "allowed_principal_ids": [owner_user_id],
-                    "allowed_service_ids": [],
-                }
-            }
-        },
-    )
-
-
-def test_exact_canonical_uri_identity_uses_indexes_and_applies_acl_before_limit(tmp_path) -> None:  # noqa: ANN001
-    store = SQLiteIndexStore(tmp_path / "canonical-uri-exact.sqlite3")
-    slot_uri = "memoryos://user/u1/memories/canonical/slots/stable-slot"
-    claim_uri = f"{slot_uri}/claims/active-claim"
-    authorized = _current_slot_record(
-        "slot:authorized:current",
-        owner_user_id="u1",
-        slot_id="authorized",
-        claim_id="active-claim",
-        canonical_slot_uri=slot_uri,
-        canonical_claim_uri=claim_uri,
-        updated_at="2026-07-01T00:00:00+00:00",
-    )
-    unauthorized = tuple(
-        _current_slot_record(
-            f"slot:foreign-{index}:current",
-            owner_user_id="u2",
-            slot_id=f"foreign-{index}",
-            claim_id=f"foreign-claim-{index}",
-            canonical_slot_uri=slot_uri,
-            canonical_claim_uri=f"{slot_uri}/claims/foreign-claim-{index}",
-            updated_at=f"2026-07-15T00:{index:02d}:00+00:00",
-        )
-        for index in range(20)
-    )
-    store.upsert_catalog_batch((*unauthorized, authorized))
-    filters = {
-        "tenant_id": "tenant-a",
-        "principal_owner_id": "u1",
-        "record_kinds": (CatalogRecordKind.CURRENT_SLOT.value,),
-        "target_identity_uris": (slot_uri,),
-        "_identity_candidate_limit": 1,
-    }
-
-    selected = store.list_catalog(filters=filters, limit=1)
-    plan = " ".join(store.explain_structured_query(filters, limit=1))
-
-    assert [record.record_key for record in selected] == [authorized.record_key]
-    assert "idx_contexts_tenant_canonical_slot_uri" in plan
-    assert "context_acl_grants" in plan
-    legacy_selected = store.list_legacy_catalog(filters=filters, limit=1)
-    assert [record.record_key for record in legacy_selected] == [authorized.record_key]
-
-    by_claim = store.list_catalog(
-        filters={**filters, "target_identity_uris": (claim_uri,)},
-        limit=1,
-    )
-    assert [record.record_key for record in by_claim] == [authorized.record_key]
-
-
-def test_exact_identity_applies_as_of_lifecycle_path_and_time_before_branch_limit(tmp_path) -> None:  # noqa: ANN001
-    store = SQLiteIndexStore(tmp_path / "canonical-uri-eligibility.sqlite3")
-    slot_uri = "memoryos://user/u1/memories/canonical/slots/eligibility-slot"
-    claim_uri = f"{slot_uri}/claims/eligibility-claim"
-    base = _current_slot_record(
-        "unused-current",
-        owner_user_id="u1",
-        slot_id="eligibility-slot",
-        claim_id="eligibility-claim",
-        canonical_slot_uri=slot_uri,
-        canonical_claim_uri=claim_uri,
-        updated_at="2026-07-01T00:00:00+00:00",
-    )
-    wanted_path = "memories/preferences/food/eligible"
-
-    def revision(
-        name: str,
-        *,
-        updated_at: str,
-        lifecycle_state: str = "active",
-        admission_status: str = "",
-        serving_tier: str = "HOT",
-        path: str = wanted_path,
-        event_time: str = "2026-07-10T00:00:00+00:00",
-        transaction_time: str = "2026-07-10T00:00:00+00:00",
-        valid_from: str = "2026-07-01T00:00:00+00:00",
-        valid_to: str = "2026-07-12T00:00:00+00:00",
-        adapter_id: str = "codex",
-        project_id: str = "project-a",
-        run_mode: str = "context_reduction",
-        scope_id: str = "eligible",
-    ) -> CatalogRecord:
-        return replace(
-            base,
-            record_key=f"claim:eligibility-claim:revision:{name}",
-            uri=claim_uri,
-            source_kind="canonical_claim_revision",
-            record_kind=CatalogRecordKind.CLAIM_REVISION.value,
-            primary_tree_path=path,
-            tree_paths=(path,),
-            updated_at=updated_at,
-            event_time=event_time,
-            transaction_time=transaction_time,
-            valid_from=valid_from,
-            valid_to=valid_to,
-            adapter_id=adapter_id,
-            lifecycle_state=lifecycle_state,
-            serving_tier=serving_tier,
-            canonical_revision=int(name) if name.isdigit() else 1,
-            source_revision=int(name) if name.isdigit() else 1,
-            source_digest=f"digest-{name}",
-            metadata={
-                **dict(base.metadata),
-                "project_id": project_id,
-                "connect": {"run_mode": run_mode},
-                "scope": {
-                    **dict(base.metadata["scope"]),
-                    "applicability": {
-                        "all_of": ({"kind": "workspace", "id": scope_id},),
-                    },
-                },
-                **(
-                    {"admission": {"decision": admission_status}}
-                    if admission_status
-                    else {}
-                ),
-            },
-        )
-
-    eligible = revision("1", updated_at="2026-07-10T00:00:00+00:00")
-    newer_ineligible = (
-        revision(
-            "2",
-            updated_at="2026-07-15T00:00:00+00:00",
-            lifecycle_state="archived",
-        ),
-        revision(
-            "3",
-            updated_at="2026-07-16T00:00:00+00:00",
-            valid_from="2026-07-14T00:00:00+00:00",
-            valid_to="",
-        ),
-        revision(
-            "4",
-            updated_at="2026-07-17T00:00:00+00:00",
-            path="memories/preferences/food/wrong-branch",
-        ),
-        revision(
-            "5",
-            updated_at="2026-07-18T00:00:00+00:00",
-            event_time="2026-08-02T00:00:00+00:00",
-        ),
-        revision(
-            "6",
-            updated_at="2026-07-19T00:00:00+00:00",
-            transaction_time="2026-08-02T00:00:00+00:00",
-        ),
-        revision(
-            "7",
-            updated_at="2026-07-20T00:00:00+00:00",
-            admission_status="pending",
-        ),
-        revision(
-            "8",
-            updated_at="2026-07-21T00:00:00+00:00",
-            serving_tier="ARCHIVED",
-        ),
-        revision(
-            "9",
-            updated_at="2026-07-22T00:00:00+00:00",
-            adapter_id="other-adapter",
-        ),
-        revision(
-            "10",
-            updated_at="2026-07-23T00:00:00+00:00",
-            project_id="project-b",
-        ),
-        revision(
-            "11",
-            updated_at="2026-07-24T00:00:00+00:00",
-            run_mode="action_capable",
-        ),
-        revision(
-            "12",
-            updated_at="2026-07-25T00:00:00+00:00",
-            scope_id="wrong-scope",
-        ),
-    )
-    store.upsert_catalog_batch((*newer_ineligible, eligible))
-    filters = {
-        "tenant_id": "tenant-a",
-        "principal_owner_id": "u1",
-        "record_kinds": (CatalogRecordKind.CLAIM_REVISION.value,),
-        "target_identity_uris": (slot_uri,),
-        "target_paths": (wanted_path,),
-        "event_time_from": "2026-07-01T00:00:00+00:00",
-        "event_time_to": "2026-08-01T00:00:00+00:00",
-        "transaction_time_from": "2026-07-01T00:00:00+00:00",
-        "transaction_time_to": "2026-08-01T00:00:00+00:00",
-        "valid_at": "2026-07-10T12:00:00+00:00",
-        "adapter_id": "codex",
-        "project_id": "project-a",
-        "connect_filters": {"run_mode": "context_reduction"},
-        "applicability_scope_keys": ("memoryos:workspace:eligible",),
-        "_identity_candidate_limit": 1,
-    }
-
-    selected = store.list_catalog(filters=filters, limit=1)
-
-    assert [record.record_key for record in selected] == [eligible.record_key]
-
-
-def test_current_relation_expansion_uses_bounded_canonical_identities_and_catalog_acl(tmp_path) -> None:  # noqa: ANN001
-    store = SQLiteIndexStore(tmp_path / "canonical-relation-identities.sqlite3")
-    first_slot_uri = "memoryos://user/u1/memories/canonical/slots/first"
-    first_claim_uri = f"{first_slot_uri}/claims/first-active"
-    second_slot_uri = "memoryos://user/u1/memories/canonical/slots/second"
-    second_claim_uri = f"{second_slot_uri}/claims/second-active"
-    foreign_slot_uri = "memoryos://user/u2/memories/canonical/slots/foreign"
-    foreign_claim_uri = f"{foreign_slot_uri}/claims/foreign-active"
-    first = _current_slot_record(
-        "slot:first:current",
-        owner_user_id="u1",
-        slot_id="first",
-        claim_id="first-active",
-        canonical_slot_uri=first_slot_uri,
-        canonical_claim_uri=first_claim_uri,
-        updated_at="2026-07-15T00:00:00+00:00",
-    )
-    second = _current_slot_record(
-        "slot:second:current",
-        owner_user_id="u1",
-        slot_id="second",
-        claim_id="second-active",
-        canonical_slot_uri=second_slot_uri,
-        canonical_claim_uri=second_claim_uri,
-        updated_at="2026-07-15T00:01:00+00:00",
-    )
-    foreign = _current_slot_record(
-        "slot:foreign:current",
-        owner_user_id="u2",
-        slot_id="foreign",
-        claim_id="foreign-active",
-        canonical_slot_uri=foreign_slot_uri,
-        canonical_claim_uri=foreign_claim_uri,
-        updated_at="2026-07-15T00:02:00+00:00",
-    )
-    store.upsert_catalog_batch((first, second, foreign))
-
-    class RecordingRelations(InMemoryRelationStore):
-        def __init__(self) -> None:
-            super().__init__()
-            self.lookups: list[tuple[str, int | None]] = []
-
-        def relations_of(
-            self,
-            uri: str,
-            *,
-            tenant_id: str | None = None,
-            owner_user_id: str | None = None,
-            limit: int | None = None,
-        ) -> list[ContextRelation]:
-            self.lookups.append((uri, limit))
-            return super().relations_of(
-                uri,
-                tenant_id=tenant_id,
-                owner_user_id=owner_user_id,
-                limit=limit,
-            )
-
-    relations = RecordingRelations()
-    relations.add_relation(
-        ContextRelation(
-            source_uri=first_claim_uri,
-            relation_type="related",
-            target_uri=foreign_claim_uri,
-            weight=1.0,
-            metadata={"tenant_id": "tenant-a", "owner_user_id": "u1"},
-        )
-    )
-    relations.add_relation(
-        ContextRelation(
-            source_uri=first_claim_uri,
-            relation_type="related",
-            target_uri=second_claim_uri,
-            weight=0.9,
-            metadata={"tenant_id": "tenant-a", "owner_user_id": "u1"},
-        )
-    )
-    plan = QueryPlanner().plan(
-        "identity-only expansion",
-        options=RetrievalOptions(
-            target_uris=(first_slot_uri,),
-            context_types=(ContextType.MEMORY,),
-            tenant_id="tenant-a",
-            owner_user_id="u1",
-            query_intent=RetrievalQueryIntent.CURRENT,
-            relation_expansion=True,
-            candidate_limit=20,
-            final_limit=20,
-        ),
-    )
-
-    generated = CandidateGenerator(store, relation_store=relations).generate(plan)
-
-    assert [candidate.record_key for candidate in generated.branches["exact"]] == [first.record_key]
-    assert [candidate.record_key for candidate in generated.branches["relation"]] == [second.record_key]
-    assert generated.relation_candidates == 1
-    assert [uri for uri, _limit in relations.lookups[:3]] == [
-        first_claim_uri,
-        first_slot_uri,
-        first.uri,
-    ]
-    assert len(relations.lookups) <= CandidateGenerator.MAX_RELATION_IDENTITIES_PER_SEED
-    assert all(
-        limit is not None and 0 < limit <= CandidateGenerator.MAX_RELATIONS_PER_SEED
-        for _uri, limit in relations.lookups
-    )
-
-
-def test_catalog_batch_supports_multi_record_uri_paths_time_and_sanitized_fts(tmp_path) -> None:
-    store = SQLiteIndexStore(tmp_path / "catalog.sqlite3")
-    first = _session_record("session:s1:tool:1")
-    second = _session_record("session:s1:tool:2", metadata={"summary": "second quarterly report"})
-
-    assert store.upsert_catalog_batch((first, second)) == 2
-    assert [record.record_key for record in store.get_catalog_by_uri(first.uri, tenant_id="tenant-a")] == [
-        first.record_key,
-        second.record_key,
-    ]
-    selected = store.list_catalog(
-        filters={
-            "tenant_id": "tenant-a",
-            "owner_user_id": "u1",
-            "workspace_ids": ["workspace-a"],
-            "context_types": ["session"],
-            "source_kinds": ["tool_result"],
-            "target_paths": ["resources/desktop"],
-            "event_time_from": "2026-07-14T00:00:00+00:00",
-            "event_time_to": "2026-07-15T00:00:00+00:00",
-        },
-        limit=10,
-    )
-    assert {record.record_key for record in selected} == {first.record_key, second.record_key}
-    assert {
-        hit.metadata["catalog_record_key"]
-        for hit in store.search_catalog(
-            "quarterly report",
-            filters={"tenant_id": "tenant-a", "target_paths": ["resources/desktop"]},
-            limit=10,
-        )
-    } == {first.record_key, second.record_key}
-
-    with sqlite3.connect(store.path) as conn:
-        catalog_text = " ".join(
-            str(value)
-            for value in conn.execute("SELECT title, l0_text, l1_text, metadata_json FROM contexts").fetchone()
-        )
-        fts_text = " ".join(
-            str(value)
-            for value in conn.execute(
-                "SELECT title, content_text, metadata_text, search_terms FROM contexts_fts"
-            ).fetchone()
-        )
-    combined = f"{catalog_text} {fts_text}"
-    assert "private-token-123456" not in combined
-    assert "sk-production-secret" not in combined
-    assert "/Users/gulf" not in combined
-    assert "quarterly-report.txt" in combined
-
-
-def test_fts_rowid_map_and_tenant_record_auxiliary_updates_are_indexed(tmp_path) -> None:  # noqa: ANN001
-    path = tmp_path / "fts-rowid-map.sqlite3"
-    store = SQLiteIndexStore(path)
-    record = _session_record("session:s1:tool:indexed")
-    store.upsert_catalog(record)
-    store.upsert_catalog(replace(record, title="Updated indexed result"))
-
-    with sqlite3.connect(path) as conn:
-        fts_rows = conn.execute(
-            "SELECT rowid, record_key FROM contexts_fts WHERE record_key = ?",
-            (record.record_key,),
-        ).fetchall()
-        mapping = conn.execute(
-            "SELECT fts_rowid FROM context_fts_map WHERE record_key = ?",
-            (record.record_key,),
-        ).fetchone()
-        assert len(fts_rows) == 1
-        assert mapping is not None and int(mapping[0]) == int(fts_rows[0][0])
-
-        map_plan = " ".join(
-            str(row[3])
-            for row in conn.execute(
-                "EXPLAIN QUERY PLAN SELECT fts_rowid FROM context_fts_map WHERE record_key = ?",
-                (record.record_key,),
-            )
-        )
-        path_plan = " ".join(
-            str(row[3])
-            for row in conn.execute(
-                "EXPLAIN QUERY PLAN DELETE FROM context_path_acl WHERE tenant_id = ? AND record_key = ?",
-                (record.tenant_id, record.record_key),
-            )
-        )
-        acl_plan = " ".join(
-            str(row[3])
-            for row in conn.execute(
-                "EXPLAIN QUERY PLAN DELETE FROM context_acl_grants WHERE tenant_id = ? AND record_key = ?",
-                (record.tenant_id, record.record_key),
-            )
-        )
-    assert "sqlite_autoindex_context_fts_map_1" in map_plan
-    assert "sqlite_autoindex_context_path_acl_1" in path_plan
-    assert "idx_context_acl_grants_record" in acl_plan
-
-    # The rowid map is rebuildable startup state. Corrupting only that map
-    # triggers an offline startup rebuild from the Catalog instead of an
-    # unbounded online delete through the FTS UNINDEXED record_key column.
-    with sqlite3.connect(path) as conn:
-        conn.execute("DELETE FROM context_fts_map")
-    restarted = SQLiteIndexStore(path)
-    with sqlite3.connect(path) as conn:
-        repaired = conn.execute(
-            "SELECT fts_rowid FROM context_fts_map WHERE record_key = ?",
-            (record.record_key,),
-        ).fetchone()
-        fts_rowid = conn.execute(
-            "SELECT rowid FROM contexts_fts WHERE record_key = ?",
-            (record.record_key,),
-        ).fetchone()
-    assert repaired is not None and fts_rowid is not None
-    assert int(repaired[0]) == int(fts_rowid[0])
-
-    assert restarted.delete_catalog(record.record_key, tenant_id=record.tenant_id)
-    with sqlite3.connect(path) as conn:
-        assert conn.execute("SELECT count(*) FROM context_fts_map").fetchone()[0] == 0
-        assert conn.execute("SELECT count(*) FROM contexts_fts").fetchone()[0] == 0
-
-
-def test_multi_path_top_k_is_order_independent_and_does_not_starve_later_path(tmp_path) -> None:  # noqa: ANN001
-    store = SQLiteIndexStore(tmp_path / "multi-path.sqlite3")
-    old_timestamp = "2026-07-01T00:00:00+00:00"
-    old_records = tuple(
-        replace(
-            _session_record(f"session:path-a:{ordinal:04d}"),
-            uri=f"memoryos://user/u1/sessions/history/path-a/{ordinal}",
-            primary_tree_path="projects/a",
-            tree_paths=("projects/a",),
-            created_at=old_timestamp,
-            updated_at=old_timestamp,
-            event_time=old_timestamp,
-            ingested_at=old_timestamp,
-            transaction_time=old_timestamp,
-            title="needle old path a result",
-            l0_text="needle old path a result",
-            l1_text="needle " + ("low density filler " * 100),
-        )
-        for ordinal in range(300)
-    )
-    newest = replace(
-        _session_record("session:path-b:newest"),
-        uri="memoryos://user/u1/sessions/history/path-b/newest",
-        primary_tree_path="projects/b",
-        tree_paths=("projects/b",),
-        updated_at="2026-07-15T00:00:00+00:00",
-        event_time="2026-07-15T00:00:00+00:00",
-        ingested_at="2026-07-15T00:00:00+00:00",
-        transaction_time="2026-07-15T00:00:00+00:00",
-        title="needle",
-        l0_text="needle",
-        l1_text="needle",
-    )
-    store.upsert_catalog_batch((*old_records, newest))
-
-    forward = store.list_catalog(
-        filters={"tenant_id": "tenant-a", "target_paths": ("projects/a", "projects/b")},
-        limit=1,
-    )
-    reverse = store.list_catalog(
-        filters={"tenant_id": "tenant-a", "target_paths": ("projects/b", "projects/a")},
-        limit=1,
-    )
-
-    assert [record.record_key for record in forward] == [newest.record_key]
-    assert [record.record_key for record in reverse] == [newest.record_key]
-    lexical_forward = store.search_catalog(
-        "needle",
-        filters={"tenant_id": "tenant-a", "target_paths": ("projects/a", "projects/b")},
-        limit=1,
-    )
-    lexical_reverse = store.search_catalog(
-        "needle",
-        filters={"tenant_id": "tenant-a", "target_paths": ("projects/b", "projects/a")},
-        limit=1,
-    )
-    assert [hit.metadata["catalog_record_key"] for hit in lexical_forward] == [newest.record_key]
-    assert [hit.metadata["catalog_record_key"] for hit in lexical_reverse] == [newest.record_key]
-
-
-def test_natural_date_plans_filter_event_transaction_and_valid_time_in_sql(tmp_path) -> None:  # noqa: ANN001
-    store = SQLiteIndexStore(tmp_path / "natural-date.sqlite3")
-    timestamp = "2026-07-14T03:00:00+00:00"
-
-    def record(
-        key: str,
-        text: str,
-        *,
-        event_time: str,
-        transaction_time: str,
-        valid_from: str = "",
-        valid_to: str = "",
-        path: str = "timeline/2026/07/14",
-    ) -> CatalogRecord:
-        return CatalogRecord(
-            record_key=key,
-            uri=f"memoryos://user/u1/catalog/{key}",
-            tenant_id="tenant-a",
-            owner_user_id="u1",
-            context_type="session",
-            source_kind="observation",
-            record_kind=CatalogRecordKind.CONTEXT.value,
-            primary_tree_path=path,
-            tree_paths=(path,),
-            created_at=timestamp,
-            updated_at=timestamp,
-            event_time=event_time,
-            ingested_at=timestamp,
-            transaction_time=transaction_time,
-            valid_from=valid_from,
-            valid_to=valid_to,
-            title=text,
-            l1_text=text,
-            source_uri=f"memoryos://user/u1/evidence/{key}",
-            source_digest=f"digest-{key}",
-        )
-
-    store.upsert_catalog_batch(
-        (
-            record(
-                "event-inside",
-                "Quarterly planning discussion",
-                event_time="2026-07-14T03:00:00+00:00",
-                transaction_time=timestamp,
-            ),
-            record(
-                "event-outside",
-                "Following-day planning discussion",
-                event_time="2026-07-14T17:00:00+00:00",
-                transaction_time=timestamp,
-                path="timeline/2026/07/15",
-            ),
-            record(
-                "transaction-inside",
-                "PostgreSQL preference revision",
-                event_time="2026-07-13T01:00:00+00:00",
-                transaction_time="2026-07-14T03:00:00+00:00",
-            ),
-            record(
-                "transaction-outside",
-                "Later preference revision",
-                event_time="2026-07-14T03:00:00+00:00",
-                transaction_time="2026-07-14T17:00:00+00:00",
-            ),
-            record(
-                "valid-inside",
-                "The project database is PostgreSQL",
-                event_time="2026-07-13T01:00:00+00:00",
-                transaction_time=timestamp,
-                valid_from="2026-07-01T00:00:00+00:00",
-                valid_to="2026-08-01T00:00:00+00:00",
-            ),
-            record(
-                "valid-outside",
-                "The future project database is SQLite",
-                event_time="2026-07-13T01:00:00+00:00",
-                transaction_time=timestamp,
-                valid_from="2026-07-14T00:00:00+00:00",
-                valid_to="2026-08-01T00:00:00+00:00",
-            ),
-        )
-    )
-    planner = QueryPlanner(
-        now_provider=lambda: datetime(2026, 7, 14, tzinfo=timezone.utc),
-    )
-    common = RetrievalOptions(
-        tenant_id="tenant-a",
-        owner_user_id="u1",
-        timezone="Asia/Singapore",
-    )
-
-    def keys(query: str) -> set[str]:
-        generated = CandidateGenerator(store).generate(planner.plan(query, options=common))
-        return {candidate.record_key for branch in generated.branches.values() for candidate in branch}
-
-    event_keys = keys("7月14日发生了什么")
-    transaction_keys = keys("7月14日系统新增了哪些记忆")
-    valid_keys = keys("7月14日时项目使用什么数据库")
-    assert "event-inside" in event_keys
-    assert "event-outside" not in event_keys
-    assert "transaction-inside" in transaction_keys
-    assert "transaction-outside" not in transaction_keys
-    assert "valid-inside" in valid_keys
-    assert "valid-outside" not in valid_keys
-
-
-def test_ordinary_semantic_query_does_not_enable_structured_catalog_listing(tmp_path) -> None:
-    store = SQLiteIndexStore(tmp_path / "semantic-not-list.sqlite3")
-    store.upsert_catalog(
-        replace(
-            _session_record("session:s1:ordinary-semantic"),
-            title="Unrelated quarterly report",
-            l0_text="Unrelated quarterly report",
-            l1_text="Unrelated quarterly report",
-        )
-    )
-    plan = QueryPlanner().plan(
-        "zzzz-no-lexical-match-984721",
-        options=RetrievalOptions(
-            tenant_id="tenant-a",
-            owner_user_id="u1",
-            workspace_ids=("workspace-a",),
-            query_intent=RetrievalQueryIntent.OPEN_RECALL,
-            candidate_limit=10,
-            final_limit=10,
-        ),
-    )
-
-    generated = CandidateGenerator(store).generate(plan)
-
-    assert generated.branches["structured"] == ()
-    assert generated.structured_candidates == 0
-    assert all(not branch for branch in generated.branches.values())
-
-
-def test_selective_fts_hit_suppresses_broader_temporal_structured_fallback(
-    tmp_path,
-    monkeypatch,
-) -> None:  # noqa: ANN001
-    store = SQLiteIndexStore(tmp_path / "selective-temporal-fts.sqlite3")
-    marker = "selectiveneedle984721"
-    store.upsert_catalog(
-        replace(
-            _session_record("session:s1:selective-temporal"),
-            title=marker,
-            l0_text=marker,
-            l1_text=marker,
-        )
-    )
-
-    def prohibit_temporal_listing(*_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202
-        raise AssertionError("selective FTS hit must suppress the broader temporal list")
-
-    monkeypatch.setattr(store, "list_catalog", prohibit_temporal_listing)
-    plan = QueryPlanner().plan(
-        marker,
-        options=RetrievalOptions(
-            tenant_id="tenant-a",
-            owner_user_id="u1",
-            workspace_ids=("workspace-a",),
-            event_time_from="2026-07-14",
-            event_time_to="2026-07-14",
-            query_intent=RetrievalQueryIntent.OPEN_RECALL,
-            candidate_limit=10,
-            final_limit=10,
-        ),
-    )
-
-    generated = CandidateGenerator(store).generate(plan)
-
-    assert generated.structured_candidates == 0
-    assert generated.exact_candidates == 0
-    assert generated.fts_candidates == 1
-    assert [item.record_key for item in generated.branches["lexical"]] == [
-        "session:s1:selective-temporal"
-    ]
-
-
-def test_history_excludes_current_slots_before_the_sql_candidate_limit(tmp_path) -> None:
-    store = SQLiteIndexStore(tmp_path / "history-record-kinds.sqlite3")
-    current_slots = tuple(
-        replace(
-            _session_record(
-                f"slot:current-{index}:current",
-                uri=f"memoryos://user/u1/memories/canonical/slots/current-{index}/serving/current",
-            ),
-            context_type="memory",
-            source_kind="canonical_current_slot",
-            record_kind=CatalogRecordKind.CURRENT_SLOT.value,
-            session_id="",
-            canonical_slot_id=f"current-{index}",
-            canonical_claim_id=f"claim-current-{index}",
-            canonical_revision=1,
-            canonical_state="ACTIVE",
-        )
-        for index in range(5)
-    )
-    ordinary_history = replace(
-        _session_record("session:s1:message:history"),
+        context_type="session",
         source_kind="message",
         record_kind=CatalogRecordKind.MESSAGE.value,
-        title="ordinary historical event",
-        l0_text="ordinary historical event",
-        l1_text="ordinary historical event",
+        primary_tree_path="sessions/shared-session",
+        tree_paths=("sessions/shared-session",),
+        created_at=_NOW,
+        updated_at=_NOW,
+        event_time=_NOW,
+        ingested_at=_NOW,
+        transaction_time=_NOW,
+        title=title,
+        l0_text=title,
+        l1_text=f"{title} tenant-safe-lexical-token",
+        source_uri="memoryos://sources/shared",
+        source_digest=f"digest-{tenant_id}",
+        source_revision=1,
     )
-    store.upsert_catalog_batch((*current_slots, ordinary_history))
 
-    plan = QueryPlanner().plan(
-        "",
-        options=RetrievalOptions(
-            tenant_id="tenant-a",
-            owner_user_id="u1",
-            workspace_ids=("workspace-a",),
-            query_intent=RetrievalQueryIntent.HISTORY,
-            candidate_limit=1,
-            final_limit=1,
+
+def _document_record(
+    *,
+    generation: int,
+    digest: str,
+    record_key: str = "document-record",
+) -> CatalogRecord:
+    return CatalogRecord(
+        record_key=record_key,
+        uri="memoryos://users/alice/memory/documents/document-1",
+        tenant_id="tenant-a",
+        owner_user_id="alice",
+        context_type="memory",
+        source_kind="markdown",
+        record_kind=CatalogRecordKind.MEMORY_DOCUMENT.value,
+        primary_tree_path="memories/knowledge/topics/catalog",
+        tree_paths=("memories/knowledge/topics/catalog",),
+        created_at=_NOW,
+        updated_at=_NOW,
+        event_time=_NOW,
+        ingested_at=_NOW,
+        transaction_time=_NOW,
+        title="Catalog document",
+        l0_text="Catalog document",
+        l1_text=f"document generation {generation}",
+        source_uri="memoryos://sources/memory/document-1",
+        source_digest=digest,
+        source_revision=generation,
+        document_id="document-1",
+        document_kind="knowledge",
+        document_revision=generation,
+        projection_generation=generation,
+        metadata={"relative_path": "knowledge/catalog.md"},
+    )
+
+
+def _block_record(
+    block_id: str,
+    *,
+    generation: int,
+    digest: str,
+) -> CatalogRecord:
+    return CatalogRecord(
+        record_key=f"block-record-{block_id}",
+        uri=f"memoryos://users/alice/memory/documents/document-1/blocks/{block_id}",
+        tenant_id="tenant-a",
+        owner_user_id="alice",
+        context_type="memory",
+        source_kind="markdown",
+        record_kind=CatalogRecordKind.MEMORY_BLOCK.value,
+        primary_tree_path="memories/knowledge/topics/catalog",
+        tree_paths=("memories/knowledge/topics/catalog",),
+        created_at=_NOW,
+        updated_at=_NOW,
+        event_time=_NOW,
+        ingested_at=_NOW,
+        transaction_time=_NOW,
+        title=f"Block {block_id}",
+        l0_text=f"Block {block_id}",
+        l1_text=f"block {block_id} generation {generation} unique{block_id}projectiontoken",
+        source_uri="memoryos://sources/memory/document-1",
+        source_digest=digest,
+        source_revision=generation,
+        document_id="document-1",
+        block_id=block_id,
+        document_kind="knowledge",
+        document_revision=generation,
+        projection_generation=generation,
+    )
+
+
+def test_greenfield_schema_has_composite_identity_and_no_removed_tables(tmp_path) -> None:
+    path = tmp_path / "catalog.sqlite3"
+    store = SQLiteIndexStore(path)
+
+    assert store.catalog_schema_version() == 1
+    with sqlite3.connect(path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(contexts)")}
+        primary = tuple(
+            row[1]
+            for row in sorted(conn.execute("PRAGMA table_info(contexts)"), key=lambda item: item[5])
+            if row[5]
+        )
+        tables = {
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+        }
+
+    assert primary == ("tenant_id", "record_key")
+    assert {
+        "document_id",
+        "block_id",
+        "document_kind",
+        "document_revision",
+        "projection_generation",
+    } <= columns
+    assert {
+        "context_projection_journal",
+        "memory_document_projection_state",
+    } <= tables
+    assert not any(
+        token in table
+        for table in tables
+        for token in ("migration", "shadow", "equivalence", "validity")
+    )
+
+
+@pytest.mark.parametrize(
+    "fts_map_columns",
+    (
+        "record_key TEXT PRIMARY KEY, fts_rowid INTEGER NOT NULL UNIQUE",
+        (
+            "tenant_id TEXT NOT NULL, record_key TEXT NOT NULL, "
+            "fts_rowid INTEGER NOT NULL, PRIMARY KEY (tenant_id, record_key)"
         ),
-    )
-    generated = CandidateGenerator(store).generate(plan)
+    ),
+    ids=("legacy-record-key-primary", "missing-rowid-unique-identity"),
+)
+def test_catalog_rejects_unsupported_fts_map_identity(
+    tmp_path,
+    fts_map_columns: str,
+) -> None:
+    path = tmp_path / "catalog.sqlite3"
+    SQLiteIndexStore(path)
+    with sqlite3.connect(path) as conn:
+        conn.execute("DROP TABLE context_fts_map")
+        conn.execute(f"CREATE TABLE context_fts_map ({fts_map_columns})")
 
-    assert [candidate.record_key for candidate in generated.branches["structured"]] == [
-        ordinary_history.record_key
+    with pytest.raises(
+        RuntimeError,
+        match="unsupported Catalog auxiliary layout for context_fts_map",
+    ):
+        SQLiteIndexStore(path)
+
+
+def test_same_record_key_fts_and_delete_are_tenant_isolated(tmp_path) -> None:
+    path = tmp_path / "catalog.sqlite3"
+    store = SQLiteIndexStore(path)
+    tenant_a = _ordinary_record("tenant-a", title="Alpha document", owner_user_id="alice")
+    tenant_b = _ordinary_record("tenant-b", title="Beta document", owner_user_id="bob")
+
+    store.upsert_catalog(tenant_a, tenant_id="tenant-a")
+    store.upsert_catalog(tenant_b, tenant_id="tenant-b")
+
+    assert store.get_catalog(tenant_a.record_key, tenant_id="tenant-a").title == tenant_a.title  # type: ignore[union-attr]
+    assert store.get_catalog(tenant_b.record_key, tenant_id="tenant-b").title == tenant_b.title  # type: ignore[union-attr]
+    assert [hit.title for hit in store.search_catalog("tenant-safe-lexical-token", tenant_id="tenant-a")] == [
+        "Alpha document"
+    ]
+    assert [hit.title for hit in store.search_catalog("tenant-safe-lexical-token", tenant_id="tenant-b")] == [
+        "Beta document"
+    ]
+
+    with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM context_fts_map WHERE record_key = ?",
+            (tenant_a.record_key,),
+        ).fetchone()[0] == 2
+        assert conn.execute(
+            "SELECT COUNT(*) FROM context_paths WHERE record_key = ?",
+            (tenant_a.record_key,),
+        ).fetchone()[0] == 2
+        assert conn.execute(
+            "SELECT COUNT(*) FROM context_acl_grants WHERE record_key = ?",
+            (tenant_a.record_key,),
+        ).fetchone()[0] == 2
+
+    assert store.delete_catalog(tenant_a.record_key, tenant_id="tenant-a") is True
+    assert store.get_catalog(tenant_a.record_key, tenant_id="tenant-a") is None
+    assert store.get_catalog(tenant_b.record_key, tenant_id="tenant-b").title == tenant_b.title  # type: ignore[union-attr]
+    assert store.search_catalog("tenant-safe-lexical-token", tenant_id="tenant-a") == []
+    assert [hit.title for hit in store.search_catalog("tenant-safe-lexical-token", tenant_id="tenant-b")] == [
+        "Beta document"
+    ]
+
+    with pytest.raises(TypeError):
+        store.get_catalog(tenant_b.record_key)  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        store.upsert_catalog(tenant_b)  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        store.delete_catalog(tenant_b.record_key)  # type: ignore[call-arg]
+
+
+def test_acl_and_path_subqueries_correlate_tenant_and_record_key(tmp_path) -> None:
+    store = SQLiteIndexStore(tmp_path / "catalog.sqlite3")
+    tenant_a = _ordinary_record("tenant-a", title="Alpha document", owner_user_id="alice")
+    tenant_b = _ordinary_record("tenant-b", title="Beta document", owner_user_id="bob")
+    store.upsert_catalog(tenant_a, tenant_id="tenant-a")
+    store.upsert_catalog(tenant_b, tenant_id="tenant-b")
+
+    assert store.list_catalog(
+        tenant_id="tenant-a",
+        filters={"principal_owner_id": "bob", "target_paths": ["sessions/shared-session"]},
+    ) == []
+    assert [
+        record.title
+        for record in store.list_catalog(
+            tenant_id="tenant-b",
+            filters={"principal_owner_id": "bob", "target_paths": ["sessions/shared-session"]},
+        )
+    ] == ["Beta document"]
+
+
+def test_structured_filters_use_tenant_first_indexes(tmp_path) -> None:
+    store = SQLiteIndexStore(tmp_path / "catalog.sqlite3")
+    record = _ordinary_record("tenant-a", title="Alpha document", owner_user_id="alice")
+    store.upsert_catalog(record, tenant_id="tenant-a")
+
+    record_kind_plan = store.explain_structured_query(
+        tenant_id="tenant-a",
+        filters={"record_kind": CatalogRecordKind.MESSAGE.value},
+    )
+    path_plan = store.explain_structured_query(
+        tenant_id="tenant-a",
+        filters={"target_paths": ["sessions/shared-session"]},
+    )
+    document_plan = store.explain_structured_query(
+        tenant_id="tenant-a",
+        filters={"document_id": "document-1"},
+    )
+
+    assert any("idx_contexts_tenant_record_kind_updated" in line for line in record_kind_plan)
+    assert any("idx_context_path_closure_ancestor" in line for line in path_plan)
+    assert any("idx_contexts_tenant_document_id" in line for line in document_plan)
+
+
+def test_document_projection_generation_cas_is_atomic_and_idempotent(tmp_path) -> None:
+    path = tmp_path / "catalog.sqlite3"
+    store = SQLiteIndexStore(path)
+    document_v1 = _document_record(generation=1, digest="digest-v1")
+    blocks_v1 = (
+        _block_record("one", generation=1, digest="digest-v1"),
+        _block_record("two", generation=1, digest="digest-v1"),
+    )
+
+    assert store.replace_memory_document_projection(
+        document_v1,
+        blocks_v1,
+        tenant_id="tenant-a",
+        owner_user_id="alice",
+        expected_previous_generation=0,
+    ) == ()
+    assert store.get_memory_document_projection_state(
+        tenant_id="tenant-a",
+        owner_user_id="alice",
+        document_id="document-1",
+    ) == {
+        "tenant_id": "tenant-a",
+        "owner_user_id": "alice",
+        "document_id": "document-1",
+        "relative_path": "knowledge/catalog.md",
+        "source_digest": "digest-v1",
+        "projection_generation": 1,
+        "projection_status": "PROJECTED",
+        "deletion_generation": 0,
+        "deletion_event_digest": "",
+        "deletion_status": "",
+    }
+    assert store.replace_memory_document_projection(
+        document_v1,
+        blocks_v1,
+        tenant_id="tenant-a",
+        owner_user_id="alice",
+        expected_previous_generation=0,
+    ) == ()
+
+    with pytest.raises(ValueError, match="digest conflicts"):
+        store.replace_memory_document_projection(
+            replace(document_v1, source_digest="different-digest"),
+            tuple(replace(block, source_digest="different-digest") for block in blocks_v1),
+            tenant_id="tenant-a",
+            owner_user_id="alice",
+            expected_previous_generation=1,
+        )
+
+    document_v2 = _document_record(generation=2, digest="digest-v2")
+    blocks_v2 = (
+        _block_record("two", generation=2, digest="digest-v2"),
+        _block_record("three", generation=2, digest="digest-v2"),
+    )
+    assert store.replace_memory_document_projection(
+        document_v2,
+        blocks_v2,
+        tenant_id="tenant-a",
+        owner_user_id="alice",
+        expected_previous_generation=1,
+    ) == ("block-record-one",)
+
+    with pytest.raises(ValueError, match="stale"):
+        store.replace_memory_document_projection(
+            _document_record(generation=3, digest="digest-v3"),
+            (_block_record("four", generation=3, digest="digest-v3"),),
+            tenant_id="tenant-a",
+            owner_user_id="alice",
+            expected_previous_generation=1,
+        )
+
+    current = store.list_catalog(
+        tenant_id="tenant-a",
+        filters={"document_id": "document-1"},
+        limit=10,
+    )
+    assert {record.record_key for record in current} == {
+        "document-record",
+        "block-record-two",
+        "block-record-three",
+    }
+    assert {record.projection_generation for record in current} == {2}
+    assert store.search_catalog("uniqueoneprojectiontoken", tenant_id="tenant-a") == []
+    assert [
+        hit.metadata["catalog_record_key"]
+        for hit in store.search_catalog("uniquethreeprojectiontoken", tenant_id="tenant-a")
+    ] == ["block-record-three"]
+
+    with sqlite3.connect(path) as conn:
+        state = conn.execute(
+            "SELECT projection_generation, source_digest FROM memory_document_projection_state "
+            "WHERE tenant_id = 'tenant-a' AND owner_user_id = 'alice' AND document_id = 'document-1'"
+        ).fetchone()
+        journal = conn.execute(
+            "SELECT source_digest FROM context_projection_journal WHERE tenant_id = 'tenant-a' "
+            "AND projector_kind = 'memory_document'"
+        ).fetchone()
+    assert state == (2, "digest-v2")
+    assert journal == ("digest-v2",)
+
+
+def test_memory_projection_cannot_bypass_atomic_publication_api(tmp_path) -> None:
+    store = SQLiteIndexStore(tmp_path / "catalog.sqlite3")
+    document = _document_record(generation=1, digest="digest-v1")
+    block = _block_record("one", generation=1, digest="digest-v1")
+    store.replace_memory_document_projection(
+        document,
+        (block,),
+        0,
+        tenant_id="tenant-a",
+        owner_user_id="alice",
+    )
+
+    ordinary_collision = replace(
+        _ordinary_record("tenant-a", title="collision", owner_user_id="alice"),
+        record_key=document.record_key,
+    )
+    with pytest.raises(ValueError, match="replace_memory_document_projection"):
+        store.upsert_catalog(ordinary_collision, tenant_id="tenant-a")
+    with pytest.raises(ValueError, match="tombstone_memory_document_projection"):
+        store.delete_catalog(document.record_key, tenant_id="tenant-a")
+    with pytest.raises(ValueError, match="tombstone_memory_document_projection"):
+        store.delete_index(document.uri, tenant_id="tenant-a")
+    with pytest.raises(ValueError, match="tombstone_memory_document_projection"):
+        store.enqueue_tombstone(
+            tenant_id="tenant-a",
+            record_key=document.record_key,
+            reason="generic-delete-must-not-bypass-document-barrier",
+        )
+
+    loaded_document = store.get_catalog(document.record_key, tenant_id="tenant-a")
+    loaded_block = store.get_catalog(block.record_key, tenant_id="tenant-a")
+    assert loaded_document is not None
+    assert loaded_block is not None
+    assert (loaded_document.document_id, loaded_document.source_digest) == (
+        document.document_id,
+        document.source_digest,
+    )
+    assert (loaded_block.block_id, loaded_block.source_digest) == (
+        block.block_id,
+        block.source_digest,
+    )
+
+
+def test_document_projection_cas_serializes_concurrent_publishers(tmp_path) -> None:
+    path = tmp_path / "catalog.sqlite3"
+    store = SQLiteIndexStore(path)
+    store.replace_memory_document_projection(
+        _document_record(generation=1, digest="digest-v1"),
+        (_block_record("one", generation=1, digest="digest-v1"),),
+        0,
+        tenant_id="tenant-a",
+        owner_user_id="alice",
+    )
+
+    def publish(digest: str) -> str:
+        local = SQLiteIndexStore(path)
+        try:
+            local.replace_memory_document_projection(
+                _document_record(generation=2, digest=digest),
+                (_block_record("two", generation=2, digest=digest),),
+                1,
+                tenant_id="tenant-a",
+                owner_user_id="alice",
+            )
+        except ValueError:
+            return "conflict"
+        return "published"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = tuple(pool.map(publish, ("digest-v2-a", "digest-v2-b")))
+
+    assert sorted(outcomes) == ["conflict", "published"]
+    records = store.list_catalog(
+        tenant_id="tenant-a",
+        filters={"document_id": "document-1"},
+        limit=10,
+    )
+    assert {record.projection_generation for record in records} == {2}
+    assert len({record.source_digest for record in records}) == 1
+
+
+def test_document_projection_rolls_back_all_rows_if_state_publish_fails(tmp_path) -> None:
+    store = SQLiteIndexStore(tmp_path / "catalog.sqlite3")
+    first_document = _document_record(generation=1, digest="digest-v1")
+    first_blocks = (_block_record("one", generation=1, digest="digest-v1"),)
+    store.replace_memory_document_projection(
+        first_document,
+        first_blocks,
+        0,
+        tenant_id="tenant-a",
+        owner_user_id="alice",
+    )
+    second_document = replace(
+        _document_record(generation=1, digest="digest-document-2"),
+        record_key="document-record-2",
+        uri="memoryos://users/alice/memory/documents/document-2",
+        source_uri="memoryos://sources/memory/document-2",
+        document_id="document-2",
+    )
+    second_block = replace(
+        _block_record("other", generation=1, digest="digest-document-2"),
+        record_key="block-record-document-2",
+        uri="memoryos://users/alice/memory/documents/document-2/blocks/other",
+        source_uri="memoryos://sources/memory/document-2",
+        document_id="document-2",
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        store.replace_memory_document_projection(
+            second_document,
+            (second_block,),
+            0,
+            tenant_id="tenant-a",
+            owner_user_id="alice",
+        )
+
+    assert {record.record_key for record in store.list_catalog(tenant_id="tenant-a")} == {
+        "document-record",
+        "block-record-one",
+    }
+    assert store.search_catalog("uniqueotherprojectiontoken", tenant_id="tenant-a") == []
+
+
+def test_document_tombstone_is_atomic_and_soft_restore_is_explicit(tmp_path) -> None:
+    path = tmp_path / "catalog.sqlite3"
+    store = SQLiteIndexStore(path)
+    document_v1 = _document_record(generation=1, digest="digest-v1")
+    blocks_v1 = (
+        _block_record("one", generation=1, digest="digest-v1"),
+        _block_record("two", generation=1, digest="digest-v1"),
+    )
+    store.replace_memory_document_projection(
+        document_v1,
+        blocks_v1,
+        0,
+        tenant_id="tenant-a",
+        owner_user_id="alice",
+    )
+
+    obsolete = store.tombstone_memory_document_projection(
+        tenant_id="tenant-a",
+        owner_user_id="alice",
+        document_id="document-1",
+        deletion_generation=2,
+        deletion_event_digest="soft-delete-digest",
+        deletion_status="SOFT_FORGOTTEN",
+    )
+
+    assert set(obsolete) == {"document-record", "block-record-one", "block-record-two"}
+    assert store.list_catalog(tenant_id="tenant-a") == []
+    assert store.search_catalog("uniqueoneprojectiontoken", tenant_id="tenant-a") == []
+    with sqlite3.connect(path) as conn:
+        serving_counts = tuple(
+            conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in (
+                "contexts",
+                "context_fts_map",
+                "context_paths",
+                "context_path_closure",
+                "context_path_acl",
+                "context_acl_grants",
+            )
+        )
+        state = conn.execute(
+            "SELECT projection_generation, projection_status, deletion_generation, "
+            "deletion_event_digest, deletion_status FROM memory_document_projection_state "
+            "WHERE tenant_id = 'tenant-a' AND owner_user_id = 'alice' AND document_id = 'document-1'"
+        ).fetchone()
+        journal = conn.execute(
+            "SELECT status, source_digest FROM context_projection_journal "
+            "WHERE tenant_id = 'tenant-a' AND projector_kind = 'memory_document'"
+        ).fetchone()
+    assert serving_counts == (0, 0, 0, 0, 0, 0)
+    assert state == (0, "TOMBSTONED", 2, "soft-delete-digest", "SOFT_FORGOTTEN")
+    assert journal == ("TOMBSTONED", "soft-delete-digest")
+    assert store.tombstone_memory_document_projection(
+        tenant_id="tenant-a",
+        owner_user_id="alice",
+        document_id="document-1",
+        deletion_generation=2,
+        deletion_event_digest="soft-delete-digest",
+        deletion_status="SOFT_FORGOTTEN",
+    ) == ()
+    with pytest.raises(ValueError, match="conflicts"):
+        store.tombstone_memory_document_projection(
+            tenant_id="tenant-a",
+            owner_user_id="alice",
+            document_id="document-1",
+            deletion_generation=2,
+            deletion_event_digest="different-delete-digest",
+            deletion_status="SOFT_FORGOTTEN",
+        )
+
+    document_v3 = _document_record(generation=3, digest="digest-v3")
+    blocks_v3 = (_block_record("three", generation=3, digest="digest-v3"),)
+    with pytest.raises(ValueError, match="blocked"):
+        store.replace_memory_document_projection(
+            document_v3,
+            blocks_v3,
+            0,
+            tenant_id="tenant-a",
+            owner_user_id="alice",
+        )
+    assert store.replace_memory_document_projection(
+        document_v3,
+        blocks_v3,
+        0,
+        tenant_id="tenant-a",
+        owner_user_id="alice",
+        restore_soft_deleted=True,
+    ) == ()
+    with sqlite3.connect(path) as conn:
+        restored = conn.execute(
+            "SELECT projection_generation, deletion_generation, deletion_status "
+            "FROM memory_document_projection_state WHERE tenant_id = 'tenant-a' "
+            "AND owner_user_id = 'alice' AND document_id = 'document-1'"
+        ).fetchone()
+    assert restored == (3, 2, "")
+    with pytest.raises(ValueError, match="stale"):
+        store.tombstone_memory_document_projection(
+            tenant_id="tenant-a",
+            owner_user_id="alice",
+            document_id="document-1",
+            deletion_generation=2,
+            deletion_event_digest="soft-delete-digest",
+            deletion_status="SOFT_FORGOTTEN",
+        )
+    assert {record.record_key for record in store.list_catalog(tenant_id="tenant-a")} == {
+        "document-record",
+        "block-record-three",
+    }
+
+    hard_obsolete = store.tombstone_memory_document_projection(
+        tenant_id="tenant-a",
+        owner_user_id="alice",
+        document_id="document-1",
+        deletion_generation=4,
+        deletion_event_digest="hard-delete-digest",
+        deletion_status="HARD_ERASED",
+    )
+    assert set(hard_obsolete) == {"document-record", "block-record-three"}
+    assert store.tombstone_memory_document_projection(
+        tenant_id="tenant-a",
+        owner_user_id="alice",
+        document_id="document-1",
+        deletion_generation=4,
+        deletion_event_digest="hard-delete-digest",
+        deletion_status="HARD_ERASED",
+    ) == ()
+    hard_state = store.get_memory_document_projection_state(
+        tenant_id="tenant-a",
+        owner_user_id="alice",
+        document_id="document-1",
+    )
+    assert hard_state is not None
+    assert hard_state["relative_path"] == ""
+    persisted = b"".join(
+        candidate.read_bytes()
+        for candidate in path.parent.glob(f"{path.name}*")
+        if candidate.is_file()
+    )
+    assert b"knowledge/catalog.md" not in persisted
+    with pytest.raises(ValueError, match="hard-erased"):
+        store.replace_memory_document_projection(
+            _document_record(generation=5, digest="digest-v5"),
+            (_block_record("five", generation=5, digest="digest-v5"),),
+            0,
+            tenant_id="tenant-a",
+            owner_user_id="alice",
+            restore_soft_deleted=True,
+        )
+
+
+def test_tombstones_with_same_id_cannot_delete_another_tenant(tmp_path) -> None:
+    store = SQLiteIndexStore(tmp_path / "catalog.sqlite3")
+    tenant_a = _ordinary_record("tenant-a", title="Alpha document", owner_user_id="alice")
+    tenant_b = _ordinary_record("tenant-b", title="Beta document", owner_user_id="bob")
+    store.upsert_catalog(tenant_a, tenant_id="tenant-a")
+    store.upsert_catalog(tenant_b, tenant_id="tenant-b")
+
+    store.enqueue_tombstone(
+        tenant_id="tenant-a",
+        record_key=tenant_a.record_key,
+        reason="delete",
+        tombstone_id="shared-tombstone",
+    )
+    store.enqueue_tombstone(
+        tenant_id="tenant-b",
+        record_key=tenant_b.record_key,
+        reason="delete",
+        tombstone_id="shared-tombstone",
+    )
+    store.mark_tombstone_applied("shared-tombstone", tenant_id="tenant-a")
+
+    assert store.get_catalog(tenant_a.record_key, tenant_id="tenant-a") is None
+    assert store.get_catalog(tenant_b.record_key, tenant_id="tenant-b").title == tenant_b.title  # type: ignore[union-attr]
+    assert store.get_pending_tombstones(tenant_id="tenant-a") == []
+    assert [row["tenant_id"] for row in store.get_pending_tombstones(tenant_id="tenant-b")] == [
+        "tenant-b"
     ]
 
 
-def test_sqlite_persists_only_sanitized_primary_secondary_and_metadata_tree_paths(tmp_path) -> None:
-    store = SQLiteIndexStore(tmp_path / "catalog.sqlite3")
-    raw_primary = "memories/preferences/Users_gulf_Desktop_private.txt/ice_cream"
-    raw_secondary = "projects/sk-abcdefghijk123456"
-    record = CatalogRecord(
-        record_key="slot:sensitive:current",
-        uri="memoryos://user/u1/memories/canonical/slots/sensitive/serving/current",
-        tenant_id="tenant-a",
-        owner_user_id="u1",
-        workspace_id="workspace-a",
-        context_type="memory",
-        source_kind="canonical_current_slot",
-        record_kind=CatalogRecordKind.CURRENT_SLOT.value,
-        primary_tree_path=raw_primary,
-        tree_paths=(raw_primary, raw_secondary, "resources/repository"),
-        title="safe current state",
-        l0_text="safe state",
-        l1_text="safe overview",
-        source_uri="memoryos://user/u1/memories/canonical/slots/sensitive",
-        source_digest="safe-digest",
-        source_revision=1,
-        canonical_slot_id="sensitive",
-        canonical_claim_id="claim-sensitive",
-        canonical_revision=1,
-        canonical_state="ACTIVE",
-        metadata={
-            "primary_tree_path": raw_primary,
-            "tree_paths": [raw_primary, raw_secondary],
-            "nested": {"secondary_tree_paths": [raw_secondary]},
-        },
-    )
-
-    store.upsert_catalog(record)
-    stored = store.get_catalog(record.record_key, tenant_id="tenant-a")
-    assert stored is not None
-    assert stored.tree_paths == record.tree_paths
-    assert store.list_catalog(
-        filters={"tenant_id": "tenant-a", "target_paths": (raw_primary,)},
-        limit=10,
-    ) == [stored]
-    assert store.list_catalog(
-        filters={"tenant_id": "tenant-a", "target_paths": (raw_secondary,)},
-        limit=10,
-    ) == [stored]
-
-    with sqlite3.connect(store.path) as conn:
-        persisted = " ".join(
-            str(value)
-            for row in conn.execute(
-                "SELECT primary_tree_path, metadata_json FROM contexts WHERE record_key = ?",
-                (record.record_key,),
-            )
-            for value in row
-        )
-        persisted += " " + " ".join(
-            str(row[0])
-            for row in conn.execute(
-                "SELECT path FROM context_paths WHERE record_key = ? ORDER BY path",
-                (record.record_key,),
-            )
-        )
-        persisted += " " + " ".join(
-            str(value)
-            for row in conn.execute(
-                "SELECT metadata_text, search_terms FROM contexts_fts WHERE record_key = ?",
-                (record.record_key,),
-            )
-            for value in row
-        )
-    assert "sk-abcdefghijk123456" not in persisted
-    assert "Users_gulf" not in persisted
-    assert "gulf_Desktop" not in persisted
-    assert "resources/repository" in persisted
-
-
-def test_current_slot_is_one_row_and_batch_constraint_failure_rolls_back(tmp_path) -> None:
-    store = SQLiteIndexStore(tmp_path / "catalog.sqlite3")
-
-    def current(record_key: str, slot_id: str, claim_id: str) -> CatalogRecord:
-        return CatalogRecord(
-            record_key=record_key,
-            uri=f"memoryos://user/u1/memories/canonical/slots/{slot_id}",
-            tenant_id="tenant-a",
-            owner_user_id="u1",
-            context_type="memory",
-            source_kind="canonical_projection",
-            record_kind=CatalogRecordKind.CURRENT_SLOT.value,
-            canonical_slot_id=slot_id,
-            canonical_claim_id=claim_id,
-            canonical_state="ACTIVE",
-            metadata={"memory_type": "preference", "canonical_value": claim_id},
-        )
-
-    store.upsert_catalog(current("slot:ice-cream:current", "ice-cream", "claim-a"))
-    store.upsert_catalog(current("slot:ice-cream:current", "ice-cream", "claim-b"))
-    rows = store.list_catalog(
-        filters={"tenant_id": "tenant-a", "record_kind": CatalogRecordKind.CURRENT_SLOT.value},
-        limit=10,
-    )
-    assert len(rows) == 1
-    assert rows[0].canonical_claim_id == "claim-b"
-
-    with pytest.raises(sqlite3.IntegrityError):
-        store.upsert_catalog_batch(
-            (
-                current("slot:conflict:a", "conflicting-slot", "claim-c"),
-                current("slot:conflict:b", "conflicting-slot", "claim-d"),
-            )
-        )
-    assert store.get_catalog("slot:conflict:a") is None
-    assert store.get_catalog("slot:conflict:b") is None
-
-
-def test_context_links_are_sanitized_indexed_and_deleted_with_either_endpoint(tmp_path) -> None:
-    store = SQLiteIndexStore(tmp_path / "catalog-links.sqlite3")
-    source = _session_record("session:source")
-    target = replace(
-        _session_record("session:target", source_revision=2),
-        uri="memoryos://user/u1/sessions/history/s2",
-        session_id="s2",
-        source_uri="memoryos://user/u1/sessions/history/s2/tool-results/1",
-        source_digest="digest-2",
-    )
-    store.upsert_catalog_batch((source, target))
-
-    def insert_link() -> str:
-        return store.upsert_context_link(
-            tenant_id="tenant-a",
-            source_record_key=source.record_key,
-            source_uri=source.uri,
-            relation_type="related_to",
-            target_record_key=target.record_key,
-            target_uri=target.uri,
-            metadata={"Authorization": "Bearer private-link-token-123456"},
-        )
-
-    link_key = insert_link()
-    with sqlite3.connect(store.path) as conn:
-        row = conn.execute(
-            "SELECT metadata_json FROM context_links WHERE link_key = ?",
-            (link_key,),
-        ).fetchone()
-        indexes = {
-            str(item[0])
-            for item in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'context_links'"
-            )
-        }
-    assert row is not None
-    assert "private-link-token-123456" not in str(row[0])
-    assert {"idx_context_links_source", "idx_context_links_target"} <= indexes
-
-    assert store.delete_catalog(target.record_key, tenant_id="tenant-a") is True
-    with sqlite3.connect(store.path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM context_links").fetchone()[0] == 0
-
-    store.upsert_catalog(target)
-    insert_link()
-    assert store.delete_catalog(source.record_key, tenant_id="tenant-a") is True
-    with sqlite3.connect(store.path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM context_links").fetchone()[0] == 0
-
-
-def test_legacy_contexts_table_migrates_in_place_idempotently_and_preserves_search(tmp_path) -> None:
-    path = tmp_path / "legacy.sqlite3"
-    with sqlite3.connect(path) as conn:
-        conn.execute(
-            """
-            CREATE TABLE contexts (
-              uri TEXT PRIMARY KEY,
-              tenant_id TEXT NOT NULL,
-              owner_user_id TEXT NOT NULL,
-              context_type TEXT NOT NULL,
-              project_id TEXT NOT NULL DEFAULT '',
-              adapter_id TEXT NOT NULL DEFAULT '',
-              admission_status TEXT NOT NULL DEFAULT '',
-              claim_state TEXT NOT NULL DEFAULT '',
-              slot_id TEXT NOT NULL DEFAULT '',
-              memory_type TEXT NOT NULL DEFAULT '',
-              scope_keys TEXT NOT NULL DEFAULT '[]',
-              title TEXT NOT NULL,
-              lifecycle_state TEXT NOT NULL,
-              hotness REAL NOT NULL,
-              semantic_hotness REAL NOT NULL,
-              behavior_support_hotness REAL NOT NULL,
-              metadata_json TEXT NOT NULL,
-              content_text TEXT NOT NULL,
-              updated_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            INSERT INTO contexts VALUES (
-              ?, 'tenant-a', 'u1', 'resource', '', '', '', '', '', '', '[]',
-              'Legacy report', 'active', 0, 0, 0, ?, ?, '2026-07-14T03:30:00+00:00'
-            )
-            """,
-            (
-                "memoryos://user/u1/resources/legacy-report",
-                json.dumps({"summary": "legacy quarterly report", "password": "legacy-secret"}),
-                "password=legacy-secret /Users/gulf/Desktop/legacy-report.txt",
-            ),
-        )
-        conn.execute("CREATE TABLE contexts_fts(uri TEXT PRIMARY KEY, title, content_text, metadata_text)")
-        conn.execute("PRAGMA user_version = 2")
-
+def test_serving_cleanup_preserves_document_deletion_barrier(tmp_path) -> None:
+    path = tmp_path / "catalog.sqlite3"
     store = SQLiteIndexStore(path)
-    migrated = store.get_catalog("memoryos://user/u1/resources/legacy-report", tenant_id="tenant-a")
-    assert migrated is not None
-    assert migrated.record_key == migrated.uri
-    assert [hit.uri for hit in store.search("legacy report", filters={"tenant_id": "tenant-a"})] == [migrated.uri]
+    document = _document_record(generation=1, digest="digest-v1")
+    blocks = (_block_record("one", generation=1, digest="digest-v1"),)
+    store.replace_memory_document_projection(
+        document,
+        blocks,
+        0,
+        tenant_id="tenant-a",
+        owner_user_id="alice",
+    )
     with sqlite3.connect(path) as conn:
-        conn.row_factory = sqlite3.Row
-        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 10
-        columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(contexts)")}
-        assert {"record_key", "event_time", "transaction_time", "canonical_slot_id", "serving_tier"} <= columns
-        persisted = " ".join(
-            str(value) for value in conn.execute("SELECT metadata_json, content_text FROM contexts").fetchone()
+        conn.execute(
+            "UPDATE memory_document_projection_state SET deletion_generation = 2, "
+            "deletion_event_digest = 'delete-digest', deletion_status = 'SOFT_FORGOTTEN' "
+            "WHERE tenant_id = 'tenant-a' AND owner_user_id = 'alice' AND document_id = 'document-1'"
         )
-        fts = " ".join(
-            str(value) for value in conn.execute("SELECT content_text, metadata_text FROM contexts_fts").fetchone()
-        )
-    assert "legacy-secret" not in f"{persisted} {fts}"
-    assert "/Users/gulf" not in f"{persisted} {fts}"
 
-    restarted = SQLiteIndexStore(path)
-    assert restarted.get_catalog(migrated.record_key, tenant_id="tenant-a") == migrated
+    store.clear(tenant_id="tenant-a")
 
-
-def test_tombstone_queue_is_replayable_stale_safe_and_migration_state_resumes(tmp_path) -> None:
-    store = SQLiteIndexStore(tmp_path / "catalog.sqlite3")
-    record = _session_record("session:s1:tool:1", source_revision=2)
-    store.upsert_catalog(record)
-
-    stale = store.enqueue_tombstone(
-        tenant_id="tenant-a",
-        record_key=record.record_key,
-        reason="stale-delete",
-        source_revision=1,
-    )
-    assert stale["status"] == "PENDING"
-    assert store.get_catalog(record.record_key) is not None
-    stale_applied = store.mark_tombstone_applied(stale["tombstone_id"])
-    assert stale_applied is not None and stale_applied["status"] == "STALE"
-    assert store.get_catalog(record.record_key) is not None
-
-    queued = store.enqueue_tombstone(
-        tenant_id="tenant-a",
-        record_key=record.record_key,
-        reason="session-delete",
-        source_revision=2,
-    )
-    failed = store.mark_tombstone_failed(queued["tombstone_id"], "password=do-not-log")
-    assert failed is not None and failed["status"] == "FAILED" and failed["retry_count"] == 1
-    assert "do-not-log" not in failed["last_error"]
-    assert {item["tombstone_id"] for item in store.get_pending_tombstones()} == {queued["tombstone_id"]}
-    applied = store.mark_tombstone_applied(queued["tombstone_id"])
-    assert applied is not None and applied["status"] == "APPLIED"
-    replayed = store.mark_tombstone_applied(queued["tombstone_id"])
-    assert replayed is not None and replayed["status"] == "APPLIED"
-    assert store.get_catalog(record.record_key) is None
+    with sqlite3.connect(path) as conn:
+        barrier = conn.execute(
+            "SELECT deletion_generation, deletion_event_digest, deletion_status "
+            "FROM memory_document_projection_state WHERE tenant_id = 'tenant-a' "
+            "AND owner_user_id = 'alice' AND document_id = 'document-1'"
+        ).fetchone()
+    assert barrier == (2, "delete-digest", "SOFT_FORGOTTEN")
     with pytest.raises(ValueError, match="not newer"):
-        store.upsert_catalog(record)
-    store.upsert_catalog(_session_record(record.record_key, source_revision=3))
-    assert store.get_catalog(record.record_key) is not None
-
-    cleaning = store.enqueue_tombstone(
-        tenant_id="tenant-a",
-        record_key=record.record_key,
-        reason="two-phase-delete",
-        source_revision=3,
-    )
-    begun = store.begin_tombstone_cleanup(str(cleaning["tombstone_id"]))
-    assert begun is not None and begun["status"] == "CLEANING"
-    assert store.get_catalog(record.record_key) is None
-    assert str(cleaning["tombstone_id"]) in {str(item["tombstone_id"]) for item in store.get_pending_tombstones()}
-    with pytest.raises(ValueError, match="in-progress tombstone"):
-        store.upsert_catalog(_session_record(record.record_key, source_revision=4))
-    finished = store.finish_tombstone_cleanup(str(cleaning["tombstone_id"]))
-    assert finished is not None and finished["status"] == "APPLIED"
-    store.upsert_catalog(_session_record(record.record_key, source_revision=4))
-    assert store.get_catalog(record.record_key) is not None
-
-    state = store.set_migration_state(
-        "unified-context-v1",
-        "BACKFILLING",
-        "session:s1",
-        {"processed": 10},
-        tenant_id="tenant-a",
-        batch_size=100,
-    )
-    assert state["checkpoint"] == "session:s1"
-    shadow = store.set_migration_state(
-        "unified-context-v1",
-        "SHADOW_VALIDATING",
-        "session:s1",
-        {"processed": 10, "shadow_validation_epoch": "epoch-1"},
-        tenant_id="tenant-a",
-        batch_size=100,
-    )
-    assert shadow["state"] == "SHADOW_VALIDATING"
-    proof = store.record_migration_equivalence_proof(
-        "unified-context-v1",
-        {
-            "plane": "session_archive",
-            "source_identity_digest": "source-digest",
-            "evidence_digest": "archive-digest",
-            "expected_count": 1,
-            "actual_count": 0,
-            "expected_digest": "expected-digest",
-            "actual_digest": "actual-digest",
-            "matched": False,
-        },
-        tenant_id="tenant-a",
-    )
-    assert proof["inserted"] is True
-    summary = store.get_migration_equivalence_summary(
-        "unified-context-v1",
-        tenant_id="tenant-a",
-        validation_epoch="epoch-1",
-    )
-    assert summary == {"sample_count": 1, "mismatch_count": 1}
-    restarted = SQLiteIndexStore(store.path)
-    restarted_state = restarted.get_migration_state("unified-context-v1", tenant_id="tenant-a")
-    assert restarted_state is not None
-    assert restarted_state["details_json"]["shadow_mismatch_count"] == 1
-
-
-def test_required_structured_indexes_exist_and_are_selected(tmp_path) -> None:
-    store = SQLiteIndexStore(tmp_path / "catalog.sqlite3")
-    store.upsert_catalog(_session_record("session:s1:tool:1"))
-
-    owner_plan = " ".join(
-        store.explain_structured_query(
-            {
-                "tenant_id": "tenant-a",
-                "owner_user_id": "u1",
-                "context_type": "session",
-            }
-        )
-    )
-    event_plan = " ".join(
-        store.explain_structured_query(
-            {
-                "tenant_id": "tenant-a",
-                "event_time_from": "2026-07-14T00:00:00+00:00",
-                "event_time_to": "2026-07-15T00:00:00+00:00",
-            }
-        )
-    )
-    updated_plan = " ".join(
-        store.explain_structured_query(
-            {
-                "tenant_id": "tenant-a",
-                "updated_at_from": "2026-07-14T00:00:00+00:00",
-                "updated_at_to": "2026-07-15T00:00:00+00:00",
-            }
-        )
-    )
-    valid_plan = " ".join(
-        store.explain_structured_query(
-            {
-                "tenant_id": "tenant-a",
-                "valid_at": "2026-07-14T12:00:00+00:00",
-            }
-        )
-    )
-    tenant_path_plan = " ".join(
-        store.explain_structured_query(
-            {"tenant_id": "tenant-a", "target_paths": ("resources/desktop",)}
-        )
-    )
-    owner_path_plan = " ".join(
-        store.explain_structured_query(
-            {
-                "tenant_id": "tenant-a",
-                "owner_user_id": "u1",
-                "target_paths": ("resources/desktop",),
-            }
-        )
-    )
-    type_path_plan = " ".join(
-        store.explain_structured_query(
-            {
-                "tenant_id": "tenant-a",
-                "context_types": ("session",),
-                "target_paths": ("resources/desktop",),
-            }
-        )
-    )
-    time_path_plan = " ".join(
-        store.explain_structured_query(
-            {
-                "tenant_id": "tenant-a",
-                "event_time_from": "2026-07-14T00:00:00+00:00",
-                "event_time_to": "2026-07-15T00:00:00+00:00",
-                "target_paths": ("resources/desktop",),
-            }
-        )
-    )
-    with sqlite3.connect(store.path) as conn:
-        path_plan = " ".join(
-            str(row[3])
-            for row in conn.execute(
-                "EXPLAIN QUERY PLAN SELECT record_key FROM context_paths "
-                "WHERE tenant_id = ? AND path >= ? AND path < ? LIMIT 10",
-                ("tenant-a", "resources/desktop", "resources/desktop/\uffff"),
-            )
-        )
-        indexes = {
-            str(row[0])
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'index' "
-                "AND tbl_name IN ('contexts', 'context_paths', 'context_path_closure', 'context_path_acl')"
-            )
-        }
-        created_plan = " ".join(
-            str(row[3])
-            for row in conn.execute(
-                "EXPLAIN QUERY PLAN SELECT record_key FROM contexts "
-                "WHERE tenant_id = ? AND created_at >= ? AND created_at < ? LIMIT 10",
-                ("tenant-a", "2026-07-14T00:00:00+00:00", "2026-07-15T00:00:00+00:00"),
-            )
-        )
-        ingested_plan = " ".join(
-            str(row[3])
-            for row in conn.execute(
-                "EXPLAIN QUERY PLAN SELECT record_key FROM contexts "
-                "WHERE tenant_id = ? AND ingested_at >= ? AND ingested_at < ? LIMIT 10",
-                ("tenant-a", "2026-07-14T00:00:00+00:00", "2026-07-15T00:00:00+00:00"),
-            )
-        )
-    assert "idx_contexts_tenant_owner_type" in owner_plan
-    assert "idx_contexts_tenant_event_time" in event_plan
-    assert "idx_contexts_tenant_updated_at" in updated_plan
-    assert "idx_contexts_tenant_valid_interval" in valid_plan
-    assert "idx_context_path_closure_tenant_ancestor" in tenant_path_plan
-    assert "idx_context_path_closure_owner_ancestor" in owner_path_plan
-    assert "idx_context_path_closure_type_ancestor" in type_path_plan
-    assert "idx_context_path_closure_ancestor_event" in time_path_plan
-    assert all(
-        "LIST SUBQUERY" in plan
-        for plan in (tenant_path_plan, owner_path_plan, type_path_plan, time_path_plan)
-    )
-    assert all(
-        "ancestor_path=?" in plan
-        for plan in (tenant_path_plan, owner_path_plan, type_path_plan, time_path_plan)
-    )
-    assert "idx_contexts_tenant_created_at" in created_plan
-    assert "idx_contexts_tenant_ingested_at" in ingested_plan
-    assert "idx_context_paths_" in path_plan and "SCAN context_paths" not in path_plan
-    assert {
-        "idx_contexts_tenant_transaction_time",
-        "idx_contexts_tenant_created_at",
-        "idx_contexts_tenant_ingested_at",
-        "idx_contexts_tenant_updated_at",
-        "idx_contexts_tenant_valid_interval",
-        "uq_contexts_current_slot",
-        "idx_context_paths_owner_path",
-        "idx_context_paths_type_path",
-        "idx_context_paths_time_path",
-        "idx_context_paths_path_time",
-        "idx_context_paths_uri",
-        "idx_context_path_closure_tenant_ancestor",
-        "idx_context_path_closure_owner_ancestor",
-        "idx_context_path_closure_type_ancestor",
-        "idx_context_path_closure_ancestor_event",
-    } <= indexes
-
-
-def test_singapore_day_boundaries_use_catalog_utc_text_for_all_time_filters(tmp_path) -> None:
-    store = SQLiteIndexStore(tmp_path / "catalog.sqlite3")
-
-    def record(
-        key: str,
-        *,
-        source_kind: str,
-        event_time: str,
-        transaction_time: str,
-        updated_at: str | None = None,
-        valid_from: str = "",
-        valid_to: str = "",
-    ) -> CatalogRecord:
-        return CatalogRecord(
-            record_key=key,
-            uri=f"memoryos://user/u1/contexts/{key}",
+        store.replace_memory_document_projection(
+            _document_record(generation=2, digest="digest-v2"),
+            (_block_record("two", generation=2, digest="digest-v2"),),
+            1,
             tenant_id="tenant-a",
-            owner_user_id="u1",
-            context_type="session",
-            source_kind=source_kind,
-            record_kind=CatalogRecordKind.CONTEXT.value,
-            created_at=transaction_time,
-            updated_at=updated_at or transaction_time,
-            event_time=event_time,
-            ingested_at=transaction_time,
-            transaction_time=transaction_time,
-            valid_from=valid_from,
-            valid_to=valid_to,
-            title=key,
-            l0_text=key,
-            l1_text=key,
-            l2_uri=f"memoryos://user/u1/contexts/{key}",
-            source_uri=f"memoryos://user/u1/contexts/{key}",
-            source_digest=f"digest-{key}",
+            owner_user_id="alice",
+        )
+    with pytest.raises(ValueError, match="blocked"):
+        store.replace_memory_document_projection(
+            _document_record(generation=3, digest="digest-v3"),
+            (_block_record("three", generation=3, digest="digest-v3"),),
+            1,
+            tenant_id="tenant-a",
+            owner_user_id="alice",
         )
 
-    store.upsert_catalog_batch(
-        (
-            # Asia/Singapore 2026-07-14 is the half-open UTC interval
-            # [2026-07-13T16:00:00, 2026-07-14T16:00:00).
-            record(
-                "event-before-transaction-start",
-                source_kind="time_test",
-                event_time="2026-07-13T15:59:59.999999Z",
-                transaction_time="2026-07-14T00:00:00+08:00",
-            ),
-            record(
-                "event-start-transaction-before",
-                source_kind="time_test",
-                event_time="2026-07-14T00:00:00+08:00",
-                transaction_time="2026-07-13T15:59:59.999999Z",
-            ),
-            record(
-                "event-last-transaction-end",
-                source_kind="time_test",
-                event_time="2026-07-14T23:59:59.999999+08:00",
-                transaction_time="2026-07-15T00:00:00+08:00",
-            ),
-            record(
-                "event-end-transaction-last",
-                source_kind="time_test",
-                event_time="2026-07-15T00:00:00+08:00",
-                transaction_time="2026-07-14T23:59:59.999999+08:00",
-            ),
-            record(
-                "updated-start-inclusive",
-                source_kind="updated_test",
-                event_time="2026-07-13T00:00:00Z",
-                transaction_time="2026-07-13T00:00:00Z",
-                updated_at="2026-07-14T00:00:00+08:00",
-            ),
-            record(
-                "updated-end-exclusive",
-                source_kind="updated_test",
-                event_time="2026-07-13T00:00:00Z",
-                transaction_time="2026-07-13T00:00:00Z",
-                updated_at="2026-07-15T00:00:00+08:00",
-            ),
-            record(
-                "valid-one-microsecond-after",
-                source_kind="valid_test",
-                event_time="2026-07-13T00:00:00Z",
-                transaction_time="2026-07-13T00:00:00Z",
-                valid_from="2026-07-13T00:00:00Z",
-                valid_to="2026-07-14T00:00:00.000001+08:00",
-            ),
-            record(
-                "valid-start-inclusive",
-                source_kind="valid_test",
-                event_time="2026-07-13T00:00:00Z",
-                transaction_time="2026-07-13T00:00:00Z",
-                valid_from="2026-07-14T00:00:00+08:00",
-                valid_to="2026-07-15T00:00:00+08:00",
-            ),
-            record(
-                "valid-end-exclusive",
-                source_kind="valid_test",
-                event_time="2026-07-13T00:00:00Z",
-                transaction_time="2026-07-13T00:00:00Z",
-                valid_from="2026-07-13T00:00:00Z",
-                valid_to="2026-07-14T00:00:00+08:00",
-            ),
-            record(
-                "valid-future",
-                source_kind="valid_test",
-                event_time="2026-07-13T00:00:00Z",
-                transaction_time="2026-07-13T00:00:00Z",
-                valid_from="2026-07-14T00:00:00.000001+08:00",
-                valid_to="2026-07-15T00:00:00+08:00",
-            ),
-        )
+
+def test_serving_cleanup_allows_active_document_full_rebuild(tmp_path) -> None:
+    path = tmp_path / "catalog.sqlite3"
+    store = SQLiteIndexStore(path)
+    document = _document_record(generation=1, digest="digest-v1")
+    blocks = (_block_record("one", generation=1, digest="digest-v1"),)
+    store.replace_memory_document_projection(
+        document,
+        blocks,
+        0,
+        tenant_id="tenant-a",
+        owner_user_id="alice",
     )
 
-    planner = QueryPlanner()
-    generator = CandidateGenerator(store)
+    store.clear(tenant_id="tenant-a")
 
-    def selected(options: RetrievalOptions) -> set[str]:
-        plan = planner.plan("", options=options)
-        generated = generator.generate(plan)
-        return {candidate.record_key for candidate in generated.branches["structured"]}
+    assert store.list_catalog(tenant_id="tenant-a") == []
+    with sqlite3.connect(path) as conn:
+        state = conn.execute(
+            "SELECT projection_generation, source_digest, projection_status "
+            "FROM memory_document_projection_state WHERE tenant_id = 'tenant-a' "
+            "AND owner_user_id = 'alice' AND document_id = 'document-1'"
+        ).fetchone()
+    assert state == (0, "", "PENDING")
+    assert store.replace_memory_document_projection(
+        document,
+        blocks,
+        0,
+        tenant_id="tenant-a",
+        owner_user_id="alice",
+    ) == ()
+    assert {record.record_key for record in store.list_catalog(tenant_id="tenant-a")} == {
+        "document-record",
+        "block-record-one",
+    }
 
-    common: dict[str, Any] = {
+
+def test_vector_catalog_identity_is_tenant_qualified_and_has_no_public_uri_alias() -> None:
+    store = InMemoryVectorStore()
+    public_uri = "memoryos://contexts/shared"
+    metadata_a = {
         "tenant_id": "tenant-a",
-        "owner_user_id": "u1",
-        "timezone": "Asia/Singapore",
-        "query_intent": RetrievalQueryIntent.OPEN_RECALL,
-        "candidate_limit": 100,
-        "final_limit": 20,
+        "catalog_record_key": "shared-record-key",
+        "public_uri": public_uri,
     }
-    event_options = RetrievalOptions(
-        **common,
-        source_kinds=("time_test",),
-        event_time_from="2026-07-14",
-        event_time_to="2026-07-14",
-    )
-    transaction_options = RetrievalOptions(
-        **common,
-        source_kinds=("time_test",),
-        transaction_time_from="2026-07-14",
-        transaction_time_to="2026-07-14",
-    )
-    valid_options = RetrievalOptions(
-        **common,
-        source_kinds=("valid_test",),
-        valid_at="2026-07-14",
-    )
-    updated_options = RetrievalOptions(
-        **common,
-        source_kinds=("updated_test",),
-        updated_at_from="2026-07-14",
-        updated_at_to="2026-07-14",
-    )
+    metadata_b = {**metadata_a, "tenant_id": "tenant-b"}
+    row_a = vector_row_id("tenant-a", "shared-record-key")
+    row_b = vector_row_id("tenant-b", "shared-record-key")
 
-    assert event_options.event_time_from == "2026-07-13T16:00:00+00:00"
-    assert event_options.event_time_to == "2026-07-14T16:00:00+00:00"
-    assert selected(event_options) == {
-        "event-start-transaction-before",
-        "event-last-transaction-end",
-    }
-    assert selected(transaction_options) == {
-        "event-before-transaction-start",
-        "event-end-transaction-last",
-    }
-    assert selected(valid_options) == {
-        "valid-one-microsecond-after",
-        "valid-start-inclusive",
-    }
-    assert selected(updated_options) == {"updated-start-inclusive"}
+    with pytest.raises(ValueError, match="row ID"):
+        store.upsert_vector(public_uri, [1.0, 0.0], metadata_a)
+    with pytest.raises(ValueError, match="catalog_record_key"):
+        store.upsert_vector(public_uri, [1.0, 0.0], {"tenant_id": "tenant-a"})
+    store.upsert_vector(row_a, [1.0, 0.0], metadata_a)
+    store.upsert_vector(row_b, [0.0, 1.0], metadata_b)
 
-    with sqlite3.connect(store.path) as conn:
-        stored_event_start = conn.execute(
-            "SELECT event_time FROM contexts WHERE record_key = ?",
-            ("event-start-transaction-before",),
-        ).fetchone()[0]
-        stored_transaction_start = conn.execute(
-            "SELECT transaction_time FROM contexts WHERE record_key = ?",
-            ("event-before-transaction-start",),
-        ).fetchone()[0]
-        stored_valid_start = conn.execute(
-            "SELECT valid_from FROM contexts WHERE record_key = ?",
-            ("valid-start-inclusive",),
-        ).fetchone()[0]
-        stored_updated_start = conn.execute(
-            "SELECT updated_at FROM contexts WHERE record_key = ?",
-            ("updated-start-inclusive",),
-        ).fetchone()[0]
-    assert stored_event_start == event_options.event_time_from
-    assert stored_transaction_start == transaction_options.transaction_time_from
-    assert stored_valid_start == valid_options.valid_at
-    assert stored_updated_start == updated_options.updated_at_from
-
-
-def test_catalog_rejects_absolute_or_file_serving_uris() -> None:
-    with pytest.raises(ValueError, match="logical memoryos URI"):
-        _session_record("unsafe-uri", uri="file:///Users/u1/Desktop/private.txt")
-    with pytest.raises(ValueError, match="logical memoryos URI"):
-        CatalogRecord(
-            record_key="unsafe-source",
-            uri="memoryos://user/u1/catalog/unsafe-source",
-            tenant_id="tenant-a",
-            source_uri="/Users/u1/Desktop/private.txt",
-        )
-
-
-@pytest.mark.parametrize("context_type", ["resource", "skill"])
-def test_public_retrieval_only_enumerates_unscoped_resources_and_skills(
-    tmp_path,
-    context_type: str,
-) -> None:
-    store = SQLiteIndexStore(tmp_path / f"{context_type}.sqlite3")
-    base: dict[str, Any] = {
-        "tenant_id": "tenant-a",
-        "context_type": context_type,
-        "source_kind": context_type,
-        "record_kind": CatalogRecordKind.CONTEXT.value,
-        "l0_text": "public lookup",
-        "source_digest": "digest",
-    }
-    store.upsert_catalog_batch(
-        (
-            CatalogRecord(
-                record_key=f"{context_type}:global",
-                uri=f"memoryos://{context_type}s/global",
-                title="global public lookup",
-                **base,
-            ),
-            CatalogRecord(
-                record_key=f"{context_type}:workspace",
-                uri=f"memoryos://{context_type}s/workspace-private",
-                title="workspace public lookup",
-                metadata={
-                    "scope": {
-                        "applicability": {
-                            "all_of": [
-                                {
-                                    "namespace": "memoryos",
-                                    "kind": "workspace",
-                                    "id": "private-workspace",
-                                }
-                            ]
-                        }
-                    }
-                },
-                **base,
-            ),
-        )
-    )
-
-    plan = QueryPlanner().plan(
-        "",
-        options=RetrievalOptions(
-            tenant_id="tenant-a",
-            context_types=(ContextType(context_type),),
-            query_intent=RetrievalQueryIntent.OPEN_RECALL,
-        ),
-    )
-    generated = CandidateGenerator(store).generate(plan)
-
-    assert [item.record_key for item in generated.branches["structured"]] == [f"{context_type}:global"]
-
-
-def test_conflicts_and_options_have_deterministic_default_states_with_explicit_override(
-    tmp_path,
-) -> None:
-    store = SQLiteIndexStore(tmp_path / "states.sqlite3")
-
-    def claim(state: str, index: int) -> CatalogRecord:
-        return CatalogRecord(
-            record_key=f"claim:{state.lower()}:{index}",
-            uri=f"memoryos://user/u1/memories/canonical/claims/{state.lower()}-{index}",
-            tenant_id="tenant-a",
-            owner_user_id="u1",
-            context_type="memory",
-            source_kind="canonical_projection",
-            record_kind=CatalogRecordKind.CLAIM_REVISION.value,
-            canonical_slot_id="slot-1",
-            canonical_claim_id=f"claim-{state.lower()}-{index}",
-            canonical_revision=1,
-            canonical_state=state,
-                title=f"{state} claim",
-                l0_text=f"{state} claim",
-                source_digest=f"digest-{state}-{index}",
-                metadata={
-                    "scope": {
-                        "visibility": {
-                            "tenant_id": "tenant-a",
-                            "private": True,
-                            "allowed_principal_ids": ["u1"],
-                            "allowed_service_ids": [],
-                        }
-                    }
-                },
-            )
-
-    store.upsert_catalog_batch(
-        (
-            claim("ACTIVE", 1),
-            claim("PROPOSED", 1),
-            claim("CONFLICTED", 1),
-            claim("SUPERSEDED", 1),
-        )
-    )
-    generator = CandidateGenerator(store)
-
-    def states(intent: RetrievalQueryIntent, *, explicit: tuple[str, ...] = ()) -> set[str]:
-        metadata_filters = {"memory_states": explicit} if explicit else {}
-        plan = QueryPlanner().plan(
-            "",
-            options=RetrievalOptions(
-                tenant_id="tenant-a",
-                owner_user_id="u1",
-                context_types=(ContextType.MEMORY,),
-                query_intent=intent,
-                metadata_filters=metadata_filters,
-            ),
-        )
-        return {
-            str(item.metadata.get("canonical_state") or "") for item in generator.generate(plan).branches["structured"]
-        }
-
-    assert states(RetrievalQueryIntent.CONFLICTS) == {"CONFLICTED"}
-    assert states(RetrievalQueryIntent.OPTIONS) == {"PROPOSED", "CONFLICTED"}
-    assert states(RetrievalQueryIntent.CONFLICTS, explicit=("ACTIVE",)) == {"ACTIVE"}
+    assert row_a != row_b
+    assert store.get_vector_metadata(public_uri) is None
+    assert store.search_vector_candidates([1.0, 0.0], [public_uri]) == []
+    assert [hit.uri for hit in store.search_vector_candidates([1.0, 0.0], [row_a, row_b])] == [
+        row_a,
+        row_b,
+    ]
+    with pytest.raises(ValueError, match="tenant_id"):
+        store.delete_by_filter({"catalog_record_key": "shared-record-key"})
+    assert store.delete_by_filter(
+        {"tenant_id": "tenant-a", "catalog_record_key": "shared-record-key"}
+    ) == 1
+    assert store.get_vector_metadata(row_a) is None
+    assert store.get_vector_metadata(row_b) == metadata_b

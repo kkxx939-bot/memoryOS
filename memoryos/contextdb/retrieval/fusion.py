@@ -19,7 +19,6 @@ class RetrievalScore:
     relation_score: float = 0.0
     recency_boost: float = 0.0
     hotness_boost: float = 0.0
-    canonical_boost: float = 0.0
     rerank_score: float = 0.0
     final_score: float = 0.0
 
@@ -48,11 +47,17 @@ class RetrievalCandidate:
     l2_uri: str = ""
     source_uri: str = ""
     source_digest: str = ""
+    tenant_id: str = ""
+    owner_user_id: str = ""
     session_id: str = ""
     workspace_id: str = ""
-    canonical_slot_id: str = ""
-    canonical_claim_id: str = ""
-    canonical_revision: int = 0
+    document_id: str = ""
+    block_id: str = ""
+    document_kind: str = ""
+    document_revision: int = 0
+    projection_generation: int = 0
+    archive_digest: str = ""
+    manifest_digest: str = ""
     event_time: str = ""
     hotness: float = 0.0
     metadata: Mapping[str, Any] = field(default_factory=dict)
@@ -123,12 +128,7 @@ class FusionRanker:
             base_relevance = max(exact, lexical, vector, relation)
             recency = self._recency(candidate.event_time, reference_now) * base_relevance * 0.08
             hotness = candidate.hotness * base_relevance * 0.05
-            canonical = (
-                0.03 * base_relevance
-                if candidate.record_kind == "current_slot" and plan.query_intent == RetrievalQueryIntent.CURRENT
-                else 0.0
-            )
-            final = min(1.0, min(1.0, rrf) * 0.84 + exact * 0.05 + recency + hotness + canonical)
+            final = min(1.0, min(1.0, rrf) * 0.87 + exact * 0.05 + recency + hotness)
             ranked.append(
                 replace(
                     candidate,
@@ -139,7 +139,6 @@ class FusionRanker:
                         relation_score=relation,
                         recency_boost=recency,
                         hotness_boost=hotness,
-                        canonical_boost=canonical,
                         final_score=final,
                     ),
                 )
@@ -171,19 +170,35 @@ class FusionRanker:
         *,
         plan: RetrievalQueryPlan,
         per_session_limit: int = 5,
+        per_document_limit: int = 3,
+        blocks_per_document_limit: int = 3,
     ) -> list[RetrievalCandidate]:
         seen: set[tuple[Any, ...]] = set()
         session_counts: dict[str, int] = {}
+        document_counts: dict[tuple[str, str, str], int] = {}
+        block_counts: dict[tuple[str, str, str], int] = {}
         result: list[RetrievalCandidate] = []
         for candidate in candidates:
             identity = self._identity(candidate, plan.query_intent)
             if identity in seen:
                 continue
             if candidate.session_id:
-                count = session_counts.get(candidate.session_id, 0)
+                session_key = candidate.manifest_digest or candidate.archive_digest or candidate.session_id
+                count = session_counts.get(session_key, 0)
                 if count >= per_session_limit:
                     continue
-                session_counts[candidate.session_id] = count + 1
+                session_counts[session_key] = count + 1
+            if candidate.document_id:
+                document_key = (candidate.tenant_id, candidate.owner_user_id, candidate.document_id)
+                count = document_counts.get(document_key, 0)
+                if count >= per_document_limit:
+                    continue
+                if candidate.block_id:
+                    block_count = block_counts.get(document_key, 0)
+                    if block_count >= blocks_per_document_limit:
+                        continue
+                    block_counts[document_key] = block_count + 1
+                document_counts[document_key] = count + 1
             seen.add(identity)
             result.append(candidate)
             if len(result) >= plan.candidate_limit:
@@ -192,20 +207,32 @@ class FusionRanker:
 
     @staticmethod
     def _identity(candidate: RetrievalCandidate, intent: RetrievalQueryIntent) -> tuple[Any, ...]:
-        if candidate.canonical_slot_id and intent == RetrievalQueryIntent.CURRENT:
-            return ("slot", candidate.canonical_slot_id)
-        if candidate.canonical_claim_id and intent in {
-            RetrievalQueryIntent.HISTORY,
-            RetrievalQueryIntent.AS_OF,
-            RetrievalQueryIntent.CONFLICTS,
-            RetrievalQueryIntent.OPTIONS,
-        }:
-            return ("claim", candidate.canonical_claim_id, candidate.canonical_revision)
+        del intent
+        if candidate.document_id and candidate.block_id:
+            return (
+                "memory_block",
+                candidate.tenant_id,
+                candidate.owner_user_id,
+                candidate.document_id,
+                candidate.block_id,
+                candidate.source_digest,
+            )
+        if candidate.document_id:
+            return (
+                "memory_document",
+                candidate.tenant_id,
+                candidate.owner_user_id,
+                candidate.document_id,
+                candidate.projection_generation,
+            )
         if candidate.source_kind in {"resource", "resource_reference"}:
             resource_uri = str(candidate.metadata.get("resource_uri") or candidate.source_uri)
             return ("resource", resource_uri, candidate.source_digest)
         if candidate.session_id:
-            return ("session", candidate.source_digest or candidate.record_key)
+            return (
+                "session",
+                candidate.manifest_digest or candidate.archive_digest or candidate.source_digest or candidate.record_key,
+            )
         return ("context", candidate.source_digest or candidate.record_key)
 
     @staticmethod

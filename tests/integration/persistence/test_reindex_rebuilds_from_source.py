@@ -10,11 +10,17 @@ from memoryos.workers.reindex_worker import ReindexWorker
 def test_reindex_worker_rebuilds_index_from_source(tmp_path) -> None:
     source = FileSystemSourceStore(tmp_path)
     index = InMemoryIndexStore()
-    obj = ContextObject(uri="memoryos://user/u1/memories/profile/a", context_type=ContextType.MEMORY, title="alpha", owner_user_id="u1")
+    obj = ContextObject(uri="memoryos://user/u1/resources/profile/a", context_type=ContextType.RESOURCE, title="alpha", owner_user_id="u1")
     source.write_object(obj, content="temperature preference")
     assert obj.uri in ConsistencyVerifier(source, index).verify().missing_index
 
     ReindexWorker(source, index).rebuild()
     assert not ConsistencyVerifier(source, index).verify().missing_index
-    assert [hit.uri for hit in index.search("temperature", filters={"owner_user_id": "u1"})] == [obj.uri]
-
+    assert [
+        hit.uri
+        for hit in index.search(
+            "temperature",
+            tenant_id="default",
+            filters={"owner_user_id": "u1"},
+        )
+    ] == [obj.uri]

@@ -42,6 +42,7 @@ def canonical_digest_bytes(payload: bytes) -> str:
 
 
 class SessionArchiveStore:
+    _MAX_ENUMERATION_ENTRIES = 10_000
     _COLLECTION_FILES = {
         "messages": "messages.jsonl",
         "observations": "observations.jsonl",
@@ -370,6 +371,87 @@ class SessionArchiveStore:
         if archive.user_id != user_id:
             raise EvidenceArchiveIntegrityError("archive manifest user mismatch")
         return archive
+
+    def list_archives(
+        self,
+        *,
+        tenant_id: str | None = None,
+        after_archive_uri: str = "",
+        limit: int = 256,
+    ) -> tuple[SessionArchive, ...]:
+        """Enumerate immutable archive heads through a bounded tenant tree.
+
+        This is a recovery-only source scan, not an online retrieval path.  It
+        deliberately walks only the fixed ``users/*/sessions/history/*``
+        layout, rejects aliases, and caps every directory fan-out before
+        sorting so an unexpected tree cannot turn startup into an unbounded
+        filesystem crawl.
+        """
+
+        effective_tenant = tenant_id or self.tenant_id
+        if effective_tenant != self.tenant_id:
+            raise PermissionError("Session archive enumeration crossed the bound tenant")
+        maximum = int(limit)
+        if maximum <= 0 or maximum > 1_000:
+            raise ValueError("Session archive enumeration limit must be between 1 and 1000")
+        cursor = str(after_archive_uri or "")
+        if cursor:
+            parsed_cursor = ContextURI.parse(cursor)
+            if (
+                parsed_cursor.authority != "user"
+                or len(parsed_cursor.segments) != 4
+                or parsed_cursor.segments[1:3] != ("sessions", "history")
+            ):
+                raise ValueError("Session archive cursor is not an archive URI")
+
+        users_root = self.root.resolve() / "tenants" / effective_tenant / "users"
+        if not users_root.exists():
+            return ()
+        users = self._bounded_child_directories(users_root, label="Session user root")
+        candidates: list[tuple[Path, str]] = []
+        for user_root in users:
+            user_id = require_safe_path_segment(user_root.name, "Session archive user_id")
+            history_root = user_root / "sessions" / "history"
+            if not history_root.exists():
+                continue
+            for session_root in self._bounded_child_directories(
+                history_root,
+                label="Session history root",
+            ):
+                head_path = session_root / "commit_head.json"
+                if not head_path.exists() and not head_path.is_symlink():
+                    continue
+                candidates.append((head_path, user_id))
+                if len(candidates) > self._MAX_ENUMERATION_ENTRIES:
+                    raise EvidenceArchiveIntegrityError(
+                        "Session archive tree exceeded its enumeration bound"
+                    )
+        archives = sorted(
+            (
+                self.read_archive_from_commit_head(
+                    head_path,
+                    tenant_id=effective_tenant,
+                    user_id=user_id,
+                )
+                for head_path, user_id in candidates
+            ),
+            key=lambda archive: archive.archive_uri,
+        )
+        return tuple(archive for archive in archives if archive.archive_uri > cursor)[:maximum]
+
+    def _bounded_child_directories(self, parent: Path, *, label: str) -> tuple[Path, ...]:
+        if parent.is_symlink() or not parent.is_dir():
+            raise EvidenceArchiveIntegrityError(f"{label} is unsafe")
+        children: list[Path] = []
+        for child in parent.iterdir():
+            if child.is_symlink():
+                raise EvidenceArchiveIntegrityError(f"{label} contains a symbolic link")
+            if not child.is_dir():
+                raise EvidenceArchiveIntegrityError(f"{label} contains a non-directory entry")
+            children.append(child)
+            if len(children) > self._MAX_ENUMERATION_ENTRIES:
+                raise EvidenceArchiveIntegrityError(f"{label} exceeded its enumeration bound")
+        return tuple(sorted(children, key=lambda path: path.name))
 
     def read_archive_at_manifest(
         self,

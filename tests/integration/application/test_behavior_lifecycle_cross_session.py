@@ -32,15 +32,17 @@ def test_behavior_lifecycle_aggregates_across_history(tmp_path) -> None:
     second_ops = planner.plan(_archive("u1", "s2", "hot_room"))
     committer.commit("u1", second_ops)
     assert any(op.context_type == ContextType.BEHAVIOR_CLUSTER for op in second_ops)
-    assert any(op.context_type == ContextType.MEMORY for op in second_ops)
+    assert any(op.context_type == ContextType.BEHAVIOR_SUPPORT for op in second_ops)
 
     third_ops = planner.plan(_archive("u1", "s3", "hot_room"))
+    support_ops = [op for op in third_ops if op.context_type == ContextType.BEHAVIOR_SUPPORT]
+    assert [op.action for op in support_ops] == [OperationAction.UPDATE]
     committer.commit("u1", third_ops)
     pattern_ops = [op for op in third_ops if op.context_type == ContextType.BEHAVIOR_PATTERN]
     assert pattern_ops
     assert pattern_ops[0].target_uri is not None
     pattern_obj = source.read_object(pattern_ops[0].target_uri)
-    assert pattern_obj.metadata["memory_anchor_uri"]
+    assert pattern_obj.metadata["support_anchor_uri"]
 
     stale_ops = planner.plan(_archive("u1", "old", "one_off", older_than_days=4))
     assert any(op.action == OperationAction.ARCHIVE for op in stale_ops)

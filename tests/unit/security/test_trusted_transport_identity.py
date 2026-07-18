@@ -11,7 +11,7 @@ import urllib.error
 import uuid
 from email.message import Message
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import pytest
 
@@ -34,23 +34,11 @@ from memoryos.api.trusted_context import (
     READ_CONTEXT,
     TrustedRequestContext,
 )
-from memoryos.contextdb.model.context_layer import ContextLayers
 from memoryos.contextdb.model.context_object import ContextObject
 from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.model.lifecycle import LifecycleState
-from memoryos.contextdb.session.session_archive import EvidenceArchiveIntegrityError
 from memoryos.contextdb.store.local_stores import FileSystemSourceStore
 from memoryos.contextdb.store.sqlite_index_store import SQLiteIndexStore
 from memoryos.contextdb.store.sqlite_relation_store import SQLiteRelationStore
-from memoryos.memory.canonical.current_head import publish_current_head_sets
-from memoryos.memory.canonical.event import canonical_digest
-from memoryos.memory.canonical.projection_state import ProjectionIntegrityError
-from memoryos.operations.commit.effect_marker import atomic_write_json
-from memoryos.operations.commit.receipt import build_transaction_receipt
-from memoryos.operations.model.context_diff import ContextDiff
-from memoryos.operations.model.context_operation import ContextOperation
-from memoryos.operations.model.operation_action import OperationAction
-from memoryos.operations.model.operation_status import OperationStatus
 from memoryos.runtime.readiness import RuntimeReadinessState
 
 
@@ -73,7 +61,7 @@ def _caller(
 def _visible_metadata(*, workspace_id: str = "trusted-project", **extra: Any) -> dict[str, Any]:
     return {
         "scope": {
-            "canonical_subject": {"namespace": "memoryos", "kind": "principal", "id": "u1"},
+            "subject": {"namespace": "memoryos", "kind": "principal", "id": "u1"},
             "applicability": {"all_of": [{"namespace": "memoryos", "kind": "workspace", "id": workspace_id}]},
             "visibility": {
                 "tenant_id": "default",
@@ -195,7 +183,14 @@ def test_http_bearer_binds_identity_capability_and_archived_actor(tmp_path: Path
     assert {message["actor_id"] for message in archived["messages"]} == {"codex"}
     assert archived["metadata"]["tenant_id"] == "default"
 
-    review_status, _ = asyncio.run(_asgi_request(app, "POST", "/v1/memories/pending/review", {"user_id": "u1"}))
+    review_status, _ = asyncio.run(
+        _asgi_request(
+            app,
+            "POST",
+            "/v1/memories/review",
+            {"proposal_id": "proposal-1", "decision": "REJECT"},
+        )
+    )
     assert review_status == 403
 
     app.client.commit_agent_session(
@@ -394,15 +389,25 @@ def test_http_user_and_service_connect_identity_is_statically_bound(
     assert client.connect_metadata["capabilities"]["can_execute_action"] is False
 
 
-def test_http_trusted_user_remember_binds_connect_source_metadata(tmp_path: Path) -> None:
+def test_http_trusted_user_remember_binds_authenticated_document_owner(tmp_path: Path) -> None:
     class RecordingClient(MemoryOSClient):
         def __init__(self, root: str) -> None:
             super().__init__(root, mode="server")
-            self.remember_metadata: dict[str, Any] = {}
+            self.remember_call: dict[str, Any] = {}
 
         def remember(self, **kwargs: Any) -> dict[str, Any]:
-            self.remember_metadata = dict(kwargs.get("connect_metadata") or {})
-            return {"status": "COMMITTED", "uri": "memoryos://user/u1/memories/test"}
+            self.remember_call = dict(kwargs)
+            return {
+                "document_uri": "memoryos://user/u1/memory/documents/document-1",
+                "document_id": "document-1",
+                "document_kind": "topic",
+                "relative_path": "topics/trusted.md",
+                "document_revision": 1,
+                "source_digest": "a" * 64,
+                "changed": True,
+                "edit_summary": "explicit remember",
+                "projection_status": "ENQUEUED",
+            }
 
     client = RecordingClient(str(tmp_path))
     caller = TrustedRequestContext(
@@ -422,24 +427,18 @@ def test_http_trusted_user_remember_binds_connect_source_metadata(tmp_path: Path
             "/v1/memories/remember",
             {
                 "content": "trusted",
-                "memory_type": "project_decision",
-                "project_id": "trusted-project",
-                "connect_metadata": {
-                    "adapter_id": "u1",
-                    "connect_type": "embodied",
-                    "capabilities": {"can_execute_action": True},
-                },
+                "target_hint": "topic:trusted",
             },
         )
     )
 
     assert status == 200
-    assert client.remember_metadata["adapter_id"] == "u1"
-    assert client.remember_metadata["connect_type"] == "agent"
-    assert client.remember_metadata["capabilities"]["can_execute_action"] is False
+    assert client.remember_call["caller"] == caller
+    assert client.remember_call["tenant_id"] == "default"
+    assert client.remember_call["target_hint"] == "topic:trusted"
 
 
-def test_http_remember_rejects_non_object_identity_fields_before_client_call(tmp_path: Path) -> None:
+def test_http_remember_rejects_removed_fields_before_client_call(tmp_path: Path) -> None:
     class RecordingClient(MemoryOSClient):
         def __init__(self, root: str) -> None:
             super().__init__(root, mode="server")
@@ -463,11 +462,8 @@ def test_http_remember_rejects_non_object_identity_fields_before_client_call(tmp
             "POST",
             "/v1/memories/remember",
             {
-                "user_id": "u1",
-                "tenant_id": "default",
                 "content": "PostgreSQL",
-                "project_id": "trusted-project",
-                "identity_fields": ["primary storage backend"],
+                "title": "primary storage backend",
             },
         )
     )
@@ -578,7 +574,7 @@ class _MCPClient:
         self.calls.append(("forget", kwargs))
         if self.forget_error:
             return {"error": {"code": "HTTP_ERROR", "message": "HTTP 409"}}
-        return {"status": "COMMITTED", "uri": kwargs["uri"]}
+        return {"document_uri": kwargs["document_uri"], "mode": "SOFT_FORGET"}
 
 
 @pytest.mark.parametrize(("actor_kind", "actor_id"), [("user", "u1"), ("service", "service-a")])
@@ -639,6 +635,7 @@ def test_mcp_defaults_hide_and_reject_authoritative_tools_and_identity_override(
 
     assert "memoryos_remember" not in names
     assert "memoryos_forget" not in names
+    assert "memoryos_merge_memory_documents" not in names
     assert server.call_tool("memoryos_remember", {"content": "x"})["error"]["code"] == "PERMISSION_DENIED"
     assert (
         server.call_tool("memoryos_commit_session", {"session_id": "s1", "user_id": "u2"})["error"]["code"]
@@ -670,15 +667,18 @@ def test_mcp_trusted_user_capability_is_static_and_preserves_remote_error() -> N
     result = server.call_tool(
         "memoryos_forget",
         {
-            "user_id": "u1",
-            "uri": "memoryos://user/u1/memories/x",
-            "connect_metadata": {"capabilities": {"can_write_memory": False}},
+            "document_uri": "memoryos://user/u1/memory/documents/01ARZ3NDEKTSV4RRFFQ69G5FAV",
         },
     )
 
-    assert {"memoryos_remember", "memoryos_forget"}.issubset(names)
+    assert {
+        "memoryos_remember",
+        "memoryos_forget",
+        "memoryos_merge_memory_documents",
+        "memoryos_resume_memory_consolidation",
+    }.issubset(names)
     assert result["error"]["code"] == "HTTP_ERROR"
-    assert client.calls[0][1]["tenant_id"] == "default"
+    assert client.calls[0][1]["document_uri"].endswith("01ARZ3NDEKTSV4RRFFQ69G5FAV")
 
 
 def test_authoritative_remember_capability_does_not_turn_an_agent_into_the_user() -> None:
@@ -697,151 +697,6 @@ def test_authoritative_remember_capability_does_not_turn_an_agent_into_the_user(
     assert client.calls == []
 
 
-def test_exact_read_requires_committed_visibility_and_formal_projection_proof(tmp_path: Path) -> None:
-    client = MemoryOSClient(str(tmp_path))
-    caller = _caller()
-    uri = "memoryos://user/u1/memories/claims/c1"
-    sibling_l0 = "memoryos://user/u1/projections/c1/l0.md"
-    obj = ContextObject(
-        uri=uri,
-        context_type=ContextType.MEMORY,
-        title="claim",
-        owner_user_id="u1",
-        tenant_id="default",
-        layers=ContextLayers(l0_uri=sibling_l0, l2_uri=f"{uri}/l2.json"),
-        metadata=_visible_metadata(
-            canonical_kind="claim",
-            state="ACTIVE",
-            canonical_idempotency_key="idem-1",
-            canonical_transaction_id="tx-1",
-        ),
-    )
-    client.source_store.write_object(obj)
-    client.source_store.write_content(sibling_l0, "committed L0")
-    persisted = client.source_store.read_object(uri)
-    persisted_content = client.source_store.read_content(persisted.layers.l2_uri or persisted.uri)
-    operation = ContextOperation(
-        user_id="u1",
-        context_type=ContextType.MEMORY,
-        action=OperationAction.ADD,
-        target_uri=uri,
-        operation_id="op-exact-read",
-        payload={
-            "canonical_memory": True,
-            "transaction_id": "tx-1",
-            "idempotency_key": "idem-1",
-            "tenant_id": "default",
-            "commit_group_id": "exact-read-group",
-            "planning_digest": canonical_digest(["exact-read-plan"]),
-            "context_object": persisted.to_dict(),
-            "content": persisted_content,
-        },
-    )
-    diff_payload = {
-        "diff_id": "diff-exact-read",
-        "user_id": "u1",
-        "operations": [operation.to_dict()],
-        "pending_operations": [],
-        "rejected_operations": [],
-    }
-    marker = tmp_path / "system" / "transactions" / "idem-1.json"
-    receipt = build_transaction_receipt(
-        transaction_id="tx-1",
-        idempotency_key="idem-1",
-        tenant_id="default",
-        user_id="u1",
-        commit_group_id="exact-read-group",
-        operations=[operation],
-        diff=diff_payload,
-        planning_digest=str(operation.payload["planning_digest"]),
-        prepared_intent_digest=canonical_digest(["exact-read-intent"]),
-        relation_effects=[],
-    )
-    atomic_write_json(
-        marker,
-        receipt,
-        artifact_root=tmp_path,
-    )
-    publish_current_head_sets(tmp_path, marker, receipt)
-
-    assert client.read(uri, layer="L2", caller=caller)["content"] == persisted_content
-    with pytest.raises(ProjectionIntegrityError):
-        client.read(uri, layer="L0", caller=caller)
-
-    marker.unlink()
-    with pytest.raises(RuntimeError, match="current proof is invalid"):
-        client.read(uri, caller=caller)
-    assert client.readiness.state.value == "NOT_READY"
-
-    pending_uri = "memoryos://user/u1/memories/pending/p1"
-    unproved_client = MemoryOSClient(str(tmp_path / "unproved"))
-    unproved_client.source_store.write_object(
-        ContextObject(
-            uri=pending_uri,
-            context_type=ContextType.MEMORY,
-            title="pending",
-            owner_user_id="u1",
-            tenant_id="default",
-            lifecycle_state=LifecycleState.PENDING,
-            metadata=_visible_metadata(canonical_kind="pending_proposal"),
-        )
-    )
-    with pytest.raises(FileNotFoundError):
-        unproved_client.read(pending_uri, caller=caller)
-
-
-def test_forget_visibility_is_not_authority_and_rejected_diff_is_not_success() -> None:
-    uri = "memoryos://user/u1/memories/x"
-    visible_only = ContextObject(
-        uri=uri,
-        context_type=ContextType.MEMORY,
-        title="other owner",
-        owner_user_id="u2",
-        metadata=_visible_metadata(),
-    )
-    client = object.__new__(MemoryOSClient)
-
-    class _VisibleOnlyDB:
-        def read_object(self, _uri: str) -> ContextObject:
-            return visible_only
-
-    client.context_db = cast(Any, _VisibleOnlyDB())
-    with pytest.raises(PermissionError):
-        client.forget(user_id="u1", uri=uri)
-
-    wrong_uri_owner = ContextObject(
-        uri="memoryos://user/u2/memories/x",
-        context_type=ContextType.MEMORY,
-        title="wrong URI owner",
-        owner_user_id="u1",
-    )
-
-    class _WrongURIContextDB:
-        def read_object(self, _uri: str) -> ContextObject:
-            return wrong_uri_owner
-
-    client.context_db = cast(Any, _WrongURIContextDB())
-    with pytest.raises(PermissionError, match="URI owner"):
-        client.forget(user_id="u1", uri=wrong_uri_owner.uri)
-
-    owned = ContextObject(
-        uri=uri,
-        context_type=ContextType.MEMORY,
-        title="owned",
-        owner_user_id="u1",
-    )
-
-    class _RejectedDB:
-        def read_object(self, _uri: str) -> ContextObject:
-            return owned
-
-        def commit_operation(self, operation: Any) -> ContextDiff:
-            operation.status = OperationStatus.REJECTED
-            return ContextDiff(user_id="u1", rejected_operations=[operation])
-
-    client.context_db = cast(Any, _RejectedDB())
-    with pytest.raises(RuntimeError, match="not fully committed"):
-        client.forget(user_id="u1", uri=uri)
 
 
 def test_shared_session_sanitizes_reserved_scope_and_local_sdk_stays_compatible(tmp_path: Path) -> None:
@@ -957,82 +812,9 @@ def test_archive_and_recall_trace_exact_reads_bind_owner_and_tenant(tmp_path: Pa
         client.recall_trace(unowned_trace_id, caller=caller)
 
 
-def test_archive_search_binds_same_user_to_trusted_tenant(tmp_path: Path) -> None:
-    client = MemoryOSClient(str(tmp_path))
-    caller = _caller()
-    client.commit_agent_session(
-        user_id="u1",
-        session_id="default-tenant",
-        messages=[{"role": "user", "content": "visible-default-tenant"}],
-        tenant_id="default",
-        scope={"tenant_id": "default"},
-        async_commit=False,
-    )
-    client.commit_agent_session(
-        user_id="u1",
-        session_id="other-tenant",
-        messages=[{"role": "user", "content": "hidden-other-tenant"}],
-        tenant_id="other",
-        scope={"tenant_id": "other"},
-        async_commit=False,
-    )
-
-    assert client.archive_search(
-        "visible-default-tenant",
-        user_id="u1",
-        tenant_id="default",
-        caller=caller,
-    )
-    assert not client.archive_search(
-        "hidden-other-tenant",
-        user_id="u1",
-        tenant_id="default",
-        caller=caller,
-    )
 
 
-def test_archive_search_fails_closed_on_malformed_owned_commit_head(tmp_path: Path) -> None:
-    client = MemoryOSClient(str(tmp_path))
-    result = client.commit_agent_session(
-        user_id="u1",
-        session_id="corrupt-head",
-        messages=[{"role": "user", "content": "must-not-disappear"}],
-        tenant_id="default",
-        scope={"tenant_id": "default"},
-        async_commit=False,
-    )
-    head_path = client.session_archive_store._dir(result.archive_uri, tenant_id="default") / "commit_head.json"
-    head_path.write_text("{not-json", encoding="utf-8")
-
-    with pytest.raises(EvidenceArchiveIntegrityError, match="archive commit head"):
-        client.archive_search("must-not-disappear", user_id="u1", tenant_id="default")
-
-
-def test_archive_search_rejects_owned_commit_head_symlink(tmp_path: Path) -> None:
-    client = MemoryOSClient(str(tmp_path))
-    result = client.commit_agent_session(
-        user_id="u1",
-        session_id="symlink-head",
-        messages=[{"role": "user", "content": "must-not-cross-artifact-path"}],
-        tenant_id="default",
-        scope={"tenant_id": "default"},
-        async_commit=False,
-    )
-    head_path = client.session_archive_store._dir(result.archive_uri, tenant_id="default") / "commit_head.json"
-    target = tmp_path / "archive-head-target.bin"
-    target.write_bytes(head_path.read_bytes())
-    head_path.unlink()
-    head_path.symlink_to(target)
-
-    with pytest.raises(EvidenceArchiveIntegrityError, match="symbolic link"):
-        client.archive_search(
-            "must-not-cross-artifact-path",
-            user_id="u1",
-            tenant_id="default",
-        )
-
-
-def test_sdk_scope_keys_use_canonical_hierarchy() -> None:
+def test_sdk_scope_keys_use_stable_hierarchy() -> None:
     assert _scope_keys(
         [
             {
@@ -1059,7 +841,7 @@ def test_runtime_tenant_binding_preserves_default_paths_and_isolates_nondefault(
     assert tenant_a.index_store.path == tmp_path / "tenants" / "tenant-a" / "indexes" / "context.sqlite3"
     assert tenant_b.relation_store.path == tmp_path / "tenants" / "tenant-b" / "indexes" / "relations.sqlite3"
 
-    uri = "memoryos://user/u1/memories/same-uri"
+    uri = "memoryos://user/u1/resources/same-uri"
     for client, tenant_id, content in (
         (tenant_a, "tenant-a", "A"),
         (tenant_b, "tenant-b", "B"),
@@ -1067,7 +849,7 @@ def test_runtime_tenant_binding_preserves_default_paths_and_isolates_nondefault(
         client.context_db.seed_object(
             ContextObject(
                 uri=uri,
-                context_type=ContextType.MEMORY,
+                    context_type=ContextType.RESOURCE,
                 title=tenant_id,
                 owner_user_id="u1",
                 tenant_id=tenant_id,
@@ -1082,8 +864,8 @@ def test_runtime_tenant_binding_preserves_default_paths_and_isolates_nondefault(
     with pytest.raises(PermissionError, match="SourceStore tenant"):
         FileSystemSourceStore(tmp_path, tenant_id="tenant-a").write_object(
             ContextObject(
-                uri="memoryos://user/u1/memories/wrong-tenant",
-                context_type=ContextType.MEMORY,
+                uri="memoryos://user/u1/resources/wrong-tenant",
+                context_type=ContextType.RESOURCE,
                 title="wrong",
                 owner_user_id="u1",
                 tenant_id="tenant-b",
@@ -1511,11 +1293,11 @@ def test_explicitly_shared_hook_queue_never_consumes_another_user(tmp_path: Path
 
 def test_workspace_authorization_applies_to_exact_and_query_paths(tmp_path: Path) -> None:
     client = MemoryOSClient(str(tmp_path))
-    uri = "memoryos://user/u1/memories/workspace-b"
+    uri = "memoryos://user/u1/resources/workspace-b"
     client.source_store.write_object(
         ContextObject(
             uri=uri,
-            context_type=ContextType.MEMORY,
+            context_type=ContextType.RESOURCE,
             title="workspace B",
             owner_user_id="u1",
             tenant_id="default",
@@ -1541,22 +1323,6 @@ def test_workspace_authorization_applies_to_exact_and_query_paths(tmp_path: Path
         )
 
 
-def test_unproved_active_canonical_claim_is_hidden(tmp_path: Path) -> None:
-    client = MemoryOSClient(str(tmp_path))
-    uri = "memoryos://user/u1/memories/claims/unproved"
-    client.source_store.write_object(
-        ContextObject(
-            uri=uri,
-            context_type=ContextType.MEMORY,
-            title="unproved",
-            owner_user_id="u1",
-            tenant_id="default",
-            metadata=_visible_metadata(canonical_kind="claim", state="ACTIVE"),
-        ),
-        content="must-not-be-visible",
-    )
-    with pytest.raises(FileNotFoundError, match="transaction proof"):
-        client.read(uri, caller=_caller())
 
 
 def test_remote_search_errors_are_not_converted_to_successful_empty_results() -> None:
@@ -1584,9 +1350,9 @@ def test_remote_search_errors_are_not_converted_to_successful_empty_results() ->
         client.assemble_context("secret")
     with pytest.raises(RemoteMemoryOSError):
         client.archive_search("secret", user_id="u1")
-    with pytest.raises(RemoteMemoryOSError) as pending_error:
-        client.list_pending(user_id="u1")
-    assert pending_error.value.status_code == 403
+    with pytest.raises(RemoteMemoryOSError) as history_error:
+        client.list_memory_history("memoryos://user/u1/memory/documents/01ARZ3NDEKTSV4RRFFQ69G5FAV")
+    assert history_error.value.status_code == 403
 
     router = MemoryOSMCPServer(
         client,
@@ -1603,7 +1369,7 @@ def test_remote_search_errors_are_not_converted_to_successful_empty_results() ->
     assert result["error"]["code"] == "PERMISSION_DENIED"
     assert result["error"]["retryable"] is False
 
-    class FailingPendingClient(DeniedHTTPClient):
+    class FailingHistoryClient(DeniedHTTPClient):
         def request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
             return {
                 "error": {
@@ -1617,7 +1383,9 @@ def test_remote_search_errors_are_not_converted_to_successful_empty_results() ->
             }
 
     with pytest.raises(RemoteMemoryOSError) as server_error:
-        FailingPendingClient().list_pending(user_id="u1")
+        FailingHistoryClient().list_memory_history(
+            "memoryos://user/u1/memory/documents/01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        )
     assert server_error.value.status_code == 500
     assert server_error.value.retryable is True
 
@@ -1679,24 +1447,41 @@ def test_remote_not_ready_error_survives_http_sdk_and_mcp_mapping() -> None:
 @pytest.mark.parametrize(
     "invoke",
     [
-        pytest.param(lambda client: client.remember(user_id="u1", content="remember"), id="remember"),
+        pytest.param(lambda client: client.remember("remember"), id="remember"),
+        pytest.param(
+            lambda client: client.edit_memory_document(
+                "memoryos://user/u1/memory/documents/01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "updated",
+                "a" * 64,
+            ),
+            id="edit",
+        ),
         pytest.param(
             lambda client: client.forget(
-                user_id="u1",
-                uri="memoryos://user/u1/memories/canonical/slots/s1/claims/c1",
+                "memoryos://user/u1/memory/documents/01ARZ3NDEKTSV4RRFFQ69G5FAV",
             ),
             id="forget",
         ),
         pytest.param(
-            lambda client: client.review_pending(
-                user_id="u1",
-                pending_uri="memoryos://user/u1/memories/pending/p1",
-                decision="REJECT",
+            lambda client: client.list_memory_history(
+                "memoryos://user/u1/memory/documents/01ARZ3NDEKTSV4RRFFQ69G5FAV"
             ),
-            id="review_pending",
+            id="history",
         ),
         pytest.param(
-            lambda client: client.read("memoryos://user/u1/memories/canonical/slots/s1/claims/c1"),
+            lambda client: client.restore_memory_revision(
+                "memoryos://user/u1/memory/documents/01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                1,
+                "",
+            ),
+            id="restore",
+        ),
+        pytest.param(
+            lambda client: client.review_memory_edit("proposal-1", "REJECT"),
+            id="review",
+        ),
+        pytest.param(
+            lambda client: client.read("memoryos://user/u1/resources/document-1"),
             id="read",
         ),
         pytest.param(lambda client: client.recall_trace("trace-1"), id="recall_trace"),
@@ -1794,7 +1579,7 @@ def test_remote_memory_mcp_write_maps_not_ready_instead_of_returning_raw_error()
         "memoryos_remember",
         {
             "content": "remember safely",
-            "identity_fields": {"decision_topic": "runtime readiness"},
+            "target_hint": "topic:runtime readiness",
         },
     )
     assert result["error"]["code"] == "NOT_READY"

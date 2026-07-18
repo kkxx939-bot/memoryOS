@@ -13,6 +13,7 @@ from memoryos.contextdb.layers.layer_generator import (
 )
 from memoryos.contextdb.model.context_layer import ContextLayers
 from memoryos.contextdb.model.context_object import ContextObject
+from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.store.source_store import SourceStore
 from memoryos.security.context_projection import ContextProjectionSanitizer
 
@@ -30,11 +31,9 @@ class LayerRefresher:
         self,
         source_store: SourceStore,
         *,
-        migration_gate=None,  # noqa: ANN001
         domain_classifier: ContextDomainClassifier | None = None,
     ) -> None:
         self.source_store = source_store
-        self.migration_gate = migration_gate or getattr(source_store, "migration_gate", None)
         self.domain_classifier = (
             domain_classifier
             or getattr(source_store, "domain_classifier", None)
@@ -43,14 +42,7 @@ class LayerRefresher:
         self.sanitizer = ContextProjectionSanitizer()
 
     def refresh(self, obj: ContextObject, content: str, bullets: list[str] | None = None) -> LayerRefreshResult:
-        acquire = getattr(self.migration_gate, "acquire_projection_fence", None)
-        release = getattr(self.migration_gate, "release_projection_fence", None)
-        fence = acquire() if callable(acquire) else None
-        try:
-            return self._refresh_unfenced(obj, content, bullets=bullets)
-        finally:
-            if callable(release):
-                release(fence)
+        return self._refresh_unfenced(obj, content, bullets=bullets)
 
     def _refresh_unfenced(
         self,
@@ -58,6 +50,10 @@ class LayerRefresher:
         content: str,
         bullets: list[str] | None = None,
     ) -> LayerRefreshResult:
+        if obj.context_type is ContextType.MEMORY or "/memory/documents/" in obj.uri:
+            raise PermissionError(
+                "Markdown memory layers are owned by MemoryDocumentProjector"
+            )
         if self.domain_classifier.owns_object(obj):
             raise ValueError("domain-owned layers require their authoritative projector")
         base = obj.uri

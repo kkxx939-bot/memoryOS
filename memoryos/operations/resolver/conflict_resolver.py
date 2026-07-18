@@ -4,10 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
 
 from memoryos.contextdb.model.context_type import ContextType
-from memoryos.operations.commit.domain_registry import memory_commit_handlers
 from memoryos.operations.model.context_operation import ContextOperation
 from memoryos.operations.model.operation_action import OperationAction
 from memoryos.operations.model.operation_status import OperationStatus
@@ -18,7 +16,7 @@ class ConflictType(str, Enum):
 
     DUPLICATE = "duplicate"
     DELETE_OVERRIDES_UPDATE = "delete_overrides_update"
-    POLICY_MEMORY_CONSTRAINS_ACTION = "policy_memory_constrains_action"
+    POLICY_SUPPORT_CONSTRAINS_ACTION = "policy_support_constrains_action"
     DISABLED_POLICY_BLOCKS_REWARD = "disabled_policy_blocks_reward"
     SUPERSEDE_REQUIRES_TARGET = "supersede_requires_target"
     REWARD_PENALTY_MERGE = "reward_penalty_merge"
@@ -34,96 +32,45 @@ class ConflictResult:
 
 
 @dataclass(frozen=True)
-class MemoryOperationMetadata:
-    """保存 MemoryOperationMetadata 需要的这组数据。"""
+class PolicySupportMetadata:
+    """Typed policy-support fields used by the generic operation plane."""
 
-    semantic_memory_type: str
-    storage_memory_kind: str
-    claim_state: str
-    canonical_rule_type: str
-    structured_value: str
+    support_anchor_kind: str
+    policy_rule_type: str
+    policy_rule_value: str
     related_action: str
     constrains_policy_uris: tuple[str, ...]
-    scope: dict[str, Any]
 
 
-def operation_memory_metadata(operation: ContextOperation) -> MemoryOperationMetadata:
-    """分开读取语义类型、存储类型、Claim 状态和作用域。"""
+def operation_policy_support_metadata(operation: ContextOperation) -> PolicySupportMetadata:
+    """Read only neutral support metadata; lexical text never grants policy authority."""
 
     context_object = operation.payload.get("context_object")
     metadata = dict(context_object.get("metadata", {}) or {}) if isinstance(context_object, dict) else {}
-    revisions = metadata.get("revisions", []) or []
-    handlers = memory_commit_handlers()
-    if metadata.get("canonical_kind") == "claim" and handlers is not None:
-        current = handlers.materialized_current_revision_payload(metadata)
-    else:
-        current = dict(revisions[-1]) if revisions and isinstance(revisions[-1], dict) else {}
-    values = dict(current.get("value_fields", {}) or {})
-    semantic_memory_type = str(operation.payload.get("memory_type") or metadata.get("memory_type") or "")
-    storage_memory_kind = str(metadata.get("memory_kind") or operation.payload.get("memory_kind") or "")
-    claim_state = str(
-        metadata.get("state") or metadata.get("claim_state") or operation.payload.get("claim_state") or ""
-    )
-    canonical_rule_type = str(
-        metadata.get("canonical_rule_type")
-        or values.get("rule_type")
-        or operation.payload.get("canonical_rule_type")
-        or ""
-    )
-    structured_value = str(
-        values.get("canonical_value") or values.get("value") or operation.payload.get("rule_value") or ""
-    )
     related_action = str(
         metadata.get("related_action")
-        or values.get("related_action")
         or operation.payload.get("related_action")
         or operation.payload.get("action")
         or ""
     )
     constrained = metadata.get("constrains_policy_uris") or operation.payload.get("constrains_policy_uris") or []
-    raw_scope = metadata["scope"] if "scope" in metadata else operation.payload.get("scope", {})
-    return MemoryOperationMetadata(
-        semantic_memory_type=semantic_memory_type,
-        storage_memory_kind=storage_memory_kind,
-        claim_state=claim_state,
-        canonical_rule_type=canonical_rule_type,
-        structured_value=structured_value,
+    if not isinstance(constrained, list | tuple | set):
+        constrained = []
+    return PolicySupportMetadata(
+        support_anchor_kind=str(metadata.get("support_anchor_kind") or ""),
+        policy_rule_type=str(metadata.get("policy_rule_type") or operation.payload.get("policy_rule_type") or ""),
+        policy_rule_value=str(
+            metadata.get("policy_rule_value") or operation.payload.get("policy_rule_value") or ""
+        ),
         related_action=related_action,
         constrains_policy_uris=tuple(str(item) for item in constrained),
-        scope=dict(raw_scope) if isinstance(raw_scope, dict) else {},
     )
-
-
-def _operation_scope_keys(operation: ContextOperation) -> set[str] | None:
-    context_object = operation.payload.get("context_object")
-    metadata = dict(context_object.get("metadata", {}) or {}) if isinstance(context_object, dict) else {}
-    raw_scope = metadata["scope"] if "scope" in metadata else operation.payload.get("scope", {})
-    if not isinstance(raw_scope, dict):
-        return None
-    raw_applicability = raw_scope.get("applicability", {}) or {}
-    if not isinstance(raw_applicability, dict):
-        return None
-    try:
-        handlers = memory_commit_handlers()
-        if handlers is None:
-            return None
-        keys = set(handlers.scope_keys_from_payloads(raw_applicability.get("all_of", [])))
-    except (KeyError, TypeError, ValueError):
-        return None
-    return keys or None
 
 
 def _operation_tenant(operation: ContextOperation) -> str:
     context_object = operation.payload.get("context_object")
     object_tenant = context_object.get("tenant_id") if isinstance(context_object, dict) else None
     return str(operation.payload.get("tenant_id") or object_tenant or "default")
-
-
-def _explicit_global_scope(scope_keys: set[str]) -> bool:
-    if len(scope_keys) != 1:
-        return False
-    parts = next(iter(scope_keys)).split(":", 2)
-    return len(parts) == 3 and parts[1] == "global"
 
 
 class ConflictResolver:
@@ -153,7 +100,7 @@ class ConflictResolver:
             self._protect_disabled_auto_execute_reward(operation)
             preprocessed.append(operation)
 
-        preprocessed, policy_conflicts = self._apply_policy_memory_constraints(preprocessed)
+        preprocessed, policy_conflicts = self._apply_policy_support_constraints(preprocessed)
         conflicts.extend(policy_conflicts)
 
         grouped: dict[tuple[str, str | None], list[ContextOperation]] = {}
@@ -241,44 +188,40 @@ class ConflictResolver:
             return [suppress], rejected + duplicates, None, "suppress supersedes reward"
         return unique, duplicates, ConflictType.DUPLICATE if duplicates else None, "duplicates rejected"
 
-    def _apply_policy_memory_constraints(
+    def _apply_policy_support_constraints(
         self, operations: list[ContextOperation]
     ) -> tuple[list[ContextOperation], list[dict]]:
         conflicts: list[dict] = []
-        policy_memories = []
+        policy_rules = []
         for operation in operations:
-            if operation.context_type != ContextType.MEMORY:
+            if operation.context_type != ContextType.ACTION_POLICY_SUPPORT:
                 continue
-            metadata = operation_memory_metadata(operation)
-            is_policy = metadata.storage_memory_kind == "policy_memory" or (
-                metadata.semantic_memory_type == "project_rule" and metadata.claim_state == "ACTIVE"
-            )
-            if is_policy:
-                policy_memories.append((operation, metadata))
-        if not policy_memories:
+            metadata = operation_policy_support_metadata(operation)
+            if metadata.support_anchor_kind == "action_policy":
+                policy_rules.append((operation, metadata))
+        if not policy_rules:
             return operations, conflicts
         constrained = list(operations)
-        for memory_op, metadata in policy_memories:
-            if metadata.canonical_rule_type != "action_auto_execute" or metadata.structured_value != "forbidden":
+        for support_op, metadata in policy_rules:
+            if metadata.policy_rule_type != "action_auto_execute" or metadata.policy_rule_value != "forbidden":
                 continue
-            if not metadata.related_action and not metadata.constrains_policy_uris:
+            if not metadata.constrains_policy_uris:
                 continue
             for operation in constrained:
                 if operation.context_type != ContextType.ACTION_POLICY:
                     continue
-                rule_scope = _operation_scope_keys(memory_op)
-                policy_scope = _operation_scope_keys(operation)
-                if rule_scope is None or policy_scope is None:
-                    continue
-                if memory_op.user_id != operation.user_id or _operation_tenant(memory_op) != _operation_tenant(
+                if support_op.user_id != operation.user_id or _operation_tenant(support_op) != _operation_tenant(
                     operation
                 ):
                     continue
-                if not _explicit_global_scope(rule_scope) and not rule_scope.issubset(policy_scope):
+                if operation.target_uri not in metadata.constrains_policy_uris:
                     continue
-                if metadata.constrains_policy_uris and operation.target_uri not in metadata.constrains_policy_uris:
-                    continue
-                if metadata.related_action and str(operation.payload.get("action") or "") != metadata.related_action:
+                context_object = operation.payload.get("context_object")
+                object_metadata = (
+                    dict(context_object.get("metadata", {}) or {}) if isinstance(context_object, dict) else {}
+                )
+                policy_action = str(operation.payload.get("action") or object_metadata.get("action") or "")
+                if metadata.related_action and policy_action != metadata.related_action:
                     continue
                 operation.payload = {
                     **operation.payload,
@@ -287,11 +230,11 @@ class ConflictResolver:
                 }
             conflicts.append(
                 {
-                    "type": ConflictType.POLICY_MEMORY_CONSTRAINS_ACTION.value,
-                    "target": memory_op.target_uri,
-                    "accepted": [memory_op.operation_id],
+                    "type": ConflictType.POLICY_SUPPORT_CONSTRAINS_ACTION.value,
+                    "target": support_op.target_uri,
+                    "accepted": [support_op.operation_id],
                     "rejected": [],
-                    "reason": "policy memory constrains related action policy",
+                    "reason": "structured policy support constrains its exact action policy",
                 }
             )
         return constrained, conflicts

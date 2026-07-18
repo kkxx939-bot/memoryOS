@@ -6,7 +6,6 @@ from importlib import import_module
 from typing import Any
 
 __all__ = [
-    "CanonicalResolutionMode",
     "ContextReranker",
     "ContextSelector",
     "EmbeddingProvider",
@@ -26,7 +25,6 @@ __all__ = [
 _PLAN = "memoryos.contextdb.retrieval.query_plan"
 _PLANNER = "memoryos.application.context.query_planner"
 _EXPORTS = {
-    "CanonicalResolutionMode": (_PLAN, "CanonicalResolutionMode"),
     "ContextReranker": ("memoryos.contextdb.retrieval.reranker", "ContextReranker"),
     "ContextSelector": ("memoryos.contextdb.retrieval.context_selector", "ContextSelector"),
     "EmbeddingProvider": ("memoryos.contextdb.retrieval.embedding", "EmbeddingProvider"),

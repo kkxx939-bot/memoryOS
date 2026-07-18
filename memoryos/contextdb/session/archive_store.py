@@ -50,6 +50,14 @@ class SessionArchiveStore(Protocol):
         user_id: str,
     ) -> SessionArchive: ...
 
+    def list_archives(
+        self,
+        *,
+        tenant_id: str | None = None,
+        after_archive_uri: str = "",
+        limit: int = 256,
+    ) -> tuple[SessionArchive, ...]: ...
+
     def read_archive_at_manifest(
         self,
         archive_uri: str,

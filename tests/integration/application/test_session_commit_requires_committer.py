@@ -17,16 +17,20 @@ from memoryos.prediction.model.prediction_request import PredictionRequest
 
 
 class SessionCommitRequiresCommitterTest(unittest.TestCase):
-    def test_requires_committer_unless_plan_only(self) -> None:
+    def test_archive_only_service_commits_empty_consumers_without_committer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             archive = SessionArchive(user_id="u1", session_id="s1", archive_uri="memoryos://user/u1/sessions/history/s1", messages=[{"content": "记住我喜欢 26 度"}])
-            service = SessionCommitService(SessionArchiveStore(tmp), InMemoryQueueStore())
-            with self.assertRaises(RuntimeError):
-                service.async_commit(archive)
-            plan_store = SessionArchiveStore(tmp)
-            plan_service = SessionCommitService(plan_store, InMemoryQueueStore(), allow_plan_only=True)
-            plan_service.async_commit(archive)
-            self.assertEqual(plan_store.read_async_outputs(archive)["memory_diff"]["status"], "planned")
+            store = SessionArchiveStore(tmp)
+            service = SessionCommitService(store, InMemoryQueueStore())
+
+            result = service.async_commit(archive)
+
+            self.assertTrue(result.done)
+            outputs = store.read_async_outputs(archive)
+            self.assertEqual(outputs["memory_diff"]["status"], "committed")
+            self.assertEqual(outputs["memory_diff"]["memory_document_change_count"], 0)
+            for name in ("behavior_diff", "action_policy_diff", "context_diff"):
+                self.assertEqual(outputs[name]["operation_count"], 0)
 
     def test_committer_and_client_produce_committed_diffs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -40,10 +44,14 @@ class SessionCommitRequiresCommitterTest(unittest.TestCase):
             service.async_commit(archive)
             payload = store.read_async_outputs(archive)["memory_diff"]
             self.assertEqual(payload["status"], "committed")
-            client = MemoryOSClient(str(root))
-            policy = ActionPolicy(user_id="u1", scene_key="hot", action="turn_on_ac", memory_anchor_uri="memoryos://user/u1/memories/anchors/hot")
+            client = MemoryOSClient(str(root / "runtime"))
+            policy = ActionPolicy(user_id="u1", scene_key="hot", action="turn_on_ac", support_anchor_uri="memoryos://user/u1/support/behavior/hot")
             client.source_store.write_object(policy.to_context_object(), content=json.dumps(policy.to_dict()))
-            client.index_store.upsert_index(policy.to_context_object(), content="hot turn_on_ac")
+            client.index_store.upsert_index(
+                policy.to_context_object(),
+                content="hot turn_on_ac",
+                tenant_id="default",
+            )
             result = client.process_observation(
                 PredictionRequest(
                     user_id="u1",

@@ -44,7 +44,7 @@ class ContextAssembler:
             vector_store=getattr(hybrid_search, "vector_store", None),
             embedding_provider=getattr(hybrid_search, "embedding_provider", None),
             reranker=reranker,
-            projection_store=getattr(context_db, "projection_store", None),
+            document_overlay=getattr(context_db, "memory_document_overlay", None),
         )
 
     def search(
@@ -61,10 +61,9 @@ class ContextAssembler:
         adapter_id: str = "",
         tenant_id: str = "default",
         applicability_scope_keys: Sequence[str] | None = None,
-        memory_states: Sequence[str] | None = None,
-        memory_types: Sequence[str] | None = None,
-        claim_uris: Sequence[str] | None = None,
-        slot_uris: Sequence[str] | None = None,
+        record_kinds: Sequence[str] | None = None,
+        document_ids: Sequence[str] | None = None,
+        document_kinds: Sequence[str] | None = None,
         query_intent: str | None = None,
         options: RetrievalOptions | None = None,
     ) -> list[dict[str, Any]]:
@@ -94,10 +93,9 @@ class ContextAssembler:
             adapter_id=adapter_id,
             tenant_id=tenant_id,
             applicability_scope_keys=applicability_scope_keys,
-            memory_states=memory_states,
-            memory_types=memory_types,
-            claim_uris=claim_uris,
-            slot_uris=slot_uris,
+            record_kinds=record_kinds,
+            document_ids=document_ids,
+            document_kinds=document_kinds,
             query_intent=query_intent,
         )
         result = self.unified_retrieval.execute(plan)
@@ -120,10 +118,9 @@ class ContextAssembler:
         adapter_id: str = "",
         tenant_id: str = "default",
         applicability_scope_keys: Sequence[str] | None = None,
-        memory_states: Sequence[str] | None = None,
-        memory_types: Sequence[str] | None = None,
-        claim_uris: Sequence[str] | None = None,
-        slot_uris: Sequence[str] | None = None,
+        record_kinds: Sequence[str] | None = None,
+        document_ids: Sequence[str] | None = None,
+        document_kinds: Sequence[str] | None = None,
         query_intent: str | None = None,
         options: RetrievalOptions | None = None,
     ) -> dict[str, Any]:
@@ -168,10 +165,9 @@ class ContextAssembler:
             adapter_id=adapter_id,
             tenant_id=tenant_id,
             applicability_scope_keys=applicability_scope_keys,
-            memory_states=memory_states,
-            memory_types=memory_types,
-            claim_uris=claim_uris,
-            slot_uris=slot_uris,
+            record_kinds=record_kinds,
+            document_ids=document_ids,
+            document_kinds=document_kinds,
             query_intent=query_intent,
         )
         result = self.unified_retrieval.execute(plan)
@@ -209,10 +205,9 @@ class ContextAssembler:
         adapter_id: str,
         tenant_id: str,
         applicability_scope_keys: Sequence[str] | None,
-        memory_states: Sequence[str] | None,
-        memory_types: Sequence[str] | None,
-        claim_uris: Sequence[str] | None,
-        slot_uris: Sequence[str] | None,
+        record_kinds: Sequence[str] | None,
+        document_ids: Sequence[str] | None,
+        document_kinds: Sequence[str] | None,
         query_intent: str | None,
     ):
         parsed_types = tuple(self._context_type(item) for item in context_types)
@@ -223,7 +218,7 @@ class ContextAssembler:
             normalized_types = (
                 tuple(item for item in normalized_types if item in public_types) if normalized_types else public_types
             )
-        intent = query_intent or ("OPTIONS" if search_scope == "candidates" else "CURRENT")
+        intent = query_intent or "CURRENT"
         metadata_filters: dict[str, Any] = {}
         if connect_filters:
             metadata_filters["connect_filters"] = dict(connect_filters)
@@ -239,10 +234,9 @@ class ContextAssembler:
                     "adapter_id": adapter_id or None,
                     "search_scope": search_scope,
                     "retrieval_views": retrieval_views,
-                    "claim_uris": claim_uris,
-                    "slot_uris": slot_uris,
-                    "memory_states": memory_states,
-                    "memory_types": memory_types,
+                    "record_kinds": record_kinds,
+                    "document_ids": document_ids,
+                    "document_kinds": document_kinds,
                     "applicability_scope_keys": applicability_scope_keys,
                     "query_intent": intent,
                     "candidate_limit": min(1000, max(50, limit * 5)),

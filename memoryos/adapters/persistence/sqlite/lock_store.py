@@ -12,6 +12,15 @@ from pathlib import Path
 
 from memoryos.contextdb.store.lock_store import LockLostError, LockToken
 
+_LOCK_TABLE_LAYOUT = (
+    ("lock_key", "TEXT", 0, None, 1),
+    ("token", "TEXT", 1, None, 0),
+    ("expires_at", "TEXT", 1, None, 0),
+    ("owner", "TEXT", 1, None, 0),
+    ("created_at", "TEXT", 1, None, 0),
+    ("fence", "INTEGER", 1, "0", 0),
+)
+
 
 class SQLiteLockStore:
     def __init__(
@@ -207,21 +216,49 @@ class SQLiteLockStore:
 
     def _init_db(self) -> None:
         with self._connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS locks (
-                  lock_key TEXT PRIMARY KEY,
-                  token TEXT NOT NULL,
-                  expires_at TEXT NOT NULL,
-                  owner TEXT NOT NULL,
-                  created_at TEXT NOT NULL,
-                  fence INTEGER NOT NULL DEFAULT 0
+            existing = conn.execute(
+                "SELECT type FROM sqlite_master WHERE name = 'locks'"
+            ).fetchone()
+            if existing is None:
+                self._create_lock_table(conn)
+            elif str(existing["type"]) != "table":
+                raise RuntimeError(
+                    "unsupported LockStore layout; reset the greenfield runtime"
                 )
-                """
+            self._require_exact_lock_layout(conn)
+
+    @staticmethod
+    def _create_lock_table(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE locks (
+              lock_key TEXT PRIMARY KEY,
+              token TEXT NOT NULL,
+              expires_at TEXT NOT NULL,
+              owner TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              fence INTEGER NOT NULL DEFAULT 0
             )
-            columns = {row["name"] for row in conn.execute("PRAGMA table_info(locks)").fetchall()}
-            if "fence" not in columns:
-                conn.execute("ALTER TABLE locks ADD COLUMN fence INTEGER NOT NULL DEFAULT 0")
+            """
+        )
+
+    @staticmethod
+    def _require_exact_lock_layout(conn: sqlite3.Connection) -> None:
+        rows = conn.execute("PRAGMA table_info(locks)").fetchall()
+        layout = tuple(
+            (
+                str(row["name"]),
+                str(row["type"]).upper(),
+                int(row["notnull"]),
+                row["dflt_value"],
+                int(row["pk"]),
+            )
+            for row in rows
+        )
+        if layout != _LOCK_TABLE_LAYOUT:
+            raise RuntimeError(
+                "unsupported LockStore layout; reset the greenfield runtime"
+            )
 
     def _lease_active(self, value: str, now: datetime) -> bool:
         try:

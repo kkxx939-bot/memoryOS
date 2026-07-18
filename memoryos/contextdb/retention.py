@@ -18,19 +18,22 @@ from memoryos.contextdb.layers.layer_generator import l0_abstract, l1_overview
 from memoryos.contextdb.store.vector import vector_row_id
 from memoryos.security.context_projection import ContextProjectionSanitizer
 
+_ALL_SERVING_TIERS = tuple(tier.value for tier in ServingTier)
+
 
 class RetentionCatalogStore(Protocol):
     def scan_catalog_batch(
         self,
         *,
+        tenant_id: str,
         after_record_key: str = "",
         filters: Mapping[str, Any] | None = None,
         limit: int = 256,
     ) -> list[CatalogRecord]: ...
 
-    def get_catalog(self, record_key: str, *, tenant_id: str | None = None) -> CatalogRecord | None: ...
+    def get_catalog(self, record_key: str, *, tenant_id: str) -> CatalogRecord | None: ...
 
-    def upsert_catalog(self, record: CatalogRecord) -> None: ...
+    def upsert_catalog(self, record: CatalogRecord, *, tenant_id: str) -> None: ...
 
     def enqueue_tombstone(
         self,
@@ -44,13 +47,25 @@ class RetentionCatalogStore(Protocol):
         payload: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]: ...
 
-    def mark_tombstone_applied(self, tombstone_id: str) -> dict[str, Any] | None: ...
+    def mark_tombstone_applied(self, tombstone_id: str, *, tenant_id: str) -> dict[str, Any] | None: ...
 
-    def mark_tombstone_failed(self, tombstone_id: str, error: str) -> dict[str, Any] | None: ...
+    def mark_tombstone_failed(
+        self,
+        tombstone_id: str,
+        error: str,
+        *,
+        tenant_id: str,
+    ) -> dict[str, Any] | None: ...
 
-    def gc_orphan_paths(self, *, limit: int = 256) -> int: ...
+    def gc_orphan_paths(self, *, tenant_id: str, limit: int = 256) -> int: ...
 
-    def gc_applied_tombstones(self, *, updated_before: str, limit: int = 256) -> int: ...
+    def gc_applied_tombstones(
+        self,
+        *,
+        tenant_id: str,
+        updated_before: str,
+        limit: int = 256,
+    ) -> int: ...
 
 
 class VectorDeleteStore(Protocol):
@@ -60,7 +75,7 @@ class VectorDeleteStore(Protocol):
 
 
 class TombstoneProcessor(Protocol):
-    def process_pending(self, *, limit: int = 100) -> Any: ...
+    def process_pending(self, *, tenant_id: str, limit: int = 100) -> Any: ...
 
 
 @dataclass(frozen=True)
@@ -189,12 +204,16 @@ class CatalogRetentionManager:
         effective_now = self._utc(now or datetime.now(timezone.utc))
         scanned = 0
         changes = 0
-        tombstone_ids: list[str] = []
         cursor = ""
         while True:
             batch = self.catalog_store.scan_catalog_batch(
+                tenant_id=tenant_id,
                 after_record_key=cursor,
-                filters={"tenant_id": tenant_id, "include_inactive": True},
+                filters={
+                    "tenant_id": tenant_id,
+                    "include_inactive": True,
+                    "serving_tier": _ALL_SERVING_TIERS,
+                },
                 limit=self.policy.batch_size,
             )
             if not batch:
@@ -211,22 +230,21 @@ class CatalogRetentionManager:
                         updated_at=effective_now.isoformat(),
                         metadata=metadata,
                     )
-                    self.catalog_store.upsert_catalog(updated)
-                    if not self._retains_vector(updated):
-                        tombstone_id = self._enqueue_vector_delete(updated, reason="retention-vector-delete")
-                        if tombstone_id:
-                            tombstone_ids.append(tombstone_id)
+                    if record.record_kind in {
+                        CatalogRecordKind.MEMORY_DOCUMENT.value,
+                        CatalogRecordKind.MEMORY_BLOCK.value,
+                    }:
+                        cursor = record.record_key
+                        continue
+                    self.catalog_store.upsert_catalog(updated, tenant_id=tenant_id)
                     changes += 1
                 cursor = record.record_key
         return RetentionRunResult(
             scanned=scanned,
             tier_changes=changes,
-            tombstones_enqueued=len(tombstone_ids),
         )
 
     def tier_for(self, record: CatalogRecord, *, now: datetime) -> ServingTier:
-        if record.record_kind == CatalogRecordKind.CURRENT_SLOT.value:
-            return ServingTier.HOT
         reference = self._reference_time(record)
         if reference is None:
             # Missing structured time is unsafe to archive automatically.
@@ -252,10 +270,12 @@ class CatalogRetentionManager:
             "tenant_id": tenant_id,
             "session_id": session_id,
             "include_inactive": True,
+            "serving_tier": _ALL_SERVING_TIERS,
         }
         if owner_user_id:
             filters["owner_user_id"] = owner_user_id
         records = self.catalog_store.scan_catalog_batch(
+            tenant_id=tenant_id,
             filters=filters,
             limit=self.policy.max_compaction_sources,
         )
@@ -328,14 +348,14 @@ class CatalogRetentionManager:
                 "vector_eligible": False,
             },
         ).with_sanitized_projection(self.sanitizer)
-        self.catalog_store.upsert_catalog(compacted)
+        self.catalog_store.upsert_catalog(compacted, tenant_id=tenant_id)
         for source in sources:
             target = (
                 ServingTier.WARM if source.record_kind == CatalogRecordKind.SEMANTIC_SEGMENT.value else ServingTier.COLD
             )
             if source.serving_tier != target.value:
                 updated = replace(source, serving_tier=target.value, updated_at=effective_now)
-                self.catalog_store.upsert_catalog(updated)
+                self.catalog_store.upsert_catalog(updated, tenant_id=tenant_id)
                 if not self._retains_vector(updated):
                     self._enqueue_vector_delete(updated, reason="retention-vector-delete")
         return compacted
@@ -352,11 +372,13 @@ class CatalogRetentionManager:
         if not normalized_path.startswith("timeline/") or len(normalized_path.split("/")) != 4:
             raise ValueError("timeline compaction requires a day path")
         sources = self.catalog_store.scan_catalog_batch(
+            tenant_id=tenant_id,
             filters={
                 "tenant_id": tenant_id,
                 "owner_user_id": owner_user_id,
                 "target_paths": (normalized_path,),
                 "include_inactive": True,
+                "serving_tier": _ALL_SERVING_TIERS,
             },
             limit=self.policy.max_compaction_sources,
         )
@@ -400,7 +422,7 @@ class CatalogRetentionManager:
                 "vector_eligible": False,
             },
         ).with_sanitized_projection(self.sanitizer)
-        self.catalog_store.upsert_catalog(record)
+        self.catalog_store.upsert_catalog(record, tenant_id=tenant_id)
         return record
 
     def restore_cold_record(
@@ -426,7 +448,12 @@ class CatalogRetentionManager:
             updated_at=effective_now,
             metadata=metadata,
         )
-        self.catalog_store.upsert_catalog(restored)
+        if record.record_kind in {
+            CatalogRecordKind.MEMORY_DOCUMENT.value,
+            CatalogRecordKind.MEMORY_BLOCK.value,
+        }:
+            raise ValueError("memory document serving state must be restored by its projector")
+        self.catalog_store.upsert_catalog(restored, tenant_id=tenant_id)
         return restored
 
     def gc_stale_projections(self, *, tenant_id: str) -> RetentionRunResult:
@@ -434,8 +461,13 @@ class CatalogRetentionManager:
         tombstone_ids: list[str] = []
         while True:
             batch = self.catalog_store.scan_catalog_batch(
+                tenant_id=tenant_id,
                 after_record_key=cursor,
-                filters={"tenant_id": tenant_id, "include_inactive": True},
+                filters={
+                    "tenant_id": tenant_id,
+                    "include_inactive": True,
+                    "serving_tier": _ALL_SERVING_TIERS,
+                },
                 limit=self.policy.batch_size,
             )
             if not batch:
@@ -447,6 +479,11 @@ class CatalogRetentionManager:
                     or record.projection_status == CatalogProjectionStatus.TOMBSTONED.value
                 )
                 if not stale:
+                    continue
+                if record.record_kind in {
+                    CatalogRecordKind.MEMORY_DOCUMENT.value,
+                    CatalogRecordKind.MEMORY_BLOCK.value,
+                }:
                     continue
                 tombstone = self.catalog_store.enqueue_tombstone(
                     tenant_id=tenant_id,
@@ -464,7 +501,7 @@ class CatalogRetentionManager:
                 )
                 if str(tombstone.get("status") or "") in {"PENDING", "FAILED", "CLEANING"}:
                     tombstone_ids.append(str(tombstone["tombstone_id"]))
-        applied, failed = self._drain_tombstones(tombstone_ids)
+        applied, failed = self._drain_tombstones(tombstone_ids, tenant_id=tenant_id)
         return RetentionRunResult(
             stale_projections=applied,
             vectors_deleted=applied if self.vector_store is not None else 0,
@@ -481,8 +518,13 @@ class CatalogRetentionManager:
         scanned = 0
         while True:
             batch = self.catalog_store.scan_catalog_batch(
+                tenant_id=tenant_id,
                 after_record_key=cursor,
-                filters={"tenant_id": tenant_id, "include_inactive": True},
+                filters={
+                    "tenant_id": tenant_id,
+                    "include_inactive": True,
+                    "serving_tier": _ALL_SERVING_TIERS,
+                },
                 limit=self.policy.batch_size,
             )
             if not batch:
@@ -498,7 +540,7 @@ class CatalogRetentionManager:
                 tombstone_id = self._enqueue_vector_delete(record, reason="retention-vector-delete")
                 if tombstone_id:
                     tombstone_ids.append(tombstone_id)
-        applied, failed = self._drain_tombstones(tombstone_ids)
+        applied, failed = self._drain_tombstones(tombstone_ids, tenant_id=tenant_id)
         return RetentionRunResult(
             scanned=scanned,
             vectors_deleted=applied,
@@ -510,11 +552,16 @@ class CatalogRetentionManager:
     def gc_auxiliary_state(
         self,
         *,
+        tenant_id: str,
         now: datetime | None = None,
     ) -> RetentionRunResult:
         effective_now = self._utc(now or datetime.now(timezone.utc))
-        path_count = self.catalog_store.gc_orphan_paths(limit=self.policy.batch_size)
+        path_count = self.catalog_store.gc_orphan_paths(
+            tenant_id=tenant_id,
+            limit=self.policy.batch_size,
+        )
         tombstone_count = self.catalog_store.gc_applied_tombstones(
+            tenant_id=tenant_id,
             updated_before=(effective_now - self.policy.tombstone_journal_for).isoformat(),
             limit=self.policy.batch_size,
         )
@@ -524,41 +571,13 @@ class CatalogRetentionManager:
         )
 
     def _vector_uri(self, record: CatalogRecord) -> str:
-        row_id = vector_row_id(record.tenant_id, record.record_key)
-        if self.vector_store is None:
-            return row_id
-        metadata_getter = getattr(self.vector_store, "get_vector_metadata", None)
-        if not callable(metadata_getter) or metadata_getter(row_id) is not None:
-            return row_id
-        # Bounded compatibility cleanup for pre-namespace local rows.  Never
-        # accept a legacy row owned by another tenant or Catalog record.
-        legacy = metadata_getter(record.uri)
-        if not isinstance(legacy, Mapping):
-            return row_id
-        actual_tenant = str(legacy.get("tenant_id") or "")
-        actual_key = str(legacy.get("catalog_record_key") or "")
-        if actual_tenant and actual_tenant != record.tenant_id:
-            return row_id
-        if actual_key and actual_key != record.record_key:
-            return row_id
-        return record.uri
+        return vector_row_id(record.tenant_id, record.record_key)
 
     def _retains_vector(self, record: CatalogRecord) -> bool:
         tier_allows_vector = record.serving_tier == ServingTier.HOT.value or (
             record.serving_tier == ServingTier.WARM.value and self.policy.vectorize_warm
         )
-        # Canonical projectors own their deterministic vector eligibility and
-        # intentionally do not trust a free-form metadata flag.  CurrentSlot
-        # is always HOT; Claim revisions retain vectors only while their
-        # lifecycle tier permits it.  Session/generic Context rows continue
-        # to use the explicit sanitized ``vector_eligible`` policy bit.
-        canonical_vector = record.record_kind in {
-            CatalogRecordKind.CURRENT_SLOT.value,
-            CatalogRecordKind.CLAIM_REVISION.value,
-        }
-        return tier_allows_vector and (
-            canonical_vector or bool(record.metadata.get("vector_eligible"))
-        )
+        return tier_allows_vector and bool(record.metadata.get("vector_eligible"))
 
     def _enqueue_vector_delete(self, record: CatalogRecord, *, reason: str) -> str:
         if self.vector_store is None:
@@ -597,7 +616,12 @@ class CatalogRetentionManager:
         )
         return str(row["tombstone_id"]) if str(row.get("status") or "") in {"PENDING", "FAILED", "CLEANING"} else ""
 
-    def _drain_tombstones(self, tombstone_ids: Sequence[str]) -> tuple[int, int]:
+    def _drain_tombstones(
+        self,
+        tombstone_ids: Sequence[str],
+        *,
+        tenant_id: str,
+    ) -> tuple[int, int]:
         targets = tuple(dict.fromkeys(str(item) for item in tombstone_ids if item))
         if not targets:
             return 0, 0
@@ -605,9 +629,12 @@ class CatalogRetentionManager:
             raise RuntimeError("retention cleanup requires a durable tombstone processor")
         exact_processor = getattr(self.tombstone_service, "process_tombstones", None)
         if callable(exact_processor):
-            result = exact_processor(targets)
+            result = exact_processor(targets, tenant_id=tenant_id)
         else:
-            result = self.tombstone_service.process_pending(limit=min(1_000, max(len(targets), 1)))
+            result = self.tombstone_service.process_pending(
+                tenant_id=tenant_id,
+                limit=min(1_000, max(len(targets), 1)),
+            )
         processed = set(getattr(result, "processed", ()) or ())
         stale = set(getattr(result, "stale", ()) or ())
         failed = set(getattr(result, "failed", ()) or ())

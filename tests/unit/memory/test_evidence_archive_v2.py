@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
 from datetime import datetime, timezone
 from enum import Enum
 
@@ -15,16 +14,8 @@ from memoryos.contextdb.session.session_archive import (
 from memoryos.contextdb.session.session_commit import SessionCommitService
 from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.contextdb.store.local_stores import InMemoryQueueStore
-from memoryos.memory.canonical import (
-    EpistemicStatus,
-    EvidenceRef,
-    MemorySemanticProposal,
-    ProposalEvidenceValidator,
-    SemanticAssessment,
-    SessionArchiveEpisodeAdapter,
-    bind_field_evidence,
-)
-from memoryos.memory.canonical.event import canonical_digest
+from memoryos.core.integrity import canonical_digest
+from memoryos.memory.evidence import SessionArchiveEpisodeAdapter
 
 
 class _Kind(Enum):
@@ -54,7 +45,7 @@ def _archive(*, content: str = "I confirm SQLite.", actor_id: str = "u1") -> Ses
     )
 
 
-def test_event_digest_covers_full_envelope_and_canonical_types() -> None:
+def test_event_digest_covers_full_envelope_and_deterministic_types() -> None:
     base = SessionArchiveEpisodeAdapter().adapt(_archive()).events[0]
     other_actor = SessionArchiveEpisodeAdapter().adapt(_archive(actor_id="u2")).events[0]
     other_tenant_archive = _archive()
@@ -86,6 +77,8 @@ def test_event_digest_covers_full_envelope_and_canonical_types() -> None:
     ordered_subjects.metadata["subjects"] = [
         {"kind": "person", "id": "u1"},
         {"kind": "asset", "id": "device-1"},
+        {"kind": "person", "id": "u1"},
+        {"kind": "person", "id": "u1", "inferred": True},
     ]
     reversed_subjects = _archive()
     reversed_subjects.metadata["subjects"] = list(reversed(ordered_subjects.metadata["subjects"]))
@@ -93,6 +86,12 @@ def test_event_digest_covers_full_envelope_and_canonical_types() -> None:
         SessionArchiveEpisodeAdapter().adapt(ordered_subjects).events[0].digest
         == SessionArchiveEpisodeAdapter().adapt(reversed_subjects).events[0].digest
     )
+    normalized = SessionArchiveEpisodeAdapter().adapt(ordered_subjects).events[0]
+    assert [(item.kind, item.id, item.inferred) for item in normalized.subjects] == [
+        ("asset", "device-1", False),
+        ("person", "u1", False),
+        ("person", "u1", True),
+    ]
 
     left = {
         "map": {"b": 2, "a": 1},
@@ -121,7 +120,7 @@ def test_event_envelope_takes_a_deep_immutable_snapshot() -> None:
         event.content["content"] = "forbidden"
 
 
-def test_inferred_envelope_fields_produce_lower_evidence_strength() -> None:
+def test_inferred_envelope_fields_are_explicitly_marked() -> None:
     archive = SessionArchive(
         user_id="u1",
         session_id="inferred",
@@ -130,10 +129,11 @@ def test_inferred_envelope_fields_produce_lower_evidence_strength() -> None:
         created_at="2026-01-01T00:00:00Z",
     )
     event = SessionArchiveEpisodeAdapter().adapt(archive).events[0]
-    ref = EvidenceRef.from_event(event, source_uri=archive.archive_uri)
     assert event.actor.role_inferred
     assert event.subjects[0].inferred
-    assert ref.evidence_strength == "INFERRED"
+    assert event.occurred_at_inferred
+    assert event.ingested_at_inferred
+    assert event.sequence_inferred
 
 
 def test_content_addressed_archive_is_idempotent_and_old_manifests_remain_readable(tmp_path) -> None:
@@ -183,14 +183,14 @@ def test_archive_write_rejects_broken_commit_head_symlink(tmp_path) -> None:
 
 def test_async_commit_reloads_archived_manifest_instead_of_overwriting_from_caller(tmp_path) -> None:
     store = SessionArchiveStore(tmp_path, tenant_id="t1")
-    service = SessionCommitService(store, InMemoryQueueStore(), allow_plan_only=True)
+    service = SessionCommitService(store, InMemoryQueueStore())
     archive = _archive(content="hello")
     service.sync_archive(archive, enqueue_commit_job=False)
     archived_manifest = archive.manifest_digest
     archive.messages[0]["content"] = "caller mutation after sync archive"
     result = service.async_commit(archive)
     persisted = store.read_archive_at_manifest(archive.archive_uri, archived_manifest, tenant_id="t1")
-    assert result.canonical_committed
+    assert result.memory_committed
     assert persisted.messages[0]["content"] == "hello"
     assert store.read_archive(archive.archive_uri, tenant_id="t1").manifest_digest == archived_manifest
 
@@ -216,7 +216,7 @@ def test_existing_event_or_manifest_with_same_digest_and_different_bytes_fails_c
         store.read_archive(other.archive_uri, tenant_id="t1")
 
 
-def test_evidence_ref_validates_actor_subject_path_digest_and_independent_field_spans() -> None:
+def test_episode_lookup_preserves_actor_subject_and_independent_event_text() -> None:
     archive = SessionArchive(
         user_id="u1",
         session_id="field-spans",
@@ -246,88 +246,12 @@ def test_evidence_ref_validates_actor_subject_path_digest_and_independent_field_
     identity_event = episode.event("identity")
     value_event = episode.event("value")
     assert identity_event is not None and value_event is not None
-    identity_text = identity_event.text()
-    value_text = value_event.text()
-    identity_ref = EvidenceRef.from_event(
-        identity_event,
-        source_uri=archive.archive_uri,
-        span_start=identity_text.index("storage"),
-        span_end=identity_text.index("storage") + len("storage"),
-    )
-    value_ref = EvidenceRef.from_event(
-        value_event,
-        source_uri=archive.archive_uri,
-        span_start=value_text.index("SQLite"),
-        span_end=value_text.index("SQLite") + len("SQLite"),
-    )
-    semantic_ref = EvidenceRef.from_event(value_event, source_uri=archive.archive_uri)
-    with pytest.raises(ValueError, match="require explicit field bindings"):
-        bind_field_evidence(
-            {"decision_topic": "storage"},
-            {"canonical_value": "SQLite"},
-            (identity_ref, value_ref),
-        )
-    proposal = MemorySemanticProposal(
-        proposal_id="p-spans",
-        memory_type="project_decision",
-        identity_fields={"decision_topic": "storage"},
-        value_fields={"canonical_value": "SQLite"},
-        semantic=SemanticAssessment("confirmation", "confirmed", "current", "unrelated"),
-        epistemic_status=EpistemicStatus.EXPLICIT,
-        suggested_scope_refs=(),
-        related_memory_ids=(),
-        evidence_refs=(identity_ref, value_ref, semantic_ref),
-        field_evidence_refs={
-            "identity.decision_topic": (identity_ref,),
-            "value.canonical_value": (value_ref,),
-            "semantic.speech_act": (semantic_ref,),
-            "semantic.commitment": (semantic_ref,),
-            "semantic.temporal_scope": (semantic_ref,),
-            "semantic.relation_to_existing": (semantic_ref,),
-            "transition": (semantic_ref,),
-        },
-        confidence=0.95,
-        extractor_version="test-v2",
-    )
-    assert ProposalEvidenceValidator().validate(proposal, episode).valid
-
-    forged = replace(identity_ref, actor_id="other")
-    forged_proposal = replace(
-        proposal,
-        evidence_refs=(forged, value_ref, semantic_ref),
-        field_evidence_refs={**dict(proposal.field_evidence_refs), "identity.decision_topic": (forged,)},
-    )
-    result = ProposalEvidenceValidator().validate(forged_proposal, episode)
-    assert not result.valid
-    assert "actor_id_mismatch:identity" in result.errors
-
-    wrong_role = replace(identity_ref, actor_role="assistant")
-    wrong_role_proposal = replace(
-        proposal,
-        evidence_refs=(wrong_role, value_ref, semantic_ref),
-        field_evidence_refs={**dict(proposal.field_evidence_refs), "identity.decision_topic": (wrong_role,)},
-    )
-    role_result = ProposalEvidenceValidator().validate(wrong_role_proposal, episode)
-    assert "actor_role_mismatch:identity" in role_result.errors
-
-    wrong_subject = replace(identity_ref, subject_refs=('{"id":"other"}',))
-    wrong_subject_proposal = replace(
-        proposal,
-        evidence_refs=(wrong_subject, value_ref, semantic_ref),
-        field_evidence_refs={**dict(proposal.field_evidence_refs), "identity.decision_topic": (wrong_subject,)},
-    )
-    subject_result = ProposalEvidenceValidator().validate(wrong_subject_proposal, episode)
-    assert "subject_mismatch:identity" in subject_result.errors
-
-    bad_path = replace(identity_ref, content_path="$.missing")
-    bad_path_proposal = replace(
-        proposal,
-        evidence_refs=(bad_path, value_ref, semantic_ref),
-        field_evidence_refs={**dict(proposal.field_evidence_refs), "identity.decision_topic": (bad_path,)},
-    )
-    path_result = ProposalEvidenceValidator().validate(bad_path_proposal, episode)
-    assert not path_result.valid
-    assert "content_path_mismatch:identity" in path_result.errors
+    assert identity_event.actor.id == "u1"
+    assert identity_event.actor.role == "user"
+    assert identity_event.subjects[0].id == "u1"
+    assert identity_event.text() == "The storage backend is under discussion."
+    assert value_event.text() == "I confirm SQLite as the current choice."
+    assert identity_event.digest != value_event.digest
 
 
 def test_v1_archive_layout_is_rejected_instead_of_implicitly_migrated(tmp_path) -> None:

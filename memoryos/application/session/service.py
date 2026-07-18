@@ -10,7 +10,7 @@ from memoryos.application.context.query_service import ContextQueryService
 from memoryos.application.service import ApplicationRuntime, ApplicationService
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.model.context_uri import ContextURI
-from memoryos.contextdb.retrieval.query_plan import CanonicalResolutionMode, RetrievalOptions, RetrievalQueryIntent
+from memoryos.contextdb.retrieval.query_plan import RetrievalOptions, RetrievalQueryIntent
 from memoryos.contextdb.session.errors import EvidenceArchiveIntegrityError
 from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.core.ids import stable_hash
@@ -66,6 +66,7 @@ class SessionApplicationService(ApplicationService):
         tenant_id: str | None = None,
         caller: TrustedRequestContext | None = None,
         project_id: str = "",
+        timezone_name: str = "UTC",
         search_context: Any | None = None,
         archive_read: Any | None = None,
     ) -> list[dict[str, Any]]:
@@ -82,15 +83,24 @@ class SessionApplicationService(ApplicationService):
         contexts = search(
             query,
             options=RetrievalOptions(
-                context_types=(ContextType.SESSION,),
+                context_types=(ContextType.SESSION, ContextType.MEMORY),
+                record_kinds=(
+                    "session_root",
+                    "session_l0",
+                    "session_l1",
+                    "message",
+                    "semantic_segment",
+                    "memory_document",
+                    "memory_block",
+                ),
+                document_kinds=("episode", "topic", "entity"),
                 tenant_id=tenant_id,
                 owner_user_id=user_id,
                 workspace_ids=((project_id,) if project_id else ()),
                 query_intent=RetrievalQueryIntent.OPEN_RECALL,
-                canonical_resolution_mode=CanonicalResolutionMode.DISABLED,
+                timezone=timezone_name,
                 candidate_limit=max(100, expanded_limit),
                 final_limit=expanded_limit,
-                metadata_filters={"minimum_lexical_relevance": 1.0},
             ),
             user_id=user_id,
             project_id=project_id,
@@ -102,6 +112,13 @@ class SessionApplicationService(ApplicationService):
         for item in contexts:
             metadata = dict(item.get("metadata", {}) or {})
             archive_uri = str(metadata.get("archive_uri") or item.get("source_uri") or "")
+            record_kind = str(metadata.get("record_kind") or item.get("record_kind") or "")
+            if record_kind in {"memory_document", "memory_block"}:
+                preview = str(item.get("content") or item.get("text") or "")[:500]
+                results.append({**dict(item), "preview": preview})
+                if len(results) >= limit:
+                    break
+                continue
             if not archive_uri or archive_uri in seen_archives:
                 continue
             seen_archives.add(archive_uri)

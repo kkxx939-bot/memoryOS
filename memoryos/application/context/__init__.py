@@ -15,11 +15,13 @@ if TYPE_CHECKING:
     )
     from memoryos.application.context.query_service import ContextQueryService
     from memoryos.application.context.retrieval_service import RetrievalService
+    from memoryos.application.context.trace_erase import RecallTraceEraseBackend
 
 __all__ = [
     "ContextAssembler",
     "ContextQueryService",
     "RetrievalMetrics",
+    "RecallTraceEraseBackend",
     "RetrievalService",
     "RetrievalUnavailableError",
     "UnifiedRetrievalOrchestrator",
@@ -31,6 +33,7 @@ _EXPORTS = {
     "ContextQueryService": ("memoryos.application.context.query_service", "ContextQueryService"),
     "RetrievalMetrics": ("memoryos.application.context.orchestrator", "RetrievalMetrics"),
     "RetrievalService": ("memoryos.application.context.retrieval_service", "RetrievalService"),
+    "RecallTraceEraseBackend": ("memoryos.application.context.trace_erase", "RecallTraceEraseBackend"),
     "RetrievalUnavailableError": ("memoryos.application.context.orchestrator", "RetrievalUnavailableError"),
     "UnifiedRetrievalOrchestrator": (
         "memoryos.application.context.orchestrator",

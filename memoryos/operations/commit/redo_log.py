@@ -47,7 +47,7 @@ class RedoEntry:
 
 
 class RedoLog:
-    SCHEMA_VERSION = "transaction_redo_v1"
+    SCHEMA_VERSION = "ordinary_operation_redo_v1"
     PHASES = {
         "begin",
         "started",
@@ -56,7 +56,6 @@ class RedoLog:
         "index_written",
         "audit_written",
         "diff_written",
-        "head_published",
         "committed",
     }
 

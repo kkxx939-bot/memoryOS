@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol
 
+from memoryos.contextdb.catalog import CatalogRecord
 from memoryos.contextdb.model.context_object import ContextObject
 
 
@@ -19,17 +21,24 @@ class IndexHit:
 
 
 class IndexStore(Protocol):
-    def upsert_index(self, obj: ContextObject, content: str = "") -> None: ...
+    def upsert_index(self, obj: ContextObject, content: str = "", *, tenant_id: str) -> None: ...
 
-    def delete_index(self, uri: str) -> None: ...
+    def delete_index(self, uri: str, *, tenant_id: str) -> None: ...
 
-    def indexed_uris(self) -> list[str]: ...
+    def indexed_uris(self, *, tenant_id: str) -> list[str]: ...
 
-    def clear(self) -> None: ...
+    def clear(self, *, tenant_id: str) -> None: ...
 
-    def search(self, query: str, filters: dict | None = None, limit: int = 10) -> list[IndexHit]: ...
+    def search(
+        self,
+        query: str,
+        *,
+        tenant_id: str,
+        filters: dict | None = None,
+        limit: int = 10,
+    ) -> list[IndexHit]: ...
 
-    def get_index_metadata(self, uri: str) -> dict | None: ...
+    def get_index_metadata(self, uri: str, *, tenant_id: str) -> dict | None: ...
 
     def ordinary_relation_endpoint_state(
         self,
@@ -40,4 +49,54 @@ class IndexStore(Protocol):
     ) -> str: ...
 
 
-__all__ = ["IndexHit", "IndexStore"]
+class CatalogStore(Protocol):
+    """Tenant-qualified exact CRUD boundary for Catalog serving records."""
+
+    def upsert_catalog(
+        self,
+        record: CatalogRecord | Mapping[str, object],
+        *,
+        tenant_id: str,
+    ) -> None: ...
+
+    def get_catalog(self, record_key: str, *, tenant_id: str) -> CatalogRecord | None: ...
+
+    def delete_catalog(self, record_key: str, *, tenant_id: str) -> bool: ...
+
+
+class MemoryDocumentProjectionStore(Protocol):
+    """Atomic serving publication boundary for one Markdown document."""
+
+    def get_memory_document_projection_state(
+        self,
+        *,
+        tenant_id: str,
+        owner_user_id: str,
+        document_id: str,
+    ) -> Mapping[str, object] | None: ...
+
+    def replace_memory_document_projection(
+        self,
+        document_record: CatalogRecord | Mapping[str, object],
+        block_records: Sequence[CatalogRecord | Mapping[str, object]],
+        expected_previous_generation: int | None,
+        *,
+        tenant_id: str,
+        owner_user_id: str,
+        restore_soft_deleted: bool = False,
+    ) -> tuple[str, ...]: ...
+
+    def tombstone_memory_document_projection(
+        self,
+        *,
+        tenant_id: str,
+        owner_user_id: str,
+        document_id: str,
+        deletion_generation: int,
+        deletion_event_digest: str,
+        deletion_status: str,
+        relative_path: str = "",
+    ) -> tuple[str, ...]: ...
+
+
+__all__ = ["CatalogStore", "IndexHit", "IndexStore", "MemoryDocumentProjectionStore"]

@@ -1,249 +1,222 @@
-"""Application service coordinating durable session commits."""
+"""Durable greenfield Session commit orchestration.
+
+The immutable SessionArchive is the evidence boundary.  Markdown memory edits
+are committed by ``MemoryDocumentCommitter`` and ordinary Session operations
+remain on ``OperationCommitter``; neither path delegates durable authority to
+the other.
+"""
 
 from __future__ import annotations
 
+import hashlib
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import AbstractContextManager, contextmanager
+from contextvars import ContextVar
 from typing import Any, cast
 
 from memoryos.application.session.commit_entry import commit_session as commit_session_entry
-from memoryos.application.session.context_projector import workspace_id_from_session_metadata
-from memoryos.application.session.planners import (
-    ActionPolicyCommitPlanner,
-    BehaviorCommitPlanner,
-    ContextCommitPlanner,
-    MemoryCommitPlanner,
+from memoryos.application.session.commit_group import (
+    CONSUMERS,
+    CommitGroupStatus,
+    CommitGroupStore,
+    MemoryDocumentEffect,
 )
-from memoryos.application.session.planners.memory_commit_planner import MemoryExtractionBackendError
+from memoryos.application.session.planners.action_policy_commit_planner import (
+    ActionPolicyCommitPlanner,
+)
+from memoryos.application.session.planners.behavior_commit_planner import BehaviorCommitPlanner
+from memoryos.application.session.planners.context_commit_planner import ContextCommitPlanner
+from memoryos.application.session.projection_journal import SessionProjectionJournal
 from memoryos.contextdb.layers.layer_generator import l0_abstract, l1_overview
-from memoryos.contextdb.model.lifecycle import LifecycleState
 from memoryos.contextdb.session.archive_store import SessionArchiveStore
-from memoryos.contextdb.session.session_model import SessionArchive, SessionCommitResult, SessionCommitState
+from memoryos.contextdb.session.session_model import (
+    SessionArchive,
+    SessionCommitResult,
+    SessionCommitState,
+)
 from memoryos.contextdb.store.queue_store import QueueJob, QueueStore
 from memoryos.core.errors import RevisionConflictError
 from memoryos.core.ids import stable_hash
-from memoryos.memory.canonical.visibility import read_committed_pending
-from memoryos.memory.integration.planning_context import MemoryPlanningResult, PlanningContext
-from memoryos.operations.commit.commit_group import CommitGroupStatus, CommitGroupStore
+from memoryos.core.integrity import canonical_digest
+from memoryos.memory.documents import (
+    DocumentCommitConflict,
+    DocumentCommitResult,
+    DocumentConflictError,
+    DocumentDeletionStatus,
+    DocumentEditPlan,
+    DocumentIntentStatus,
+    MemoryDocumentCommitter,
+    MemoryDocumentPlanner,
+    MemoryEditProposal,
+)
+from memoryos.memory.documents.control_store import document_intent_id
+from memoryos.memory.documents.layout import tenant_control_root
 from memoryos.operations.commit.operation_committer import OperationCommitter
 from memoryos.operations.model.context_diff import ContextDiff
 from memoryos.operations.model.context_operation import ContextOperation
 
 
 class DerivedConsumerError(RuntimeError):
-    def __init__(
-        self,
-        consumer: str,
-        failures: list[str],
-        *,
-        retryable: bool = True,
-    ) -> None:
-        self.consumer = consumer
+    """One or more independent derived consumers did not complete."""
+
+    def __init__(self, failures: Sequence[tuple[str, bool]]) -> None:
         self.failures = tuple(failures)
-        self.retryable = retryable
-        super().__init__(f"{consumer} consumer failed: {','.join(failures)}")
+        self.retryable = bool(self.failures) and all(item[1] for item in self.failures)
+        names = ",".join(item[0] for item in self.failures)
+        super().__init__(f"Session derived consumers failed: {names}")
+
+
+class ConsumerLeaseBusy(RuntimeError):
+    retryable = True
+
+
+class ConsumerTerminalError(RuntimeError):
+    retryable = False
 
 
 class SessionCommitService:
-    """先归档会话，再规划并提交各类上下文变更。"""
+    """Archive first, then independently commit memory and ordinary consumers."""
 
     def __init__(
         self,
         archive_store: SessionArchiveStore,
         queue_store: QueueStore,
         committer: OperationCommitter | None = None,
-        memory_planner: MemoryCommitPlanner | None = None,
+        memory_planner: Any | None = None,
         behavior_planner: BehaviorCommitPlanner | None = None,
         action_policy_planner: ActionPolicyCommitPlanner | None = None,
         context_planner: ContextCommitPlanner | None = None,
-        allow_plan_only: bool = False,
-        projection_worker=None,
-        session_projector=None,
-        migration_gate=None,
+        session_projector: Any | None = None,
         commit_group_store: CommitGroupStore | None = None,
+        memory_committer: MemoryDocumentCommitter | None = None,
+        document_planner: MemoryDocumentPlanner | None = None,
+        projection_journal: SessionProjectionJournal | None = None,
     ) -> None:
         self.archive_store = archive_store
         self.queue_store = queue_store
         self.committer = committer
-        self.memory_planner = memory_planner or MemoryCommitPlanner()
-        bind_runtime_stores = getattr(self.memory_planner, "bind_runtime_stores", None)
-        if committer is not None and callable(bind_runtime_stores):
-            binding_committer = getattr(committer, "delegate", committer)
-            required = ("source_store", "index_store", "relation_store", "root", "tenant_id")
-            if all(hasattr(binding_committer, name) for name in required):
-                bind_runtime_stores(
-                    binding_committer.source_store,
-                    binding_committer.index_store,
-                    binding_committer.relation_store,
-                    root=binding_committer.root,
-                    tenant_id=binding_committer.tenant_id,
-                    archive_store=self.archive_store,
-                )
+        self.memory_planner = memory_planner
         self.behavior_planner = behavior_planner or BehaviorCommitPlanner()
         self.action_policy_planner = action_policy_planner or ActionPolicyCommitPlanner()
         self.context_planner = context_planner or ContextCommitPlanner()
-        self.allow_plan_only = allow_plan_only
-        self.projection_worker = projection_worker
         self.session_projector = session_projector
-        self.migration_gate = migration_gate
-        self.commit_group_store = commit_group_store or CommitGroupStore(archive_store.root)
+        expected_control_root = tenant_control_root(archive_store.root, archive_store.tenant_id)
+        if commit_group_store is not None and commit_group_store.artifact_root != expected_control_root.resolve(
+            strict=False
+        ):
+            raise ValueError("CommitGroupStore root differs from the bound Session tenant")
+        self.commit_group_store = commit_group_store or CommitGroupStore(expected_control_root)
+        self.memory_committer = memory_committer
+        planner_document = getattr(memory_planner, "document_planner", None)
+        if document_planner is not None and planner_document is not None and planner_document is not document_planner:
+            raise ValueError("Session and memory planners must share one document planner")
+        self.document_planner = document_planner or (
+            planner_document if isinstance(planner_document, MemoryDocumentPlanner) else None
+        )
+        journal_store = getattr(session_projector, "catalog_store", None)
+        self.projection_journal = projection_journal or SessionProjectionJournal(journal_store)
+        self._startup_recovery_group: ContextVar[str] = ContextVar(
+            f"memoryos_session_startup_recovery_{id(self)}",
+            default="",
+        )
 
-    def commit_session(self, archive: SessionArchive, *, async_commit: bool = True) -> SessionCommitResult:
+    def commit_session(
+        self,
+        archive: SessionArchive,
+        *,
+        async_commit: bool = True,
+    ) -> SessionCommitResult:
         return commit_session_entry(self, archive, async_commit=async_commit)
 
-    def _project_session_archive(self, archive: SessionArchive) -> tuple[Any | None, str]:
-        """Apply the durable migration dual-write gate to Session serving rows."""
-
-        if self.session_projector is None:
-            return None, "not_configured"
-        if self.migration_gate is not None:
-            feature_gate = getattr(self.migration_gate, "feature_gate", None)
-            if feature_gate is None or not bool(getattr(feature_gate, "dual_write_enabled", False)):
-                return None, "migration_legacy_only"
-        result = self.session_projector.project(archive)
-        recorder = getattr(self.migration_gate, "record_projection_equivalence", None)
-        proof = getattr(result, "equivalence_proof", None)
-        if callable(recorder):
-            if proof is None:
-                state = str(
-                    getattr(
-                        getattr(getattr(self.migration_gate, "feature_gate", None), "state", None),
-                        "value",
-                        "",
-                    )
-                )
-                if state == "SHADOW_VALIDATING":
-                    raise RuntimeError("shadow Session projection has no independent equivalence proof")
-            else:
-                recorder(proof)
-        return result, "projected"
-
-    def _require_runtime_ready(self) -> None:
-        committer = getattr(self.committer, "delegate", self.committer)
-        source_store = getattr(committer, "source_store", None)
-        if source_store is None:
-            source_store = getattr(self.memory_planner, "source_store", None)
-        readiness = getattr(source_store, "readiness", None)
-        require_ready = getattr(readiness, "require_ready", None)
-        if not callable(require_ready):
-            return
-        state = str(getattr(getattr(readiness, "state", None), "value", ""))
-        recovery_group = getattr(committer, "_startup_recovery_group", None)
-        recovery_group_get = getattr(recovery_group, "get", None)
-        if state == "RECOVERING" and callable(recovery_group_get) and recovery_group_get():
-            return
-        require_ready()
-
-    def sync_archive(self, archive: SessionArchive, *, enqueue_commit_job: bool = True) -> SessionCommitResult:
-        """先把原始会话证据写稳，再投递异步提交任务。"""
+    def sync_archive(
+        self,
+        archive: SessionArchive,
+        *,
+        enqueue_commit_job: bool = True,
+    ) -> SessionCommitResult:
+        """Durably archive evidence before projection or queue publication."""
 
         self._require_runtime_ready()
-        fence = self._acquire_migration_projection_fence()
+        tenant_id = self._bind_archive_tenant(archive)
         tracking = False
         try:
-            tenant_id = self._bind_archive_tenant(archive)
-            tracking = self._record_session_projection_frontier(archive, status="PENDING")
+            tracking = self._record_projection(archive, tenant_id=tenant_id, status="PENDING")
             self.archive_store.write_sync_archive(archive)
+            projection, projection_status = self._project_session_archive(archive)
+            if tracking:
+                self._record_projection(archive, tenant_id=tenant_id, status="PROJECTED")
             if enqueue_commit_job:
                 self._enqueue_session_commit(archive, tenant_id=tenant_id)
-            # The immutable evidence and (on failure) durable replay job exist
-            # before releasing the migration cutover fence.
-            session_projection, session_projection_status = self._project_session_archive(archive)
-            if tracking:
-                self._record_session_projection_frontier(archive, status="PROJECTED")
             return SessionCommitResult(
                 task_id=archive.task_id,
                 archive_uri=archive.archive_uri,
                 status="queued",
                 state=SessionCommitState.QUEUED,
                 archive_committed=True,
-                session_projection_status=session_projection_status,
-                session_projected_count=int(getattr(session_projection, "projected", 0) or 0),
+                session_projection_status=projection_status,
+                session_projected_count=int(getattr(projection, "projected", 0) or 0),
             )
         except Exception as exc:
             if tracking:
-                self._record_session_projection_frontier(
+                self._record_projection(
                     archive,
+                    tenant_id=tenant_id,
                     status="FAILED",
-                    error=f"{type(exc).__name__}: {exc}",
+                    error=type(exc).__name__,
                 )
-            tenant_id = self._bind_archive_tenant(archive)
             if self.archive_store.archive_exists(archive.archive_uri, tenant_id=tenant_id):
                 self._enqueue_session_commit(archive, tenant_id=tenant_id)
             raise
-        finally:
-            self._release_migration_projection_fence(fence)
 
     def enqueue_failed_inline_commit(self, archive: SessionArchive) -> QueueJob:
-        """Durably recover an inline commit after its immutable archive exists.
+        """Publish the same durable task identity after an inline failure."""
 
-        Successful ``async_commit=True`` calls retain their historical no-job
-        behavior.  This helper is invoked only after an inline projection or
-        consumer raises, closing the BACKFILLING checkpoint race without
-        inventing evidence for a session that was never archived.
-        """
-
-        fence = self._acquire_migration_projection_fence()
-        try:
-            tenant_id = self._bind_archive_tenant(archive)
-            if not self.archive_store.archive_exists(archive.archive_uri, tenant_id=tenant_id):
-                raise RuntimeError("failed inline Session commit has no durable archive evidence")
-            return self._enqueue_session_commit(archive, tenant_id=tenant_id)
-        finally:
-            self._release_migration_projection_fence(fence)
-
-    def _enqueue_session_commit(self, archive: SessionArchive, *, tenant_id: str) -> QueueJob:
-        return self.queue_store.enqueue(
-            QueueJob(
-                job_id=archive.task_id,
-                queue_name="session_commit",
-                action="async_session_commit",
-                target_uri=archive.archive_uri,
-                payload={
-                    "user_id": archive.user_id,
-                    "session_id": archive.session_id,
-                    "tenant_id": tenant_id,
-                    "archive_digest": str(getattr(archive, "archive_digest", "") or ""),
-                    "manifest_digest": str(getattr(archive, "manifest_digest", "") or ""),
-                },
-            )
+        tenant_id = self._bind_archive_tenant(archive)
+        if not self.archive_store.archive_exists(archive.archive_uri, tenant_id=tenant_id):
+            raise RuntimeError("failed inline Session commit has no immutable archive")
+        persisted = self.archive_store.read_archive(
+            archive.archive_uri,
+            tenant_id=tenant_id,
+            manifest_digest=str(archive.manifest_digest or "") or None,
         )
+        self._assert_archive_identity(archive, persisted)
+        return self._enqueue_session_commit(persisted, tenant_id=tenant_id)
 
     def async_commit(self, archive: SessionArchive) -> SessionCommitResult:
-        """根据已归档会话生成并提交记忆、行为和上下文变更。"""
+        """Commit one exact archived Session through independent consumers."""
 
         self._require_runtime_ready()
-        fence = self._acquire_migration_projection_fence()
+        tenant_id = self._bind_archive_tenant(archive)
         tracking = False
         try:
-            tenant_id = self._bind_archive_tenant(archive)
-            tracking = self._record_session_projection_frontier(archive, status="PENDING")
+            tracking = self._record_projection(archive, tenant_id=tenant_id, status="PENDING")
             requested_manifest = str(archive.manifest_digest or "")
             if not self.archive_store.archive_exists(archive.archive_uri, tenant_id=tenant_id):
                 self.archive_store.write_sync_archive(archive)
                 requested_manifest = archive.manifest_digest
-            archive = self.archive_store.read_archive(
+            persisted = self.archive_store.read_archive(
                 archive.archive_uri,
                 tenant_id=tenant_id,
                 manifest_digest=requested_manifest or None,
             )
-            self._project_session_archive(archive)
+            self._assert_archive_identity(archive, persisted, allow_materialized_digests=True)
+            archive = persisted
+            projection, projection_status = self._project_session_archive(archive)
             if tracking:
-                self._record_session_projection_frontier(archive, status="PROJECTED")
+                self._record_projection(archive, tenant_id=tenant_id, status="PROJECTED")
         except Exception as exc:
             if tracking:
-                self._record_session_projection_frontier(
+                self._record_projection(
                     archive,
+                    tenant_id=tenant_id,
                     status="FAILED",
-                    error=f"{type(exc).__name__}: {exc}",
+                    error=type(exc).__name__,
                 )
-            tenant_id = self._bind_archive_tenant(archive)
             if self.archive_store.archive_exists(archive.archive_uri, tenant_id=tenant_id):
                 self._enqueue_session_commit(archive, tenant_id=tenant_id)
             raise
-        finally:
-            self._release_migration_projection_fence(fence)
-        tenant_id = self._bind_archive_tenant(archive)
+
         group_id = f"commit_group_{archive.task_id}"
         group = self.commit_group_store.create(
             group_id,
@@ -254,10 +227,534 @@ class SessionCommitService:
             archive_digest=archive.archive_digest,
             manifest_digest=archive.manifest_digest,
         )
-        if self.committer is None and not self.allow_plan_only:
-            raise RuntimeError("SessionCommitService requires OperationCommitter unless allow_plan_only=True")
         if group.complete and self.archive_store.async_outputs_done_for_task(archive):
-            return self._result(archive, group)
+            return self._result(
+                archive,
+                group,
+                projection_status=projection_status,
+                projected_count=int(getattr(projection, "projected", 0) or 0),
+            )
+
+        failures: list[tuple[str, bool]] = []
+        actions: tuple[tuple[str, Callable[[str], dict[str, Any]]], ...] = (
+            ("memory", lambda attempt: self._commit_memory(archive, group_id, attempt)),
+            (
+                "behavior",
+                self._skipped_action
+                if self._is_coding_agent(archive)
+                else lambda _attempt: self._commit_ordinary(
+                    archive,
+                    group_id,
+                    "behavior",
+                    self.behavior_planner.plan(archive),
+                ),
+            ),
+            (
+                "action_policy",
+                self._skipped_action
+                if self._is_coding_agent(archive)
+                else lambda _attempt: self._commit_ordinary(
+                    archive,
+                    group_id,
+                    "action_policy",
+                    self.action_policy_planner.plan(archive),
+                ),
+            ),
+            (
+                "context",
+                lambda _attempt: self._commit_ordinary(
+                    archive,
+                    group_id,
+                    "context",
+                    self.context_planner.plan(archive),
+                ),
+            ),
+        )
+        for consumer, action in actions:
+            try:
+                self._run_consumer(group_id, consumer, action)
+            except Exception as exc:
+                failures.append((consumer, self._is_retryable(exc)))
+
+        refreshed = self.commit_group_store.load(group_id)
+        if refreshed is None:
+            raise KeyError(f"unknown commit group: {group_id}")
+        group = refreshed
+        if failures:
+            self._write_outputs(archive, group, complete=False)
+            raise DerivedConsumerError(failures)
+        if not group.complete:
+            raise DerivedConsumerError(
+                tuple((name, item.retryable) for name, item in group.consumers.items() if item.status != "completed")
+            )
+        self._validate_persisted_memory_effects(group)
+        self._write_outputs(archive, group, complete=True)
+        if tracking:
+            self._record_projection(archive, tenant_id=tenant_id, status="PENDING")
+        try:
+            projection, projection_status = self._project_session_archive(archive)
+        except Exception as exc:
+            if tracking:
+                self._record_projection(
+                    archive,
+                    tenant_id=tenant_id,
+                    status="FAILED",
+                    error=type(exc).__name__,
+                )
+            raise
+        if tracking:
+            self._record_projection(archive, tenant_id=tenant_id, status="PROJECTED")
+        return self._result(
+            archive,
+            group,
+            projection_status=projection_status,
+            projected_count=int(getattr(projection, "projected", 0) or 0),
+        )
+
+    def recover_session_projection_frontier(self, *, batch_size: int = 256) -> dict[str, int]:
+        """Replay ordinary Session projection and its exact commit job."""
+
+        if self.session_projector is None or not self.projection_journal.enabled:
+            return {"projected": 0, "abandoned": 0, "failed": 0}
+        self._require_runtime_ready()
+        tenant_id = str(self.archive_store.tenant_id)
+        maximum = max(1, min(int(batch_size), 1_000))
+        counts = {"projected": 0, "abandoned": 0, "failed": 0}
+        after = ""
+        while True:
+            entries = self.projection_journal.pending(
+                tenant_id=tenant_id,
+                after_archive_uri=after,
+                limit=maximum,
+            )
+            if not entries:
+                break
+            for entry in entries:
+                after = entry.archive_uri
+                if not self.archive_store.archive_exists(entry.archive_uri, tenant_id=tenant_id):
+                    self.projection_journal.mark(entry, status="ABANDONED", error="archive_missing")
+                    counts["abandoned"] += 1
+                    continue
+                try:
+                    archive = self.archive_store.read_archive(
+                        entry.archive_uri,
+                        tenant_id=tenant_id,
+                        manifest_digest=entry.manifest_digest or None,
+                    )
+                    if archive.user_id != entry.owner_user_id or archive.session_id != entry.session_id:
+                        raise RuntimeError("Session projection journal identity is detached")
+                    self._project_session_archive(archive)
+                    self._enqueue_session_commit(archive, tenant_id=tenant_id)
+                    self.projection_journal.mark(entry, status="PROJECTED")
+                    counts["projected"] += 1
+                except Exception as exc:
+                    self.projection_journal.mark(entry, status="FAILED", error=type(exc).__name__)
+                    counts["failed"] += 1
+                    raise RuntimeError("Session projection journal recovery failed") from exc
+            if len(entries) < maximum:
+                break
+        return counts
+
+    def rebuild_session_archives(
+        self,
+        *,
+        batch_size: int = 256,
+        max_archives: int = 10_000,
+    ) -> dict[str, int]:
+        """Rebuild derived Session Catalog rows from immutable archive heads.
+
+        Startup calls this while the runtime is RECOVERING, so it deliberately
+        bypasses the ordinary READY gate.  Enumeration and total replay are
+        both bounded; reaching the configured ceiling with unseen work fails
+        closed instead of publishing a partially rebuilt runtime.
+        """
+
+        if self.session_projector is None:
+            return {
+                "projected_archives": 0,
+                "projected_records": 0,
+                "async_output_archives": 0,
+            }
+        maximum = max(1, min(int(batch_size), 1_000))
+        total_bound = int(max_archives)
+        if total_bound <= 0 or total_bound > 100_000:
+            raise ValueError("Session archive rebuild bound must be between 1 and 100000")
+        tenant_id = str(self.archive_store.tenant_id)
+        cursor = ""
+        counts = {
+            "projected_archives": 0,
+            "projected_records": 0,
+            "async_output_archives": 0,
+        }
+        while counts["projected_archives"] < total_bound:
+            requested = min(maximum, total_bound - counts["projected_archives"])
+            archives = self.archive_store.list_archives(
+                tenant_id=tenant_id,
+                after_archive_uri=cursor,
+                limit=requested,
+            )
+            if not archives:
+                break
+            for archive in archives:
+                cursor = archive.archive_uri
+                try:
+                    projection, _status = self._project_session_archive(
+                        archive,
+                        respect_applied_tombstones=True,
+                    )
+                    self._record_projection(
+                        archive,
+                        tenant_id=tenant_id,
+                        status="PROJECTED",
+                    )
+                except Exception as exc:
+                    self._record_projection(
+                        archive,
+                        tenant_id=tenant_id,
+                        status="FAILED",
+                        error=type(exc).__name__,
+                    )
+                    raise RuntimeError("Session archive Catalog rebuild failed") from exc
+                counts["projected_archives"] += 1
+                counts["projected_records"] += int(
+                    getattr(projection, "projected", 0) or 0
+                )
+                counts["async_output_archives"] += int(
+                    self.archive_store.async_outputs_done_for_task(archive)
+                )
+            if len(archives) < requested:
+                break
+        if counts["projected_archives"] >= total_bound and self.archive_store.list_archives(
+            tenant_id=tenant_id,
+            after_archive_uri=cursor,
+            limit=1,
+        ):
+            raise RuntimeError("Session archive rebuild exceeded its total bound")
+        return counts
+
+    def resume_startup_commit_group(
+        self,
+        archive: SessionArchive,
+        *,
+        group_id: str,
+    ) -> SessionCommitResult:
+        """Validate exact archive/document effects, then replay one durable group."""
+
+        expected_group = f"commit_group_{archive.task_id}"
+        if group_id != expected_group:
+            raise RuntimeError("startup archive is detached from its commit-group identity")
+        tenant_id = self._bind_archive_tenant(archive)
+        group = self.commit_group_store.load(group_id)
+        if group is None:
+            raise RuntimeError("startup commit group does not exist")
+        identity = (
+            archive.task_id,
+            archive.archive_uri,
+            archive.user_id,
+            tenant_id,
+            archive.archive_digest,
+            archive.manifest_digest,
+        )
+        durable = (
+            group.task_id,
+            group.archive_uri,
+            group.user_id,
+            group.tenant_id,
+            group.archive_digest,
+            group.manifest_digest,
+        )
+        if identity != durable:
+            raise RuntimeError("startup archive is detached from its durable commit group")
+        self._validate_persisted_memory_effects(group)
+        with self._startup_recovery_scope(group_id):
+            return self.async_commit(archive)
+
+    def resumable_commit_groups(self, *, limit: int = 256) -> tuple[CommitGroupStatus, ...]:
+        """Discover unfinished groups and complete groups missing async outputs.
+
+        A process can exit after all four consumers are durable but before the
+        async-output head is published.  Such a group is terminal from the
+        consumer store's perspective, so ``CommitGroupStore.pending()`` cannot
+        discover it.  Recovery therefore checks the exact immutable archive
+        named by each complete group before deciding that no work remains.
+
+        This helper intentionally does not require READY: startup recovery uses
+        it while the runtime is still proving its durable state.
+        """
+
+        maximum = max(1, min(int(limit), 1_000))
+        actionable: list[CommitGroupStatus] = []
+        leased: list[CommitGroupStatus] = []
+        for group in self.commit_group_store.all():
+            if not group.terminal:
+                target = leased if any(item.status == "running" for item in group.consumers.values()) else actionable
+                target.append(group)
+            elif group.complete:
+                archive = self.archive_store.read_archive_at_manifest(
+                    group.archive_uri,
+                    group.manifest_digest,
+                    tenant_id=group.tenant_id,
+                )
+                identity = (
+                    archive.task_id,
+                    archive.archive_uri,
+                    archive.user_id,
+                    self._tenant_id(archive),
+                    archive.archive_digest,
+                    archive.manifest_digest,
+                )
+                durable = (
+                    group.task_id,
+                    group.archive_uri,
+                    group.user_id,
+                    group.tenant_id,
+                    group.archive_digest,
+                    group.manifest_digest,
+                )
+                if identity != durable:
+                    raise RuntimeError("commit-group discovery found detached Session evidence")
+                if not self.archive_store.async_outputs_done_for_task(archive):
+                    actionable.append(group)
+        # A long-running consumer cannot starve a later group whose consumer
+        # work or output-head publication is immediately recoverable.
+        return tuple((*actionable, *leased)[:maximum])
+
+    def _commit_memory(
+        self,
+        archive: SessionArchive,
+        group_id: str,
+        attempt_id: str,
+    ) -> dict[str, Any]:
+        if self.memory_planner is None:
+            return {
+                "status": "committed",
+                "edit_proposal_count": 0,
+                "edit_proposal_ids": [],
+                "document_change_count": 0,
+                "no_op_count": 0,
+            }
+        plan_session = getattr(self.memory_planner, "plan_session", None)
+        if not callable(plan_session):
+            raise TypeError("memory planner must implement plan_session over immutable SessionArchive")
+        planned = plan_session(
+            archive,
+            tenant_id=self._tenant_id(archive),
+            owner_user_id=archive.user_id,
+            commit_group_id=group_id,
+        )
+        edits = getattr(planned, "edits", None)
+        proposal_digest = str(getattr(planned, "proposal_set_digest", "") or "")
+        proposal_count = getattr(planned, "edit_proposal_count", None)
+        proposal_ids = getattr(planned, "edit_proposal_ids", None)
+        candidate_count = getattr(planned, "candidate_count", None)
+        if not isinstance(edits, tuple):
+            raise TypeError("memory planning result edits must be an immutable tuple")
+        if not self._is_sha256(proposal_digest):
+            raise ValueError("memory planning result must carry a sealed proposal-set digest")
+        if isinstance(proposal_count, bool) or not isinstance(proposal_count, int) or proposal_count < 0:
+            raise TypeError("memory planning proposal count is invalid")
+        if not isinstance(proposal_ids, tuple) or any(
+            not isinstance(item, str) or not item.startswith("mdreview_") for item in proposal_ids
+        ):
+            raise TypeError("memory planning review proposal IDs must be an immutable tuple")
+        if proposal_count != len(proposal_ids):
+            raise ValueError("memory planning proposal count differs from its sealed review proposals")
+        if isinstance(candidate_count, bool) or not isinstance(candidate_count, int) or candidate_count < 0:
+            raise TypeError("memory planning candidate count is invalid")
+        if candidate_count != len(edits) + len(proposal_ids):
+            raise ValueError("memory planning candidates differ from direct and review plans")
+        if edits and self.memory_committer is None:
+            raise RuntimeError("Markdown memory edits require MemoryDocumentCommitter")
+
+        no_op_count = 0
+        for position, edit in enumerate(edits):
+            proposal = getattr(edit, "proposal", None)
+            plan = getattr(edit, "plan", None)
+            if not isinstance(proposal, MemoryEditProposal) or not isinstance(plan, DocumentEditPlan):
+                raise TypeError("planned memory edit must bind one sealed proposal to one DocumentEditPlan")
+            self._validate_document_plan(plan, archive)
+            result = self._commit_document_with_replan(
+                archive,
+                proposal,
+                plan,
+                position=position,
+            )
+            if result.no_op:
+                no_op_count += 1
+                continue
+            effect = self._effect_from_document_result(result)
+            self.commit_group_store.record_memory_effect(
+                group_id,
+                effect,
+                attempt_id=attempt_id,
+            )
+
+        group = self.commit_group_store.load(group_id)
+        if group is None:
+            raise KeyError(f"unknown commit group: {group_id}")
+        self._validate_persisted_memory_effects(group)
+        return {
+            "status": "committed",
+            "edit_proposal_count": proposal_count,
+            "edit_proposal_ids": list(proposal_ids),
+            "document_change_count": len(group.memory_effects),
+            "no_op_count": no_op_count,
+        }
+
+    def _commit_document_with_replan(
+        self,
+        archive: SessionArchive,
+        proposal: MemoryEditProposal,
+        plan: DocumentEditPlan,
+        *,
+        position: int,
+    ) -> DocumentCommitResult:
+        assert self.memory_committer is not None
+        resumed = self._resume_document_intent(archive, plan, position=position)
+        if resumed is not None:
+            return resumed
+        try:
+            return self.memory_committer.commit(
+                plan,
+                actor_binding=self._actor_binding(archive),
+                evidence_reference=self._evidence_reference(archive, position),
+            )
+        except DocumentCommitConflict:
+            raise
+        except DocumentConflictError:
+            if self.document_planner is None:
+                raise
+            replanned = self.document_planner.replan(
+                proposal,
+                tenant_id=plan.tenant_id,
+                owner_user_id=plan.owner_user_id,
+                idempotency_key=plan.idempotency_key,
+                evidence_digest=plan.evidence_digest,
+            )
+            self._validate_document_plan(replanned, archive)
+            resumed = self._resume_document_intent(archive, replanned, position=position)
+            if resumed is not None:
+                return resumed
+            return self.memory_committer.commit(
+                replanned,
+                actor_binding=self._actor_binding(archive),
+                evidence_reference=self._evidence_reference(archive, position),
+            )
+
+    def _resume_document_intent(
+        self,
+        archive: SessionArchive,
+        plan: DocumentEditPlan,
+        *,
+        position: int,
+    ) -> DocumentCommitResult | None:
+        """Resume a source commit that crashed before its group effect was recorded."""
+
+        assert self.memory_committer is not None
+        idempotency_digest = hashlib.sha256(plan.idempotency_key.encode("utf-8")).hexdigest()
+        intent_id = document_intent_id(
+            plan.tenant_id,
+            plan.owner_user_id,
+            plan.document_id,
+            idempotency_digest,
+        )
+        intent = self.memory_committer.control_store.load_intent(
+            plan.tenant_id,
+            plan.owner_user_id,
+            intent_id,
+        )
+        if intent is None:
+            return None
+        if (
+            intent.evidence_digest != plan.evidence_digest
+            or intent.actor_binding != self._actor_binding(archive)
+            or intent.evidence_reference != self._evidence_reference(archive, position)
+        ):
+            raise RuntimeError("document intent lineage differs from its sealed Session proposal")
+        return self.memory_committer.recover_intent(
+            plan.tenant_id,
+            plan.owner_user_id,
+            intent_id,
+        )
+
+    def _commit_ordinary(
+        self,
+        archive: SessionArchive,
+        group_id: str,
+        consumer: str,
+        operations: Sequence[ContextOperation],
+    ) -> dict[str, Any]:
+        stabilized = self._stabilize_operations(archive, group_id, consumer, operations)
+        if stabilized and self.committer is None:
+            raise RuntimeError(f"{consumer} Session operations require OperationCommitter")
+        diff = (
+            self.committer.commit(archive.user_id, stabilized)
+            if self.committer is not None
+            else ContextDiff(
+                user_id=archive.user_id,
+                operations=[],
+            )
+        )
+        operation_ids = [
+            item.operation_id for item in (*diff.operations, *diff.pending_operations, *diff.rejected_operations)
+        ]
+        return {
+            "status": "committed",
+            "operation_count": len(operation_ids),
+            "operation_ids": operation_ids,
+            "diff_id": diff.diff_id,
+            "skipped": False,
+        }
+
+    def _run_consumer(
+        self,
+        group_id: str,
+        consumer: str,
+        action: Callable[[str], dict[str, Any]],
+    ) -> dict[str, Any]:
+        if consumer not in CONSUMERS:
+            raise ValueError(f"unsupported Session consumer: {consumer}")
+        group = self.commit_group_store.load(group_id)
+        if group is None:
+            raise KeyError(f"unknown commit group: {group_id}")
+        current = group.consumers[consumer]
+        if current.status == "completed":
+            return dict(current.summary)
+        if current.status in {"dead_letter", "quarantine"} or (current.status == "failed" and not current.retryable):
+            raise ConsumerTerminalError(f"{consumer} consumer is terminal")
+        attempt_id = uuid.uuid4().hex
+        if not self.commit_group_store.claim_consumer(
+            group_id,
+            consumer,
+            attempt_id=attempt_id,
+        ):
+            raise ConsumerLeaseBusy(f"{consumer} consumer lease is unavailable")
+        try:
+            summary = action(attempt_id)
+            self.commit_group_store.complete_consumer(
+                group_id,
+                consumer,
+                attempt_id=attempt_id,
+                summary=summary,
+            )
+            return summary
+        except Exception as exc:
+            self.commit_group_store.fail_consumer(
+                group_id,
+                consumer,
+                type(exc).__name__,
+                retryable=self._is_retryable(exc),
+                attempt_id=attempt_id,
+            )
+            raise
+
+    def _write_outputs(
+        self,
+        archive: SessionArchive,
+        group: CommitGroupStatus,
+        *,
+        complete: bool,
+    ) -> None:
         source_text = "\n".join(
             [
                 *[str(item.get("content", item.get("text", ""))) for item in archive.messages],
@@ -272,678 +769,270 @@ class SessionCommitService:
                 f"observations: {len(archive.observations)}",
                 f"predictions: {len(archive.predictions)}",
                 f"feedback: {len(archive.feedback)}",
-                "Long-term memory, behavior, action policy, and context diffs are emitted separately.",
+                "Memory documents and ordinary Session consumers are committed independently.",
             ],
         )
-        if group.canonical_status != "completed":
-            if group.canonical_status in {"dead_letter", "quarantine"} or (
-                group.canonical_status == "failed" and not group.canonical_retryable
-            ):
-                return self._write_incomplete_outputs(
-                    archive,
-                    group,
-                    abstract,
-                    overview,
-                    memory_diff=self._partial_memory_result(group),
-                )
-            canonical_attempt_id = uuid.uuid4().hex
-            if not self.commit_group_store.claim_canonical(
-                group_id,
-                attempt_id=canonical_attempt_id,
-            ):
-                current = self.commit_group_store.load(group_id)
-                assert current is not None
-                return self._result(archive, current)
-            try:
-                if self.committer is not None:
-                    self._recover_pending_memory_effects(archive.user_id, group_id)
-                    self._backfill_canonical_effects(group_id, archive.user_id)
-                plan_with_progress = getattr(self.memory_planner, "plan_with_progress", None)
-                if callable(plan_with_progress):
-                    memory_result = cast(
-                        MemoryPlanningResult,
-                        plan_with_progress(
-                            archive,
-                            progress=lambda phase, digest: self.commit_group_store.mark_canonical_phase(
-                                group_id,
-                                phase=phase,
-                                attempt_id=canonical_attempt_id,
-                                salience_reservation_digest=digest,
-                            ),
-                        ),
-                    )
-                else:
-                    memory_result = self.memory_planner.plan(archive)
-                if (
-                    len(memory_result.context.salience_reservation_digest) == 64
-                    and len(memory_result.context.planning_digest) == 64
-                ):
-                    self.commit_group_store.mark_canonical_phase(
-                        group_id,
-                        phase="planning_sealed",
-                        attempt_id=canonical_attempt_id,
-                        salience_reservation_digest=memory_result.context.salience_reservation_digest,
-                        planning_digest=memory_result.context.planning_digest,
-                    )
-                memory_ops = list(memory_result.operations)
-                memory_diff = self._commit_memory_with_reconcile_retry(
-                    archive,
-                    memory_ops,
-                    memory_result.context,
-                    commit_group_id=group_id,
-                )
-            except MemoryExtractionBackendError as exc:
-                if exc.retryable:
-                    self._enqueue_memory_proposal(archive, exc)
-                group = self.commit_group_store.fail_canonical(
-                    group_id,
-                    exc.error_type,
-                    retryable=exc.retryable,
-                    attempt_id=canonical_attempt_id,
-                )
-                return self._write_incomplete_outputs(
-                    archive,
-                    group,
-                    abstract,
-                    overview,
-                    memory_diff={
-                        "status": "pending",
-                        "proposal_status": "queued" if exc.retryable else "dead_letter",
-                        "error": exc.error_type,
-                        "operation_count": 0,
-                        "operations": [],
-                    },
-                )
-            except (OSError, TimeoutError, RevisionConflictError) as exc:
-                self.commit_group_store.fail_canonical(
-                    group_id,
-                    type(exc).__name__,
-                    retryable=True,
-                    attempt_id=canonical_attempt_id,
-                )
-                raise
-            except (KeyError, TypeError, ValueError, RuntimeError) as exc:
-                self.commit_group_store.fail_canonical(
-                    group_id,
-                    type(exc).__name__,
-                    retryable=False,
-                    attempt_id=canonical_attempt_id,
-                )
-                raise
-            except Exception as exc:
-                # Unknown internal failures are configuration/code failures,
-                # not transport failures. Release the canonical lease before
-                # propagating so the group cannot remain indefinitely running.
-                self.commit_group_store.fail_canonical(
-                    group_id,
-                    type(exc).__name__,
-                    retryable=False,
-                    attempt_id=canonical_attempt_id,
-                )
-                raise
-            group = self.commit_group_store.mark_canonical(
-                group_id,
-                revision=self._max_revision_from_diff(memory_diff),
-                result=memory_diff,
-                attempt_id=canonical_attempt_id,
-            )
-        memory_diff = dict(group.canonical_result)
-        coding_agent = self._is_coding_agent(archive)
-        projection_diff = self._run_consumer(
-            group_id,
-            "projection",
-            lambda: self._project_commit_group(group_id, memory_diff),
-        )
-        memory_diff["projection"] = projection_diff
-        if coding_agent:
-            behavior_diff = self._complete_skipped_consumer(group_id, "behavior")
-        else:
-            behavior_diff = self._run_consumer(
-                group_id,
-                "behavior",
-                lambda: self._commit_consumer_operations(
-                    archive,
-                    group_id,
-                    "behavior",
-                    self.behavior_planner.plan(archive),
-                ),
-            )
-        if coding_agent:
-            action_policy_diff = self._complete_skipped_consumer(group_id, "action_policy")
-        else:
-            action_policy_diff = self._run_consumer(
-                group_id,
-                "action_policy",
-                lambda: self._commit_consumer_operations(
-                    archive,
-                    group_id,
-                    "action_policy",
-                    self.action_policy_planner.plan(archive),
-                ),
-            )
-        context_diff = self._run_consumer(
-            group_id,
-            "context",
-            lambda: self._commit_consumer_operations(
-                archive,
-                group_id,
-                "context",
-                self.context_planner.plan(archive),
-            ),
-        )
-        refreshed_group = self.commit_group_store.load(group_id)
-        assert refreshed_group is not None
-        group = refreshed_group
+        memory = group.consumers["memory"]
+        memory_summary = dict(memory.summary)
+        memory_payload = {
+            "task_id": archive.task_id,
+            "commit_group_id": group.group_id,
+            "status": memory_summary.get("status", memory.status),
+            "edit_proposal_count": int(memory_summary.get("edit_proposal_count", 0) or 0),
+            "edit_proposal_ids": list(memory_summary.get("edit_proposal_ids", []) or []),
+            "memory_document_change_count": len(group.memory_effects),
+            "no_op_count": int(memory_summary.get("no_op_count", 0) or 0),
+            "effects": [effect.to_dict() for effect in group.memory_effects],
+        }
         self.archive_store.write_async_outputs(
             archive.archive_uri,
             abstract=abstract,
             overview=overview,
-            memory_diff={"task_id": archive.task_id, "commit_group_id": group_id, **memory_diff},
-            behavior_diff={"task_id": archive.task_id, **behavior_diff},
-            action_policy_diff={"task_id": archive.task_id, **action_policy_diff},
-            context_diff={"task_id": archive.task_id, **context_diff},
-            tenant_id=tenant_id,
+            memory_diff=memory_payload,
+            behavior_diff=self._ordinary_output(archive, group, "behavior"),
+            action_policy_diff=self._ordinary_output(archive, group, "action_policy"),
+            context_diff=self._ordinary_output(archive, group, "context"),
+            tenant_id=group.tenant_id,
             commit_group_status=group.to_dict(),
-            complete=group.complete,
+            complete=complete,
+            task_id=archive.task_id,
+            created_at=group.created_at,
         )
-        return self._result(archive, group)
 
-    def _acquire_migration_projection_fence(self) -> Any | None:
-        acquire = getattr(self.migration_gate, "acquire_projection_fence", None)
-        return acquire() if callable(acquire) else None
-
-    def _release_migration_projection_fence(self, token: Any | None) -> None:
-        release = getattr(self.migration_gate, "release_projection_fence", None)
-        if callable(release):
-            release(token)
-
-    def _record_session_projection_frontier(
-        self,
+    @staticmethod
+    def _ordinary_output(
         archive: SessionArchive,
-        *,
-        status: str,
-        error: str = "",
-    ) -> bool:
-        if self.session_projector is None:
-            return False
-        feature_gate = getattr(self.migration_gate, "feature_gate", None)
-        if feature_gate is not None and not bool(getattr(feature_gate, "dual_write_enabled", False)):
-            return False
-        store = getattr(self.session_projector, "catalog_store", None)
-        recorder = getattr(store, "set_session_projection_frontier", None)
-        if not callable(recorder):
-            return False
-        recorder(
-            tenant_id=self._bind_archive_tenant(archive),
-            archive_uri=archive.archive_uri,
-            owner_user_id=archive.user_id,
-            workspace_id=workspace_id_from_session_metadata(archive.metadata),
-            session_id=archive.session_id,
-            manifest_digest=str(archive.manifest_digest or ""),
-            status=status,
-            error=error,
-        )
-        return True
-
-    def recover_session_projection_frontier(self, *, batch_size: int = 256) -> dict[str, int]:
-        fence = self._acquire_migration_projection_fence()
-        try:
-            return self._recover_session_projection_frontier_unfenced(batch_size=batch_size)
-        finally:
-            self._release_migration_projection_fence(fence)
-
-    def _recover_session_projection_frontier_unfenced(self, *, batch_size: int = 256) -> dict[str, int]:
-        """Repair crash windows between Archive publish, queueing, and projection.
-
-        The scan is tenant-keyset paginated.  Every row is rebound to an
-        immutable Archive manifest before an idempotent queue job or Catalog
-        projection is created; a pre-write frontier without Evidence becomes
-        an explicit terminal ABANDONED record instead of poisoning cutover.
-        """
-
-        if self.session_projector is None:
-            return {"scanned": 0, "projected": 0, "enqueued": 0, "abandoned": 0}
-        store = cast(Any, getattr(self.session_projector, "catalog_store", None))
-        if store is None:
-            return {"scanned": 0, "projected": 0, "enqueued": 0, "abandoned": 0}
-        lister = getattr(store, "list_session_projection_frontier", None)
-        if not callable(lister):
-            return {"scanned": 0, "projected": 0, "enqueued": 0, "abandoned": 0}
-        tenant_id = str(self.archive_store.tenant_id)
-        maximum = max(1, min(int(batch_size), 1_000))
-        counts = {"scanned": 0, "projected": 0, "enqueued": 0, "abandoned": 0}
-        after = ""
-        while True:
-            rows = cast(
-                list[dict[str, Any]],
-                lister(
-                    tenant_id=tenant_id,
-                    statuses=("PENDING", "FAILED"),
-                    after_archive_uri=after,
-                    limit=maximum,
-                ),
-            )
-            if not rows:
-                break
-            for row in rows:
-                archive: SessionArchive | None = None
-                after = str(row.get("archive_uri") or "")
-                counts["scanned"] += 1
-                if not self.archive_store.archive_exists(after, tenant_id=tenant_id):
-                    store.set_session_projection_frontier(
-                        tenant_id=tenant_id,
-                        archive_uri=after,
-                        owner_user_id=str(row.get("owner_user_id") or ""),
-                        workspace_id=str(row.get("workspace_id") or ""),
-                        session_id=str(row.get("session_id") or ""),
-                        manifest_digest=str(row.get("manifest_digest") or ""),
-                        status="ABANDONED",
-                        error="immutable SessionArchive evidence was not published",
-                    )
-                    counts["abandoned"] += 1
-                    continue
-                try:
-                    archive = self.archive_store.read_archive(
-                        after,
-                        tenant_id=tenant_id,
-                        manifest_digest=str(row.get("manifest_digest") or "") or None,
-                    )
-                    if archive.session_id != str(row.get("session_id") or ""):
-                        raise ValueError("Session projection frontier session identity mismatch")
-                    self._enqueue_session_commit(archive, tenant_id=tenant_id)
-                    counts["enqueued"] += 1
-                    projection, status = self._project_session_archive(archive)
-                    if status != "projected" or projection is None:
-                        raise RuntimeError("Session projection recovery is outside the dual-write gate")
-                    self._record_session_projection_frontier(archive, status="PROJECTED")
-                    counts["projected"] += 1
-                except Exception as exc:
-                    store.set_session_projection_frontier(
-                        tenant_id=tenant_id,
-                        archive_uri=after,
-                        owner_user_id=str(row.get("owner_user_id") or (archive.user_id if archive else "")),
-                        workspace_id=str(
-                            row.get("workspace_id")
-                            or (workspace_id_from_session_metadata(archive.metadata) if archive else "")
-                        ),
-                        session_id=str(row.get("session_id") or ""),
-                        manifest_digest=str(row.get("manifest_digest") or ""),
-                        status="FAILED",
-                        error=f"{type(exc).__name__}: {exc}",
-                    )
-                    raise RuntimeError("Session projection frontier recovery failed") from exc
-            if len(rows) < maximum:
-                break
-        return counts
-
-    def resume_startup_commit_group(
-        self,
-        archive: SessionArchive,
-        *,
-        group_id: str,
-    ) -> SessionCommitResult:
-        """Resume one durable group without opening a RECOVERING write bypass."""
-
-        if self.committer is None:
-            raise RuntimeError("startup commit-group recovery requires OperationCommitter")
-        expected_group_id = f"commit_group_{archive.task_id}"
-        if group_id != expected_group_id:
-            raise RuntimeError("startup archive is detached from its commit-group identity")
-        group = self.commit_group_store.load(group_id)
-        tenant_id = self._bind_archive_tenant(archive)
-        if (
-            group is None
-            or group.task_id != archive.task_id
-            or group.archive_uri != archive.archive_uri
-            or group.user_id != archive.user_id
-            or group.tenant_id != tenant_id
-            or group.archive_digest != archive.archive_digest
-            or group.manifest_digest != archive.manifest_digest
-            or group.complete
-        ):
-            raise RuntimeError("startup archive is detached from its durable commit group")
-        if group.canonical_status != "completed":
-            planning_envelopes = self.committer.planning_envelopes
-            if planning_envelopes is None:
-                raise RuntimeError("startup canonical commit recovery requires durable planning envelopes")
-            envelope = planning_envelopes.load_validated_payload(group.task_id)
-            if (
-                envelope.get("operation_group_identity") != group.group_id
-                or envelope.get("archive_uri") != group.archive_uri
-                or envelope.get("archive_digest") != group.archive_digest
-                or envelope.get("manifest_digest") != group.manifest_digest
-                or envelope.get("user_id") != group.user_id
-                or envelope.get("tenant_id") != group.tenant_id
-                or (group.planning_digest and envelope.get("planning_digest") != group.planning_digest)
-            ):
-                raise RuntimeError("startup commit group is detached from durable planning")
-        with self.committer._durable_startup_recovery_scope(group_id):
-            return self.async_commit(archive)
-
-    def _commit_memory_with_reconcile_retry(
-        self,
-        archive: SessionArchive,
-        operations: list[ContextOperation],
-        planning_context: PlanningContext | None = None,
-        *,
-        commit_group_id: str = "",
-    ) -> dict:
-        planned_operations = list(operations)
-        try:
-            try:
-                committed = self._commit_or_describe(archive.user_id, operations)
-            except RevisionConflictError as exc:
-                partial_diff = exc.committed_diff
-                if self.committer is not None:
-                    self._recover_pending_memory_effects(
-                        archive.user_id,
-                        commit_group_id,
-                    )
-                if planning_context is None:
-                    raise RevisionConflictError("revision conflict has no request-scoped PlanningContext") from exc
-                replanned = self.memory_planner.replan(planning_context, archive)
-                planned_operations.extend(replanned.operations)
-                if self.committer is not None:
-                    retried_diff = self.committer.commit(archive.user_id, list(replanned.operations))
-                    combined_diff = self.committer.combine_committed_diffs(
-                        archive.user_id,
-                        [item for item in (partial_diff, retried_diff) if item is not None],
-                    )
-                    committed = self._diff_payload(combined_diff, status="committed")
-                else:
-                    retried = self._commit_or_describe(archive.user_id, list(replanned.operations))
-                    partial = self._diff_payload(partial_diff, status="committed") if partial_diff is not None else None
-                    committed = self._merge_diff_payloads(*(item for item in (partial, retried) if item is not None))
-        except BaseException as original_error:
-            if commit_group_id and self.committer is not None:
-                recovery_error: Exception | None = None
-                try:
-                    self._recover_pending_memory_effects(archive.user_id, commit_group_id)
-                except (OSError, TimeoutError, RuntimeError, ValueError, KeyError, TypeError) as exc:
-                    recovery_error = exc
-                try:
-                    self._backfill_canonical_effects(commit_group_id, archive.user_id)
-                except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
-                    if recovery_error is None:
-                        recovery_error = exc
-                if recovery_error is not None:
-                    raise recovery_error from original_error
-            raise
-        if commit_group_id and self.committer is not None:
-            self._backfill_canonical_effects(commit_group_id, archive.user_id)
-            committed = self._merge_canonical_effects(
-                commit_group_id,
-                archive.user_id,
-                committed,
-            )
-        return self._memory_commit_metadata(committed, planned_operations)
-
-    def _run_consumer(
-        self,
-        group_id: str,
+        group: CommitGroupStatus,
         consumer: str,
-        action: Callable[[], dict[str, Any]],
     ) -> dict[str, Any]:
-        status = self.commit_group_store.load(group_id)
-        if status is None:
-            raise KeyError(f"unknown commit group: {group_id}")
-        existing = status.consumers[consumer]
-        if existing.status == "completed":
-            return dict(existing.result) or {"status": "completed"}
-        if existing.status in {"dead_letter", "quarantine"} or (existing.status == "failed" and not existing.retryable):
-            return {"status": existing.status, "error": existing.last_error, "retryable": False}
-        attempt_id = uuid.uuid4().hex
-        if not self.commit_group_store.claim_consumer(
-            group_id,
-            consumer,
-            attempt_id=attempt_id,
-        ):
-            current = self.commit_group_store.load(group_id)
-            assert current is not None
-            item = current.consumers[consumer]
-            return {
-                "status": item.status,
-                "error": item.last_error,
-                "retryable": item.retryable,
-            }
-        try:
-            result = action()
-            failures = [str(item) for item in result.get("failed", []) or []]
-            if failures:
-                raise DerivedConsumerError(
-                    consumer,
-                    failures,
-                    retryable=bool(result.get("retryable", True)),
-                )
-        except DerivedConsumerError as exc:
-            failed = self.commit_group_store.fail_consumer(
-                group_id,
-                consumer,
-                type(exc).__name__,
-                retryable=exc.retryable,
-                attempt_id=attempt_id,
-            )
-            item = failed.consumers[consumer]
-            return {
-                "status": item.status,
-                "error": item.last_error,
-                "retryable": item.retryable,
-            }
-        except (OSError, TimeoutError, RuntimeError, ValueError, KeyError, TypeError) as exc:
-            failed = self.commit_group_store.fail_consumer(
-                group_id,
-                consumer,
-                type(exc).__name__,
-                retryable=True,
-                attempt_id=attempt_id,
-            )
-            item = failed.consumers[consumer]
-            return {
-                "status": item.status,
-                "error": item.last_error,
-                "retryable": item.retryable,
-            }
-        except Exception as exc:
-            failed = self.commit_group_store.fail_consumer(
-                group_id,
-                consumer,
-                type(exc).__name__,
-                retryable=False,
-                attempt_id=attempt_id,
-            )
-            item = failed.consumers[consumer]
-            return {
-                "status": item.status,
-                "error": item.last_error,
-                "retryable": item.retryable,
-            }
-        current = self.commit_group_store.load(group_id)
-        assert current is not None
-        self.commit_group_store.complete_consumer(
-            group_id,
-            consumer,
-            revision=current.canonical_revision,
-            attempt_id=attempt_id,
-            result=result,
-        )
-        return result
-
-    def _complete_skipped_consumer(self, group_id: str, consumer: str) -> dict[str, Any]:
-        result = {"status": "skipped", "operations": [], "operation_count": 0}
-        status = self.commit_group_store.load(group_id)
-        if status is None:
-            raise KeyError(f"unknown commit group: {group_id}")
-        if status.consumers[consumer].status != "completed":
-            self.commit_group_store.complete_consumer(
-                group_id,
-                consumer,
-                revision=status.canonical_revision,
-                result=result,
-            )
-        return result
-
-    def _project_commit_group(self, group_id: str, memory_diff: dict[str, Any]) -> dict[str, Any]:
-        transaction_ids = tuple(
-            dict.fromkeys(
-                str(operation.get("payload", {}).get("transaction_id", ""))
-                for operation in memory_diff.get("operations", []) or []
-                if isinstance(operation, dict)
-                and operation.get("payload", {}).get("canonical_memory") is True
-                and operation.get("payload", {}).get("transaction_id")
-            )
-        )
-        if self.projection_worker is None:
-            if transaction_ids:
-                return {
-                    "status": "failed",
-                    "processed": [],
-                    "stale": [],
-                    "failed": ["projection_worker_unavailable"],
-                    "retryable": False,
-                }
-            return {"status": "skipped", "processed": [], "stale": [], "failed": []}
-        result = self.projection_worker.process_commit_group(
-            group_id,
-            transaction_ids=transaction_ids,
-        )
+        item = group.consumers[consumer]
+        summary = dict(item.summary)
         return {
-            "status": "completed" if not result["failed"] else "failed",
-            "transaction_ids": list(transaction_ids),
-            **result,
+            "task_id": archive.task_id,
+            "commit_group_id": group.group_id,
+            "status": summary.get("status", item.status),
+            "operation_count": int(summary.get("operation_count", 0) or 0),
+            "operation_ids": list(summary.get("operation_ids", []) or []),
+            "diff_id": str(summary.get("diff_id", "") or ""),
+            "skipped": bool(summary.get("skipped", False)),
         }
 
-    def _commit_consumer_operations(
-        self,
-        archive: SessionArchive,
-        group_id: str,
-        consumer: str,
-        operations: list[ContextOperation],
-    ) -> dict[str, Any]:
-        self._stabilize_consumer_operations(archive, group_id, consumer, operations)
-        return self._commit_or_describe(archive.user_id, operations)
-
-    def _stabilize_consumer_operations(
-        self,
-        archive: SessionArchive,
-        group_id: str,
-        consumer: str,
-        operations: list[ContextOperation],
-    ) -> None:
-        for index, operation in enumerate(operations):
-            operation.operation_id = f"op_{stable_hash([group_id, consumer, index, operation.action.value, operation.target_uri], length=32)}"
-            operation.created_at = archive.created_at
-            operation.payload["commit_group_id"] = group_id
-            operation.payload["commit_consumer"] = consumer
-
-    def _enqueue_memory_proposal(self, archive: SessionArchive, exc: MemoryExtractionBackendError) -> None:
-        self.queue_store.enqueue(
-            QueueJob(
-                job_id=f"memory_proposal_{archive.task_id}",
-                queue_name="memory_proposal",
-                action="retry_memory_proposal",
-                target_uri=archive.archive_uri,
-                payload={
-                    "task_id": archive.task_id,
-                    "tenant_id": self._tenant_id(archive),
-                    "archive_digest": archive.archive_digest,
-                    "manifest_digest": archive.manifest_digest,
-                    "error_type": exc.error_type,
-                },
-            )
-        )
-
-    def _write_incomplete_outputs(
+    def _result(
         self,
         archive: SessionArchive,
         group: CommitGroupStatus,
-        abstract: str,
-        overview: str,
         *,
-        memory_diff: dict[str, Any],
+        projection_status: str = "not_configured",
+        projected_count: int = 0,
     ) -> SessionCommitResult:
-        pending = {"status": "pending", "operations": [], "operation_count": 0}
-        memory_diff = {
-            "archive_committed": True,
-            "canonical_active_operation_count": 0,
-            "pending_count": 0,
-            "pending_persisted": False,
-            **memory_diff,
-        }
-        self.archive_store.write_async_outputs(
-            archive.archive_uri,
-            abstract=abstract,
-            overview=overview,
-            memory_diff={"task_id": archive.task_id, "commit_group_id": group.group_id, **memory_diff},
-            behavior_diff={"task_id": archive.task_id, **pending},
-            action_policy_diff={"task_id": archive.task_id, **pending},
-            context_diff={"task_id": archive.task_id, **pending},
-            tenant_id=group.tenant_id,
-            commit_group_status=group.to_dict(),
-            complete=False,
-        )
-        return self._result(archive, group)
-
-    def _result(self, archive: SessionArchive, group: CommitGroupStatus) -> SessionCommitResult:
-        failed_consumers = [
-            name for name, item in group.consumers.items() if item.status in {"failed", "dead_letter", "quarantine"}
-        ]
-        memory_result = dict(group.canonical_result or {})
-        pending_count = int(memory_result.get("pending_count", 0) or 0)
-        active_count = int(memory_result.get("canonical_active_operation_count", 0) or 0)
-        pending_persisted = bool(memory_result.get("pending_persisted", False))
-        if group.complete and pending_count:
-            status = "done_with_pending"
-        elif group.complete:
+        if group.complete:
             status = "done"
-        elif group.canonical_status == "completed" and failed_consumers:
-            status = "derived_failed"
-        elif group.canonical_status == "completed":
-            status = "canonical_committed"
+            state = SessionCommitState.COMMITTED
+            done = True
+        elif group.terminal:
+            status = "dead_letter"
+            state = SessionCommitState.DEAD_LETTER
+            done = False
         else:
-            status = "canonical_pending"
-        terminal_failure = group.canonical_status in {"dead_letter", "quarantine"} or any(
-            item.status in {"dead_letter", "quarantine"} for item in group.consumers.values()
-        )
-        retryable_failure = (group.canonical_status == "failed" and group.canonical_retryable) or any(
-            item.status == "failed" and item.retryable for item in group.consumers.values()
-        )
+            status = "retrying"
+            state = SessionCommitState.FAILED_RETRYABLE
+            done = False
+        memory_summary = group.consumers["memory"].summary
         return SessionCommitResult(
             task_id=archive.task_id,
             archive_uri=archive.archive_uri,
             status=status,
-            done=group.complete,
-            state=(
-                SessionCommitState.DEAD_LETTER
-                if terminal_failure
-                else SessionCommitState.FAILED_RETRYABLE
-                if retryable_failure
-                else SessionCommitState.COMMITTED
-                if group.canonical_status == "completed"
-                else SessionCommitState.PROCESSING
-            ),
+            done=done,
+            state=state,
             commit_group_id=group.group_id,
-            canonical_committed=group.canonical_status == "completed",
+            memory_committed=group.memory_committed,
             commit_group_status=group.to_dict(),
             archive_committed=True,
-            canonical_active_operation_count=active_count,
-            pending_count=pending_count,
-            pending_persisted=pending_persisted,
+            memory_document_change_count=len(group.memory_effects),
+            edit_proposal_count=int(memory_summary.get("edit_proposal_count", 0) or 0),
+            edit_proposal_ids=tuple(memory_summary.get("edit_proposal_ids", []) or ()),
+            session_projection_status=projection_status,
+            session_projected_count=projected_count,
         )
+
+    def _validate_persisted_memory_effects(self, group: CommitGroupStatus) -> None:
+        if not group.memory_effects:
+            return
+        if self.memory_committer is None:
+            raise RuntimeError("durable memory effects require MemoryDocumentCommitter")
+        for effect in group.memory_effects:
+            binding = self.memory_committer.control_store.load_event_binding(
+                group.tenant_id,
+                group.user_id,
+                effect.document_id,
+                effect.change_event_id,
+            )
+            if binding is None:
+                barrier = self.memory_committer.control_store.load_publication_barrier(
+                    group.tenant_id,
+                    group.user_id,
+                    effect.document_id,
+                )
+                if barrier is not None and barrier.status is DocumentDeletionStatus.HARD_ERASED:
+                    continue
+                raise RuntimeError("commit-group memory effect is detached from its change event")
+            intent, event = binding
+            if intent.status is not DocumentIntentStatus.COMPLETED:
+                raise RuntimeError("commit-group memory effect is detached from its completed intent")
+            if canonical_digest(event.to_dict()) != effect.change_digest:
+                raise RuntimeError("commit-group memory effect is detached from its change event")
+            job = self.memory_committer.projection_queue.get(intent.projection_job_id)
+            if (
+                job is None
+                or job.queue_name != "memory_projection"
+                or job.action != "memory_committed"
+                or job.payload.get("intent_id") != intent.intent_id
+                or job.payload.get("document_id") != intent.document_id
+                or job.payload.get("event_id") != intent.event_id
+            ):
+                raise RuntimeError("completed memory intent has no durable projection job")
+
+    def _effect_from_document_result(self, result: DocumentCommitResult) -> MemoryDocumentEffect:
+        if result.status is not DocumentIntentStatus.COMPLETED or result.event is None:
+            raise RuntimeError("document committer did not complete its source and projection enqueue")
+        if result.event.document_id == "":
+            raise RuntimeError("document change event has no document identity")
+        return MemoryDocumentEffect(
+            document_id=result.event.document_id,
+            change_event_id=result.event.event_id,
+            change_digest=canonical_digest(result.event.to_dict()),
+        )
+
+    def _validate_document_plan(self, plan: DocumentEditPlan, archive: SessionArchive) -> None:
+        if plan.tenant_id != self._tenant_id(archive) or plan.owner_user_id != archive.user_id:
+            raise PermissionError("document plan crosses the archived Session boundary")
+        if not self._is_sha256(plan.evidence_digest):
+            raise ValueError("document plan evidence digest is invalid")
+        if not plan.idempotency_key:
+            raise ValueError("document plan idempotency key is empty")
+
+    def _stabilize_operations(
+        self,
+        archive: SessionArchive,
+        group_id: str,
+        consumer: str,
+        operations: Sequence[ContextOperation],
+    ) -> list[ContextOperation]:
+        stable: list[ContextOperation] = []
+        for position, operation in enumerate(operations):
+            if not isinstance(operation, ContextOperation):
+                raise TypeError(f"{consumer} planner returned a non-ContextOperation")
+            if operation.user_id != archive.user_id:
+                raise PermissionError(f"{consumer} operation crosses the Session owner boundary")
+            operation_key = stable_hash(
+                [
+                    group_id,
+                    consumer,
+                    position,
+                    operation.context_type.value,
+                    operation.action.value,
+                    operation.target_uri,
+                ],
+                40,
+            )
+            operation.operation_id = f"op_{operation_key}"
+            operation.created_at = archive.created_at
+            operation.payload["commit_group_id"] = group_id
+            operation.payload["commit_consumer"] = consumer
+            stable.append(operation)
+        return stable
+
+    def _enqueue_session_commit(self, archive: SessionArchive, *, tenant_id: str) -> QueueJob:
+        return self.queue_store.enqueue(
+            QueueJob(
+                job_id=archive.task_id,
+                queue_name="session_commit",
+                action="async_session_commit",
+                target_uri=archive.archive_uri,
+                payload={
+                    "user_id": archive.user_id,
+                    "session_id": archive.session_id,
+                    "tenant_id": tenant_id,
+                    "archive_digest": archive.archive_digest,
+                    "manifest_digest": archive.manifest_digest,
+                },
+            )
+        )
+
+    def _project_session_archive(
+        self,
+        archive: SessionArchive,
+        *,
+        respect_applied_tombstones: bool = False,
+    ) -> tuple[Any | None, str]:
+        if self.session_projector is None:
+            return None, "not_configured"
+        async_outputs: dict[str, Any] | None = None
+        if self.archive_store.async_outputs_done_for_task(archive):
+            async_outputs = self.archive_store.read_async_outputs(archive)
+        elif str(getattr(self.archive_store, "last_async_output_error", "") or ""):
+            raise RuntimeError("Session async outputs failed integrity validation")
+        kwargs: dict[str, Any] = {}
+        if async_outputs is not None:
+            kwargs["async_outputs"] = async_outputs
+        if respect_applied_tombstones:
+            kwargs["respect_applied_tombstones"] = True
+        return self.session_projector.project(archive, **kwargs), "projected"
+
+    def _record_projection(
+        self,
+        archive: SessionArchive,
+        *,
+        tenant_id: str,
+        status: str,
+        error: str = "",
+    ) -> bool:
+        if self.session_projector is None or not self.projection_journal.enabled:
+            return False
+        return self.projection_journal.record(
+            archive,
+            tenant_id=tenant_id,
+            status=status,
+            error=error,
+        )
+
+    def _require_runtime_ready(self) -> None:
+        committer = getattr(self.committer, "delegate", self.committer)
+        source_store = getattr(committer, "source_store", None)
+        if source_store is None:
+            source_store = getattr(self.memory_planner, "source_store", None)
+        readiness = getattr(source_store, "readiness", None)
+        require_ready = getattr(readiness, "require_ready", None)
+        if not callable(require_ready) or self._startup_recovery_group.get():
+            return
+        require_ready()
+
+    @contextmanager
+    def _startup_recovery_scope(self, group_id: str) -> Iterator[None]:
+        token = self._startup_recovery_group.set(group_id)
+        committer = getattr(self.committer, "delegate", self.committer)
+        scope = getattr(committer, "_durable_startup_recovery_scope", None)
+        try:
+            if callable(scope):
+                with cast(AbstractContextManager[None], scope(group_id)):
+                    yield
+            else:
+                yield
+        finally:
+            self._startup_recovery_group.reset(token)
 
     def _tenant_id(self, archive: SessionArchive) -> str:
         metadata = dict(archive.metadata or {})
         scope = dict(metadata.get("scope", {}) or {})
-        bound_tenant = str(self.archive_store.tenant_id)
-        claimed_tenants = tuple(
+        bound = str(self.archive_store.tenant_id)
+        claimed = tuple(
             str(value) for value in (metadata.get("tenant_id"), scope.get("tenant_id")) if value not in (None, "")
         )
-        if any(claimed != bound_tenant for claimed in claimed_tenants):
-            raise PermissionError("session archive tenant does not match the bound archive store")
-        return bound_tenant
+        if any(value != bound for value in claimed):
+            raise PermissionError("SessionArchive tenant differs from its bound store")
+        return bound
 
     def _bind_archive_tenant(self, archive: SessionArchive) -> str:
-        """Validate the trust boundary before I/O and materialize its tenant."""
-
         tenant_id = self._tenant_id(archive)
         metadata = dict(archive.metadata or {})
         metadata["tenant_id"] = tenant_id
@@ -954,231 +1043,67 @@ class SessionCommitService:
         archive.metadata = metadata
         return tenant_id
 
-    def _max_revision_from_diff(self, diff: dict[str, Any]) -> int | None:
-        revisions = []
-        for operation in diff.get("operations", []) or []:
-            payload = operation.get("payload", {}).get("context_object") if isinstance(operation, dict) else None
-            if isinstance(payload, dict):
-                value = dict(payload.get("metadata", {}) or {}).get("revision")
-                if value is not None:
-                    revisions.append(int(value))
-        return max(revisions) if revisions else None
+    @staticmethod
+    def _assert_archive_identity(
+        requested: SessionArchive,
+        persisted: SessionArchive,
+        *,
+        allow_materialized_digests: bool = False,
+    ) -> None:
+        if (
+            requested.task_id != persisted.task_id
+            or requested.user_id != persisted.user_id
+            or requested.session_id != persisted.session_id
+            or requested.archive_uri != persisted.archive_uri
+        ):
+            raise RuntimeError("SessionArchive request is detached from durable evidence")
+        for field in ("archive_digest", "manifest_digest"):
+            expected = str(getattr(requested, field, "") or "")
+            actual = str(getattr(persisted, field, "") or "")
+            if expected and expected != actual:
+                raise RuntimeError(f"SessionArchive {field} changed across durable read")
+            if not expected and not allow_materialized_digests:
+                raise RuntimeError(f"SessionArchive {field} is not materialized")
 
-    def _is_coding_agent(self, archive: SessionArchive) -> bool:
+    @staticmethod
+    def _actor_binding(archive: SessionArchive) -> str:
+        return f"session:{archive.task_id}:{archive.user_id}"
+
+    @staticmethod
+    def _evidence_reference(archive: SessionArchive, position: int) -> str:
+        manifest = archive.manifest_uri or f"{archive.archive_uri}#manifest={archive.manifest_digest}"
+        return f"{manifest}:memory-edit:{position}"
+
+    @staticmethod
+    def _skipped_action(_attempt_id: str) -> dict[str, Any]:
+        return {
+            "status": "skipped",
+            "operation_count": 0,
+            "operation_ids": [],
+            "diff_id": "",
+            "skipped": True,
+        }
+
+    @staticmethod
+    def _is_coding_agent(archive: SessionArchive) -> bool:
         connect = dict(archive.metadata.get("connect", {}) or {})
         return connect.get("connect_type") == "agent" and connect.get("run_mode") == "context_reduction"
 
-    def _commit_or_describe(self, user_id: str, operations: list[ContextOperation]) -> dict:
-        if self.committer is not None and operations:
-            diff = self.committer.commit(user_id, operations)
-            return self._diff_payload(diff, status="committed")
-        if self.committer is not None:
-            return {"status": "committed", "operations": [], "operation_count": 0}
-        return {
-            "status": "planned",
-            "operations": [operation.to_dict() for operation in operations],
-            "operation_count": len(operations),
-        }
+    @staticmethod
+    def _is_retryable(exc: BaseException) -> bool:
+        explicit = getattr(exc, "retryable", None)
+        if isinstance(explicit, bool):
+            return explicit
+        return isinstance(exc, (OSError, TimeoutError, RevisionConflictError, DocumentConflictError))
 
-    def _diff_payload(self, diff: ContextDiff, status: str) -> dict:
-        payload = diff.to_dict()
-        payload["status"] = status
-        payload["operation_count"] = len(diff.operations)
-        return payload
+    @staticmethod
+    def _is_sha256(value: str) -> bool:
+        return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
 
-    def _merge_diff_payloads(self, *payloads: dict[str, Any]) -> dict[str, Any]:
-        merged: dict[str, Any] = {"status": "committed"}
-        for key in ("operations", "pending_operations", "rejected_operations"):
-            by_id: dict[str, dict[str, Any]] = {}
-            for payload in payloads:
-                for operation in payload.get(key, []) or []:
-                    if not isinstance(operation, dict):
-                        continue
-                    operation_id = str(operation.get("operation_id") or "")
-                    if operation_id:
-                        by_id.setdefault(operation_id, operation)
-            merged[key] = list(by_id.values())
-        merged["operation_count"] = len(merged["operations"])
-        return merged
 
-    def _backfill_canonical_effects(self, group_id: str, user_id: str) -> CommitGroupStatus:
-        if self.committer is None:
-            status = self.commit_group_store.load(group_id)
-            if status is None:
-                raise KeyError(f"unknown commit group: {group_id}")
-            return status
-        committed_effects = getattr(self.committer, "committed_memory_effect_diffs", None)
-        if not callable(committed_effects):
-            status = self.commit_group_store.load(group_id)
-            if status is None:
-                raise KeyError(f"unknown commit group: {group_id}")
-            return status
-        load_effects = cast(Callable[[str, str], list[ContextDiff]], committed_effects)
-        for diff in load_effects(user_id, group_id):
-            self.commit_group_store.record_canonical_effect(group_id, diff.to_dict())
-        status = self.commit_group_store.load(group_id)
-        if status is None:
-            raise KeyError(f"unknown commit group: {group_id}")
-        return status
-
-    def _recover_pending_memory_effects(self, user_id: str, group_id: str) -> None:
-        if self.committer is None:
-            return
-        recover_canonical = getattr(self.committer, "recover_pending_canonical", None)
-        if callable(recover_canonical):
-            recover_canonical(
-                user_id,
-                commit_group_id=group_id or None,
-            )
-        if not group_id:
-            return
-        recover_regular = getattr(self.committer, "recover_pending_regular_memory", None)
-        if callable(recover_regular):
-            recover_regular(
-                user_id,
-                commit_group_id=group_id,
-            )
-
-    def _merge_canonical_effects(
-        self,
-        group_id: str,
-        user_id: str,
-        current: dict[str, Any],
-    ) -> dict[str, Any]:
-        if self.committer is None:
-            return current
-        status = self.commit_group_store.load(group_id)
-        if status is None:
-            raise KeyError(f"unknown commit group: {group_id}")
-        diffs = [self._context_diff_from_payload(payload) for payload in status.canonical_effects.values()]
-        if any(current.get(key) for key in ("operations", "pending_operations", "rejected_operations")):
-            diffs.append(self._context_diff_from_payload(current))
-        if not diffs:
-            return current
-        combine = getattr(self.committer, "combine_committed_diffs", None)
-        if callable(combine):
-            combine_diffs = cast(Callable[[str, list[ContextDiff]], ContextDiff], combine)
-            combined = combine_diffs(user_id, diffs)
-            return self._diff_payload(combined, status="committed")
-        return self._merge_diff_payloads(*(self._diff_payload(diff, "committed") for diff in diffs))
-
-    def _context_diff_from_payload(self, payload: dict[str, Any]) -> ContextDiff:
-        return ContextDiff(
-            user_id=str(payload["user_id"]),
-            operations=[ContextOperation.from_dict(item) for item in payload.get("operations", []) or []],
-            pending_operations=[
-                ContextOperation.from_dict(item) for item in payload.get("pending_operations", []) or []
-            ],
-            rejected_operations=[
-                ContextOperation.from_dict(item) for item in payload.get("rejected_operations", []) or []
-            ],
-            diff_id=str(payload.get("diff_id") or ""),
-            created_at=str(payload.get("created_at") or ""),
-            schema_version=str(payload.get("schema_version") or "context_diff_v1"),
-        )
-
-    def _partial_memory_result(self, group: CommitGroupStatus) -> dict[str, Any]:
-        if group.canonical_result:
-            return {
-                **group.canonical_result,
-                "status": "partial_failed",
-                "error": group.canonical_last_error,
-            }
-        if group.canonical_effects:
-            merged = self._merge_diff_payloads(*group.canonical_effects.values())
-            merged.update(
-                {
-                    "user_id": group.user_id,
-                    "status": "partial_failed",
-                    "error": group.canonical_last_error,
-                }
-            )
-            return self._memory_commit_metadata(merged, [])
-        return {
-            "status": "failed",
-            "error": group.canonical_last_error,
-            "operation_count": 0,
-            "operations": [],
-        }
-
-    def _memory_commit_metadata(
-        self,
-        payload: dict[str, Any],
-        planned_operations: list[ContextOperation],
-    ) -> dict[str, Any]:
-        planned_pending = {
-            str(operation.target_uri or operation.payload.get("pending_proposal_id") or operation.operation_id)
-            for operation in planned_operations
-            if operation.payload.get("canonical_pending_proposal") is True
-        }
-        committed_pending = {
-            str(operation.get("target_uri") or operation.get("payload", {}).get("pending_proposal_id") or "")
-            for operation in payload.get("operations", []) or []
-            if isinstance(operation, dict) and operation.get("payload", {}).get("canonical_pending_proposal") is True
-        }
-        if self.committer is not None and planned_pending - committed_pending:
-            raise RuntimeError("canonical pending proposals were not durably committed")
-        outstanding_pending = self._outstanding_pending_uris(
-            planned_operations,
-            committed_pending,
-        )
-        active_operations = [
-            operation
-            for operation in payload.get("operations", []) or []
-            if isinstance(operation, dict)
-            and operation.get("payload", {}).get("canonical_memory") is True
-            and dict(dict(operation.get("payload", {}).get("context_object", {}) or {}).get("metadata", {}) or {}).get(
-                "canonical_kind"
-            )
-            == "claim"
-            and dict(dict(operation.get("payload", {}).get("context_object", {}) or {}).get("metadata", {}) or {}).get(
-                "state"
-            )
-            == "ACTIVE"
-        ]
-        return {
-            **payload,
-            "archive_committed": True,
-            "canonical_active_operation_count": len(active_operations),
-            "pending_count": len(outstanding_pending),
-            "pending_persisted": bool(outstanding_pending) and self.committer is not None,
-        }
-
-    def _outstanding_pending_uris(
-        self,
-        planned_operations: list[ContextOperation],
-        committed_pending: set[str],
-    ) -> set[str]:
-        outstanding_states = {
-            LifecycleState.PENDING.value,
-            LifecycleState.RETRYABLE.value,
-            LifecycleState.CONFIRMED.value,
-        }
-        if self.committer is not None:
-            outstanding: set[str] = set()
-            for uri in committed_pending:
-                try:
-                    obj = read_committed_pending(
-                        self.committer.source_store,
-                        uri,
-                        getattr(self.committer, "relation_store", None),
-                    ).object
-                except (FileNotFoundError, IsADirectoryError, NotADirectoryError) as exc:
-                    raise RuntimeError("committed pending proposal has no valid lifecycle proof") from exc
-                metadata = dict(obj.metadata or {})
-                if (
-                    metadata.get("canonical_kind") == "pending_proposal"
-                    and obj.lifecycle_state.value in outstanding_states
-                ):
-                    outstanding.add(uri)
-            return outstanding
-
-        planned_states: dict[str, str] = {}
-        for operation in planned_operations:
-            if operation.payload.get("canonical_pending_proposal") is not True:
-                continue
-            uri = str(operation.target_uri or operation.payload.get("pending_proposal_id") or operation.operation_id)
-            object_payload = operation.payload.get("context_object")
-            object_state = str(object_payload.get("lifecycle_state") or "") if isinstance(object_payload, dict) else ""
-            planned_states[uri] = str(operation.payload.get("pending_lifecycle_state") or object_state)
-        return {uri for uri, state in planned_states.items() if state in outstanding_states}
+__all__ = [
+    "ConsumerLeaseBusy",
+    "ConsumerTerminalError",
+    "DerivedConsumerError",
+    "SessionCommitService",
+]

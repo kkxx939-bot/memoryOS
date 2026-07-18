@@ -14,7 +14,7 @@ def _pattern(stats: OpportunityStats | None = None, trigger_conditions: dict | N
         user_id="u1",
         scene_key="hot_room",
         trigger_conditions=trigger_conditions or {"context_tags": ["home", "hot_environment"]},
-        memory_anchor_uri="memoryos://user/u1/memories/anchors/hot",
+        support_anchor_uri="memoryos://user/u1/support/behavior/hot",
         case_refs=["c1", "c2", "c3"],
         action_distribution=[{"action": "turn_on_ac", "count": 3}],
         opportunity=stats or OpportunityStats(),
@@ -30,7 +30,7 @@ def test_recent_no_opportunity_ignores_old_negative_feedback_and_no_penalty(tmp_
     source = FileSystemSourceStore(tmp_path)
     index = InMemoryIndexStore()
     source.write_object(pattern.to_context_object(), content="hot room")
-    index.upsert_index(pattern.to_context_object(), content="hot room")
+    index.upsert_index(pattern.to_context_object(), content="hot room", tenant_id="default")
     worker_result = CoolingWorker(source, index, OperationCommitter(source, index, str(tmp_path))).process_behavior_patterns(
         "u1", [Observation(user_id="u1", raw_text="hot room", location="office")]
     )

@@ -33,7 +33,7 @@ from memoryos.adapters.persistence.sqlite._common import (
     sqlite3,
     timezone,
 )
-from memoryos.core.types import ContextScope, scope_key_from_payload
+from memoryos.core.types import scope_key_from_payload
 
 
 class CatalogSerializer:
@@ -79,8 +79,6 @@ class CatalogSerializer:
             event_time=self._store._coerce_timestamp(str(row["event_time"])),
             ingested_at=self._store._coerce_timestamp(str(row["ingested_at"])),
             transaction_time=self._store._coerce_timestamp(str(row["transaction_time"])),
-            valid_from=self._store._coerce_timestamp(str(row["valid_from"])),
-            valid_to=self._store._coerce_timestamp(str(row["valid_to"])),
             title=str(row["title"]),
             l0_text=str(row["l0_text"]),
             l1_text=str(row["l1_text"]),
@@ -88,14 +86,11 @@ class CatalogSerializer:
             source_uri=str(row["source_uri"]),
             source_digest=str(row["source_digest"]),
             source_revision=int(row["source_revision"]),
-            canonical_slot_id=str(row["canonical_slot_id"]),
-            canonical_slot_uri=str(row["canonical_slot_uri"]),
-            canonical_claim_id=str(row["canonical_claim_id"]),
-            canonical_claim_uri=str(row["canonical_claim_uri"]),
-            canonical_revision=int(row["canonical_revision"]),
-            canonical_state=str(row["canonical_state"]),
-            canonical_head_digest=str(row["canonical_head_digest"]),
-            receipt_digest=str(row["receipt_digest"]),
+            document_id=str(row["document_id"]),
+            block_id=str(row["block_id"]),
+            document_kind=str(row["document_kind"]),
+            document_revision=int(row["document_revision"]),
+            projection_generation=int(row["projection_generation"]),
             projection_effect_hash=str(row["projection_effect_hash"]),
             hotness=float(row["hotness"]),
             semantic_hotness=float(row["semantic_hotness"]),
@@ -113,21 +108,13 @@ class CatalogSerializer:
         return [self._store._catalog_record_from_row(conn, row) for row in rows]
 
     def _scope_keys_from_metadata(self, metadata: Mapping[str, Any]) -> list[str]:
-        if metadata.get("canonical_kind") == "current_slot_projection":
-            explicit = metadata.get("scope_keys")
+        explicit = metadata.get("scope_keys")
+        if explicit is not None:
             if not isinstance(explicit, list | tuple) or any(
                 not isinstance(item, str) or not item or len(item) > 1_000 for item in explicit
             ):
-                raise ValueError("Current Slot projection scope keys are invalid")
+                raise ValueError("Catalog scope keys are invalid")
             return list(dict.fromkeys(explicit))
-        if metadata.get("canonical_kind") in {"claim", "slot", "pending_proposal"}:
-            raw_scope = metadata.get("scope")
-            if not isinstance(raw_scope, Mapping):
-                raise ValueError("canonical scope must be an object")
-            canonical_scope = ContextScope.from_dict(raw_scope)
-            if canonical_scope.canonical_subject is None:
-                raise ValueError("canonical scope requires a subject")
-            return [scope.key for scope in canonical_scope.applicability.all_of]
         raw_scope = metadata.get("scope")
         if raw_scope is None:
             return []
@@ -175,39 +162,6 @@ class CatalogSerializer:
             name, location = self._store.sanitizer.sanitize_path(raw)
             return f"resource://{location or 'external'}/{name}" if name else "resource://redacted"
         return str(self._store.sanitizer.sanitize_trace(raw))
-
-    def _restore_internal_projection_path(self, metadata: dict[str, Any]) -> None:
-        """Recreate a canonical control path for the legacy verifier, never for FTS."""
-
-        claimed_path = metadata.get("projection_record_path")
-        if not isinstance(claimed_path, Mapping) and Path(str(claimed_path or "")).is_absolute():
-            return
-        claim_uri = str(metadata.get("claim_uri") or "")
-        attempt_id = str(metadata.get("projection_attempt_id") or "")
-        revision = metadata.get("projection_source_revision")
-        if (
-            not claim_uri
-            or not attempt_id
-            or revision is None
-            or any(character not in "0123456789abcdef" for character in attempt_id.casefold())
-        ):
-            return
-        try:
-            source_revision = int(revision)
-        except (TypeError, ValueError):
-            return
-        claim_digest = hashlib.sha256(claim_uri.encode("utf-8")).hexdigest()
-        artifact_root = self._store.path.parent.parent
-        metadata["projection_record_path"] = str(
-            artifact_root
-            / "system"
-            / "projection-state"
-            / claim_digest[:2]
-            / claim_digest
-            / "revisions"
-            / f"rev-{source_revision}"
-            / f"attempt-{attempt_id}.json"
-        )
 
     def _match_query(self, query: str) -> str:
         escaped = [f'"{term.replace(chr(34), chr(34) + chr(34))}"' for term in lexical_terms(query)]
@@ -432,24 +386,28 @@ class CatalogSerializer:
             tuple(values[column] for column in _CONTEXT_COLUMNS),
         )
 
-    def _delete_fts_record(self, conn: sqlite3.Connection, record_key: str) -> None:
+    def _delete_fts_record(self, conn: sqlite3.Connection, tenant_id: str, record_key: str) -> None:
         mapping = conn.execute(
-            "SELECT fts_rowid FROM context_fts_map WHERE record_key = ?",
-            (str(record_key),),
+            "SELECT fts_rowid FROM context_fts_map WHERE tenant_id = ? AND record_key = ?",
+            (str(tenant_id), str(record_key)),
         ).fetchone()
         if mapping is None:
             return
         fts_rowid = int(mapping["fts_rowid"])
         current = conn.execute(
-            "SELECT record_key FROM contexts_fts WHERE rowid = ?",
+            "SELECT tenant_id, record_key FROM contexts_fts WHERE rowid = ?",
             (fts_rowid,),
         ).fetchone()
-        if current is None or str(current["record_key"]) != str(record_key):
+        if (
+            current is None
+            or str(current["tenant_id"]) != str(tenant_id)
+            or str(current["record_key"]) != str(record_key)
+        ):
             raise RuntimeError("FTS rowid map failed integrity validation")
         conn.execute("DELETE FROM contexts_fts WHERE rowid = ?", (fts_rowid,))
         conn.execute(
-            "DELETE FROM context_fts_map WHERE record_key = ? AND fts_rowid = ?",
-            (str(record_key), fts_rowid),
+            "DELETE FROM context_fts_map WHERE tenant_id = ? AND record_key = ? AND fts_rowid = ?",
+            (str(tenant_id), str(record_key), fts_rowid),
         )
 
     @staticmethod
@@ -487,10 +445,6 @@ class CatalogSerializer:
         return str(value) if isinstance(value, str | int | float) and not isinstance(value, bool) else ""
 
     @staticmethod
-    def _legacy_value(row: sqlite3.Row, columns: set[str], name: str) -> str:
-        return str(row[name] if name in columns and row[name] is not None else "")
-
-    @staticmethod
     def _coerce_timestamp(value: str) -> str:
         raw = str(value or "")
         if not raw:
@@ -502,32 +456,6 @@ class CatalogSerializer:
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc).isoformat()
-
-    @staticmethod
-    def _timestamp_number(value: str, *, lower: bool) -> float:
-        """Map a normalized timestamp to an RTree-safe interval endpoint."""
-
-        raw = str(value or "")
-        if not raw:
-            return -1.0e12 if lower else 1.0e12
-        try:
-            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        except ValueError as exc:
-            raise ValueError("validity timestamps must be ISO-8601") from exc
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc).timestamp()
-
-    @staticmethod
-    def _tenant_rtree_key(conn: sqlite3.Connection, tenant_id: str) -> int:
-        conn.execute(
-            "INSERT INTO context_tenants(tenant_id) VALUES (?) ON CONFLICT(tenant_id) DO NOTHING",
-            (str(tenant_id),),
-        )
-        row = conn.execute("SELECT tenant_key FROM context_tenants WHERE tenant_id = ?", (str(tenant_id),)).fetchone()
-        if row is None:
-            raise RuntimeError("failed to allocate a collision-free tenant validity key")
-        return int(row["tenant_key"])
 
     @staticmethod
     def _now() -> str:

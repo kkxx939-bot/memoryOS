@@ -19,8 +19,22 @@ MAX_TREE_DEPTH = 12
 _PATH_SEGMENT = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")
 _PATH_ROOTS = frozenset({"timeline", "sessions", "projects", "resources", "memories", "skills", "agents"})
 _RESOURCE_PATH_KINDS = frozenset({"desktop", "repository", "uploads", "temporary", "user", "external"})
-_MEMORY_PATH_KINDS = frozenset(
-    {"preferences", "profiles", "rules", "decisions", "experiences", "entities", "events", "state"}
+_MEMORY_FIXED_PATHS = frozenset(
+    {
+        ("root",),
+        ("profile",),
+        ("preferences",),
+        ("knowledge",),
+        ("knowledge", "open-loops"),
+    }
+)
+_MEMORY_DYNAMIC_BRANCHES = frozenset(
+    {
+        ("knowledge", "entities"),
+        ("knowledge", "topics"),
+        ("knowledge", "episodes"),
+        ("experiences",),
+    }
 )
 
 
@@ -38,8 +52,8 @@ class CatalogRecordKind(str, Enum):
     OBSERVATION = "observation"
     ACTION_RESULT = "action_result"
     EVENT = "event"
-    CLAIM_REVISION = "claim_revision"
-    CURRENT_SLOT = "current_slot"
+    MEMORY_DOCUMENT = "memory_document"
+    MEMORY_BLOCK = "memory_block"
     TREE_OVERVIEW = "tree_overview"
 
 
@@ -80,8 +94,6 @@ class CatalogRecord:
     event_time: str = ""
     ingested_at: str = ""
     transaction_time: str = ""
-    valid_from: str = ""
-    valid_to: str = ""
     title: str = ""
     l0_text: str = ""
     l1_text: str = ""
@@ -89,14 +101,11 @@ class CatalogRecord:
     source_uri: str = ""
     source_digest: str = ""
     source_revision: int = 0
-    canonical_slot_id: str = ""
-    canonical_slot_uri: str = ""
-    canonical_claim_id: str = ""
-    canonical_claim_uri: str = ""
-    canonical_revision: int = 0
-    canonical_state: str = ""
-    canonical_head_digest: str = ""
-    receipt_digest: str = ""
+    document_id: str = ""
+    block_id: str = ""
+    document_kind: str = ""
+    document_revision: int = 0
+    projection_generation: int = 0
     projection_effect_hash: str = ""
     hotness: float = 0.0
     semantic_hotness: float = 0.0
@@ -115,8 +124,6 @@ class CatalogRecord:
             "parent_uri",
             "l2_uri",
             "source_uri",
-            "canonical_slot_uri",
-            "canonical_claim_uri",
         ):
             value = str(getattr(self, name) or "")
             if value and not value.startswith("memoryos://"):
@@ -150,13 +157,26 @@ class CatalogRecord:
             "event_time",
             "ingested_at",
             "transaction_time",
-            "valid_from",
-            "valid_to",
         ):
-            value = str(getattr(self, name) or "")
-            if value:
-                object.__setattr__(self, name, normalize_timestamp(value, name))
+            timestamp_value = str(getattr(self, name) or "")
+            if timestamp_value:
+                object.__setattr__(self, name, normalize_timestamp(timestamp_value, name))
         object.__setattr__(self, "metadata", metadata)
+        for name in ("source_revision", "document_revision", "projection_generation"):
+            revision_value = int(getattr(self, name))
+            if revision_value < 0:
+                raise ValueError(f"catalog {name} must be non-negative")
+            object.__setattr__(self, name, revision_value)
+        if record_kind in {
+            CatalogRecordKind.MEMORY_DOCUMENT.value,
+            CatalogRecordKind.MEMORY_BLOCK.value,
+        }:
+            if not self.owner_user_id or not self.document_id or not self.document_kind or not self.source_digest:
+                raise ValueError("memory document projections require owner, document identity, kind and digest")
+            if self.primary_tree_path and not self.primary_tree_path.startswith("memories/"):
+                raise ValueError("memory document projections require a memories tree path")
+            if record_kind == CatalogRecordKind.MEMORY_BLOCK.value and not self.block_id:
+                raise ValueError("memory block projections require block_id")
         for name in ("hotness", "semantic_hotness", "behavior_support_hotness"):
             score = float(getattr(self, name))
             if score != score or score in {float("inf"), float("-inf")}:
@@ -234,31 +254,16 @@ class CatalogRecord:
         )
         raw_paths = tuple(tree_paths or metadata.get("tree_paths", ()) or ())
         primary = str(metadata.get("primary_tree_path") or (raw_paths[0] if raw_paths else ""))
-        canonical_kind = str(metadata.get("canonical_kind") or "")
         projection_source_revision = int(
             metadata.get("projection_source_revision")
             or metadata.get("source_revision")
             or metadata.get("revision")
             or 0
         )
-        resolved_record_kind = record_kind or str(metadata.get("record_kind") or "")
-        if not resolved_record_kind:
-            resolved_record_kind = (
-                CatalogRecordKind.CLAIM_REVISION.value if canonical_kind == "claim" else CatalogRecordKind.CONTEXT.value
-            )
-        # Generic Context projection remains URI-keyed.  The formal canonical
-        # projector passes its revision-scoped key explicitly after proving a
-        # committed Current Head; trusting Claim-looking metadata here would
-        # let an uncommitted raw object overwrite an authoritative projection.
+        resolved_record_kind = record_kind or str(metadata.get("record_kind") or CatalogRecordKind.CONTEXT.value)
+        # Generic Context projection remains URI-keyed. Domain projectors pass
+        # their stable, tenant-scoped record key explicitly.
         resolved_record_key = record_key or obj.uri
-        canonical_claim_uri = obj.uri if canonical_kind == "claim" else str(metadata.get("canonical_claim_uri") or "")
-        canonical_slot_uri = (
-            obj.uri
-            if canonical_kind == "slot"
-            else str(metadata.get("slot_uri") or metadata.get("canonical_slot_uri") or "")
-        )
-        if not canonical_slot_uri and "/claims/" in canonical_claim_uri:
-            canonical_slot_uri = canonical_claim_uri.rsplit("/claims/", 1)[0]
         source_uri = str(metadata.get("source_uri") or obj.uri)
         source_digest = str(
             metadata.get("source_digest") or ContextProjectionSanitizer().digest(content or obj.to_dict())
@@ -283,8 +288,6 @@ class CatalogRecord:
             event_time=str(metadata.get("event_time") or metadata.get("occurred_at") or obj.created_at or ""),
             ingested_at=str(metadata.get("ingested_at") or obj.created_at or ""),
             transaction_time=str(metadata.get("transaction_time") or obj.updated_at or obj.created_at or ""),
-            valid_from=str(metadata.get("valid_from") or ""),
-            valid_to=str(metadata.get("valid_to") or ""),
             title=obj.title,
             l0_text=str(metadata.get("l0_text") or obj.title),
             l1_text=str(metadata.get("l1_text") or metadata.get("summary") or content),
@@ -292,16 +295,11 @@ class CatalogRecord:
             source_uri=source_uri,
             source_digest=source_digest,
             source_revision=projection_source_revision,
-            canonical_slot_id=str(metadata.get("slot_id") or metadata.get("canonical_slot_id") or ""),
-            canonical_slot_uri=canonical_slot_uri,
-            canonical_claim_id=str(metadata.get("claim_id") or metadata.get("canonical_claim_id") or ""),
-            canonical_claim_uri=canonical_claim_uri,
-            canonical_revision=projection_source_revision,
-            canonical_state=str(metadata.get("state") or metadata.get("claim_state") or ""),
-            canonical_head_digest=str(
-                metadata.get("canonical_head_digest") or metadata.get("current_head_digest") or ""
-            ),
-            receipt_digest=str(metadata.get("receipt_digest") or metadata.get("current_receipt_digest") or ""),
+            document_id=str(metadata.get("document_id") or ""),
+            block_id=str(metadata.get("block_id") or ""),
+            document_kind=str(metadata.get("document_kind") or ""),
+            document_revision=int(metadata.get("document_revision") or 0),
+            projection_generation=int(metadata.get("projection_generation") or 0),
             projection_effect_hash=str(
                 metadata.get("projection_effect_hash") or metadata.get("projection_input_effect_hash") or ""
             ),
@@ -323,8 +321,8 @@ def catalog_vector_metadata(
 
     Vector databases are a rebuildable serving layer.  Every row therefore
     carries the exact Catalog identity and all trusted structured-filter
-    dimensions needed to filter before Top-K.  Raw projection metadata is not
-    copied: only typed Catalog fields and canonical scope keys are emitted.
+    dimensions needed to filter before Top-K. Raw projection metadata is not
+    copied: only typed Catalog fields and validated scope keys are emitted.
     """
 
     policy = sanitizer or ContextProjectionSanitizer()
@@ -349,19 +347,14 @@ def catalog_vector_metadata(
         "event_time": record.event_time,
         "ingested_at": record.ingested_at,
         "transaction_time": record.transaction_time,
-        "valid_from": record.valid_from,
-        "valid_to": record.valid_to,
         "source_uri": record.source_uri,
         "source_digest": record.source_digest,
         "source_revision": record.source_revision,
-        "canonical_slot_id": record.canonical_slot_id,
-        "canonical_slot_uri": record.canonical_slot_uri,
-        "canonical_claim_id": record.canonical_claim_id,
-        "canonical_claim_uri": record.canonical_claim_uri,
-        "canonical_revision": record.canonical_revision,
-        "canonical_state": record.canonical_state,
-        "canonical_head_digest": record.canonical_head_digest,
-        "receipt_digest": record.receipt_digest,
+        "document_id": record.document_id,
+        "block_id": record.block_id,
+        "document_kind": record.document_kind,
+        "document_revision": record.document_revision,
+        "projection_generation": record.projection_generation,
         "projection_effect_hash": record.projection_effect_hash,
         "serving_tier": record.serving_tier,
         "projection_status": record.projection_status,
@@ -371,9 +364,8 @@ def catalog_vector_metadata(
         raise ValueError("vector metadata sanitizer returned a non-object")
     result = dict(safe)
     # ``record_key`` is a server-owned join/CAS identity, not free-form
-    # content.  Generic credential redaction can otherwise mistake a valid
-    # suffix such as ``claim:<id>:revision:1`` for a secret assignment and
-    # detach the vector row from its Catalog owner.
+    # content. Generic credential redaction must not detach a trusted row
+    # identity from its Catalog owner.
     result["catalog_record_key"] = record.record_key
     return result
 
@@ -408,7 +400,7 @@ def _workspace_is_publicly_shared(
 
     Workspace applicability alone is not visibility: profile/preferences may
     carry a workspace applicability ref while remaining principal-private.
-    Only tenant-public canonical scope is eligible for cross-owner candidate
+    Only an explicit tenant-public scope is eligible for cross-owner candidate
     generation; exact Source validation still runs after fusion.
     """
 
@@ -467,7 +459,16 @@ def _dynamic_tree_segment_indexes(segments: Sequence[str]) -> tuple[int, ...]:
     if root in {"sessions", "projects", "skills", "agents"}:
         return tuple(range(1, len(segments)))
     if root == "memories":
-        return tuple(range(2, len(segments)))
+        tail = tuple(segments[1:])
+        if len(tail) == 2 and tail[:1] == ("experiences",):
+            return (2,)
+        if len(tail) == 3 and tail[:2] in {
+            ("knowledge", "entities"),
+            ("knowledge", "topics"),
+            ("knowledge", "episodes"),
+        }:
+            return (3,)
+        return ()
     return ()
 
 
@@ -507,11 +508,16 @@ def _validate_taxonomy_shape(segments: Sequence[str]) -> None:
             raise ValueError("resource path kind is outside the controlled taxonomy")
         return
     if root == "memories":
-        if tail and tail[0] not in _MEMORY_PATH_KINDS:
-            raise ValueError("memory path kind is outside the controlled taxonomy")
-        if len(tail) > 4:
-            raise ValueError("memory path exceeds the schema-owned identity depth")
-        return
+        path = tuple(tail)
+        if not path:
+            return
+        if path in _MEMORY_FIXED_PATHS:
+            return
+        if path[:-1] in _MEMORY_DYNAMIC_BRANCHES:
+            return
+        if path in _MEMORY_DYNAMIC_BRANCHES:
+            return
+        raise ValueError("memory path is outside the Markdown document taxonomy")
     raise ValueError("tree path is outside the controlled taxonomy")
 
 

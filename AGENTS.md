@@ -14,45 +14,47 @@
 
 不自动提交，不自动 Push，不修改 README，除非用户明确授权。
 
-## 统一 Context 与 Canonical Memory 强制约束
+## 统一 Context 与 Markdown File Memory 强制约束
 
-以下九条是不可协商的不变量：
+以下约束不可协商：
 
-1. Slot/Claim 只服务状态型长期记忆。
-2. 普通 Session、Resource、Tool Result 使用统一 Catalog，不得被机械转换成 Slot/Claim。
-3. Claim Revision Projection 与 Slot Current Projection 必须并存；后者不能替换前者。
-4. 所有公共 Context 在线检索必须经过统一编排链；Prediction、Behavior、ActionPolicy 的隔离域内 policy lookup 不得暴露或回接成第二条 Context Serving API。
-5. Tree Path 不参与 Canonical Identity，也不得改变 Slot ID、Claim ID 或 Canonical URI。
-6. 在线查询禁止全库扫描；`list_objects()`、全量 canonical snapshot、`vector_uris()`、递归 Tree/Archive 扫描只能用于 startup、migration、repair、audit 或 test utility。
-7. Tool Result 必须先经过 `ContextProjectionSanitizer`，才可进入 Catalog、FTS、Vector、Trace 或 L0/L1。
-8. 删除必须通过耐久、幂等、可重放的 Tombstone 传播到派生层。
-9. 迁移必须支持兼容读、可选双写、Shadow Validation、Feature Gate、Cutover 和 Rollback。
+1. 用户长期记忆的当前正文只以受信任 runtime root 下的 live Markdown exact bytes 为事实源。
+2. 文档稳定身份来自 front matter 中由系统创建、在 tenant 与 owner 范围内唯一且不可变的 `document_id`；路径、标题、摘要和 tree path 均不参与身份。
+3. Catalog、FTS、Vector、Tree、Relation 和 L0/L1 投影只是可删除、可从 Markdown 与 SessionArchive 重建的 serving 层，不得成为第二份当前记忆正文。
+4. SessionArchive 是历史对话 evidence 的事实源；普通 Session、Resource 和 Tool Result 继续使用统一 Catalog。
+5. 所有系统文档写入都必须比较 exact raw bytes 的 expected digest。live state 是 expected、after、unsafe 之外的第三状态时必须停止，不得覆盖或回滚用户外部编辑。
+6. 文件 watcher 事件只是扫描提示，不能直接授权 create、rename、forget 或 delete；只有完整、稳定且通过安全校验的 scan generation 才能确认外部变化。
+7. soft forget 与 hard erase 必须区分。两者都要以耐久、幂等、可重放的 barrier/tombstone 清理派生层；hard erase 还必须清除文档子系统中所有可枚举的正文副本。
+8. 在线查询禁止递归扫描 memory tree、SessionArchive、全量 Vector URI 或 `list_objects()`；完整扫描只允许用于 startup、repair、rebuild、audit 或受限后台任务。
+9. Tenant、Owner、Workspace、Visibility、Authority 与 ACL 只能由 trusted caller、受信任根和服务端策略绑定，不能从模型输出、front matter 或普通 payload 获取或覆盖。
+10. Tool Result 必须先经过 `ContextProjectionSanitizer`，才可进入 Catalog、FTS、Vector、Trace 或 L0/L1。
+11. `Memory`、`Behavior`、`ActionPolicy` 语义隔离；Behavior/Action 的 support object 不得伪装成用户 Markdown memory。Coding Agent 默认只走 context reduction，Embodied Agent 动作继续经过 PolicyGate。
 
 统一模型是：
 
 ```text
-Evidence Plane
+Evidence Plane (immutable SessionArchive or explicit trusted command)
+    -> sealed semantic memory proposal
+    -> deterministic document routing and read-before-write planning
+    -> Markdown document CAS commit
+    -> durable projection job
     -> Unified Context Catalog / Tree / Graph
-    -> Unified Serving Index
     -> Unified Retrieval Orchestration
-    -> Optional Canonical Resolution
-    -> L0 / L1 / L2 Context Packing
+    -> bounded L0 / L1 / L2 Context Packing
 ```
 
-即 `Context First + Canonical State Overlay`。`SQLiteIndexStore.contexts` 是唯一统一 Serving Catalog；不得新增保存同一 Serving 状态的第二张主表。普通 Context 的事实源仍是 SourceStore 或不可变 SessionArchive；Slot/Claim/Revision 的权威状态仍是 Canonical Source。Catalog、FTS、Vector、Tree、Projection 和 Relation Serving Index 都必须可重建。
+`SQLiteIndexStore.contexts` 是统一 Serving Catalog；不得新增保存同一 Serving 状态的第二张主表。普通 Context 的事实源仍是 SourceStore 或不可变 SessionArchive。Memory document 的 live Markdown 是其正文事实源，受保护的 revision/after blob 只服务恢复并必须可由 hard erase 枚举删除。控制数据只能保存身份、路径、digest、generation、状态和时间，不得成为语义 current pointer。
 
-重建必须与在线查询共用 serving lock，并在修改派生层前完成 Canonical Source/Receipt/Head/Projection preflight。Generic rebuild 不得把 raw/uncommitted Canonical row 当正式 Projection；Session 派生 row、Claim Revision 和 CurrentSlot 分别由其 Evidence backfill/正式 projector 恢复。
+## Markdown Memory 不变量
 
-## Canonical Memory 不变量
-
-- Identity V2、Slot ID 和 Claim ID 的确定性计算保持单一实现。
-- Tree Path、日期路径、文件路径、标题、L0/L1、Vector/Projection ID、Session ID 和 Tool Result ID 不得加入 Slot/Claim Hash 输入。
-- 一个 Slot 最多一个 ACTIVE Claim；多值状态使用一个 Claim 的结构化集合、更细粒度 Slot 或多个独立单值 Slot。
-- LLM 只能提出语义候选或辅助非安全查询改写，不能决定最终 ADD/UPDATE/DELETE、是否晋升、Tenant/Owner/Workspace、SQL、URI、Slot ID 或 Claim ID。
-- `CanonicalPromotionPolicy` 只做确定性路由；PROMOTE 后仍须通过 Evidence、Schema、Identity、Scope、Authority、Admission、Reconcile、Transition 和 Transaction。
-- Canonical Current 强一致并 fail closed。启动期全局完整性验证必须保留；在线检索只校验融合后的有界候选。
-- Canonical Source 旧 Revision 不得为关闭区间而回写；Serving Projection 和 AS_OF Resolver 必须从下一非 historical Revision 派生同一 `valid_to`，且 AS_OF 只返回时点 ACTIVE Revision。
-- `Memory`、`Behavior`、`ActionPolicy` 语义隔离；Coding Agent 默认只走 context reduction；Embodied Agent 动作继续经过 PolicyGate。
+- 每个 Store、Planner、Committer、Scanner、Revision 和 Erase 调用都必须显式携带 trusted `tenant_id` 与 `owner_user_id`，并与绑定 root 再校验。
+- LLM 只能提出语义候选或辅助非安全查询改写，不能决定文件路径、document ID、Tenant/Owner/Workspace/ACL、SQL、delete/hard erase、projection generation 或最终 authority。
+- 文档 kind 由受控相对路径推导；`projects/` 不得成为用户长期记忆的物理目录。项目只作为 entity、topic、episode 或 workspace/applicability 元数据。
+- 单文档 create/update/delete/rename 使用 exact raw-state CAS、同目录原子安装和 file/parent fsync。跨文档整理是只向前恢复的 saga，不承诺全局原子性。
+- Cooperative lock 只约束合作进程。恢复时 `live == after` 可补齐 event/outbox，`live == before` 可 roll-forward，第三状态或 unsafe 必须进入 conflict/quarantine，绝不恢复 before image。
+- 外部新建但缺少系统 ID 的安全文件是 unmanaged，必须显式 adopt；非法 UTF-8、坏 front matter、重复或被修改的 ID 必须 quarantine；symlink、hardlink 和非 regular file 必须 fail closed。
+- 删除 publication barrier 位于受保护、耐久的 control store。低 generation 的 queue、scan、vector retry 或 projection 不得复活 soft-forgotten/hard-erased 文档；hard-erased document ID 永不复用。
+- Revision restore 是一次新的 CAS 更新并产生更高 revision/generation；不得通过切换数据库 pointer 改变当前正文。
 
 ## 写、读和删除主链
 
@@ -63,62 +65,64 @@ SessionArchive -> ContextProjectionSanitizer -> SessionContextProjector
 -> contexts / FTS / context_paths / optional bounded Vector
 ```
 
-Canonical 写链：
+Memory 写链：
 
 ```text
-Evidence -> CanonicalPromotionPolicy -> Canonical formation/transaction
--> durable Outbox -> Claim Revision Projection + Current Slot Projection
--> contexts / FTS / context_paths / optional Vector
+Evidence -> sealed semantic proposal -> deterministic document router
+-> read-before-write DocumentEditPlan -> MemoryDocumentCommitter
+-> live Markdown -> durable projection job
+-> contexts / FTS / context_paths / optional bounded Vector
 ```
 
 在线读链：
 
 ```text
-SDK / HTTP / MCP / archive_search compatibility wrapper
+SDK / HTTP / MCP / archive_search convenience entry
 -> RetrievalOptions -> QueryPlanner -> trusted scope binding
 -> structured filters -> exact / FTS / bounded vector / relation
--> fusion / rerank -> semantic dedup -> bounded canonical validation
+-> fusion / rerank -> document/session semantic dedup
+-> source digest and projection generation validation
 -> L0/L1/L2 selection -> token packing -> sanitized Recall Trace
 ```
 
-统一 HISTORY 同时服务普通 Session/Event/Resource/Tool Result 与 Claim Revision，并在 SQL Top-K 前排除 CurrentSlot；状态时点问题使用 AS_OF，系统写入日期问题使用 transaction-time HISTORY。Session Timeline 与每条记录的 `event_time` 必须同源，不能用 Archive 写入日期代替发生日期。
+`CURRENT` 表示当前 Markdown 或普通 Context 投影；`HISTORY` 服务普通 Session/Event/Resource/Tool Result 与文档历史入口；`OPEN_RECALL` 服务统一开放召回；`EXACT` 服务精确受权读取。Session Timeline 与每条记录的 `event_time` 必须同源，不能用 Archive 写入日期代替发生日期。
 
 删除链：
 
 ```text
-Forget / Retract / Supersede / Source or Session delete / reclassify
--> durable projection event or Tombstone
+Document CAS edit / soft forget / hard erase / Source or Session delete
+-> durable change event, publication barrier or Tombstone
 -> Catalog / FTS / Vector / Path / Link / Projection cleanup
 ```
 
-Canonical 事务不得同步跨越所有派生后端做删除。Tombstone 先以 SQLite 事务摘除 Catalog/FTS/Path/Link/Projection 并进入 CLEANING，再按 record key/revision/effect compare-and-delete 外部 Vector/Relation，最后 APPLIED；外部失败保持 CLEANING 可重放，不能 ACK 或伪装成功。
+Memory document 提交成功定义为 live Markdown 已耐久安装且 projection job 已耐久入队，不要求外部 Vector 同步完成。删除不得同步跨越所有派生后端；Tombstone 先以 SQLite 事务摘除 Catalog/FTS/Path/Link/Projection 并进入 CLEANING，再按 tenant-qualified record key、generation 和 digest compare-and-delete外部 Vector/Relation，最后 APPLIED。外部失败保持 CLEANING 可重放，不能 ACK 或伪装成功。
 
 ## 安全边界
 
 - Trusted Caller Constraint 优先于用户显式 Filter；用户 Filter 优先于确定性日期/路径解析；Schema 默认值优先于 LLM 辅助。
 - `authorized_scope_keys` 必须区分授权 envelope 缺失、可信非空 grants、用户显式缩小和显式空 grants；空 grants 只允许 unscoped 数据。
-- Tenant、Owner、Workspace、Adapter Private Scope 和 Visibility/Authority 必须在候选生成前绑定并在 Canonical Resolution 再验证。
-- Session、Claim Revision、CurrentSlot 的 Vector metadata 必须使用统一安全契约；native Vector 命中后仍由 SQL Catalog 复核 ACL、path、time 与 proof ownership。
+- Tenant、Owner、Workspace、Adapter Private Scope 和 Visibility/Authority 必须在候选生成前绑定，并在 source hydration 前再次验证。
+- Session 与 Memory Document/Block 的 Vector metadata 必须使用统一安全契约；native Vector 命中后仍由 SQL Catalog 以 `(tenant_id, record_key)` 复核 ACL、path、generation、digest 和 source ownership。
 - 凭证、Authorization、Cookie、密码、私钥、环境变量、数据库/SSH 凭证、敏感绝对路径、Binary 和超长日志不得通过 metadata JSON 绕过清洗。
 - 完整路径仅留在受保护 Source Evidence；Serving 层默认只保留 basename 与受控 location。
 - Sanitization 失败必须 fail closed；Recall Trace 使用相同安全投影。
-- Canonical 精确回源后的公开 title、text 和 metadata 也必须再次经过同一安全投影，并在清洗后复核 Slot/Claim/Revision/Head/Receipt/Effect 等证明字段。
+- Memory document 精确回源后的公开 title、text 和 metadata 也必须再次经过同一安全投影，并在清洗后复核 tenant、owner、document ID、revision、generation 和 digest。
 
 ## 验证门槛
 
 涉及本主链的变更必须同时覆盖真实存储和公开入口，而不是只写 Mock。至少验证：
 
 - FileSystemSourceStore、SQLiteIndexStore、RelationStore、QueueStore、SessionArchiveStore；
-- Canonical Claim Revision Projection、Current Slot Projection、Outbox/Recovery；
-- Session Projection、Tombstone、Retention、Migration/Checkpoint/Shadow/Cutover/Rollback；
+- MemoryDocumentStore、CAS commit、revision restore、scanner、projection、soft forget/hard erase 与 conflict recovery；
+- Session Projection、SessionProjectionJournal、Tombstone、Retention、commit-group recovery；
 - SDK、HTTP、MCP、`archive_search()` 和 Context Packing；
 - Tenant/Owner/Workspace/Adapter 隔离、secret/path/trace 清洗和篡改 fail closed；
-- 在线查询不会调用禁止的 O(N) API，且候选、source read、vector overfetch、per-session 和 per-slot 均有硬上限；
+- 在线查询不会调用禁止的 O(N) API，且候选、source read、vector overfetch、per-session 和 per-document 均有硬上限；
 - `EXPLAIN QUERY PLAN` 证明结构化过滤使用索引。
 
 完成前运行项目实际配置支持的完整 pytest、相关集成/性能测试、Ruff、MyPy 和 Pyright。工具缺失或外部服务不可用时记录真实命令与真实错误，不得伪造通过，也不得为跑检查随意修改依赖。
 
-详细设计见：
+当前 Markdown Memory 设计见：
 
 - `docs/architecture/canonical-memory-pipeline.md`
 - `docs/architecture/MemoryOS第一主链-记忆形成与更新设计.md`

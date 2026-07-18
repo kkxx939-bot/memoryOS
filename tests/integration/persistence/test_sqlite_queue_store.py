@@ -101,6 +101,72 @@ def _job(job_id: str, queue_name: str = "race", *, payload: dict | None = None) 
     )
 
 
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_hard_erase_target_purge_removes_every_job_state_and_semantic_path(
+    tmp_path: Path,
+    store_kind: str,
+) -> None:
+    path = tmp_path / "queue-purge.sqlite3"
+    store = InMemoryQueueStore() if store_kind == "memory" else SQLiteQueueStore(path)
+    target = "memoryos://user/u1/memory/documents/memdoc_AAAAAAAAAAAAAAAA"
+    secret_path = "knowledge/topics/semantic-secret-path.md"
+    jobs = []
+    for index in range(3):
+        jobs.append(
+            store.enqueue(
+                QueueJob(
+                    job_id=f"purge-{index}",
+                    queue_name="memory_projection",
+                    action="project_memory_document",
+                    target_uri=target,
+                    payload={
+                        "tenant_id": "tenant-a",
+                        "owner_user_id": "u1",
+                        "old_relative_path": secret_path,
+                    },
+                )
+            )
+        )
+    leased = store.lease(
+        "memory_projection",
+        lease_owner="worker",
+        limit=1,
+        job_ids=(jobs[1].job_id,),
+    )[0]
+    store.ack(leased)
+    unrelated = store.enqueue(
+        QueueJob(
+            job_id="unrelated",
+            queue_name="memory_projection",
+            action="project_memory_document",
+            target_uri="memoryos://user/u1/memory/documents/memdoc_BBBBBBBBBBBBBBBB",
+            payload={"tenant_id": "tenant-a", "owner_user_id": "u1"},
+        )
+    )
+
+    assert store.purge_target_jobs(
+        queue_name="memory_projection",
+        target_uri=target,
+        tenant_id="tenant-a",
+        owner_user_id="u1",
+    ) == 3
+    assert all(store.get(job.job_id) is None for job in jobs)
+    assert store.get(unrelated.job_id) is not None
+    assert store.purge_target_jobs(
+        queue_name="memory_projection",
+        target_uri=target,
+        tenant_id="tenant-a",
+        owner_user_id="u1",
+    ) == 0
+    if store_kind == "sqlite":
+        persisted = b"".join(
+            candidate.read_bytes()
+            for candidate in path.parent.glob(f"{path.name}*")
+            if candidate.is_file()
+        )
+        assert secret_path.encode() not in persisted
+
+
 def test_two_processes_claim_one_job_exactly_once(tmp_path: Path) -> None:
     path = tmp_path / "queue.sqlite3"
     SQLiteQueueStore(path).enqueue(_job("one"))
@@ -230,7 +296,38 @@ def test_crashed_worker_job_is_reclaimed_after_expiry(tmp_path: Path) -> None:
     assert stored is not None and stored.status == "done"
 
 
-def test_old_queue_schema_is_migrated_without_deleting_database(tmp_path: Path) -> None:
+def test_fresh_queue_schema_is_complete_and_exact(tmp_path: Path) -> None:
+    path = tmp_path / "queue.sqlite3"
+
+    SQLiteQueueStore(path)
+
+    with sqlite3.connect(path) as conn:
+        layout = tuple(
+            (row[1], row[2], row[3], row[4], row[5])
+            for row in conn.execute("PRAGMA table_info(queue_jobs)")
+        )
+    assert layout == (
+        ("job_id", "TEXT", 0, None, 1),
+        ("queue_name", "TEXT", 1, None, 0),
+        ("action", "TEXT", 1, None, 0),
+        ("target_uri", "TEXT", 1, None, 0),
+        ("payload_json", "TEXT", 1, None, 0),
+        ("tenant_id", "TEXT", 1, "''", 0),
+        ("owner_user_id", "TEXT", 1, "''", 0),
+        ("workspace_id", "TEXT", 1, "''", 0),
+        ("status", "TEXT", 1, None, 0),
+        ("leased_until", "TEXT", 0, None, 0),
+        ("lease_token", "TEXT", 1, "''", 0),
+        ("lease_generation", "INTEGER", 1, "0", 0),
+        ("lease_owner", "TEXT", 1, "''", 0),
+        ("retry_count", "INTEGER", 1, "0", 0),
+        ("created_at", "TEXT", 1, None, 0),
+        ("updated_at", "TEXT", 1, None, 0),
+        ("last_error", "TEXT", 1, "''", 0),
+    )
+
+
+def test_old_queue_schema_fails_fast_without_mutating_database(tmp_path: Path) -> None:
     path = tmp_path / "queue.sqlite3"
     with sqlite3.connect(path) as conn:
         conn.execute(
@@ -250,28 +347,40 @@ def test_old_queue_schema_is_migrated_without_deleting_database(tmp_path: Path) 
             ("legacy", "race", "run", "memoryos://user/u1/jobs/legacy", "{}", "pending", None, 0, now, now, ""),
         )
 
-    store = SQLiteQueueStore(path)
+    with pytest.raises(RuntimeError, match="unsupported QueueStore layout"):
+        SQLiteQueueStore(path)
+
     with sqlite3.connect(path) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(queue_jobs)")}
-        indexes = {row[1] for row in conn.execute("PRAGMA index_list(queue_jobs)")}
-    assert {
-        "lease_token",
-        "lease_generation",
-        "lease_owner",
-        "tenant_id",
-        "owner_user_id",
-        "workspace_id",
-    }.issubset(columns)
-    assert "queue_jobs_scope_status_idx" in indexes
-    assert store.stats_for_scope(
-        queue_name="race",
-        tenant_id="default",
-        owner_user_id="u1",
-        workspace_ids=("",),
-    ) == {"pending": 1}
-    leased = store.lease("race", lease_owner="migrated", limit=1)
-    assert leased[0].job_id == "legacy"
-    assert leased[0].lease_generation == 1
+        row = conn.execute(
+            "SELECT status, payload_json FROM queue_jobs WHERE job_id = 'legacy'"
+        ).fetchone()
+    assert "lease_token" not in columns
+    assert "tenant_id" not in columns
+    assert row == ("pending", "{}")
+
+
+def test_queue_open_rejects_legacy_data_without_status_or_scope_backfill(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "queue.sqlite3"
+    store = SQLiteQueueStore(path)
+    store.enqueue(_job("legacy-data"))
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "UPDATE queue_jobs SET status = 'failed', tenant_id = '' WHERE job_id = ?",
+            ("legacy-data",),
+        )
+
+    with pytest.raises(RuntimeError, match="unsupported QueueStore data"):
+        SQLiteQueueStore(path)
+
+    with sqlite3.connect(path) as conn:
+        row = conn.execute(
+            "SELECT status, tenant_id FROM queue_jobs WHERE job_id = ?",
+            ("legacy-data",),
+        ).fetchone()
+    assert row == ("failed", "")
 
 
 def test_subject_uri_projection_queue_scope_is_indexed_and_workspace_bounded(tmp_path: Path) -> None:
@@ -281,8 +390,8 @@ def test_subject_uri_projection_queue_scope_is_indexed_and_workspace_bounded(tmp
         QueueJob(
             job_id="outbox-subject",
             queue_name="memory_projection",
-            action="project_memory_committed",
-            target_uri="memoryos://user/subject_hash/memories/canonical/slots/slot-a",
+            action="memory_committed",
+            target_uri="memoryos://user/subject_hash/memory/documents/memdoc_queue_scope",
             payload={
                 "transaction_id": "subject",
                 "tenant_id": "tenant-a",
@@ -334,8 +443,8 @@ def test_unresolved_subject_job_blocks_only_its_own_tenant(tmp_path: Path, store
         QueueJob(
             job_id="legacy-subject",
             queue_name="memory_projection",
-            action="project_memory_committed",
-            target_uri="memoryos://user/subject_hash/memories/canonical/slots/slot-a",
+            action="memory_committed",
+            target_uri="memoryos://user/subject_hash/memory/documents/memdoc_queue_scope",
             payload={"transaction_id": "legacy", "tenant_id": "tenant-a"},
         )
     )
@@ -367,8 +476,8 @@ def test_scope_health_real_queries_use_scope_index(tmp_path: Path, monkeypatch: 
         QueueJob(
             job_id="legacy-subject",
             queue_name="memory_projection",
-            action="project_memory_committed",
-            target_uri="memoryos://user/subject_hash/memories/canonical/slots/slot-a",
+            action="memory_committed",
+            target_uri="memoryos://user/subject_hash/memory/documents/memdoc_queue_scope",
             payload={"transaction_id": "legacy", "tenant_id": "tenant-a"},
         )
     )

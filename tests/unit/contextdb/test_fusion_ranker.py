@@ -39,12 +39,15 @@ def test_rrf_does_not_compare_raw_branch_scores_and_records_components() -> None
     assert 0.0 <= results[0].score.final_score <= 1.0
 
 
-def test_current_dedupes_by_slot_and_enforces_per_session_limit() -> None:
+def test_current_dedupes_live_document_generation_and_enforces_per_session_limit() -> None:
     candidates = [
         _candidate(
-            f"claim-{index}",
-            canonical_slot_id="slot-1",
-            canonical_claim_id=f"claim-{index}",
+            f"document-projection-{index}",
+            tenant_id="tenant-a",
+            owner_user_id="u1",
+            document_id="document-1",
+            document_kind="preferences",
+            projection_generation=3,
             branch_scores={"lexical": 1.0 - index / 10},
         )
         for index in range(2)
@@ -60,7 +63,7 @@ def test_current_dedupes_by_slot_and_enforces_per_session_limit() -> None:
 
     results = FusionRanker().fuse({"lexical": candidates}, plan=_plan(candidate_limit=20))
 
-    assert sum(item.canonical_slot_id == "slot-1" for item in results) == 1
+    assert sum(item.document_id == "document-1" for item in results) == 1
     assert sum(item.session_id == "session-1" for item in results) == 5
 
 

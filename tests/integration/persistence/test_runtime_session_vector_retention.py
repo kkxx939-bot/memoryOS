@@ -10,7 +10,7 @@ from memoryos.contextdb.catalog import CatalogRecord, CatalogRecordKind, Serving
 from memoryos.contextdb.retention import CatalogRetentionManager, RetentionPolicy
 from memoryos.contextdb.session.session_model import SessionArchive
 from memoryos.contextdb.store.sqlite_index_store import SQLiteIndexStore
-from memoryos.contextdb.store.vector_store import InMemoryVectorStore
+from memoryos.contextdb.store.vector_store import InMemoryVectorStore, vector_row_id
 from memoryos.providers.embedding import HashingEmbeddingProvider
 from memoryos.runtime import RuntimeConfig, build_runtime_container
 
@@ -77,6 +77,7 @@ def test_runtime_projects_safe_session_vectors_and_retention_replays_tombstones(
     assert runtime.retention_manager is not None
     assert runtime.context_db.retention_manager is runtime.retention_manager
     records = runtime.index_store.scan_catalog_batch(  # type: ignore[attr-defined]
+        tenant_id="tenant-a",
         filters={
             "tenant_id": "tenant-a",
             "session_ids": (archive.session_id,),
@@ -99,6 +100,7 @@ def test_runtime_projects_safe_session_vectors_and_retention_replays_tombstones(
     assert cycle["vectors"]["vectors_deleted"] == initial_vector_count
     assert not vectors.rows
     retained = runtime.index_store.scan_catalog_batch(  # type: ignore[attr-defined]
+        tenant_id="tenant-a",
         filters={
             "tenant_id": "tenant-a",
             "session_ids": (archive.session_id,),
@@ -107,7 +109,10 @@ def test_runtime_projects_safe_session_vectors_and_retention_replays_tombstones(
         limit=100,
     )
     assert retained and all(record.serving_tier == ServingTier.ARCHIVED.value for record in retained)
-    evidence = runtime.session_archive_store.read_archive(archive.archive_uri)
+    evidence = runtime.session_archive_store.read_archive(
+        archive.archive_uri,
+        tenant_id="tenant-a",
+    )
     assert evidence.archive_digest == archive.archive_digest
     with sqlite3.connect(runtime.index_store.path) as connection:  # type: ignore[attr-defined]
         rows = connection.execute(
@@ -163,6 +168,7 @@ def test_session_vector_failure_keeps_durable_job_and_replays_idempotently(tmp_p
     queued = runtime.queue_store.get(archive.task_id)
     assert queued is not None and queued.status == "pending"
     degraded = runtime.index_store.scan_catalog_batch(  # type: ignore[attr-defined]
+        tenant_id="tenant-a",
         filters={
             "tenant_id": "tenant-a",
             "session_ids": (archive.session_id,),
@@ -179,6 +185,7 @@ def test_session_vector_failure_keeps_durable_job_and_replays_idempotently(tmp_p
     runtime.queue_store.ack(leased)
 
     projected = runtime.index_store.scan_catalog_batch(  # type: ignore[attr-defined]
+        tenant_id="tenant-a",
         filters={
             "tenant_id": "tenant-a",
             "session_ids": (archive.session_id,),
@@ -227,8 +234,18 @@ def test_retention_vector_failure_stays_durable_and_retryable(tmp_path) -> None:
         serving_tier=ServingTier.HOT.value,
         metadata={"vector_eligible": True},
     )
-    catalog.upsert_catalog(record)
-    vectors.upsert_vector(record.uri, [1.0, 0.0])
+    catalog.upsert_catalog(record, tenant_id="tenant-a")
+    row_id = vector_row_id("tenant-a", record.record_key)
+    vectors.upsert_vector(
+        row_id,
+        [1.0, 0.0],
+        metadata={
+            "tenant_id": "tenant-a",
+            "catalog_record_key": record.record_key,
+            "source_revision": record.source_revision,
+            "projection_effect_hash": record.projection_effect_hash,
+        },
+    )
     manager = CatalogRetentionManager(
         catalog,
         vector_store=vectors,
@@ -243,7 +260,7 @@ def test_retention_vector_failure_stays_durable_and_retryable(tmp_path) -> None:
         manager.gc_vectors(tenant_id="tenant-a")
 
     assert catalog.get_catalog(record.record_key, tenant_id="tenant-a") is not None
-    assert record.uri in vectors.rows
+    assert row_id in vectors.rows
     with sqlite3.connect(catalog.path) as connection:
         failed = connection.execute(
             "SELECT status, retry_count, last_error, payload_json FROM context_tombstones "
@@ -259,7 +276,7 @@ def test_retention_vector_failure_stays_durable_and_retryable(tmp_path) -> None:
     retried = manager.gc_vectors(tenant_id="tenant-a")
 
     assert retried.vectors_deleted == 1
-    assert record.uri not in vectors.rows
+    assert row_id not in vectors.rows
     assert catalog.get_catalog(record.record_key, tenant_id="tenant-a") is not None
 
 

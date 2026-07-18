@@ -11,18 +11,13 @@ from memoryos.contextdb.model.lifecycle import LifecycleState
 from memoryos.contextdb.store.index_store import IndexHit, IndexStore
 from memoryos.contextdb.store.relation_store import RelationStore
 from memoryos.contextdb.store.source_store import SourceStore
-from memoryos.memory.canonical.visibility import committed_content, read_committed_canonical
-from memoryos.memory.integration.classification import (
-    is_canonical_memory_object,
-    is_canonical_memory_uri,
-)
 from memoryos.prediction.model.action_context import ActionContext
 
 
 class ActionContextBuilder:
     relation_types = {
-        "anchored_by": "memory_anchor",
-        "constrained_by": "memory_rules",
+        "anchored_by": "support_anchor",
+        "constrained_by": "support_rules",
         "supported_by": "behavior_pattern",
         "updated_by": "behavior_pattern",
         "requires_resource": "resource",
@@ -53,23 +48,23 @@ class ActionContextBuilder:
         skills: list[dict] | None = None,
         *,
         tenant_id: str | None = None,
-        verified_memory_anchor_uris: Collection[str] | None = None,
+        verified_support_anchor_uris: Collection[str] | None = None,
     ) -> ActionContext:
         actions = [candidate.action for candidate in top_candidates]
         policy_by_uri = {policy.uri: policy for policy in policies if policy.user_id == user_id}
         expected_tenant = self._expected_tenant_id(tenant_id)
-        derived_verified_anchors = self.verified_memory_anchor_uris(
+        derived_verified_anchors = self.verified_support_anchor_uris(
             user_id,
             list(policy_by_uri.values()),
             tenant_id=expected_tenant,
         )
-        if verified_memory_anchor_uris is not None:
+        if verified_support_anchor_uris is not None:
             derived_verified_anchors &= {
-                str(uri) for uri in verified_memory_anchor_uris if str(uri)
+                str(uri) for uri in verified_support_anchor_uris if str(uri)
             }
         sections = {
-            "memory_rules": [],
-            "memory_anchor": [],
+            "support_rules": [],
+            "support_anchor": [],
             "behavior_pattern": [],
             "action_policy": [],
             "resource": resources or [],
@@ -93,42 +88,77 @@ class ActionContextBuilder:
                 user_id=user_id,
                 token_budget_remaining=token_budget,
                 candidate_score=candidate.score,
-                expected_anchor_uri=policy.memory_anchor_uri,
+                expected_anchor_uri=policy.support_anchor_uri,
                 verified_anchor_uris=derived_verified_anchors,
                 tenant_id=expected_tenant,
             )
             for section, items in relation_sections.items():
                 sections[section].extend(items)
             if (
-                policy.memory_anchor_uri in derived_verified_anchors
-                and not relation_sections.get("memory_anchor")
+                policy.support_anchor_uri in derived_verified_anchors
+                and not relation_sections.get("support_anchor")
             ):
-                anchor = self._exact_memory_anchor_context(
-                    policy.memory_anchor_uri,
+                anchor = self._exact_support_anchor_context(
+                    policy.support_anchor_uri,
                     user_id=user_id,
                     tenant_id=expected_tenant,
                     token_budget_remaining=token_budget,
                     candidate_score=candidate.score,
                 )
                 if anchor is not None:
-                    sections["memory_anchor"].append(anchor)
-            if not relation_sections.get("memory_rules"):
-                sections["memory_rules"].extend(
+                    sections["support_anchor"].append(anchor)
+            policy_rule_uris = {
+                str(item.get("uri") or "") for item in relation_sections.get("support_rules", [])
+            }
+            for rule_uri in policy.constrained_by_support_uris:
+                if not rule_uri or rule_uri in policy_rule_uris:
+                    continue
+                rule = self._exact_policy_rule_context(
+                    rule_uri,
+                    policy_uri=policy.uri,
+                    user_id=user_id,
+                    tenant_id=expected_tenant,
+                    token_budget_remaining=token_budget,
+                    candidate_score=candidate.score,
+                )
+                if rule is not None:
+                    sections["support_rules"].append(rule)
+                    policy_rule_uris.add(rule_uri)
+            if not policy_rule_uris:
+                fallback_rules = self._hits(
+                    user_id,
+                    candidate.action,
+                    ContextType.ACTION_POLICY_SUPPORT,
+                    token_budget_remaining=token_budget,
+                    tenant_id=expected_tenant,
+                )
+                for item in fallback_rules:
+                    exact_rule = self._exact_policy_rule_context(
+                        str(item.get("uri") or ""),
+                        policy_uri=policy.uri,
+                        user_id=user_id,
+                        tenant_id=expected_tenant,
+                        token_budget_remaining=token_budget,
+                        candidate_score=candidate.score,
+                    )
+                    if exact_rule is not None:
+                        sections["support_rules"].append(exact_rule)
+                        policy_rule_uris.add(str(exact_rule.get("uri") or ""))
+            if not relation_sections.get("behavior_pattern"):
+                sections["behavior_pattern"].extend(
                     self._hits(
                         user_id,
-                        candidate.action,
-                        ContextType.MEMORY,
+                        policy.scene_key,
+                        ContextType.BEHAVIOR_PATTERN,
                         token_budget_remaining=token_budget,
                         tenant_id=expected_tenant,
                     )
                 )
-            if not relation_sections.get("behavior_pattern"):
-                sections["behavior_pattern"].extend(self._hits(user_id, policy.scene_key, ContextType.BEHAVIOR_PATTERN, token_budget_remaining=token_budget))
         packer = self.context_packer or ContextPacker(
             token_budget,
             allocations={
-                "memory_rules": 350,
-                "memory_anchor": 200,
+                "support_rules": 350,
+                "support_anchor": 200,
                 "behavior_pattern": 350,
                 "action_policy": 250,
                 "resource": 250,
@@ -140,7 +170,7 @@ class ActionContextBuilder:
         source_uris = self._packed_source_uris(packed)
         return ActionContext(user_id=user_id, candidate_actions=actions, packed_context=packed, source_uris=source_uris)
 
-    def verified_memory_anchor_uris(
+    def verified_support_anchor_uris(
         self,
         user_id: str,
         policies: list[ActionPolicy],
@@ -152,10 +182,10 @@ class ActionContextBuilder:
         expected_tenant = self._expected_tenant_id(tenant_id)
         verified: set[str] = set()
         for policy in policies:
-            uri = str(policy.memory_anchor_uri or "")
+            uri = str(policy.support_anchor_uri or "")
             if policy.user_id != user_id or not uri:
                 continue
-            if self._read_verified_memory_anchor(uri, user_id=user_id, tenant_id=expected_tenant) is not None:
+            if self._read_verified_support_anchor(uri, user_id=user_id, tenant_id=expected_tenant) is not None:
                 verified.add(uri)
         return verified
 
@@ -182,14 +212,23 @@ class ActionContextBuilder:
             section = self.relation_types.get(relation.relation_type)
             if not section:
                 continue
-            if section == "memory_anchor":
+            if section == "support_anchor":
                 if (
                     relation.target_uri != expected_anchor_uri
                     or relation.target_uri not in verified_anchor_uris
                 ):
                     continue
-                item = self._exact_memory_anchor_context(
+                item = self._exact_support_anchor_context(
                     relation.target_uri,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                    token_budget_remaining=token_budget_remaining,
+                    candidate_score=candidate_score,
+                )
+            elif section == "support_rules":
+                item = self._exact_policy_rule_context(
+                    relation.target_uri,
+                    policy_uri=policy_uri,
                     user_id=user_id,
                     tenant_id=tenant_id,
                     token_budget_remaining=token_budget_remaining,
@@ -205,7 +244,7 @@ class ActionContextBuilder:
                     tenant_id=tenant_id,
                 )
             if item is None:
-                if self.source_store is not None or section in {"memory_anchor", "memory_rules"}:
+                if self.source_store is not None or section in {"support_anchor", "support_rules"}:
                     continue
                 item = {
                     "uri": relation.target_uri,
@@ -217,7 +256,7 @@ class ActionContextBuilder:
             sections.setdefault(section, []).append(item)
         return sections
 
-    def _exact_memory_anchor_context(
+    def _exact_support_anchor_context(
         self,
         uri: str,
         *,
@@ -226,12 +265,12 @@ class ActionContextBuilder:
         token_budget_remaining: int,
         candidate_score: float,
     ) -> dict | None:
-        obj = self._read_verified_memory_anchor(uri, user_id=user_id, tenant_id=tenant_id)
+        obj = self._read_verified_support_anchor(uri, user_id=user_id, tenant_id=tenant_id)
         if obj is None:
             return None
         item = self._context_from_object(
             obj,
-            section="memory_anchor",
+            section="support_anchor",
             token_budget_remaining=token_budget_remaining,
             candidate_score=candidate_score,
         )
@@ -239,83 +278,89 @@ class ActionContextBuilder:
         item["verified_anchor_tenant_id"] = tenant_id
         return item
 
-    def _read_verified_memory_anchor(self, uri: str, *, user_id: str, tenant_id: str):  # noqa: ANN202
+    def _exact_policy_rule_context(
+        self,
+        uri: str,
+        *,
+        policy_uri: str,
+        user_id: str,
+        tenant_id: str,
+        token_budget_remaining: int,
+        candidate_score: float,
+    ) -> dict | None:
+        obj = self._read_verified_policy_rule(
+            uri,
+            policy_uri=policy_uri,
+            user_id=user_id,
+            tenant_id=tenant_id,
+        )
+        if obj is None:
+            return None
+        item = self._context_from_object(
+            obj,
+            section="support_rules",
+            token_budget_remaining=token_budget_remaining,
+            candidate_score=candidate_score,
+        )
+        item["verified_policy_rule"] = True
+        item["verified_rule_tenant_id"] = tenant_id
+        return item
+
+    def _read_verified_support_anchor(self, uri: str, *, user_id: str, tenant_id: str):  # noqa: ANN202
         if self.source_store is None:
             return None
         try:
-            if is_canonical_memory_uri(uri):
-                obj = read_committed_canonical(
-                    self.source_store,
-                    uri,
-                    self.relation_store,
-                ).object
-            else:
-                obj = self.source_store.read_object(uri)
+            obj = self.source_store.read_object(uri)
         except (FileNotFoundError, IsADirectoryError, NotADirectoryError, TypeError, ValueError):
             return None
-        if is_canonical_memory_object(obj):
-            try:
-                committed = read_committed_canonical(self.source_store, uri, self.relation_store)
-            except (FileNotFoundError, IsADirectoryError, NotADirectoryError, TypeError, ValueError):
-                return None
-            obj = committed.object
         if (
             obj.uri != uri
-            or obj.context_type != ContextType.MEMORY
+            or obj.context_type != ContextType.BEHAVIOR_SUPPORT
             or obj.owner_user_id != user_id
             or str(obj.tenant_id or "default") != tenant_id
-            or not self._is_active_authoritative_anchor(obj, user_id=user_id, tenant_id=tenant_id)
+            or not self._is_active_support_object(obj, expected_kind="behavior")
         ):
             return None
         return obj
 
-    def _is_active_authoritative_anchor(self, obj, *, user_id: str, tenant_id: str) -> bool:  # noqa: ANN001
+    def _read_verified_policy_rule(
+        self,
+        uri: str,
+        *,
+        policy_uri: str,
+        user_id: str,
+        tenant_id: str,
+    ):  # noqa: ANN202
+        if self.source_store is None:
+            return None
+        try:
+            obj = self.source_store.read_object(uri)
+        except (FileNotFoundError, IsADirectoryError, NotADirectoryError, TypeError, ValueError):
+            return None
+        constrained_payload = dict(obj.metadata or {}).get("constrains_policy_uris", [])
+        if not isinstance(constrained_payload, (list, tuple, set)):
+            return None
+        constrained = {
+            str(item)
+            for item in constrained_payload
+            if isinstance(item, str) and item
+        }
+        if (
+            obj.uri != uri
+            or obj.context_type != ContextType.ACTION_POLICY_SUPPORT
+            or obj.owner_user_id != user_id
+            or str(obj.tenant_id or "default") != tenant_id
+            or policy_uri not in constrained
+            or not self._is_active_support_object(obj, expected_kind="action_policy")
+        ):
+            return None
+        return obj
+
+    def _is_active_support_object(self, obj, *, expected_kind: str) -> bool:  # noqa: ANN001
         if obj.lifecycle_state != LifecycleState.ACTIVE or not isinstance(obj.metadata, Mapping):
             return False
         metadata = dict(obj.metadata)
-        raw_admission = metadata.get("admission", {})
-        if raw_admission is not None and not isinstance(raw_admission, Mapping):
-            return False
-        admission = dict(raw_admission or {})
-        if admission.get("decision") in {"pending", "restricted", "archive_only", "reject"}:
-            return False
-        canonical_kind = str(metadata.get("canonical_kind") or "")
-        if canonical_kind:
-            if canonical_kind != "claim":
-                return False
-            if str(metadata.get("state") or metadata.get("claim_state") or "") != "ACTIVE":
-                return False
-            scope = metadata.get("scope", {})
-            if not isinstance(scope, Mapping):
-                return False
-            scope = dict(scope)
-            authority = metadata.get("authority") or scope.get("authority") or {}
-            visibility = scope.get("visibility", {})
-            if not isinstance(authority, Mapping) or not isinstance(visibility, Mapping):
-                return False
-            authority = dict(authority)
-            visibility = dict(visibility)
-            if not authority or bool(authority.get("inferred", False)):
-                return False
-            if str(authority.get("tenant_id") or tenant_id) != tenant_id:
-                return False
-            if str(visibility.get("tenant_id") or tenant_id) != tenant_id:
-                return False
-            principals = {
-                str(item)
-                for item in (
-                    authority.get("allowed_principal_ids")
-                    or authority.get("principal_ids")
-                    or []
-                )
-            }
-            visible_principals = {
-                str(item) for item in visibility.get("allowed_principal_ids", []) or []
-            }
-            return (not principals or user_id in principals) and (
-                not visible_principals or user_id in visible_principals
-            )
-        return str(metadata.get("memory_kind") or "") == "anchor_memory"
+        return str(metadata.get("support_anchor_kind") or "") == expected_kind
 
     def _expected_tenant_id(self, tenant_id: str | None) -> str:
         source_tenant = str(getattr(self.source_store, "tenant_id", "") or "")
@@ -331,12 +376,22 @@ class ActionContextBuilder:
         token_budget_remaining: int,
         tenant_id: str | None = None,
     ) -> list[dict]:
-        if context_type == ContextType.MEMORY and self.source_store is None:
+        if context_type in {ContextType.BEHAVIOR_SUPPORT, ContextType.ACTION_POLICY_SUPPORT} and self.source_store is None:
             return []
-        filters = {"owner_user_id": user_id, "context_type": context_type.value}
-        if tenant_id:
-            filters["tenant_id"] = tenant_id
-        hits = self.index_store.search(query, filters=filters, limit=4)
+        expected_tenant = str(
+            tenant_id or getattr(self.source_store, "tenant_id", "default") or "default"
+        )
+        filters = {
+            "tenant_id": expected_tenant,
+            "owner_user_id": user_id,
+            "context_type": context_type.value,
+        }
+        hits = self.index_store.search(
+            query,
+            tenant_id=expected_tenant,
+            filters=filters,
+            limit=4,
+        )
         items = []
         for hit in hits:
             item = self._hit_context(
@@ -382,30 +437,20 @@ class ActionContextBuilder:
         if self.source_store is None:
             return None
         try:
-            if is_canonical_memory_uri(uri):
-                obj = read_committed_canonical(
-                    self.source_store,
-                    uri,
-                    self.relation_store,
-                ).object
-            else:
-                obj = self.source_store.read_object(uri)
+            obj = self.source_store.read_object(uri)
         except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
             return None
-        if obj.context_type == ContextType.MEMORY and isinstance(obj.metadata, Mapping):
-            if is_canonical_memory_object(obj):
-                try:
-                    committed = read_committed_canonical(
-                        self.source_store,
-                        uri,
-                        self.relation_store,
-                    )
-                except (FileNotFoundError, IsADirectoryError, NotADirectoryError, TypeError, ValueError):
-                    return None
-                obj = committed.object
         if obj.lifecycle_state in {LifecycleState.DELETED, LifecycleState.OBSOLETE}:
             return None
-        if obj.context_type == ContextType.MEMORY and not self._is_active_authoritative_memory(obj):
+        if section == "support_anchor" and (
+            obj.context_type != ContextType.BEHAVIOR_SUPPORT
+            or not self._is_active_support_object(obj, expected_kind="behavior")
+        ):
+            return None
+        if section == "support_rules" and (
+            obj.context_type != ContextType.ACTION_POLICY_SUPPORT
+            or not self._is_active_support_object(obj, expected_kind="action_policy")
+        ):
             return None
         if tenant_id is not None and str(obj.tenant_id or "default") != str(tenant_id):
             return None
@@ -437,42 +482,9 @@ class ActionContextBuilder:
             "token_estimate": max(40, min(300, len(str(layer_content).split()) + 40)),
         }
 
-    def _is_active_authoritative_memory(self, obj) -> bool:  # noqa: ANN001
-        if obj.lifecycle_state != LifecycleState.ACTIVE:
-            return False
-        metadata = dict(obj.metadata or {})
-        admission = dict(metadata.get("admission", {}) or {})
-        if admission.get("decision") in {"pending", "restricted", "archive_only", "reject"}:
-            return False
-        if metadata.get("memory_kind") == "memory_candidate":
-            return False
-        canonical_kind = str(metadata.get("canonical_kind") or "")
-        if canonical_kind == "pending_proposal":
-            return False
-        if canonical_kind and canonical_kind != "claim":
-            return False
-        claim_state = str(metadata.get("state") or metadata.get("claim_state") or "")
-        if claim_state and claim_state != "ACTIVE":
-            return False
-        if canonical_kind == "claim":
-            authority = dict(dict(metadata.get("scope", {}) or {}).get("authority", {}) or {})
-            if not authority or bool(authority.get("inferred", False)):
-                return False
-        return True
-
     def _read_best_layer(self, obj, section: str, token_budget_remaining: int = 1000, candidate_score: float = 0.0):
         if section == "action_policy":
             return obj.metadata, "metadata"
-        if (
-            self.source_store is not None
-            and dict(obj.metadata or {}).get("canonical_kind") == "claim"
-        ):
-            committed = read_committed_canonical(
-                self.source_store,
-                obj.uri,
-                self.relation_store,
-            )
-            return committed_content(committed), "committed_l2"
         if token_budget_remaining <= 120:
             preferred = [(obj.layers.l0_uri, "l0"), (obj.layers.l1_uri, "l1")]
         else:
@@ -502,7 +514,9 @@ class ActionContextBuilder:
             return "skill"
         if context_type == ContextType.ACTION_POLICY.value:
             return "action_policy"
-        return "memory_rules"
+        if context_type == ContextType.BEHAVIOR_SUPPORT.value:
+            return "support_anchor"
+        return "support_rules"
 
     def _packed_source_uris(self, packed: dict) -> list[str]:
         uris: list[str] = []

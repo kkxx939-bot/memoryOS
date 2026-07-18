@@ -1,132 +1,182 @@
-# MemoryOS 第一主链：记忆形成与更新设计
+# MemoryOS 第一主链：Markdown 记忆形成与更新
 
 ## 1. 目标与边界
 
-第一主链负责把 Evidence 转成可审计、可恢复的状态型长期记忆，并把普通上下文保留在统一检索体系中。它不把“可搜索”错误等同于“必须成为 Canonical Memory”。
+第一主链把不可变 SessionArchive 或受信任显式命令转换为用户可编辑的 Markdown 记忆，并保证写入、恢复、投影、检索和删除闭环。它不把“可搜索”等同于“应写入长期记忆”；普通 Session、Resource、Tool Result 继续进入统一 Catalog。
 
 ```text
-所有 Context -> Unified Context Catalog
-状态型长期记忆 -> Canonical Slot/Claim/Revision Overlay
+Session evidence or trusted command
+-> semantic extraction and salience gate
+-> sealed MemoryEditProposal
+-> deterministic document router
+-> read-before-write DocumentEditPlan
+-> exact-byte CAS commit
+-> durable projection job
+-> unified retrieval
 ```
 
-必须同时遵守：Slot/Claim 只服务状态型长期记忆；普通 Session/Resource/Tool Result 使用统一 Catalog；Claim Projection 与 Slot Current Projection 并存；所有在线检索经过统一编排；Tree Path 不参与 Canonical Identity；在线查询禁止全库扫描；Tool Result 必须 Sanitization；删除必须通过 Tombstone 传播；迁移必须支持 Cutover 和 Rollback。
+live Markdown exact bytes 是文档当前正文的唯一业务事实源。Catalog、FTS、Vector、Tree、Relation、L0/L1 及 block records 都是 serving 派生。
 
 ## 2. Evidence Plane
 
 Evidence Plane 包含：
 
-- 用户显式 `remember()`/`forget()` 命令及认证调用上下文；
-- SessionArchive 的 message、tool result、observation、action result、used context/skill；
-- 字段级 EvidenceRef、source URI、digest、发生时间和摄取时间；
-- Canonical Transaction 的 Receipt、Current Head、Redo、Recovery 和 Pending Review 证据。
+- immutable SessionArchive、manifest digest、event IDs 和发生时间；
+- 受信任用户的显式 `remember`/edit/forget 命令引用；
+- field-level evidence references、actor binding 和 durability/atomicity 约束；
+- document change event 中不含正文的 lineage digest 与逻辑引用。
 
-普通 SessionArchive 保持不可变证据源。SourceStore 是普通 Context 的事实源；Canonical Source 是 Slot/Claim/Revision 的权威状态源。任何 Catalog、FTS、Vector 或 Tree 行都不能反向成为业务真相。
+SessionArchive 的原始消息和 tool result 不复制进 control/event/queue payload。`MemoryEgressPolicy` 控制进入模型的内容，`ContextProjectionSanitizer` 控制进入 serving 与 trace 的内容。
 
-## 3. Context First 路由
-
-每个输入先接受安全投影并可进入 Catalog，然后才由 `CanonicalPromotionPolicy` 判断是否允许进入状态层：
+## 3. Session 同步提交
 
 ```text
-input/evidence
--> ContextProjectionSanitizer
--> Context Catalog projection
--> CanonicalPromotionPolicy
-   -> CATALOG_ONLY
-   -> PROMOTE -> canonical gates
-   -> REJECT
+commit_entry.commit_session
+-> SessionCommitService.sync_archive
+-> immutable SessionArchive + manifest
+-> idempotent SessionContextProjector
+-> SessionProjectionJournal
 ```
 
-`AUTHORITATIVE_STATE` 默认覆盖 Profile、Preference、Project Rule、Project Decision 和明确的单值实体属性。`EXPERIENCE` 需要提炼、跨会话价值、稳定 Identity、完整 Evidence 与 Admission 阈值。`OBSERVATIONAL` 默认只进 Catalog；认证的显式 remember、stateful Schema 和全部安全/身份门禁同时成立时才可晋升。
+Archive 写入前失败不创建异步任务。Archive 已耐久落盘后，同步投影可幂等重试。`SessionProjectionJournal` 保存 archive/manifest identity 到 Catalog projection 的耐久进度，解决 archive 已写但 projection 尚未完成的崩溃窗口。
 
-LLM 不决定晋升，也不生成最终 storage operation、URI、Slot ID 或 Claim ID。
+`SessionContextProjector` 生成 root、L0/L1、semantic segment、message、tool result、resource reference、event、observation 和 action result 等 ordinary Catalog records。Timeline path 与 `event_time` 来自同一发生时间；不用 archive write time 伪造事件日期。
 
-## 4. Canonical 形成链
-
-PROMOTE 后必须完整通过：
+## 4. Session 异步提交
 
 ```text
-Evidence
--> Schema validation
--> Identity V2
--> Scope / Visibility / Authority
--> Admission
--> Reconcile
--> TransitionProfile
--> Canonical Transaction
--> Receipt / Current Head / Redo
+inline async_commit
+-> CommitGroupStore(memory, behavior, action_policy, context)
+-> independent consumer leases
+-> document changes and ordinary operation effects
+-> async outputs
 ```
 
-Identity Hash 只使用稳定业务身份字段。Tree Path、日期、文件路径/名、标题、L0/L1、Vector/Projection/Session/Tool Result ID 禁止参与。
+保留 inline-or-queued 产品语义：
 
-一个 Slot 最多一个 ACTIVE Claim。重复偏好应复用 Slot/Claim 或增加 Evidence；状态改变应保持 Slot ID，旧 Claim 进入 SUPERSEDED，新 Claim 成为 ACTIVE；多值偏好存为结构化集合或拆分更细 Slot。
+1. inline 成功时直接返回。
+2. Archive 已落盘但 inline 失败时，以相同 task/commit-group identity 耐久入队。
+3. `SessionCommitWorker` 按同一 identity lease/retry/ack，每个 consumer 独立幂等恢复。
 
-## 5. 事务后投影
+Memory consumer 的完成定义是所有计划的 live Markdown change 已耐久提交，且对应 projection jobs 已耐久入队。Behavior、ActionPolicy 和 ordinary Context 继续由 operation pipeline 处理，不得写入 document URI 或伪装成文件记忆。
 
-Canonical commit 成功后写入耐久 Outbox，再由 `MemoryProjectionWorker` 发布两个模型：
+## 5. 语义提取与 sealing
 
-- Claim Revision Projection：历史、AS_OF、AUDIT、CONFLICTS、Evidence 与 revision 精确读取；
-- Current Slot Projection：每个 ACTIVE Slot 唯一一条 `slot:{slot_id}:current`，服务 CURRENT。
-
-Current Slot 绑定 Slot 与 active Claim 的 Current Head、Receipt 和组合 Projection Effect Hash。Active Claim 切换时原位更新；旧 Claim history 保留。投影失败不回滚 Canonical 事务，也不 ACK 成功，而是持久记录并重试。
-
-## 6. Session 与普通 Context 形成链
+提取器对 archive/manifest digest、event ordering、actor、evidence span 和 egress policy 先做确定性校验，再输出 `MemoryEditProposal`：
 
 ```text
-SessionArchive
--> SessionContextProjector
--> sanitized Catalog records
-   root / L0 / L1 / semantic segment
-   message / tool result / resource reference
-   used context / used skill / observation / action result / event
+candidate_kind
+title / subject / body
+entity_hints / topic_hints
+occurred_at / temporal_status
+relation_hints
+evidence_refs / field_evidence_refs
+confidence
 ```
 
-Session Root 与 semantic segment 可进入 FTS、Vector 和 structured filter；重要 event/resource 按配置向量化；原子 message/tool result 默认仅 structured + FTS，L2 留在 Archive。
+模型不能决定路径、文档身份、tenant/owner/workspace/ACL、最终 authority、SQL、删除或 generation。Proposal set 封存后不可替换；CAS 冲突重计划必须使用同一 sealed bytes，不二次调用模型。
 
-文件读取时，即使用户消息没有文件名，只要 Tool Result 有文件 URI，Projector 也会提取 basename、受控 location、Archive source URI/digest，并挂到 timeline、session 和 `resources/{location}` 路径。它不会创建 Slot/Claim。
+Salience gate 排除原始 tool log、一次性失败、短期执行状态和无 evidence 结论。用户显式命令可绕过自动 salience 阈值，但仍不能绕过 trusted scope、文档 CAS 与安全边界。
 
-## 7. 更新与状态转换
+## 6. 确定性路由与 read-before-write
 
-状态更新流程以 Slot 为稳定身份：
+`MemoryDocumentRouter` 仅按 candidate kind、safe slug 和受控日期选择目标。项目名是 entity/topic/workspace applicability，不产生项目物理目录。
+
+Planner 在生成 `DocumentEditPlan` 前必须：
+
+1. 以 trusted tenant/owner 查询 Catalog 的有界相关文档；
+2. 按 document URI 或 controlled relative path 精确读 live raw bytes；
+3. 校验 front matter 身份、path-derived kind 和 raw SHA-256；
+4. 做确定性 dedup/append/correction/merge；
+5. 限制 patch 范围、文件大小、front matter 与单次 edit 数量；
+6. 绑定 exact expected raw effect vector 与 idempotency key。
+
+Planner 不依赖 serving 文本作为最新正文。Catalog 候选只帮助定位，最终 plan 以 live read 为准。
+
+## 7. 文档 CAS 提交
+
+`MemoryDocumentCommitter` 的提交边界为单文档。Plan、intent、revision blob、event、queue payload 与 idempotency identity 全部绑定 `(tenant_id, owner_user_id, document_id)`。
 
 ```text
-old ACTIVE claim B
--> reconcile new evidence/value
--> transition B to SUPERSEDED
--> create/activate claim C
--> update slot.active_claim_id
--> atomic canonical transaction
--> outbox
--> preserve B revision projection
--> overwrite one current-slot serving row with C
+validate exact before vector
+-> fsync body-bearing blob when applicable
+-> persist content-free PREPARED intent
+-> lock document identity
+-> re-read all affected paths
+-> atomic create/replace/unlink/rename + parent fsync
+-> append content-free DocumentChangeEvent
+-> enqueue projection job
+-> COMPLETED
 ```
 
-CURRENT 去重键是 `slot_id`；HISTORY 去重键是 `claim_id + revision`。Tree 重分类只更新 `context_paths`，不触发 Identity 变化。
+DELETE 的 after 是 ABSENT，不伪造空 after blob。RENAME 同时校验 old/new 两条路径，且目标必须 ABSENT。不合作外部编辑可能穿过 cooperative lock，因此恢复只根据 before/after/第三状态决策，不回写 before image。
 
-## 8. 删除与撤销
+## 8. Revision 与 review
 
-Forget、Retract、Supersede、Source/Resource/Session Delete 等先形成权威变化，再写耐久 Tombstone 或投影事件。Projection Tombstone 可重放并清理 Catalog、FTS、Vector、Path、Link、Current/Claim Projection 和 Relation Serving 数据；失败保留 error/retry 状态。
+每次变更产生 monotonic logical revision 和 projection generation。Revision blob 是受保护的恢复资料，不是当前正文 pointer。`restore_memory_revision()` 把旧 blob 作为新 after bytes，仍须通过当前 digest CAS，并产生新 revision。
 
-Canonical Transaction 不同步跨所有派生后端删除，避免扩大事务边界。不可变 Evidence Source 无明确策略时不删除。
+审核流封存 plan identity、expected effects、bounded diff 和 body-bearing blob。Approve 时执行同一 committer；Reject 只改审核状态。任何 hard erase 都要删除该文档的 review blobs/records。
 
-## 9. 召回闭环
+## 9. Scanner 与外部编辑
 
-写入后的所有在线召回统一进入：
+Watcher 只调用 `notify()`。Scanner 使用完整、有上限的 scan generation 对比 `(document_id, path, raw digest)`，并经稳定窗口确认外部 create/update/rename/delete。
+
+以下条件 fail closed：
+
+- root identity 变化、不可访问或遍历不完整；
+- symlink、hardlink、non-regular file 或权限错误；
+- unmanaged/quarantined 文件使删除判定产生歧义；
+- duplicate document identity；
+- mass-delete threshold 命中。
+
+外部确认的变更也产生 revision、change event 和 projection job，不直接依赖 mtime 作为版本事实。
+
+## 10. Projection 与读链
 
 ```text
-RetrievalOptions
--> QueryPlanner / Trusted Scope
--> SQL structured filters
--> exact / FTS / bounded vector / relation
--> RRF fusion / optional rerank / dedup
--> bounded Canonical Resolver
--> L0/L1/L2 selector / ContextPacker
--> sanitized Recall Trace
+MemoryDocumentProjectionWorker
+-> document and bounded block Catalog records
+-> FTS / paths / relations / optional vector
+-> atomic document projection state
 ```
 
-CURRENT 只把通过强校验的 Current Slot 作为 canonical current；统一 HISTORY 同时包含普通 Session/Event/Resource/Tool Result 和 Claim Revision，并排除 Current Slot；AS_OF/CONFLICTS 使用 Claim Revision。Canonical Source 回源后的 title/text/metadata 必须再次安全清洗；AS_OF 使用不改写 Source 的派生半开有效区间且只接受时点 ACTIVE Revision。Vector 或 reranker 失败有明确 degraded/fallback；Catalog backfill 未完成由 migration feature gate 选择 legacy/shadow/unified route，不能静默漏数据。
+Projection row 必须带 source digest、logical revision 和 generation。更低 generation 不可覆盖更新投影。Soft-forgotten 或 hard-erased identity 的 publication barrier 会拒绝迟到 job。
 
-## 10. 生命周期与迁移
+在线读链使用 SQL structured filter、exact、FTS、bounded vector 和 relation 生成候选，融合后只 hydrate 有界前缀。Memory document hydrate 必须回读 live bytes 并重新验证 tenant、owner、document identity、digest 与 generation。不一致时丢弃 stale candidate 并触发 rescan，不从 Catalog 返回旧正文。
 
-ServingTier 与 ClaimState 分离：HOT/WARM/COLD/ARCHIVED 只控制检索派生层。Current Slot 保持 HOT；普通记录按 event/created/transaction time 分层。Compaction 和 GC 不改变事实源，冷数据可恢复到 WARM。
+## 11. Forget、erase 与恢复保障
 
-统一 Catalog 迁移依次经过 NOT_STARTED、SCHEMA_READY、BACKFILLING、DUAL_WRITE、SHADOW_VALIDATING、READY_TO_CUTOVER、CUTOVER、COMPLETED；任何允许阶段可进入 FAILED 或 ROLLBACK，并从 checkpoint 恢复。pre-v10 原地升级必须先耐久记录 provenance；既有 Archive 但未回填时不得把缺失迁移行解释为 greenfield。回填只重建 Serving，不伪造 Receipt、Current Head 或 Evidence。
+Soft forget 是可恢复的 CAS edit/delete，并以耐久删除状态清理 serving。Hard erase 仅允许整文档 target，先建立不可逆 publication barrier，再以幂等 backend 清理 live file、revision/after/review blobs、Catalog、FTS、Vector、Relation、Path、Link 和其他可枚举正文副本。
+
+外部 backend 失败时保持 `ERASE_PENDING`，旧任务仍被 barrier 拦截。全部 backend 确认后才能返回 completed。独立 SessionArchive 不默认删除；如果其仍包含原始 evidence，返回精确的 `independent_evidence_retained` references。
+
+## 12. Startup 恢复顺序
+
+Runtime 在 READY 前执行：
+
+```text
+validate markdown_memory_v1 layout
+-> recover expired queue leases and ordinary operations
+-> recover incomplete document intents
+-> resume Session commit groups
+-> complete bounded stable scans
+-> rebuild/replay document projections
+-> replay deletion tombstones
+-> verify live source against Catalog generations
+-> READY
+```
+
+任一恢复或验证失败都保持 NOT_READY，公开 mutation fail closed。新 layout 是绿地格式；发现不受支持的历史 layout 或数据库时要求显式 reset，不自动删除、转换或建立并行读写路线。
+
+## 13. 公开合同
+
+SDK、HTTP 与 MCP 共用 `memoryos/api/memory_contract.py` 的 document-native schema：
+
+- `remember(content, occurred_at, target_hint, expected_document_digest)`；
+- `edit_memory_document(document_uri, edit, expected_digest)`；
+- `forget(document_uri, section_anchor, mode, expected_digest)`；
+- `list_memory_history(document_uri)`；
+- `restore_memory_revision(document_uri, revision, expected_digest)`；
+- review list/approve/reject。
+
+结果字段只暴露 document URI、digest、revision/generation、change event、projection job 与 erase status，不暴露受保护 control path 或未清洗 evidence payload。

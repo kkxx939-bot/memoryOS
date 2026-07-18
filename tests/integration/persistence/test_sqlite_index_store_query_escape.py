@@ -15,11 +15,20 @@ def test_fts_query_escapes_uri_punctuation(tmp_path) -> None:
         context_type=ContextType.ACTION_POLICY,
         title="AC policy",
         owner_user_id="u1",
-        metadata={"scene_key": "hot_room", "action": "turn_on_ac", "memory_anchor_uri": "memoryos://user/u1/memories/anchors/hot"},
+        metadata={
+            "scene_key": "hot_room",
+            "action": "turn_on_ac",
+            "support_anchor_uri": "memoryos://user/u1/support/anchors/hot",
+        },
     )
-    store.upsert_index(obj, content="hot room turn_on_ac")
+    store.upsert_index(obj, content="hot room turn_on_ac", tenant_id="default")
 
-    hits = store.search("memoryos://user/u1/memories/anchors/hot", filters={"owner_user_id": "u1"}, limit=5)
+    hits = store.search(
+        "memoryos://user/u1/support/anchors/hot",
+        tenant_id="default",
+        filters={"owner_user_id": "u1"},
+        limit=5,
+    )
 
     assert hits[0].uri == uri
 
@@ -27,15 +36,20 @@ def test_fts_query_escapes_uri_punctuation(tmp_path) -> None:
 def test_chinese_query_without_spaces_falls_back_to_contains(tmp_path) -> None:
     store = SQLiteIndexStore(tmp_path / "index.sqlite3")
     obj = ContextObject(
-        uri="memoryos://user/u1/memories/m1",
-        context_type=ContextType.MEMORY,
+        uri="memoryos://user/u1/resources/m1",
+        context_type=ContextType.RESOURCE,
         title="偏好",
         owner_user_id="u1",
         metadata={"summary": "用户喜欢热的时候开空调"},
     )
-    store.upsert_index(obj, content="用户喜欢热的时候开空调")
+    store.upsert_index(obj, content="用户喜欢热的时候开空调", tenant_id="default")
 
-    hits = store.search("用户喜欢热的时候开空调", filters={"owner_user_id": "u1"}, limit=5)
+    hits = store.search(
+        "用户喜欢热的时候开空调",
+        tenant_id="default",
+        filters={"owner_user_id": "u1"},
+        limit=5,
+    )
 
     assert hits[0].uri == obj.uri
 
@@ -43,14 +57,19 @@ def test_chinese_query_without_spaces_falls_back_to_contains(tmp_path) -> None:
 def test_chinese_ngram_fallback_matches_non_contiguous_phrase(tmp_path) -> None:
     store = SQLiteIndexStore(tmp_path / "index.sqlite3")
     obj = ContextObject(
-        uri="memoryos://user/u1/memories/m1",
-        context_type=ContextType.MEMORY,
+        uri="memoryos://user/u1/resources/m1",
+        context_type=ContextType.RESOURCE,
         title="空调偏好",
         owner_user_id="u1",
     )
-    store.upsert_index(obj, content="用户喜欢热的时候开空调")
+    store.upsert_index(obj, content="用户喜欢热的时候开空调", tenant_id="default")
 
-    hits = store.search("喜欢开空调", filters={"owner_user_id": "u1"}, limit=5)
+    hits = store.search(
+        "喜欢开空调",
+        tenant_id="default",
+        filters={"owner_user_id": "u1"},
+        limit=5,
+    )
 
     assert [hit.uri for hit in hits] == [obj.uri]
     assert hits[0].metadata["retrieval_scores"]["lexical"] == 0.75
@@ -59,41 +78,41 @@ def test_chinese_ngram_fallback_matches_non_contiguous_phrase(tmp_path) -> None:
 def test_zero_relevance_is_not_promoted_by_hotness(tmp_path) -> None:
     store = SQLiteIndexStore(tmp_path / "index.sqlite3")
     unrelated = ContextObject(
-        uri="memoryos://user/u1/memories/unrelated",
-        context_type=ContextType.MEMORY,
+        uri="memoryos://user/u1/resources/unrelated",
+        context_type=ContextType.RESOURCE,
         title="天气偏好",
         owner_user_id="u1",
         hotness=1.0,
         semantic_hotness=1.0,
         behavior_support_hotness=1.0,
     )
-    store.upsert_index(unrelated, content="晴天适合户外活动")
+    store.upsert_index(unrelated, content="晴天适合户外活动", tenant_id="default")
 
-    assert store.search("PostgreSQL", filters={"owner_user_id": "u1"}) == []
+    assert store.search("PostgreSQL", tenant_id="default", filters={"owner_user_id": "u1"}) == []
 
 
 def test_fts_disabled_does_not_run_contains_scan_or_apply_hotness(tmp_path) -> None:
     store = SQLiteIndexStore(tmp_path / "index.sqlite3")
     relevant = ContextObject(
-        uri="memoryos://user/u1/memories/relevant",
-        context_type=ContextType.MEMORY,
+        uri="memoryos://user/u1/resources/relevant",
+        context_type=ContextType.RESOURCE,
         title="database",
         owner_user_id="u1",
     )
     unrelated = ContextObject(
-        uri="memoryos://user/u1/memories/hot",
-        context_type=ContextType.MEMORY,
+        uri="memoryos://user/u1/resources/hot",
+        context_type=ContextType.RESOURCE,
         title="weather",
         owner_user_id="u1",
         hotness=1.0,
         semantic_hotness=1.0,
         behavior_support_hotness=1.0,
     )
-    store.upsert_index(relevant, content="PostgreSQL database")
-    store.upsert_index(unrelated, content="sunny outdoor activity")
+    store.upsert_index(relevant, content="PostgreSQL database", tenant_id="default")
+    store.upsert_index(unrelated, content="sunny outdoor activity", tenant_id="default")
     store.fts_enabled = False
 
-    assert store.search("PostgreSQL", filters={"owner_user_id": "u1"}) == []
+    assert store.search("PostgreSQL", tenant_id="default", filters={"owner_user_id": "u1"}) == []
 
 
 def test_metadata_exact_scene_key_and_action_are_prioritized(tmp_path) -> None:
@@ -106,16 +125,16 @@ def test_metadata_exact_scene_key_and_action_are_prioritized(tmp_path) -> None:
         metadata={"scene_key": "hot_room", "action": "turn_on_ac"},
     )
     lexical = ContextObject(
-        uri="memoryos://user/u1/memories/noise",
-        context_type=ContextType.MEMORY,
+        uri="memoryos://user/u1/resources/noise",
+        context_type=ContextType.RESOURCE,
         title="hot_room",
         owner_user_id="u1",
         metadata={"summary": "hot_room appears in text"},
     )
-    store.upsert_index(lexical, content="hot_room hot_room hot_room")
-    store.upsert_index(exact, content="policy")
+    store.upsert_index(lexical, content="hot_room hot_room hot_room", tenant_id="default")
+    store.upsert_index(exact, content="policy", tenant_id="default")
 
-    hits = store.search("hot_room", filters={"owner_user_id": "u1"}, limit=5)
+    hits = store.search("hot_room", tenant_id="default", filters={"owner_user_id": "u1"}, limit=5)
 
     assert hits[0].uri == exact.uri
     assert hits[0].metadata["retrieval_scores"]["identity"] == 1.0
@@ -125,15 +144,15 @@ def test_metadata_exact_scene_key_and_action_are_prioritized(tmp_path) -> None:
 def test_nan_rank_and_hotness_cannot_create_non_finite_or_zero_base_hit(tmp_path) -> None:
     store = SQLiteIndexStore(tmp_path / "index.sqlite3")
     obj = ContextObject(
-        uri="memoryos://user/u1/memories/m1",
-        context_type=ContextType.MEMORY,
+        uri="memoryos://user/u1/resources/m1",
+        context_type=ContextType.RESOURCE,
         title="database",
         owner_user_id="u1",
         hotness=1.0,
         semantic_hotness=1.0,
         behavior_support_hotness=1.0,
     )
-    store.upsert_index(obj, content="PostgreSQL database")
+    store.upsert_index(obj, content="PostgreSQL database", tenant_id="default")
     with store._connect() as conn:  # noqa: SLF001
         conn.execute("UPDATE contexts SET hotness = ? WHERE uri = ?", ("NaN", obj.uri))
         row = conn.execute("SELECT * FROM contexts WHERE uri = ?", (obj.uri,)).fetchone()

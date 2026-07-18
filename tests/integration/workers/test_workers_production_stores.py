@@ -8,8 +8,7 @@ from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.store.local_stores import FileSystemSourceStore
 from memoryos.contextdb.store.source_store import QueueJob
 from memoryos.contextdb.store.sqlite_queue_store import SQLiteQueueStore
-from memoryos.contextdb.store.vector_store import InMemoryVectorStore
-from memoryos.memory.integration.context_overlay import CanonicalMemoryContextOverlay
+from memoryos.contextdb.store.vector_store import InMemoryVectorStore, vector_row_id
 from memoryos.providers.embedding import HashingEmbeddingProvider
 from memoryos.security.context_projection import (
     ContextProjectionSanitizationError,
@@ -45,8 +44,8 @@ def test_semantic_worker_uses_sqlite_queue_and_acks_success(tmp_path) -> None:
     source = FileSystemSourceStore(tmp_path)
     queue_path = tmp_path / "queue.sqlite3"
     queue = SQLiteQueueStore(queue_path)
-    uri = "memoryos://user/u1/memories/m1"
-    source.write_object(ContextObject(uri=uri, context_type=ContextType.MEMORY, title="M", owner_user_id="u1"), content="content")
+    uri = "memoryos://user/u1/resources/m1"
+    source.write_object(ContextObject(uri=uri, context_type=ContextType.RESOURCE, title="M", owner_user_id="u1"), content="content")
     queue.enqueue(QueueJob(job_id="j1", queue_name="semantic", action="refresh", target_uri=uri))
 
     assert SemanticWorker(source, queue).process_pending()["processed"] == ["j1"]
@@ -58,13 +57,13 @@ def test_embedding_worker_uses_provider_metadata_and_sqlite_ack(tmp_path) -> Non
     queue_path = tmp_path / "queue.sqlite3"
     queue = SQLiteQueueStore(queue_path)
     vector = InMemoryVectorStore()
-    uri = "memoryos://user/u1/memories/m1"
-    source.write_object(ContextObject(uri=uri, context_type=ContextType.MEMORY, title="M", owner_user_id="u1"), content="hot room")
+    uri = "memoryos://user/u1/resources/m1"
+    source.write_object(ContextObject(uri=uri, context_type=ContextType.RESOURCE, title="M", owner_user_id="u1"), content="hot room")
     queue.enqueue(QueueJob(job_id="j2", queue_name="embedding", action="embed", target_uri=uri))
 
     assert EmbeddingWorker(source, queue, vector, HashingEmbeddingProvider()).process_pending()["processed"] == ["j2"]
     assert _status(queue_path, "j2") == "done"
-    metadata = vector.rows[uri][1]
+    metadata = vector.rows[vector_row_id("default", uri)][1]
     assert metadata["embedding_model"] == "hashing-v1"
     assert metadata["embedding_dimension"] == 16
     assert metadata["source_uri"] == uri
@@ -76,7 +75,7 @@ def test_semantic_and_embedding_workers_sanitize_derived_layers_and_vector_input
     queue = SQLiteQueueStore(tmp_path / "queue.sqlite3")
     vector = InMemoryVectorStore()
     provider = _CapturingEmbeddingProvider()
-    uri = "memoryos://user/u1/memories/sensitive-derived-projection"
+    uri = "memoryos://user/u1/resources/sensitive-derived-projection"
     raw = (
         "Authorization: Bearer abcdefghijklmnop\n"
         "password=hunter2\n"
@@ -85,7 +84,7 @@ def test_semantic_and_embedding_workers_sanitize_derived_layers_and_vector_input
     source.write_object(
         ContextObject(
             uri=uri,
-            context_type=ContextType.MEMORY,
+            context_type=ContextType.RESOURCE,
             title="Sensitive projection",
             owner_user_id="u1",
             metadata={"source_kind": "tool_result", "authorization": "Bearer metadata-secret"},
@@ -99,7 +98,7 @@ def test_semantic_and_embedding_workers_sanitize_derived_layers_and_vector_input
     ContextProjectionSanitizer().assert_safe(provider.inputs[0])
     assert "secret-report.txt" in provider.inputs[0]
 
-    vector_metadata = vector.rows[uri][1]
+    vector_metadata = vector.rows[vector_row_id("default", uri)][1]
     ContextProjectionSanitizer().assert_safe(vector_metadata)
     assert vector_metadata["projection_sanitized"] is True
     assert vector_metadata["projection_redacted"] is True
@@ -132,9 +131,9 @@ def test_embedding_worker_fails_closed_before_provider_and_vector_when_sanitizat
     queue = SQLiteQueueStore(tmp_path / "queue.sqlite3")
     vector = InMemoryVectorStore()
     provider = _CapturingEmbeddingProvider()
-    uri = "memoryos://user/u1/memories/fail-closed-vector"
+    uri = "memoryos://user/u1/resources/fail-closed-vector"
     source.write_object(
-        ContextObject(uri=uri, context_type=ContextType.MEMORY, title="fail closed", owner_user_id="u1"),
+        ContextObject(uri=uri, context_type=ContextType.RESOURCE, title="fail closed", owner_user_id="u1"),
         content="must never reach the provider",
     )
     queue.enqueue(QueueJob(job_id="unsafe", queue_name="embedding", action="embed", target_uri=uri))
@@ -157,70 +156,3 @@ def test_worker_failure_does_not_ack_job(tmp_path) -> None:
 
     assert SemanticWorker(source, queue).process_pending()["processed"] == []
     assert _status(queue_path, "bad") == "pending"
-
-
-def test_generic_semantic_and_embedding_workers_quarantine_raw_canonical_jobs(
-    tmp_path,
-) -> None:  # noqa: ANN001
-    source = FileSystemSourceStore(
-        tmp_path,
-        domain_classifier=CanonicalMemoryContextOverlay(),
-    )
-    queue_path = tmp_path / "queue.sqlite3"
-    queue = SQLiteQueueStore(queue_path)
-    vector = InMemoryVectorStore()
-    uri = "memoryos://user/u1/memories/canonical/slots/raw/claims/uncommitted"
-    source.write_object(
-        ContextObject(
-            uri=uri,
-            context_type=ContextType.MEMORY,
-            title="uncommitted",
-            owner_user_id="u1",
-            # URI classification must remain fail-closed even when torn or
-            # tampered metadata no longer declares the canonical kind.
-            metadata={"revision": 1},
-        ),
-        content="must not be projected",
-    )
-    schema_only_uri = "memoryos://user/u1/memories/schema-only-uncommitted"
-    source.write_object(
-        ContextObject(
-            uri=schema_only_uri,
-            context_type=ContextType.MEMORY,
-            title="schema-only uncommitted",
-            owner_user_id="u1",
-            metadata={"revision": 1},
-            schema_version="canonical_memory_v2",
-        ),
-        content="must not be projected through generic workers",
-    )
-    queue.enqueue(QueueJob(job_id="raw-semantic", queue_name="semantic", action="refresh", target_uri=uri))
-    queue.enqueue(QueueJob(job_id="raw-embedding", queue_name="embedding", action="embed", target_uri=uri))
-    queue.enqueue(
-        QueueJob(
-            job_id="schema-semantic",
-            queue_name="semantic",
-            action="refresh",
-            target_uri=schema_only_uri,
-        )
-    )
-    queue.enqueue(
-        QueueJob(
-            job_id="schema-embedding",
-            queue_name="embedding",
-            action="embed",
-            target_uri=schema_only_uri,
-        )
-    )
-
-    semantic = SemanticWorker(source, queue).process_pending()
-    embedding = EmbeddingWorker(source, queue, vector).process_pending()
-
-    assert semantic["quarantine"] == ["raw-semantic", "schema-semantic"]
-    assert embedding["quarantine"] == ["raw-embedding", "schema-embedding"]
-    assert _status(queue_path, "raw-semantic") == "quarantine"
-    assert _status(queue_path, "raw-embedding") == "quarantine"
-    assert _status(queue_path, "schema-semantic") == "quarantine"
-    assert _status(queue_path, "schema-embedding") == "quarantine"
-    assert uri not in vector.rows
-    assert schema_only_uri not in vector.rows

@@ -4,10 +4,10 @@ from memoryos.action_policy.model.action_policy import ActionPolicy
 from memoryos.behavior.model.behavior_pattern import BehaviorCluster, BehaviorPattern
 from memoryos.contextdb.model.context_type import ContextType
 from memoryos.contextdb.store.local_stores import FileSystemSourceStore, InMemoryIndexStore, InMemoryRelationStore
-from memoryos.memory.model.memory import MemoryCandidate, MemoryKind
 from memoryos.operations.commit.operation_committer import OperationCommitter
 from memoryos.operations.model.context_operation import ContextOperation
 from memoryos.operations.model.operation_action import OperationAction
+from memoryos.support import SupportAnchor
 
 
 def test_anchor_and_candidate_relations_are_populated(tmp_path) -> None:
@@ -15,9 +15,9 @@ def test_anchor_and_candidate_relations_are_populated(tmp_path) -> None:
     index = InMemoryIndexStore()
     relations = InMemoryRelationStore()
     committer = OperationCommitter(source, index, tmp_path, relation_store=relations)
-    anchor_uri = "memoryos://user/u1/memories/anchors/hot"
+    anchor_uri = "memoryos://user/u1/support/behavior/hot"
 
-    cluster = BehaviorCluster(user_id="u1", scene_key="hot", memory_anchor_uri=anchor_uri, case_refs=["case1", "case2"])
+    cluster = BehaviorCluster(user_id="u1", scene_key="hot", support_anchor_uri=anchor_uri, case_refs=["case1", "case2"])
     cluster_uri = "memoryos://user/u1/behavior/clusters/hot/c1"
     committer.commit(
         "u1",
@@ -42,14 +42,18 @@ def test_anchor_and_candidate_relations_are_populated(tmp_path) -> None:
     )
     assert any(
         relation.relation_type == "anchored_by" and relation.target_uri == anchor_uri
-        for relation in relations.relations_of(cluster_uri, owner_user_id="u1")
+        for relation in relations.relations_of(
+            cluster_uri,
+            tenant_id="default",
+            owner_user_id="u1",
+        )
     )
 
     pattern = BehaviorPattern(
         user_id="u1",
         scene_key="hot",
         trigger_conditions={},
-        memory_anchor_uri=anchor_uri,
+        support_anchor_uri=anchor_uri,
         case_refs=["case1"],
         action_distribution=[],
     )
@@ -66,10 +70,15 @@ def test_anchor_and_candidate_relations_are_populated(tmp_path) -> None:
         ],
     )
     assert any(
-        relation.relation_type == "anchored_by" for relation in relations.relations_of(pattern.uri, owner_user_id="u1")
+        relation.relation_type == "anchored_by"
+        for relation in relations.relations_of(
+            pattern.uri,
+            tenant_id="default",
+            owner_user_id="u1",
+        )
     )
 
-    policy = ActionPolicy(user_id="u1", scene_key="hot", action="turn_on_ac", memory_anchor_uri=anchor_uri)
+    policy = ActionPolicy(user_id="u1", scene_key="hot", action="turn_on_ac", support_anchor_uri=anchor_uri)
     committer.commit(
         "u1",
         [
@@ -83,15 +92,20 @@ def test_anchor_and_candidate_relations_are_populated(tmp_path) -> None:
         ],
     )
     assert any(
-        relation.relation_type == "anchored_by" for relation in relations.relations_of(policy.uri, owner_user_id="u1")
+        relation.relation_type == "anchored_by"
+        for relation in relations.relations_of(
+            policy.uri,
+            tenant_id="default",
+            owner_user_id="u1",
+        )
     )
 
-    candidate = MemoryCandidate(
-        uri="memoryos://user/u1/memories/candidates/temp",
+    candidate = SupportAnchor(
+        uri=anchor_uri,
         user_id="u1",
-        title="temp candidate",
-        content="candidate content",
-        kind=MemoryKind.CANDIDATE,
+        title="behavior support",
+        content="behavior support evidence",
+        anchor_key="hot",
         supporting_behavior_uris=[pattern.uri],
     )
     committer.commit(
@@ -99,7 +113,7 @@ def test_anchor_and_candidate_relations_are_populated(tmp_path) -> None:
         [
             ContextOperation(
                 user_id="u1",
-                context_type=ContextType.MEMORY,
+                context_type=ContextType.BEHAVIOR_SUPPORT,
                 action=OperationAction.ADD,
                 target_uri=candidate.uri,
                 payload={"context_object": candidate.to_context_object().to_dict(), "content": candidate.content},
@@ -108,5 +122,9 @@ def test_anchor_and_candidate_relations_are_populated(tmp_path) -> None:
     )
     assert any(
         relation.relation_type == "evidence_for" and relation.target_uri == pattern.uri
-        for relation in relations.relations_of(candidate.uri, owner_user_id="u1")
+        for relation in relations.relations_of(
+            candidate.uri,
+            tenant_id="default",
+            owner_user_id="u1",
+        )
     )

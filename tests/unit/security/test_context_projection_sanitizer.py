@@ -47,16 +47,22 @@ def test_projection_sanitizer_allows_logical_uri_but_removes_credentials_and_abs
 
 def test_catalog_record_validates_taxonomy_enum_and_finite_hotness() -> None:
     record = CatalogRecord(
-        record_key="slot:s1:current",
-        uri="memoryos://user/u1/memories/canonical/slots/s1",
+        record_key="memory-document:u1:memdoc_0123456789ABCDEF",
+        uri="memoryos://user/u1/memory/documents/memdoc_0123456789ABCDEF",
         tenant_id="t1",
-        record_kind=CatalogRecordKind.CURRENT_SLOT,
+        owner_user_id="u1",
+        context_type="memory",
+        source_kind="markdown_memory_document",
+        record_kind=CatalogRecordKind.MEMORY_DOCUMENT,
+        document_id="memdoc_0123456789ABCDEF",
+        document_kind="topic",
+        source_digest="a" * 64,
         serving_tier=ServingTier.WARM,
-        tree_paths=("memories/preferences/food/ice_cream_flavors", "timeline/2026/07/14"),
+        tree_paths=("memories/knowledge/topics/ice_cream_flavors", "timeline/2026/07/14"),
         event_time="2026-07-14T00:00:00+08:00",
     )
 
-    assert record.record_kind == "current_slot"
+    assert record.record_kind == "memory_document"
     assert record.serving_tier == "WARM"
     assert record.event_time == "2026-07-13T16:00:00+00:00"
     assert record.path_depth == 4
@@ -65,7 +71,7 @@ def test_catalog_record_validates_taxonomy_enum_and_finite_hotness() -> None:
         validate_tree_paths(("invented/unbounded/path",))
     with pytest.raises(ValueError, match="resource path kind"):
         validate_tree_paths(("resources/llm-invented-folder",))
-    with pytest.raises(ValueError, match="memory path kind"):
+    with pytest.raises(ValueError, match="Markdown document taxonomy"):
         validate_tree_paths(("memories/random/new/folder",))
     with pytest.raises(ValueError, match="calendar date"):
         validate_tree_paths(("timeline/2026/02/30",))
@@ -76,13 +82,19 @@ def test_catalog_record_validates_taxonomy_enum_and_finite_hotness() -> None:
 
 
 def test_catalog_tree_paths_pseudonymize_sensitive_dynamic_segments_and_metadata_mirrors() -> None:
-    raw_primary = "memories/preferences/Users_gulf_Desktop_private.txt/ice_cream"
+    raw_primary = "memories/knowledge/topics/Users_gulf_Desktop_private.txt"
     raw_secondary = "projects/sk-abcdefghijk123456"
     record = CatalogRecord(
-        record_key="slot:sensitive:current",
-        uri="memoryos://user/u1/memories/canonical/slots/sensitive",
+        record_key="memory-document:u1:memdoc_0123456789ABCDEF",
+        uri="memoryos://user/u1/memory/documents/memdoc_0123456789ABCDEF",
         tenant_id="t1",
-        record_kind=CatalogRecordKind.CURRENT_SLOT,
+        owner_user_id="u1",
+        context_type="memory",
+        source_kind="markdown_memory_document",
+        record_kind=CatalogRecordKind.MEMORY_DOCUMENT,
+        document_id="memdoc_0123456789ABCDEF",
+        document_kind="topic",
+        source_digest="a" * 64,
         primary_tree_path=raw_primary,
         tree_paths=(raw_primary, raw_secondary, "timeline/2026/07/14"),
         metadata={
@@ -95,7 +107,7 @@ def test_catalog_tree_paths_pseudonymize_sensitive_dynamic_segments_and_metadata
     safe = record.with_sanitized_projection()
     encoded = repr(safe.to_dict())
 
-    assert safe.primary_tree_path.startswith("memories/preferences/id-")
+    assert safe.primary_tree_path.startswith("memories/knowledge/topics/id-")
     assert safe.tree_paths[1].startswith("projects/id-")
     assert safe.tree_paths[2] == "timeline/2026/07/14"
     assert safe.metadata["primary_tree_path"] == safe.primary_tree_path

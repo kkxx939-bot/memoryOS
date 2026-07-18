@@ -36,10 +36,10 @@ class OperationCommitterPathLockTest(unittest.TestCase):
             source = FileSystemSourceStore(root)
             index = InMemoryIndexStore()
             committer = OperationCommitter(source, index, str(root), lock_store=lock_store)
-            obj = ContextObject(uri="memoryos://user/u1/memories/preferences/temp", context_type=ContextType.MEMORY, title="temperature", owner_user_id="u1")
+            obj = ContextObject(uri="memoryos://user/u1/resources/preferences/temp", context_type=ContextType.RESOURCE, title="temperature", owner_user_id="u1")
             operation = ContextOperation(
                 user_id="u1",
-                context_type=ContextType.MEMORY,
+                context_type=ContextType.RESOURCE,
                 action=OperationAction.ADD,
                 target_uri=obj.uri,
                 payload={"context_object": obj.to_dict(), "content": "prefers 26 degree"},
@@ -51,7 +51,13 @@ class OperationCommitterPathLockTest(unittest.TestCase):
             finally:
                 lock_store.release(token)
             committer.commit("u1", [operation])
-            self.assertTrue(index.search("26", filters={"owner_user_id": "u1", "context_type": "memory"}))
+            self.assertTrue(
+                index.search(
+                    "26",
+                    tenant_id="default",
+                    filters={"owner_user_id": "u1", "context_type": "resource"},
+                )
+            )
 
     def test_lost_fence_stops_before_index_audit_diff_and_marker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -61,14 +67,14 @@ class OperationCommitterPathLockTest(unittest.TestCase):
             index = InMemoryIndexStore()
             committer = OperationCommitter(source, index, str(root), lock_store=lock_store)
             obj = ContextObject(
-                uri="memoryos://user/u1/memories/preferences/fenced",
-                context_type=ContextType.MEMORY,
+                uri="memoryos://user/u1/resources/preferences/fenced",
+                context_type=ContextType.RESOURCE,
                 title="fenced",
                 owner_user_id="u1",
             )
             operation = ContextOperation(
                 user_id="u1",
-                context_type=ContextType.MEMORY,
+                context_type=ContextType.RESOURCE,
                 action=OperationAction.ADD,
                 target_uri=obj.uri,
                 payload={"context_object": obj.to_dict(), "content": "fenced write"},
@@ -94,7 +100,7 @@ class OperationCommitterPathLockTest(unittest.TestCase):
             with self.assertRaises(LockLostError):
                 committer.commit("u1", [operation])
 
-            self.assertNotIn(obj.uri, index.indexed_uris())
+            self.assertNotIn(obj.uri, index.indexed_uris(tenant_id="default"))
             self.assertFalse(list((root / "system" / "audit").glob("*.jsonl")))
             self.assertFalse(list((root / "system" / "diffs").glob("*.json")))
             self.assertFalse((root / "system" / "operations" / f"{operation.operation_id}.json").exists())
@@ -110,8 +116,8 @@ class OperationCommitterPathLockTest(unittest.TestCase):
             committer = OperationCommitter(source, index, str(root), lock_store=lock_store)
             objects = [
                 ContextObject(
-                    uri=f"memoryos://user/u1/memories/preferences/{name}",
-                    context_type=ContextType.MEMORY,
+                    uri=f"memoryos://user/u1/resources/preferences/{name}",
+                    context_type=ContextType.RESOURCE,
                     title=name,
                     owner_user_id="u1",
                 )
@@ -120,7 +126,7 @@ class OperationCommitterPathLockTest(unittest.TestCase):
             operations = [
                 ContextOperation(
                     user_id="u1",
-                    context_type=ContextType.MEMORY,
+                    context_type=ContextType.RESOURCE,
                     action=OperationAction.ADD,
                     target_uri=obj.uri,
                     payload={"context_object": obj.to_dict(), "content": obj.title},
