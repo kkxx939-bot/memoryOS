@@ -6,29 +6,31 @@ from datetime import datetime, timezone
 
 import pytest
 
-from memoryos.adapters.persistence.filesystem.memory_document_store import FileSystemMemoryDocumentStore
-from memoryos.adapters.persistence.in_memory.queue_store import InMemoryQueueStore
-from memoryos.memory.documents import (
-    ABSENT,
+from infrastructure.context.layers import MemoryDocumentContextOverlay
+from infrastructure.context.projection import MemoryDocumentProjector
+from infrastructure.store.filesystem.memory_document_store import FileSystemMemoryDocumentStore
+from infrastructure.store.memory import (
     DocumentControlIntegrityError,
     DocumentControlRecord,
-    DocumentUnsafeError,
     ExternalChangeKind,
     ExternalDocumentChange,
-    MemoryCandidateKind,
-    MemoryDocumentCommitter,
-    MemoryDocumentContextOverlay,
     MemoryDocumentControlStore,
-    MemoryDocumentPlanner,
-    MemoryDocumentProjector,
     MemoryDocumentRevisionStore,
     MemoryDocumentScanner,
+)
+from infrastructure.store.memory.erasure_store import MemoryDocumentEraseStore
+from memory.commit import MemoryDocumentCommitter
+from memory.core import (
+    ABSENT,
+    MemoryCandidateKind,
     MemoryEditProposal,
     QuarantinedDocument,
-    explicit_evidence_digest,
     new_document_id,
     render_new_document,
 )
+from memory.execute import MemoryDocumentPlanner, explicit_evidence_digest
+from memory.ports import DocumentUnsafeError
+from tests.support.persistence.in_memory import InMemoryQueueStore
 
 
 def _proposal(kind: MemoryCandidateKind = MemoryCandidateKind.TOPIC_NOTE) -> MemoryEditProposal:
@@ -249,7 +251,13 @@ def test_scanner_journals_external_create_and_update_without_overwriting(tmp_pat
     control = MemoryDocumentControlStore(tmp_path)
     revisions = MemoryDocumentRevisionStore(tmp_path)
     queue = InMemoryQueueStore()
-    committer = MemoryDocumentCommitter(store, control, revisions, queue)
+    committer = MemoryDocumentCommitter(
+        store,
+        control,
+        revisions,
+        queue,
+        erasure_store=MemoryDocumentEraseStore(control.root),
+    )
     document_id = new_document_id()
     relative_path = "knowledge/topics/external.md"
     original = render_new_document(document_id, "# External\n\nBefore\n")
@@ -294,7 +302,13 @@ def test_scanner_journals_external_rename_then_stable_delete(tmp_path) -> None:
     control = MemoryDocumentControlStore(tmp_path)
     revisions = MemoryDocumentRevisionStore(tmp_path)
     queue = InMemoryQueueStore()
-    committer = MemoryDocumentCommitter(store, control, revisions, queue)
+    committer = MemoryDocumentCommitter(
+        store,
+        control,
+        revisions,
+        queue,
+        erasure_store=MemoryDocumentEraseStore(control.root),
+    )
     document_id = new_document_id()
     old_relative = "knowledge/topics/external-rename.md"
     new_relative = "knowledge/entities/external-rename.md"
@@ -375,9 +389,7 @@ def test_scanner_copy_with_duplicate_id_never_emits_rename_or_delete(tmp_path) -
     assert second.deletions_paused is True
     assert first.confirmed_changes == second.confirmed_changes == ()
     assert published == []
-    quarantined = tuple(
-        item for item in first.generation.registrations if isinstance(item, QuarantinedDocument)
-    )
+    quarantined = tuple(item for item in first.generation.registrations if isinstance(item, QuarantinedDocument))
     assert len(quarantined) == 2
     assert all("duplicate document_id" in item.reason for item in quarantined)
     assert (memory_root / original_relative).read_bytes() == raw
@@ -529,7 +541,7 @@ def test_scanner_pauses_when_bound_root_is_temporarily_unavailable(
     def unavailable(*_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202
         raise DocumentUnsafeError("root temporarily unavailable")
 
-    monkeypatch.setattr(store, "_open_user_root", unavailable)
+    monkeypatch.setattr(store._files, "open_user_root", unavailable)
     result = scanner.scan("default", "u1", force_stable=True)
 
     assert result.deletions_paused is True

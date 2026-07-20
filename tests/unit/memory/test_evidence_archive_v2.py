@@ -6,16 +6,16 @@ from enum import Enum
 
 import pytest
 
-from memoryos.contextdb.session.session_archive import (
+from foundation.integrity import canonical_digest
+from memory.commit.evidence.errors import (
     EvidenceArchiveConflictError,
     EvidenceArchiveIntegrityError,
-    SessionArchiveStore,
 )
-from memoryos.contextdb.session.session_commit import SessionCommitService
-from memoryos.contextdb.session.session_model import SessionArchive
-from memoryos.contextdb.store.local_stores import InMemoryQueueStore
-from memoryos.core.integrity import canonical_digest
-from memoryos.memory.evidence import SessionArchiveEpisodeAdapter
+from memory.commit.session_commit import SessionCommitService
+from pre.evidence import SessionArchiveEpisodeAdapter
+from pre.session import SessionArchive
+from tests.support.persistence import InMemoryQueueStore
+from tests.support.session_archive import build_session_archive_store
 
 
 class _Kind(Enum):
@@ -137,7 +137,7 @@ def test_inferred_envelope_fields_are_explicitly_marked() -> None:
 
 
 def test_content_addressed_archive_is_idempotent_and_old_manifests_remain_readable(tmp_path) -> None:
-    store = SessionArchiveStore(tmp_path, tenant_id="t1")
+    store = build_session_archive_store(tmp_path, tenant_id="t1")
     archive = _archive()
     directory = store.write_sync_archive(archive)
     first_manifest = archive.manifest_digest
@@ -166,7 +166,7 @@ def test_content_addressed_archive_is_idempotent_and_old_manifests_remain_readab
 
 
 def test_archive_write_rejects_broken_commit_head_symlink(tmp_path) -> None:
-    store = SessionArchiveStore(tmp_path, tenant_id="t1")
+    store = build_session_archive_store(tmp_path, tenant_id="t1")
     archive = _archive()
     directory = store._dir(archive.archive_uri, tenant_id="t1")
     directory.mkdir(parents=True, exist_ok=True)
@@ -182,7 +182,7 @@ def test_archive_write_rejects_broken_commit_head_symlink(tmp_path) -> None:
 
 
 def test_async_commit_reloads_archived_manifest_instead_of_overwriting_from_caller(tmp_path) -> None:
-    store = SessionArchiveStore(tmp_path, tenant_id="t1")
+    store = build_session_archive_store(tmp_path, tenant_id="t1")
     service = SessionCommitService(store, InMemoryQueueStore())
     archive = _archive(content="hello")
     service.sync_archive(archive, enqueue_commit_job=False)
@@ -196,7 +196,7 @@ def test_async_commit_reloads_archived_manifest_instead_of_overwriting_from_call
 
 
 def test_existing_event_or_manifest_with_same_digest_and_different_bytes_fails_closed(tmp_path) -> None:
-    store = SessionArchiveStore(tmp_path, tenant_id="t1")
+    store = build_session_archive_store(tmp_path, tenant_id="t1")
     archive = _archive()
     directory = store.write_sync_archive(archive)
     event = SessionArchiveEpisodeAdapter().adapt(archive).events[0]
@@ -274,4 +274,4 @@ def test_v1_archive_layout_is_rejected_instead_of_implicitly_migrated(tmp_path) 
         encoding="utf-8",
     )
     with pytest.raises(EvidenceArchiveIntegrityError, match="missing evidence archive object"):
-        SessionArchiveStore(tmp_path).read_archive("memoryos://user/u1/sessions/history/v1")
+        build_session_archive_store(tmp_path).read_archive("memoryos://user/u1/sessions/history/v1")

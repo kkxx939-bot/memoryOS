@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from memoryos.memory.documents.model import MemoryDocumentKind
-from memoryos.memory.documents.path_policy import MemoryDocumentPathPolicy
+from memory.core.model import MemoryDocumentKind
+from memory.core.structure.path_policy import MemoryDocumentPathPolicy
 
 DOCUMENT_ID = "memdoc_0123456789ABCDEF"
 

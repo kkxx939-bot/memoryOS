@@ -1,0 +1,514 @@
+"""本地 MCP 工具名到 MemoryOS SDK 能力的路由。"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, is_dataclass
+from typing import Any
+
+from foundation.identity import LocalUserContext
+from infrastructure.context.query_planner import merge_retrieval_options, retrieval_options_from_legacy
+from infrastructure.context.retrieval.limits import MAX_RETRIEVAL_LIMIT
+from infrastructure.context.retrieval.query_plan import (
+    DEFAULT_CANDIDATE_LIMIT,
+    RetrievalOptions,
+    RetrievalQueryIntent,
+)
+from infrastructure.store.model.context.context_uri import ContextURI
+from openApi.mcp.config import MCPServerConfig
+from openApi.mcp.errors import MCPErrorCode, ToolPermissionError, exception_payload, ok_payload
+from openApi.mcp.schemas import (
+    agent_search_filter_metadata,
+    connection_schema,
+    normalize_action_metadata,
+    normalize_agent_metadata,
+    optional_bool,
+    optional_int,
+    optional_list,
+    require_process_observation_metadata,
+    required_str,
+)
+from openApi.memory_contract import validate_memory_request, validate_memory_response
+from openApi.retrieval_contract import parse_retrieval_options
+from openApi.version import __version__
+from policy.action_policy.decision.request import PredictionRequest
+from policy.action_policy.model.action_policy import ActionPolicy
+
+
+class MCPToolRouter:
+    """在当前本地用户上下文中校验并分发 MCP 工具调用。"""
+
+    def __init__(self, client: Any, config: MCPServerConfig | None = None) -> None:
+        self.client = client
+        self.config = config or MCPServerConfig.from_env()
+        self.caller = self.config.local_context()
+
+    def call(self, name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
+        """执行一次工具调用，并保证所有异常都转换为 MCP 错误载荷。"""
+
+        args = dict(arguments or {})
+        try:
+            if name in {"memoryos_search", "memoryos_search_context"}:
+                return self.search_context(args)
+            if name in {"memoryos_assemble", "memoryos_assemble_context"}:
+                return self.assemble_context(args)
+            if name == "memoryos_commit_session":
+                return self.commit_session(args)
+            if name == "memoryos_health":
+                return self.health()
+            if name == "memoryos_read":
+                return _client_payload(
+                    self.client.read(
+                        required_str(args, "uri"),
+                        layer=str(args.get("layer") or "L2"),
+                        **self._local_caller_kwargs(),
+                    )
+                )
+            if name == "memoryos_adopt_memory_document":
+                return self._memory_command(
+                    "adopt",
+                    "adopt_memory_document",
+                    args,
+                )
+            if name == "memoryos_remember":
+                return self._memory_command("remember", "remember", args)
+            if name == "memoryos_edit_memory_document":
+                return self._memory_command(
+                    "edit",
+                    "edit_memory_document",
+                    args,
+                )
+            if name == "memoryos_rename_memory_document":
+                return self._memory_command(
+                    "rename",
+                    "rename_memory_document",
+                    args,
+                )
+            if name == "memoryos_merge_memory_documents":
+                return self._memory_command(
+                    "merge",
+                    "merge_memory_documents",
+                    args,
+                )
+            if name == "memoryos_propose_memory_consolidation":
+                return self._memory_command(
+                    "merge_propose",
+                    "propose_memory_consolidation",
+                    args,
+                )
+            if name == "memoryos_resume_memory_consolidation":
+                return self._memory_command(
+                    "merge_resume",
+                    "resume_memory_consolidation",
+                    args,
+                )
+            if name == "memoryos_forget":
+                request = validate_memory_request("forget", args)
+                return self._memory_command(
+                    "forget",
+                    "forget",
+                    request,
+                    already_validated=True,
+                )
+            if name == "memoryos_memory_history":
+                request = validate_memory_request("history", args)
+                return _validated_memory_payload(
+                    "history",
+                    self.client.list_memory_history(**request, **self._local_caller_kwargs()),
+                )
+            if name == "memoryos_restore_memory_revision":
+                return self._memory_command(
+                    "restore",
+                    "restore_memory_revision",
+                    args,
+                )
+            if name == "memoryos_review_memory_edit":
+                return self._memory_command(
+                    "review",
+                    "review_memory_edit",
+                    args,
+                )
+            if name == "memoryos_preview_memory_edit":
+                request = validate_memory_request("review_preview", args)
+                return _validated_memory_payload(
+                    "review_preview",
+                    self.client.preview_memory_edit(**request, **self._local_caller_kwargs()),
+                )
+            if name == "memoryos_archive_search":
+                return ok_payload(
+                    {
+                        "results": self.client.archive_search(
+                            required_str(args, "query"),
+                            user_id=self._bound_user(args),
+                            limit=optional_int(args, "limit", 20, maximum=100),
+                            project_id=str(args.get("project_id") or ""),
+                            **self._local_caller_kwargs(),
+                        )
+                    }
+                )
+            if name == "memoryos_archive_read":
+                archive_uri = required_str(args, "archive_uri")
+                if ContextURI.parse(archive_uri).user_id != self.caller.user_id:
+                    raise FileNotFoundError(archive_uri)
+                return _client_payload(self.client.archive_read(archive_uri, **self._local_caller_kwargs()))
+            if name == "memoryos_recall_trace":
+                return _client_payload(
+                    self.client.recall_trace(
+                        required_str(args, "trace_id"),
+                        **self._local_caller_kwargs(),
+                    )
+                )
+            if name == "memoryos_connection_schema":
+                return ok_payload(connection_schema(self.config))
+            if name == "memoryos_predict":
+                return self.predict(args)
+            if name == "memoryos_process_observation":
+                return self.process_observation(args)
+            return {
+                "error": {
+                    "code": MCPErrorCode.VALIDATION_ERROR,
+                    "message": f"Unknown tool: {name}",
+                    "retryable": False,
+                    "details": {},
+                }
+            }
+        except Exception as exc:  # 工具层是外部 Agent 的最后一道安全边界。
+            return exception_payload(exc)
+
+    def _memory_command(
+        self,
+        operation: str,
+        method_name: str,
+        args: dict[str, Any],
+        *,
+        already_validated: bool = False,
+    ) -> dict[str, Any]:
+        """统一校验并执行本地用户记忆命令。"""
+
+        request = args if already_validated else validate_memory_request(operation, args)
+        method = getattr(self.client, method_name)
+        return _validated_memory_payload(
+            operation,
+            method(**request, **self._local_caller_kwargs()),
+        )
+
+    def search_context(self, args: dict[str, Any]) -> dict[str, Any]:
+        """校验检索范围并调用统一检索能力。"""
+
+        query = required_str(args, "query")
+        limit = optional_int(
+            args,
+            "limit",
+            10,
+            minimum=1,
+            maximum=MAX_RETRIEVAL_LIMIT,
+        )
+        metadata = normalize_agent_metadata(args.get("connect_metadata"), self.config)
+        filter_metadata = agent_search_filter_metadata(args.get("connect_metadata"), self.config)
+        context_type = args.get("context_type")
+        context_types = optional_list(args, "context_types")
+        search_scope = args.get("search_scope")
+        project_id = str(args.get("project_id") or "")
+        retrieval_views = optional_list(args, "retrieval_views")
+        requested_types = [context_type] if context_type is not None else list(context_types or [])
+        options = self._retrieval_options(
+            args,
+            context_types=tuple(str(item) for item in requested_types),
+            limit=limit,
+        )
+        contexts = self.client.search_context(
+            query,
+            options=options,
+            user_id=self._bound_user(args),
+            context_type=None,
+            limit=limit,
+            connect_metadata=filter_metadata,
+            search_scope=str(search_scope) if search_scope else None,
+            retrieval_views=[str(item) for item in retrieval_views or []],
+            project_id=project_id,
+            applicability_scopes=[dict(item) for item in optional_list(args, "applicability_scopes") or []],
+            record_kinds=[str(item) for item in optional_list(args, "record_kinds") or []],
+            document_ids=[str(item) for item in optional_list(args, "document_ids") or []],
+            document_kinds=[str(item) for item in optional_list(args, "document_kinds") or []],
+            query_intent=str(args.get("query_intent")) if args.get("query_intent") else None,
+            **self._local_caller_kwargs(),
+        )
+        source_uris = list(
+            dict.fromkeys(
+                source_uri for item in contexts if (source_uri := str(item.get("source_uri") or item.get("uri") or ""))
+            )
+        )
+        payload = {
+            "contexts": contexts,
+            "results": contexts,
+            "source_uris": source_uris,
+            "metadata": {"connect": metadata},
+        }
+        trace_id = str(getattr(self.client, "last_recall_trace_id", "") or "")
+        if trace_id:
+            payload["trace_id"] = trace_id
+        return ok_payload(payload)
+
+    def assemble_context(self, args: dict[str, Any]) -> dict[str, Any]:
+        """按检索条目上限组装可注入 Agent 的上下文。"""
+
+        query = required_str(args, "query")
+        limit = optional_int(
+            args,
+            "limit",
+            20,
+            minimum=1,
+            maximum=MAX_RETRIEVAL_LIMIT,
+        )
+        context_types = optional_list(args, "context_types")
+        search_scope = args.get("search_scope")
+        project_id = str(args.get("project_id") or "")
+        retrieval_views = optional_list(args, "retrieval_views")
+        metadata = normalize_agent_metadata(args.get("connect_metadata"), self.config)
+        filter_metadata = agent_search_filter_metadata(args.get("connect_metadata"), self.config)
+        options = self._retrieval_options(
+            args,
+            context_types=tuple(str(item) for item in context_types or []),
+            limit=limit,
+        )
+        assembled = self.client.assemble_context(
+            query,
+            options=options,
+            user_id=self._bound_user(args),
+            context_types=context_types,
+            limit=limit,
+            connect_metadata=filter_metadata,
+            search_scope=str(search_scope) if search_scope else None,
+            retrieval_views=[str(item) for item in retrieval_views or []],
+            project_id=project_id,
+            applicability_scopes=[dict(item) for item in optional_list(args, "applicability_scopes") or []],
+            record_kinds=[str(item) for item in optional_list(args, "record_kinds") or []],
+            document_ids=[str(item) for item in optional_list(args, "document_ids") or []],
+            document_kinds=[str(item) for item in optional_list(args, "document_kinds") or []],
+            query_intent=str(args.get("query_intent")) if args.get("query_intent") else None,
+            **self._local_caller_kwargs(),
+        )
+        payload = {
+            **assembled,
+            "packed_context": assembled.get("packed_context", ""),
+            "contexts": assembled.get("contexts", []),
+            "source_uris": assembled.get("source_uris", []),
+            "dropped_contexts": assembled.get("dropped_contexts", []),
+            "metadata": {"connect": metadata},
+        }
+        return ok_payload(payload)
+
+    def commit_session(self, args: dict[str, Any]) -> dict[str, Any]:
+        """清理会话入口数据并提交调用者拥有的 Agent 会话。"""
+
+        session_id = required_str(args, "session_id")
+        user_id = self._bound_user(args)
+        metadata = normalize_agent_metadata(args.get("connect_metadata"), self.config)
+        scope = dict(args.get("scope") or {})
+        self.caller.assert_identity(user_id=scope.get("user_id"), tenant_id=scope.get("tenant_id"))
+        scope.pop("tenant_id", None)
+        scope.update({"user_id": user_id})
+        result = self.client.commit_agent_session(
+            user_id=user_id,
+            session_id=session_id,
+            messages=list(args.get("messages") or []),
+            used_contexts=list(args.get("used_contexts") or []),
+            used_skills=list(args.get("used_skills") or []),
+            tool_results=list(args.get("tool_results") or []),
+            connect_metadata=metadata,
+            async_commit=optional_bool(args, "async_commit", False),
+            project_id=str(args.get("project_id") or ""),
+            session_key=str(args.get("session_key") or ""),
+            scope=scope,
+            provenance=dict(args.get("provenance") or {}),
+            **self._local_caller_kwargs(),
+        )
+        result_payload = _to_payload(result) or {"status": "accepted"}
+        if isinstance(result_payload, dict) and isinstance(result_payload.get("error"), dict):
+            return result_payload
+        return ok_payload(
+            {
+                "status": result_payload.get("status", "accepted"),
+                "result": result_payload,
+                "metadata": {"connect": metadata},
+            }
+        )
+
+    def _assert_identity(self, args: dict[str, Any]) -> None:
+        if "tenant_id" in args:
+            raise ValueError("tenant_id is unavailable in local single-user mode")
+        self.caller.assert_identity(user_id=args.get("user_id"))
+
+    def _retrieval_options(
+        self,
+        args: dict[str, Any],
+        *,
+        context_types: tuple[str, ...],
+        limit: int,
+    ) -> RetrievalOptions | None:
+        structured = parse_retrieval_options(args.get("options"))
+        requested_project = str(args.get("project_id") or "").strip()
+        option_workspaces = structured.workspace_ids if structured is not None else ()
+        if structured is not None:
+            self.caller.assert_identity(
+                user_id=structured.owner_user_id,
+                tenant_id=structured.tenant_id,
+            )
+            if len(option_workspaces) > 1:
+                raise PermissionError("local query must select one workspace")
+            if requested_project and option_workspaces and option_workspaces != (requested_project,):
+                raise PermissionError("structured options conflict with project_id")
+            if "limit" in args and structured.final_limit != limit:
+                raise ValueError("structured options conflict with legacy limit")
+            if args.get("query_intent") is not None:
+                requested_intent = RetrievalQueryIntent(str(args["query_intent"]).strip().upper())
+                if structured.query_intent is not requested_intent:
+                    raise ValueError("structured options conflict with legacy query_intent")
+        if not context_types:
+            return structured
+        type_options = retrieval_options_from_legacy(
+            {
+                "context_types": context_types,
+                "candidate_limit": max(DEFAULT_CANDIDATE_LIMIT, limit),
+                "limit": limit,
+                "query_intent": args.get("query_intent"),
+            }
+        )
+        return type_options if structured is None else merge_retrieval_options(structured, type_options)
+
+    def _bound_user(self, args: dict[str, Any]) -> str:
+        self._assert_identity(args)
+        return self.caller.user_id
+
+    def _local_caller_kwargs(self) -> dict[str, LocalUserContext]:
+        if getattr(self.client, "mode", None) in {"local", "server"}:
+            return {"caller": self.caller}
+        return {}
+
+    def health(self) -> dict[str, Any]:
+        metadata = {
+            "root_configured": bool(self.config.root),
+            "adapter_id": self.config.adapter_id,
+        }
+        health_fn = getattr(self.client, "health", None)
+        raw_health = health_fn() if callable(health_fn) else {}
+        health: dict[str, Any] = raw_health if isinstance(raw_health, dict) else {}
+        runtime_payload = health.get("runtime")
+        runtime = dict(runtime_payload) if isinstance(runtime_payload, dict) else {}
+        runtime_state = str(runtime.get("state") or "NOT_READY")
+        reported_status = str(health.get("status") or "not_ready").casefold()
+        ready = runtime.get("ready") is True and runtime_state == "READY" and reported_status == "ready"
+        status = (
+            "ok"
+            if ready
+            else (reported_status if reported_status in {"degraded", "not_ready"} else runtime_state.casefold())
+        )
+        return ok_payload(
+            {
+                **health,
+                "status": status,
+                "storage_ready": ready and hasattr(self.client, "source_store"),
+                "contextdb_ready": ready and hasattr(self.client, "_context_facade"),
+                "client_ready": ready and self.client is not None,
+                "version": __version__,
+                "metadata": metadata,
+            }
+        )
+
+    def predict(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._ensure_action_tools_enabled()
+        request_payload = args.get("request")
+        if not isinstance(request_payload, dict):
+            raise ValueError("requires object field: request")
+        required_str(request_payload, "user_id")
+        self.caller.assert_identity(user_id=request_payload.get("user_id"))
+        request_payload = {**request_payload, "user_id": self.caller.user_id}
+        metadata = normalize_action_metadata(request_payload.get("connect_metadata") or args.get("connect_metadata"))
+        request_payload = {**request_payload, "connect_metadata": metadata.to_dict()}
+        result = self.client.predict(_prediction_request(request_payload), _policies(args.get("policies")))
+        return ok_payload({"prediction": _to_payload(result)})
+
+    def process_observation(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._ensure_action_tools_enabled()
+        request_payload = args.get("request")
+        if not isinstance(request_payload, dict):
+            raise ValueError("requires object field: request")
+        required_str(request_payload, "user_id")
+        self.caller.assert_identity(user_id=request_payload.get("user_id"))
+        request_payload = {**request_payload, "user_id": self.caller.user_id}
+        metadata = require_process_observation_metadata(
+            request_payload.get("connect_metadata") or args.get("connect_metadata")
+        )
+        request_payload = {**request_payload, "connect_metadata": metadata.to_dict()}
+        result = self.client.process_observation(
+            _prediction_request(request_payload),
+            _policies(args.get("policies")),
+            archive_session=optional_bool(args, "archive_session", True),
+            async_commit=optional_bool(args, "async_commit", True),
+        )
+        return ok_payload({"result": _to_payload(result)})
+
+    def _ensure_action_tools_enabled(self) -> None:
+        if not self.config.enable_action_tools:
+            raise ToolPermissionError("action-capable tools are disabled; set MEMORYOS_ENABLE_ACTION_TOOLS=1")
+
+
+def _client_payload(value: dict[str, Any]) -> dict[str, Any]:
+    if value.get("error"):
+        return value
+    return ok_payload(value)
+
+
+def _validated_memory_payload(operation: str, value: dict[str, Any]) -> dict[str, Any]:
+    """Preserve a structured remote error; validate only successful payloads."""
+
+    if value.get("error"):
+        return _client_payload(value)
+    return _client_payload(validate_memory_response(operation, value))
+
+
+def _to_payload(value: Any) -> Any:
+    if value is None:
+        return None
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        return to_dict()
+    if is_dataclass(value) and not isinstance(value, type):
+        return asdict(value)
+    if isinstance(value, dict):
+        return dict(value)
+    return value
+
+
+def _dedupe_contexts(contexts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for item in sorted(contexts, key=lambda row: float(row.get("score", 0.0)), reverse=True):
+        uri = str(item.get("uri", ""))
+        if uri in seen:
+            continue
+        seen.add(uri)
+        deduped.append(item)
+    return deduped
+
+
+def _policies(value: Any) -> list[ActionPolicy] | None:
+    if not value:
+        return None
+    if not isinstance(value, list):
+        raise ValueError("policies must be an array")
+    policies = []
+    for item in value:
+        if isinstance(item, ActionPolicy):
+            policies.append(item)
+            continue
+        if not isinstance(item, dict):
+            raise ValueError("policies entries must be objects")
+        policies.append(ActionPolicy(**item))
+    return policies
+
+
+def _prediction_request(payload: dict[str, Any]) -> PredictionRequest:
+    try:
+        return PredictionRequest(**payload)
+    except TypeError as exc:
+        raise ValueError("request payload does not match PredictionRequest schema") from exc

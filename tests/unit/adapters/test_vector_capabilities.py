@@ -6,23 +6,18 @@ from typing import Any
 
 import pytest
 
-from memoryos.adapters.vector.chroma_store import ChromaStore
-from memoryos.adapters.vector.errors import VectorBackendUnavailableError
-from memoryos.adapters.vector.milvus_store import MilvusStore
-from memoryos.adapters.vector.qdrant_store import QdrantStore
-from memoryos.contextdb.catalog import CatalogRecord, CatalogRecordKind, catalog_vector_metadata
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.retrieval.candidate_generator import CandidateGenerator
-from memoryos.contextdb.retrieval.query_plan import RetrievalQueryIntent, RetrievalQueryPlan
-from memoryos.contextdb.store.sqlite_index_store import SQLiteIndexStore
-from memoryos.contextdb.store.vector_store import (
-    InMemoryVectorStore,
+from infrastructure.context.candidate import CandidateGenerator
+from infrastructure.context.retrieval.query_plan import RetrievalQueryIntent, RetrievalQueryPlan
+from infrastructure.store.contracts.vector import (
     VectorCapabilities,
     VectorHit,
     require_production_vector_capabilities,
     vector_capabilities,
     vector_row_id,
 )
+from infrastructure.store.model.catalog import CatalogRecord, CatalogRecordKind, catalog_vector_metadata
+from infrastructure.store.model.context.context_type import ContextType
+from tests.support.persistence import InMemoryVectorStore
 
 
 def test_local_vector_store_declares_bounded_fallback_not_native_filtering() -> None:
@@ -34,13 +29,6 @@ def test_local_vector_store_declares_bounded_fallback_not_native_filtering() -> 
     assert not capabilities.production_filtered_top_k_ready
     with pytest.raises(ValueError, match="supports_metadata_filtering"):
         require_production_vector_capabilities(store)
-
-
-@pytest.mark.parametrize("store_type", [QdrantStore, MilvusStore, ChromaStore])
-def test_unimplemented_named_adapter_selection_fails_fast(store_type: type) -> None:
-    assert store_type is not InMemoryVectorStore
-    with pytest.raises(VectorBackendUnavailableError, match="not implemented"):
-        store_type()
 
 
 def test_native_capability_contract_accepts_only_explicit_full_backend() -> None:
@@ -69,6 +57,8 @@ def test_native_capability_contract_accepts_only_explicit_full_backend() -> None
 
 
 def test_native_filtered_vector_branch_can_recall_without_lexical_seed(tmp_path) -> None:  # noqa: ANN001
+    from infrastructure.store.sqlite.index_store import SQLiteIndexStore
+
     class Embedding:
         model_name = "test-filtered"
         dimension = 2
@@ -281,6 +271,8 @@ def test_native_filtered_vector_branch_can_recall_without_lexical_seed(tmp_path)
 
 
 def test_candidate_generation_reports_fts_unavailable(tmp_path) -> None:  # noqa: ANN001
+    from infrastructure.store.sqlite.index_store import SQLiteIndexStore
+
     index = SQLiteIndexStore(tmp_path / "fts-unavailable.sqlite3")
     index.fts_enabled = False
     generated = CandidateGenerator(index).generate(

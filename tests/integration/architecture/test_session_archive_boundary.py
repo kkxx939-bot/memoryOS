@@ -9,19 +9,11 @@ def test_filesystem_session_archive_import_does_not_load_or_register_memory() ->
     code = """
 import json
 import sys
-from memoryos.adapters.persistence.filesystem.session_archive import SessionArchiveStore
-from memoryos.contextdb.session.evidence_encoder import session_evidence_encoder
-
-try:
-    session_evidence_encoder()
-except RuntimeError as exc:
-    registration_error = str(exc)
-else:
-    registration_error = ""
+from infrastructure.store.filesystem.session_archive import SessionArchiveStore
 
 print(json.dumps({
-    "memory_modules": sorted(name for name in sys.modules if name.startswith("memoryos.memory")),
-    "registration_error": registration_error,
+    "evidence_modules": sorted(name for name in sys.modules if name == "pre.evidence" or name.startswith("pre.evidence.")),
+    "legacy_encoder_loaded": "memory.commit.evidence.encoder" in sys.modules,
 }))
 """
     result = subprocess.run(
@@ -32,6 +24,6 @@ print(json.dumps({
     )
     payload = json.loads(result.stdout)
     assert payload == {
-        "memory_modules": [],
-        "registration_error": "Session evidence encoder is not registered",
+        "evidence_modules": [],
+        "legacy_encoder_loaded": False,
     }

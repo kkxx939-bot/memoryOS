@@ -20,12 +20,12 @@ def test_store_package_does_not_eagerly_load_implementations() -> None:
         """
 import json
 import sys
-import memoryos.contextdb.store
+import infrastructure.store.contracts
 
 watched = (
-    "memoryos.adapters.persistence",
-    "memoryos.contextdb.store.index_consistency",
-    "memoryos.contextdb.store.local_stores",
+    "infrastructure.store.sqlite",
+    "infrastructure.store.locks.process_local",
+    "infrastructure.context.maintenance.index_consistency",
 )
 print(json.dumps({"loaded": sorted(name for name in sys.modules if name.startswith(watched))}))
 """
@@ -37,8 +37,8 @@ def test_operation_committer_import_is_independent_of_store_import_order() -> No
     probe = _run_import_probe(
         """
 import json
-import memoryos.contextdb.store
-from memoryos.operations.commit.operation_committer import OperationCommitter
+import infrastructure.store.contracts
+from transaction.commit.operation_committer import OperationCommitter
 
 print(json.dumps({"committer": OperationCommitter.__name__}))
 """
@@ -46,21 +46,33 @@ print(json.dumps({"committer": OperationCommitter.__name__}))
     assert probe == {"committer": "OperationCommitter"}
 
 
-def test_historical_sqlite_exports_resolve_to_canonical_adapters() -> None:
-    from memoryos.adapters.persistence.sqlite import (
+def test_sqlite_package_exports_resolve_to_canonical_implementations() -> None:
+    from infrastructure.store.sqlite import (
         SQLiteIndexStore,
         SQLiteLockStore,
         SQLiteQueueStore,
         SQLiteRelationStore,
     )
-    from memoryos.contextdb.store.sqlite_index_store import SQLiteIndexStore as HistoricalIndexStore
-    from memoryos.contextdb.store.sqlite_lock_store import SQLiteLockStore as HistoricalLockStore
-    from memoryos.contextdb.store.sqlite_queue_store import SQLiteQueueStore as HistoricalQueueStore
-    from memoryos.contextdb.store.sqlite_relation_store import (
-        SQLiteRelationStore as HistoricalRelationStore,
+    from infrastructure.store.sqlite.index_store import SQLiteIndexStore as ConcreteIndexStore
+    from infrastructure.store.sqlite.lock_store import SQLiteLockStore as ConcreteLockStore
+    from infrastructure.store.sqlite.queue_store import SQLiteQueueStore as ConcreteQueueStore
+    from infrastructure.store.sqlite.relation_store import (
+        SQLiteRelationStore as ConcreteRelationStore,
     )
 
-    assert HistoricalIndexStore is SQLiteIndexStore
-    assert HistoricalLockStore is SQLiteLockStore
-    assert HistoricalQueueStore is SQLiteQueueStore
-    assert HistoricalRelationStore is SQLiteRelationStore
+    assert ConcreteIndexStore is SQLiteIndexStore
+    assert ConcreteLockStore is SQLiteLockStore
+    assert ConcreteQueueStore is SQLiteQueueStore
+    assert ConcreteRelationStore is SQLiteRelationStore
+
+
+def test_trace_package_exports_storage_implementations_only() -> None:
+    from infrastructure.store.trace import (
+        RecallTraceEraseBackend,
+        RecallTraceRepository,
+    )
+    from infrastructure.store.trace.erase import RecallTraceEraseBackend as ConcreteEraseBackend
+    from infrastructure.store.trace.repository import RecallTraceRepository as ConcreteRepository
+
+    assert ConcreteEraseBackend is RecallTraceEraseBackend
+    assert ConcreteRepository is RecallTraceRepository

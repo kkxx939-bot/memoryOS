@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from memoryos.contextdb.catalog import CatalogRecord, CatalogRecordKind
-from memoryos.contextdb.session.context_projector import SessionContextProjector
-from memoryos.contextdb.session.session_archive import SessionArchiveStore
-from memoryos.contextdb.session.session_model import SessionArchive
-from memoryos.contextdb.store.vector_store import InMemoryVectorStore, vector_row_id
-from memoryos.providers.embedding import HashingEmbeddingProvider
+from infrastructure.context.session_projector import SessionContextProjector
+from infrastructure.store.contracts.vector import vector_row_id
+from infrastructure.store.model.catalog import CatalogRecord, CatalogRecordKind
+from pre.session import SessionArchive
+from tests.support.embedding import DeterministicEmbeddingProvider
+from tests.support.persistence import InMemoryVectorStore
+from tests.support.session_archive import build_session_archive_store
 
 
 class _Catalog:
@@ -58,7 +59,7 @@ def _written_archive(tmp_path: Path) -> SessionArchive:
             },
         ],
     )
-    SessionArchiveStore(tmp_path, tenant_id="tenant-a").write_sync_archive(archive)
+    build_session_archive_store(tmp_path, tenant_id="tenant-a").write_sync_archive(archive)
     return archive
 
 
@@ -149,7 +150,7 @@ def test_session_summary_timeline_uses_episode_start_not_archive_write_time(tmp_
         used_contexts=[{"title": "context without event time", "source_uri": "memoryos://resource/context-a"}],
         used_skills=[{"skill_name": "skill-without-event-time"}],
     )
-    SessionArchiveStore(tmp_path, tenant_id="tenant-a").write_sync_archive(archive)
+    build_session_archive_store(tmp_path, tenant_id="tenant-a").write_sync_archive(archive)
 
     records = SessionContextProjector(_Catalog()).build_records(archive)
     summaries = [
@@ -299,11 +300,11 @@ def test_session_vectors_use_only_sanitized_policy_eligible_records(tmp_path: Pa
             }
         ],
     )
-    SessionArchiveStore(tmp_path, tenant_id="tenant-a").write_sync_archive(archive)
+    build_session_archive_store(tmp_path, tenant_id="tenant-a").write_sync_archive(archive)
     catalog = _Catalog()
     vectors = InMemoryVectorStore()
 
-    class RecordingEmbedding(HashingEmbeddingProvider):
+    class RecordingEmbedding(DeterministicEmbeddingProvider):
         def __init__(self) -> None:
             super().__init__()
             self.texts: list[str] = []
@@ -377,7 +378,7 @@ def test_same_session_manifests_keep_catalog_identity_and_vector_ownership_disti
 ) -> None:
     """A stale manifest tombstone must be unable to delete its replacement vector."""
 
-    store = SessionArchiveStore(tmp_path, tenant_id="tenant-a")
+    store = build_session_archive_store(tmp_path, tenant_id="tenant-a")
     first = SessionArchive(
         user_id="u1",
         session_id="session-shared",
@@ -403,7 +404,7 @@ def test_same_session_manifests_keep_catalog_identity_and_vector_ownership_disti
     projector = SessionContextProjector(
         catalog,
         vector_store=vectors,
-        embedding_provider=HashingEmbeddingProvider(),
+        embedding_provider=DeterministicEmbeddingProvider(),
     )
 
     first_result = projector.project(first)
@@ -466,7 +467,7 @@ def test_shared_vector_backend_keeps_same_public_uri_tenant_scoped(tmp_path: Pat
                 }
             ],
         )
-        SessionArchiveStore(tmp_path / tenant_id, tenant_id=tenant_id).write_sync_archive(archive)
+        build_session_archive_store(tmp_path / tenant_id, tenant_id=tenant_id).write_sync_archive(archive)
         archives.append(archive)
 
     catalog = _Catalog()
@@ -474,7 +475,7 @@ def test_shared_vector_backend_keeps_same_public_uri_tenant_scoped(tmp_path: Pat
     projector = SessionContextProjector(
         catalog,
         vector_store=vectors,
-        embedding_provider=HashingEmbeddingProvider(),
+        embedding_provider=DeterministicEmbeddingProvider(),
     )
     for archive in archives:
         projector.project(archive)
@@ -501,13 +502,13 @@ def test_shared_vector_backend_keeps_same_public_uri_tenant_scoped(tmp_path: Pat
 def test_important_resource_vector_requires_explicit_projection_policy(tmp_path: Path) -> None:
     archive = _written_archive(tmp_path)
     archive.tool_results[0]["important"] = True
-    SessionArchiveStore(tmp_path, tenant_id="tenant-a").write_sync_archive(archive)
+    build_session_archive_store(tmp_path, tenant_id="tenant-a").write_sync_archive(archive)
     catalog = _Catalog()
     vectors = InMemoryVectorStore()
     SessionContextProjector(
         catalog,
         vector_store=vectors,
-        embedding_provider=HashingEmbeddingProvider(),
+        embedding_provider=DeterministicEmbeddingProvider(),
         vectorize_important_events=False,
     ).project(archive)
 

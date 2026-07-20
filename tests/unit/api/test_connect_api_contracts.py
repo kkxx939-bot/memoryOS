@@ -1,26 +1,27 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, replace
+from threading import RLock
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
-from memoryos.api.http.app import handle
-from memoryos.api.mcp.config import MCPServerConfig
-from memoryos.api.mcp.server import MemoryOSMCPServer
-from memoryos.api.sdk.client import MemoryOSClient
-from memoryos.behavior.model.observation import Observation
-from memoryos.connect import CapabilityProfile, ConnectMetadata, PipelineMode
-from memoryos.contextdb.model.context_object import ContextObject
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.retrieval.context_assembler import ContextAssembler
-from memoryos.contextdb.session.session_model import SessionArchive
-from memoryos.contextdb.store.source_store import IndexHit
-from memoryos.prediction.model.action_context import ActionContext
-from memoryos.prediction.model.action_result import ActionResult
-from memoryos.prediction.model.prediction_request import PredictionRequest
-from memoryos.prediction.model.prediction_result import PolicyDecision, PredictionResult
-from memoryos.skill.tool_registry import ToolRegistry
+from behavior.core.model.observation import Observation
+from infrastructure.store.contracts.index import IndexHit
+from infrastructure.store.model.context.context_object import ContextObject
+from infrastructure.store.model.context.context_type import ContextType
+from openApi.http.app import handle
+from openApi.mcp.config import MCPServerConfig
+from openApi.mcp.server import MemoryOSMCPServer
+from openApi.sdk.client import MemoryOSClient
+from policy.action_policy.decision.action_context import ActionContext
+from policy.action_policy.decision.request import PredictionRequest
+from policy.action_policy.decision.result import PolicyDecision, PredictionResult
+from policy.action_policy.execution.result import ActionResult
+from policy.action_policy.execution.tool_registry import ToolRegistry
+from pre.connect import CapabilityProfile, ConnectMetadata, PipelineMode
+from pre.session import SessionArchive
 
 
 class FakeContextDB:
@@ -40,6 +41,14 @@ class FakeContextDB:
         self.search_calls: list[dict] = []
         self.committed: list[tuple[SessionArchive, bool]] = []
         self.fail_commit = False
+        self.index_store = self
+        self.serving_lock = RLock()
+
+    def _require_ready(self) -> None:
+        return None
+
+    def serving_generation_token(self) -> str:
+        return ""
 
     def search(
         self,
@@ -128,9 +137,25 @@ class ReturningEngine:
 
 def _client(context_db: FakeContextDB | None = None) -> Any:
     client: Any = object.__new__(MemoryOSClient)
-    client.context_db = context_db or FakeContextDB()
-    client.engine = FailingEngine()
-    client.executor = FailingExecutor()
+    facade = context_db or FakeContextDB()
+    client.runtime = SimpleNamespace(
+        stores=SimpleNamespace(
+            source=None,
+            index=facade,
+            relation=None,
+            queue=None,
+            vector=None,
+            embedding=None,
+            reranker=None,
+            model_client=None,
+        ),
+        session=SimpleNamespace(commit_service=facade, archive_store=None),
+        context=SimpleNamespace(facade=facade, memory_document_overlay=None),
+        policy=SimpleNamespace(engine=FailingEngine(), executor=FailingExecutor()),
+        readiness=SimpleNamespace(require_ready=lambda: None, snapshot=lambda: {"ready": True}),
+    )
+    client.root = "/tmp/memoryos-test"
+    client.tenant_id = "default"
     return client
 
 
@@ -210,7 +235,7 @@ def test_context_reduction_sdk_does_not_call_prediction_or_executor() -> None:
     client = _client(context_db)
 
     results = client.search_context("MCP", user_id="u1", limit=1, connect_metadata={"adapter_id": "codex"})
-    assembled = client.assemble_context("MCP", user_id="u1", token_budget=200, limit=1)
+    assembled = client.assemble_context("MCP", user_id="u1", limit=1)
     client.commit_agent_session(
         user_id="u1",
         session_id="s1",
@@ -230,8 +255,8 @@ def test_context_reduction_sdk_does_not_call_prediction_or_executor() -> None:
     assert archive.metadata["connect"]["adapter_id"] == "codex"
     assert archive.predictions == []
     assert archive.action_results == []
-    assert client.engine.called is False
-    assert client.executor.called is False
+    assert client.runtime.policy.engine.called is False
+    assert client.runtime.policy.executor.called is False
 
 
 def test_connect_filters_from_metadata_only_uses_explicit_simple_fields() -> None:
@@ -296,7 +321,6 @@ def test_search_and_assemble_context_apply_connect_filters_without_behavior_or_a
         "terminal",
         user_id="u1",
         connect_metadata=claude_metadata,
-        token_budget=500,
     )
     unfiltered_results = client.search_context("terminal", user_id="u1")
 
@@ -306,8 +330,8 @@ def test_search_and_assemble_context_apply_connect_filters_without_behavior_or_a
         "memoryos://user/u1/memories/anchors/claude",
         "memoryos://user/u1/memories/anchors/codex",
     }
-    assert client.engine.called is False
-    assert client.executor.called is False
+    assert client.runtime.policy.engine.called is False
+    assert client.runtime.policy.executor.called is False
 
 
 def test_search_context_adapter_id_filter_does_not_apply_default_fields() -> None:
@@ -336,22 +360,22 @@ def test_search_context_adapter_id_filter_does_not_apply_default_fields() -> Non
     assert [item["uri"] for item in codex_results] == ["memoryos://user/u1/memories/anchors/codex"]
     assert claude_results == []
     assert [item["uri"] for item in unfiltered_results] == ["memoryos://user/u1/memories/anchors/codex"]
-    assert client.engine.called is False
-    assert client.executor.called is False
+    assert client.runtime.policy.engine.called is False
+    assert client.runtime.policy.executor.called is False
 
 
 def test_assemble_context_passes_explicit_connect_filters() -> None:
     client = _client(FakeContextDB())
 
-    assembled = client.assemble_context("terminal", connect_metadata={"adapter_id": "codex"}, token_budget=500)
+    assembled = client.assemble_context("terminal", connect_metadata={"adapter_id": "codex"})
 
     assert assembled["connect_metadata"]["adapter_id"] == "codex"
     assert assembled["query_plan"]["metadata_filters"]["connect_filters"] == {"adapter_id": "codex"}
-    assert client.engine.called is False
-    assert client.executor.called is False
+    assert client.runtime.policy.engine.called is False
+    assert client.runtime.policy.executor.called is False
 
 
-def test_context_assembler_connect_filter_simple_fields() -> None:
+def test_context_query_connect_filter_simple_fields() -> None:
     claude_connect = ConnectMetadata(adapter_id="claude_code", source_kind="terminal").to_dict()
     codex_connect = ConnectMetadata(adapter_id="codex", source_kind="terminal").to_dict()
     context_db = FakeContextDB(
@@ -372,41 +396,34 @@ def test_context_assembler_connect_filter_simple_fields() -> None:
             ),
         ]
     )
-    assembler = ContextAssembler(cast(Any, context_db))
+    client = _client(context_db)
 
-    matched = assembler.search(
+    matched = client.search_context(
         "context",
         user_id="u1",
-        connect_filters={
-            "connect_type": "agent",
-            "adapter_id": "claude_code",
-            "run_mode": "context_reduction",
-            "world_domain": "digital",
-            "source_kind": "terminal",
-        },
+        connect_metadata=claude_connect,
     )
-    adapter_miss = assembler.search(
-        "context", user_id="u1", connect_filters={"adapter_id": "openclaw"}
-    )
-    domain_miss = assembler.search(
-        "context", user_id="u1", connect_filters={"world_domain": "physical"}
-    )
-    ignored_complex_filters = assembler.search(
+    adapter_miss = client.search_context(
         "context",
         user_id="u1",
-        connect_filters={"capabilities": {"can_predict_behavior": True}, "modality": ["text"], "extra": {"x": "y"}},
+        connect_metadata=ConnectMetadata(adapter_id="openclaw", source_kind="terminal").to_dict(),
+    )
+    domain_miss = client.search_context(
+        "context",
+        user_id="u1",
+        connect_metadata=ConnectMetadata(
+            adapter_id="claude_code",
+            source_kind="terminal",
+            world_domain="physical",
+        ).to_dict(),
     )
 
     assert [item["uri"] for item in matched] == ["memoryos://user/u1/memories/anchors/claude"]
     assert adapter_miss == []
     assert domain_miss == []
-    assert {item["uri"] for item in ignored_complex_filters} == {
-        "memoryos://user/u1/memories/anchors/claude",
-        "memoryos://user/u1/memories/anchors/codex",
-    }
 
 
-def test_context_assembler_connect_filter_overfetches_before_limit_slice() -> None:
+def test_context_query_connect_filter_overfetches_before_limit_slice() -> None:
     claude_connect = ConnectMetadata(adapter_id="claude_code", source_kind="terminal").to_dict()
     codex_connect = ConnectMetadata(adapter_id="codex", source_kind="terminal").to_dict()
     context_db = FakeContextDB(
@@ -427,10 +444,13 @@ def test_context_assembler_connect_filter_overfetches_before_limit_slice() -> No
             ),
         ]
     )
-    assembler = ContextAssembler(cast(Any, context_db))
+    client = _client(context_db)
 
-    matched = assembler.search(
-        "context", user_id="u1", limit=1, connect_filters={"adapter_id": "codex"}
+    matched = client.search_context(
+        "context",
+        user_id="u1",
+        limit=1,
+        connect_metadata=ConnectMetadata(adapter_id="codex", source_kind="terminal").to_dict(),
     )
 
     assert [item["uri"] for item in matched] == ["memoryos://user/u1/memories/anchors/codex"]
@@ -438,7 +458,7 @@ def test_context_assembler_connect_filter_overfetches_before_limit_slice() -> No
 
 
 def test_assemble_context_empty_results_are_stable() -> None:
-    assembled = _client(FakeContextDB()).assemble_context("missing", token_budget=100)
+    assembled = _client(FakeContextDB()).assemble_context("missing")
 
     assert assembled["contexts"] == []
     assert assembled["packed_context"] == ""
@@ -452,7 +472,7 @@ def test_predict_rejects_context_reduction_metadata_before_engine() -> None:
 
     with pytest.raises(PermissionError):
         client.predict(_request(ConnectMetadata.default_agent("codex").to_dict()))
-    assert client.engine.called is False
+    assert client.runtime.policy.engine.called is False
     assert context_db.committed == []
 
 
@@ -467,7 +487,7 @@ def test_predict_rejects_missing_behavior_capability_before_engine() -> None:
 
     with pytest.raises(PermissionError):
         client.predict(_request(metadata))
-    assert client.engine.called is False
+    assert client.runtime.policy.engine.called is False
     assert context_db.committed == []
 
 
@@ -485,7 +505,7 @@ def test_predict_rejects_missing_connect_metadata_before_engine() -> None:
 
     with pytest.raises(PermissionError):
         client.predict(request)
-    assert client.engine.called is False
+    assert client.runtime.policy.engine.called is False
     assert context_db.committed == []
 
 
@@ -495,7 +515,7 @@ def test_predict_rejects_empty_connect_metadata_before_engine() -> None:
 
     with pytest.raises(PermissionError):
         client.predict(_request({}))
-    assert client.engine.called is False
+    assert client.runtime.policy.engine.called is False
     assert context_db.committed == []
 
 
@@ -507,7 +527,7 @@ def test_predict_rejects_string_false_behavior_capability_before_engine() -> Non
 
     with pytest.raises(ValueError, match="capability field must be boolean"):
         client.predict(_request(metadata))
-    assert client.engine.called is False
+    assert client.runtime.policy.engine.called is False
     assert context_db.committed == []
 
 
@@ -551,16 +571,16 @@ def test_predict_rejects_agent_action_capable_metadata_before_engine() -> None:
 
     with pytest.raises(PermissionError):
         client.predict(_request(metadata))
-    assert client.engine.called is False
+    assert client.runtime.policy.engine.called is False
     assert context_db.committed == []
 
 
 def test_predict_allows_embodied_action_capable_metadata() -> None:
     client = _client()
-    client.engine = ReturningEngine({"ok": True})
+    client.runtime.policy.engine = ReturningEngine({"ok": True})
 
     assert client.predict(_request(ConnectMetadata.action_capable_embodied("reachy_mini").to_dict())) == {"ok": True}
-    assert client.engine.called is True
+    assert client.runtime.policy.engine.called is True
 
 
 def test_process_observation_rejects_missing_connect_metadata_before_engine_or_executor() -> None:
@@ -569,8 +589,8 @@ def test_process_observation_rejects_missing_connect_metadata_before_engine_or_e
 
     with pytest.raises(PermissionError):
         client.process_observation(_request({}), archive_session=False)
-    assert client.engine.called is False
-    assert client.executor.called is False
+    assert client.runtime.policy.engine.called is False
+    assert client.runtime.policy.executor.called is False
     assert context_db.committed == []
 
 
@@ -585,8 +605,8 @@ def test_process_observation_rejects_missing_execute_capability_before_engine_or
 
     with pytest.raises(PermissionError):
         client.process_observation(_request(metadata))
-    assert client.engine.called is False
-    assert client.executor.called is False
+    assert client.runtime.policy.engine.called is False
+    assert client.runtime.policy.executor.called is False
     assert context_db.committed == []
 
 
@@ -598,23 +618,23 @@ def test_process_observation_rejects_string_false_execute_capability_before_engi
 
     with pytest.raises(ValueError, match="capability field must be boolean"):
         client.process_observation(_request(metadata))
-    assert client.engine.called is False
-    assert client.executor.called is False
+    assert client.runtime.policy.engine.called is False
+    assert client.runtime.policy.executor.called is False
     assert context_db.committed == []
 
 
 def test_process_observation_allows_embodied_action_capable_execute_metadata() -> None:
     context_db = FakeContextDB()
     client = _client(context_db)
-    client.engine = ReturningEngine(_prediction_result())
-    client.executor = ReturningExecutor()
+    client.runtime.policy.engine = ReturningEngine(_prediction_result())
+    client.runtime.policy.executor = ReturningExecutor()
     metadata = ConnectMetadata.action_capable_embodied("reachy_mini").to_dict()
 
     result = client.process_observation(_request(metadata), async_commit=False)
 
     assert result.archive_uri == "memoryos://user/u1/sessions/history/s1"
-    assert client.engine.called is True
-    assert client.executor.called is True
+    assert client.runtime.policy.engine.called is True
+    assert client.runtime.policy.executor.called is True
     archive, async_commit = context_db.committed[0]
     assert async_commit is False
     assert archive.metadata["connect"]["connect_type"] == "embodied"
@@ -625,8 +645,8 @@ def test_process_observation_returns_archive_error_when_commit_fails_after_actio
     context_db = FakeContextDB()
     context_db.fail_commit = True
     client = _client(context_db)
-    client.engine = ReturningEngine(_prediction_result())
-    client.executor = SuccessfulExecutor()
+    client.runtime.policy.engine = ReturningEngine(_prediction_result())
+    client.runtime.policy.executor = SuccessfulExecutor()
     metadata = ConnectMetadata.action_capable_embodied("reachy_mini").to_dict()
 
     result = client.process_observation(_request(metadata), async_commit=False)
@@ -637,14 +657,14 @@ def test_process_observation_returns_archive_error_when_commit_fails_after_actio
     assert result.archive_error == {"code": "ARCHIVE_COMMIT_FAILED", "message": "RuntimeError"}
     assert result.session_commit_result is None
     assert result.archive_uri == "memoryos://user/u1/sessions/history/s1"
-    assert client.executor.called is True
+    assert client.runtime.policy.executor.called is True
 
 
 def test_process_observation_archives_failed_action_when_executor_raises() -> None:
     context_db = FakeContextDB()
     client = _client(context_db)
-    client.engine = ReturningEngine(_prediction_result())
-    client.executor = RaisingExecutor()
+    client.runtime.policy.engine = ReturningEngine(_prediction_result())
+    client.runtime.policy.executor = RaisingExecutor()
     metadata = ConnectMetadata.action_capable_embodied("reachy_mini").to_dict()
 
     result = client.process_observation(_request(metadata), async_commit=False)
@@ -659,8 +679,8 @@ def test_process_observation_archives_failed_action_when_executor_raises() -> No
 def test_process_observation_archive_session_false_does_not_commit() -> None:
     context_db = FakeContextDB()
     client = _client(context_db)
-    client.engine = ReturningEngine(_prediction_result())
-    client.executor = SuccessfulExecutor()
+    client.runtime.policy.engine = ReturningEngine(_prediction_result())
+    client.runtime.policy.executor = SuccessfulExecutor()
     metadata = ConnectMetadata.action_capable_embodied("reachy_mini").to_dict()
 
     result = client.process_observation(_request(metadata), archive_session=False)
@@ -669,8 +689,8 @@ def test_process_observation_archive_session_false_does_not_commit() -> None:
     assert result.session_commit_result is None
     assert result.archive_error is None
     assert context_db.committed == []
-    assert client.engine.called is True
-    assert client.executor.called is True
+    assert client.runtime.policy.engine.called is True
+    assert client.runtime.policy.executor.called is True
 
 
 def test_commit_agent_session_uses_stable_task_id_for_same_payload() -> None:
@@ -763,12 +783,12 @@ def test_http_predict_rejects_missing_and_agent_metadata_before_engine() -> None
             client,
             {"request": _request(ConnectMetadata.default_agent("codex").to_dict()).__dict__},
         )
-    assert client.engine.called is False
+    assert client.runtime.policy.engine.called is False
 
 
 def test_http_predict_allows_embodied_action_capable_metadata() -> None:
     client = _client()
-    client.engine = ReturningEngine(_prediction_result())
+    client.runtime.policy.engine = ReturningEngine(_prediction_result())
 
     result = handle(
         "POST /predict",
@@ -777,7 +797,7 @@ def test_http_predict_allows_embodied_action_capable_metadata() -> None:
     )
 
     assert result["episode_id"] == "s1"
-    assert client.engine.called is True
+    assert client.runtime.policy.engine.called is True
 
 
 def test_mcp_routes_and_unknown_tool() -> None:

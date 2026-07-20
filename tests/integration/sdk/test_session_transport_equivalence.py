@@ -3,22 +3,17 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from memoryos.api.http.app import handle
-from memoryos.api.mcp.config import MCPServerConfig
-from memoryos.api.mcp.server import MemoryOSMCPServer
-from memoryos.api.sdk.client import MemoryOSClient
-from memoryos.api.trusted_context import DEFAULT_AGENT_CAPABILITIES, TrustedRequestContext
-from memoryos.connect import ConnectMetadata
+from foundation.identity import LocalUserContext
+from openApi.http.app import handle
+from openApi.mcp.config import MCPServerConfig
+from openApi.mcp.server import MemoryOSMCPServer
+from openApi.sdk.client import MemoryOSClient
+from pre.connect import ConnectMetadata
 
 
-def _caller() -> TrustedRequestContext:
-    return TrustedRequestContext(
-        tenant_id="default",
+def _caller() -> LocalUserContext:
+    return LocalUserContext(
         user_id="u1",
-        actor_kind="agent",
-        actor_id="codex",
-        capabilities=DEFAULT_AGENT_CAPABILITIES,
-        allowed_workspace_ids=frozenset({"project-x"}),
     )
 
 
@@ -34,7 +29,7 @@ def _payload() -> dict[str, Any]:
         ],
         "used_skills": [{"uri": "memoryos://skills/testing/pytest", "version": "1"}],
         "tool_results": [{"tool_name": "shell", "content": "ok"}],
-        "scope": {"tenant_id": "default", "user_id": "u1", "purpose": "test"},
+        "scope": {"user_id": "u1", "purpose": "test"},
         "provenance": {"transport_evidence": "equivalent"},
         "connect_metadata": ConnectMetadata.default_agent("codex").to_dict(),
         "async_commit": False,
@@ -54,13 +49,8 @@ def test_local_http_and_mcp_preserve_equivalent_session_evidence(tmp_path: Path)
         mcp,
         config=MCPServerConfig(
             root=str(tmp_path / "mcp"),
-            tenant_id="default",
             user_id="u1",
             adapter_id="codex",
-            actor_kind="agent",
-            actor_id="codex",
-            capabilities=DEFAULT_AGENT_CAPABILITIES,
-            allowed_workspace_ids=frozenset({"project-x"}),
         ),
     ).call_tool("memoryos_commit_session", payload)
 
@@ -70,7 +60,7 @@ def test_local_http_and_mcp_preserve_equivalent_session_evidence(tmp_path: Path)
     assert mcp_result["status"] == "queued"
     uri = "memoryos://user/u1/sessions/history/shared-session-key"
     archives = [
-        client.session_archive_store.read_archive(uri)
+        client.runtime.session.archive_store.read_archive(uri)
         for client in (local, http, mcp)
     ]
     expected = archives[0]
@@ -100,7 +90,6 @@ def test_mcp_does_not_wrap_downstream_error_as_accepted() -> None:
         FailedRemoteClient(),
         config=MCPServerConfig(
             root="/tmp/memoryos-test",
-            tenant_id="default",
             user_id="u1",
             adapter_id="codex",
         ),

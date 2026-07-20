@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-from memoryos.contextdb.model.context_object import ContextObject
-from memoryos.contextdb.model.context_relation import ContextRelation
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.model.lifecycle import LifecycleState
-from memoryos.contextdb.store.index_consistency import IndexConsistencyService
-from memoryos.contextdb.store.local_stores import FileSystemSourceStore, InMemoryIndexStore
-from memoryos.contextdb.store.source_store import IndexHit
-from memoryos.contextdb.store.sqlite_index_store import SQLiteIndexStore
-from memoryos.contextdb.store.sqlite_relation_store import SQLiteRelationStore
-from memoryos.contextdb.transaction.consistency import ConsistencyVerifier
+from infrastructure.context.maintenance.index_consistency import IndexConsistencyService
+from infrastructure.store.contracts.index import IndexHit
+from infrastructure.store.sqlite.index_store import SQLiteIndexStore
+from infrastructure.store.sqlite.relation_store import SQLiteRelationStore
+from infrastructure.store.model.context.context_object import ContextObject
+from infrastructure.store.model.context.context_relation import ContextRelation
+from infrastructure.store.model.context.context_type import ContextType
+from infrastructure.store.model.context.lifecycle import LifecycleState
+from tests.support.persistence import FileSystemSourceStore, InMemoryIndexStore
 
 
 def test_consistency_reports_missing_orphan_and_deleted_hot_index(tmp_path) -> None:
@@ -46,10 +45,10 @@ def test_consistency_reports_missing_orphan_and_deleted_hot_index(tmp_path) -> N
     index.upsert_index(orphan, content="orphan", tenant_id="default")
     index.upsert_index(deleted, content="deleted", tenant_id="default")
 
-    report = ConsistencyVerifier(source, index).verify()
-    assert source_obj.uri in report.missing_index
+    report = IndexConsistencyService(source, index, tenant_id="default").verify()
+    assert source_obj.uri in report.missing_in_index
     assert orphan.uri in report.orphan_index
-    assert deleted.uri in report.deleted_in_default_search
+    assert deleted.uri in report.deleted_or_archived_in_default_search
 
 
 def test_index_consistency_service_supports_sqlite_index_and_relations(tmp_path) -> None:

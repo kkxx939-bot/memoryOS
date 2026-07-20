@@ -1,20 +1,30 @@
 from __future__ import annotations
 
-from memoryos.action_policy.model.action_policy import ActionPolicy
-from memoryos.behavior.model.behavior_pattern import BehaviorCluster, BehaviorPattern
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.store.local_stores import FileSystemSourceStore, InMemoryIndexStore, InMemoryRelationStore
-from memoryos.operations.commit.operation_committer import OperationCommitter
-from memoryos.operations.model.context_operation import ContextOperation
-from memoryos.operations.model.operation_action import OperationAction
-from memoryos.support import SupportAnchor
+from behavior.core.model.behavior_pattern import BehaviorCluster, BehaviorPattern
+from behavior.core.support import BehaviorSupportAnchor
+from behavior.projection import behavior_pattern_to_context_object, behavior_support_to_context_object
+from infrastructure.context.operation_effects import InfrastructureContextOperationEffects
+from infrastructure.store.model.context.context_type import ContextType
+from policy.action_policy.integration.commit_registration import build_action_policy_transaction_extensions
+from policy.action_policy.model.action_policy import ActionPolicy
+from tests.support.persistence import FileSystemSourceStore, InMemoryIndexStore, InMemoryRelationStore
+from tests.support.transaction import build_test_operation_committer as OperationCommitter
+from transaction.model.context_operation import ContextOperation
+from transaction.model.operation_action import OperationAction
 
 
 def test_anchor_and_candidate_relations_are_populated(tmp_path) -> None:
     source = FileSystemSourceStore(tmp_path)
     index = InMemoryIndexStore()
     relations = InMemoryRelationStore()
-    committer = OperationCommitter(source, index, tmp_path, relation_store=relations)
+    committer = OperationCommitter(
+        source,
+        index,
+        tmp_path,
+        relation_store=relations,
+        context_effects=InfrastructureContextOperationEffects(),
+        domain_extensions=build_action_policy_transaction_extensions(),
+    )
     anchor_uri = "memoryos://user/u1/support/behavior/hot"
 
     cluster = BehaviorCluster(user_id="u1", scene_key="hot", support_anchor_uri=anchor_uri, case_refs=["case1", "case2"])
@@ -65,7 +75,7 @@ def test_anchor_and_candidate_relations_are_populated(tmp_path) -> None:
                 context_type=ContextType.BEHAVIOR_PATTERN,
                 action=OperationAction.ADD,
                 target_uri=pattern.uri,
-                payload={"context_object": pattern.to_context_object().to_dict(), "content": "pattern"},
+                payload={"context_object": behavior_pattern_to_context_object(pattern).to_dict(), "content": "pattern"},
             )
         ],
     )
@@ -100,7 +110,7 @@ def test_anchor_and_candidate_relations_are_populated(tmp_path) -> None:
         )
     )
 
-    candidate = SupportAnchor(
+    candidate = BehaviorSupportAnchor(
         uri=anchor_uri,
         user_id="u1",
         title="behavior support",
@@ -116,7 +126,10 @@ def test_anchor_and_candidate_relations_are_populated(tmp_path) -> None:
                 context_type=ContextType.BEHAVIOR_SUPPORT,
                 action=OperationAction.ADD,
                 target_uri=candidate.uri,
-                payload={"context_object": candidate.to_context_object().to_dict(), "content": candidate.content},
+                payload={
+                    "context_object": behavior_support_to_context_object(candidate).to_dict(),
+                    "content": candidate.content,
+                },
             )
         ],
     )

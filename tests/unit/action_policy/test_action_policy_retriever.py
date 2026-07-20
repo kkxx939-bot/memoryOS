@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import json
 
-from memoryos.action_policy.model.action_policy import ActionPolicy, ActionPolicyStatus
-from memoryos.action_policy.retrieval import ActionPolicyRetriever
-from memoryos.contextdb.context_db import ContextDB
-from memoryos.contextdb.model.lifecycle import LifecycleState
-from memoryos.contextdb.store.local_stores import FileSystemSourceStore, InMemoryIndexStore, InMemoryRelationStore
+from infrastructure.context.facade import ContextDB
+from infrastructure.store.model.context.lifecycle import LifecycleState
+from policy.action_policy.model.action_policy import ActionPolicy, ActionPolicyStatus
+from policy.action_policy.retrieval import ActionPolicyRetriever
+from tests.support.persistence import (
+    FileSystemSourceStore,
+    InMemoryIndexStore,
+    InMemoryRelationStore,
+    seed_context_object,
+)
 
 
 def _db(tmp_path) -> ContextDB:
@@ -16,7 +21,7 @@ def _db(tmp_path) -> ContextDB:
 def _seed(db: ContextDB, policy: ActionPolicy, lifecycle: LifecycleState = LifecycleState.ACTIVE) -> None:
     obj = policy.to_context_object()
     obj.lifecycle_state = lifecycle
-    db.seed_object(obj, content=json.dumps(policy.to_dict()))
+    seed_context_object(db.source_store, db.index_store, obj, content=json.dumps(policy.to_dict()))
 
 
 def test_retriever_loads_filters_and_keeps_disabled_auto_execute(tmp_path) -> None:

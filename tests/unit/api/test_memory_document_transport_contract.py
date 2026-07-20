@@ -2,28 +2,25 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from memoryos.api.cli.agent_hook_transport import AgentHookTransportClient
-from memoryos.api.http.app import MemoryOSASGI
-from memoryos.api.mcp.schemas import TOOL_INPUT_SCHEMAS
-from memoryos.api.memory_contract import (
+from foundation.identity import LocalUserContext
+from infrastructure.store.memory.layout import user_memory_root
+from openApi.cli.agent_hook_transport import AgentHookTransportClient
+from openApi.http.app import MemoryOSASGI
+from openApi.mcp.schemas import TOOL_INPUT_SCHEMAS
+from openApi.memory_contract import (
     MEMORY_COMMAND_REQUEST_SCHEMAS,
     MEMORY_COMMAND_RESPONSE_SCHEMAS,
     memory_request_schema,
     validate_memory_request,
     validate_memory_response,
 )
-from memoryos.api.sdk.client import MemoryOSClient
-from memoryos.api.sdk.http_client import HTTPMemoryOSClient
-from memoryos.memory.documents.layout import user_memory_root
-from memoryos.security.trusted_context import (
-    AUTHORITATIVE_FORGET,
-    AUTHORITATIVE_REMEMBER,
-    TrustedRequestContext,
-)
+from openApi.sdk.client import MemoryOSClient
+from openApi.sdk.http_client import HTTPMemoryOSClient
 
 
 class _CaptureHTTPClient(HTTPMemoryOSClient):
@@ -358,6 +355,10 @@ def test_http_adopt_route_binds_identity_outside_the_payload() -> None:
 
         def __init__(self) -> None:
             self.calls: list[dict[str, Any]] = []
+            self.runtime = SimpleNamespace(
+                agent=SimpleNamespace(session_service=object()),
+                readiness=_Ready(),
+            )
 
         def adopt_memory_document(self, **kwargs: Any) -> dict[str, Any]:
             self.calls.append(kwargs)
@@ -374,14 +375,10 @@ def test_http_adopt_route_binds_identity_outside_the_payload() -> None:
             }
 
     client = _Client()
-    caller = TrustedRequestContext(
-        tenant_id="tenant-a",
+    caller = LocalUserContext(
         user_id="alice",
-        actor_kind="user",
-        actor_id="alice",
-        capabilities=frozenset({AUTHORITATIVE_REMEMBER}),
     )
-    app = MemoryOSASGI(client, trusted_context=caller)  # type: ignore[arg-type]
+    app = MemoryOSASGI(client, local_context=caller)  # type: ignore[arg-type]
     digest = "a" * 64
 
     response = app._dispatch(
@@ -400,7 +397,6 @@ def test_http_adopt_route_binds_identity_outside_the_payload() -> None:
         {
             "relative_path": "knowledge/topics/external.md",
             "expected_raw_sha256": digest,
-            "tenant_id": "tenant-a",
             "caller": caller,
         }
     ]
@@ -430,6 +426,10 @@ def test_http_routes_preserve_rename_edit_and_copy_on_write_consolidation_contra
 
         def __init__(self) -> None:
             self.calls: list[tuple[str, dict[str, Any]]] = []
+            self.runtime = SimpleNamespace(
+                agent=SimpleNamespace(session_service=object()),
+                readiness=_Ready(),
+            )
 
         def rename_memory_document(self, **kwargs: Any) -> dict[str, Any]:
             self.calls.append(("rename", kwargs))
@@ -484,15 +484,11 @@ def test_http_routes_preserve_rename_edit_and_copy_on_write_consolidation_contra
                 "pending_document_ids": ["memdoc_BBBBBBBBBBBBBBBB"],
             }
 
-    caller = TrustedRequestContext(
-        tenant_id="tenant-a",
+    caller = LocalUserContext(
         user_id="alice",
-        actor_kind="user",
-        actor_id="alice",
-        capabilities=frozenset({AUTHORITATIVE_REMEMBER, AUTHORITATIVE_FORGET}),
     )
     client = _Client()
-    app = MemoryOSASGI(client, trusted_context=caller)  # type: ignore[arg-type]
+    app = MemoryOSASGI(client, local_context=caller)  # type: ignore[arg-type]
     uri = "memoryos://user/alice/memory/documents/memdoc_AAAAAAAAAAAAAAAA"
     rename_request = {
         "document_uri": uri,
@@ -526,23 +522,19 @@ def test_http_routes_preserve_rename_edit_and_copy_on_write_consolidation_contra
     assert merged["status"] == "AWAITING_TARGET_PROJECTION"
     assert proposed["workflow_kind"] == "CONSOLIDATION"
     assert client.calls == [
-        ("rename", {**rename_request, "tenant_id": "tenant-a", "caller": caller}),
-        ("merge", {**proposal_request, "tenant_id": "tenant-a", "caller": caller}),
+        ("rename", {**rename_request, "caller": caller}),
+        ("merge", {**proposal_request, "caller": caller}),
         (
             "merge_propose",
-            {**proposal_request, "tenant_id": "tenant-a", "caller": caller},
+            {**proposal_request, "caller": caller},
         ),
     ]
 
 
-def test_local_sdk_adopt_uses_trusted_caller_root(tmp_path: Path) -> None:
-    client = MemoryOSClient(str(tmp_path), tenant_id="tenant-a")
-    caller = TrustedRequestContext(
-        tenant_id="tenant-a",
+def test_local_sdk_adopt_uses_local_user_root(tmp_path: Path) -> None:
+    client = MemoryOSClient(str(tmp_path))
+    caller = LocalUserContext(
         user_id="alice",
-        actor_kind="user",
-        actor_id="alice",
-        capabilities=frozenset({AUTHORITATIVE_REMEMBER}),
     )
     relative_path = "knowledge/topics/sdk-note.md"
     raw = b"# SDK-created file\n\nNo hidden identity yet.\n"
@@ -559,7 +551,7 @@ def test_local_sdk_adopt_uses_trusted_caller_root(tmp_path: Path) -> None:
     assert result["document_uri"].startswith("memoryos://user/alice/memory/documents/")
     assert result["document_revision"] == 1
     assert result["projection_status"] == "ENQUEUED"
-    assert client.queue_store.stats(queue_name="memory_projection")["pending"] == 1
+    assert client.runtime.stores.queue.stats(queue_name="memory_projection")["pending"] == 1
 
     renamed = client.rename_memory_document(
         result["document_uri"],

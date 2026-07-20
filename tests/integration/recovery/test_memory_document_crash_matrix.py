@@ -10,28 +10,31 @@ from typing import cast
 
 import pytest
 
-from memoryos.adapters.persistence.filesystem.memory_document_store import FileSystemMemoryDocumentStore
-from memoryos.contextdb.store.queue_store import QueueJob, QueueStore
-from memoryos.core.durable_io import atomic_create_json
-from memoryos.memory.documents import (
-    ABSENT,
-    DocumentConflictError,
+from infrastructure.store.contracts.queue import QueueJob, QueueStore
+from infrastructure.store.filesystem.durable_io import atomic_create_json
+from infrastructure.store.filesystem.memory_document_store import FileSystemMemoryDocumentStore
+from infrastructure.store.memory import (
     DocumentControlIntegrityError,
-    DocumentEditKind,
-    DocumentEditPlan,
     DocumentIntentStatus,
     ExternalChangeKind,
     ExternalDocumentChange,
-    MemoryDocumentCommitter,
     MemoryDocumentControlStore,
     MemoryDocumentRevisionStore,
     MemoryDocumentScanner,
     adoption_document_id,
     adoption_request_digest,
+)
+from infrastructure.store.memory.erasure_store import MemoryDocumentEraseStore
+from infrastructure.store.memory.layout import user_memory_root
+from memory.commit import MemoryDocumentCommitter
+from memory.core import (
+    ABSENT,
+    DocumentEditKind,
+    DocumentEditPlan,
     new_document_id,
     render_new_document,
 )
-from memoryos.memory.documents.layout import user_memory_root
+from memory.ports import DocumentConflictError
 
 
 class _InjectedCrash(RuntimeError):
@@ -99,12 +102,19 @@ def _committer(root: Path, *, hook=None):  # noqa: ANN001, ANN202
     controls = MemoryDocumentControlStore(root)
     revisions = MemoryDocumentRevisionStore(root)
     queue = _FileProjectionQueue(root)
-    return source, controls, revisions, queue, MemoryDocumentCommitter(
+    return (
         source,
         controls,
         revisions,
-        cast(QueueStore, queue),
-        test_hook=hook,
+        queue,
+        MemoryDocumentCommitter(
+            source,
+            controls,
+            revisions,
+            cast(QueueStore, queue),
+            test_hook=hook,
+            erasure_store=MemoryDocumentEraseStore(controls.root),
+        ),
     )
 
 
@@ -161,9 +171,7 @@ def test_create_crash_windows_roll_forward_from_exact_before_or_after(
         "intent_id": intent.intent_id,
     }
     assert all("durable exact after bytes" not in json.dumps(payload) for payload in payloads)
-    assert source.read_state("default", "owner-1", path) == recovered_source.read_state(
-        "default", "owner-1", path
-    )
+    assert source.read_state("default", "owner-1", path) == recovered_source.read_state("default", "owner-1", path)
 
 
 def test_initial_create_prebinds_real_root_before_blob_intent_or_install(tmp_path: Path) -> None:
@@ -188,9 +196,7 @@ def test_initial_create_prebinds_real_root_before_blob_intent_or_install(tmp_pat
     assert identity.root_identity == source.full_scan("default", "owner-1").root_identity
     assert controls.incomplete_intents("default", "owner-1") == ()
     assert revisions.latest_revision("default", "owner-1", document_id) == 0
-    assert not tuple(
-        (root / "system" / "memory-documents" / "owner-1" / "blobs").rglob("*.blob")
-    )
+    assert not tuple((root / "system" / "memory-documents" / "owner-1" / "blobs").rglob("*.blob"))
     assert queue.payloads() == ()
     assert source.read_state("default", "owner-1", path) == ABSENT
 
@@ -284,9 +290,7 @@ def test_create_postinstall_verification_detects_root_swap(
     path = "knowledge/topics/install-root-swap.md"
     raw = render_new_document(document_id, "swap after atomic install")
     durable_create = source.create
-    detached_root = user_memory_root(root, "default", "owner-1").with_name(
-        "memory-detached-during-install"
-    )
+    detached_root = user_memory_root(root, "default", "owner-1").with_name("memory-detached-during-install")
 
     def create_then_swap(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202 - race injection.
         result = durable_create(*args, **kwargs)
@@ -444,8 +448,7 @@ def test_concurrent_first_creates_share_one_owner_root_identity(tmp_path: Path) 
     assert all(result.status is DocumentIntentStatus.COMPLETED for _, result in completed)
     assert len(controls.controls("default", "owner-1")) == 2
     assert all(
-        source.full_scan("default", "owner-1").root_identity == identity.root_identity
-        for source, _ in completed
+        source.full_scan("default", "owner-1").root_identity == identity.root_identity for source, _ in completed
     )
 
 
@@ -508,6 +511,7 @@ def test_third_state_after_install_is_preserved_and_intent_becomes_conflicted(tm
         MemoryDocumentRevisionStore(root),
         cast(QueueStore, _FileProjectionQueue(root)),
         test_hook=_CrashAt("after_installed"),
+        erasure_store=MemoryDocumentEraseStore(root),
     )
 
     with pytest.raises(_InjectedCrash):
@@ -562,6 +566,7 @@ def test_rename_partial_vector_is_conflicted_without_deleting_either_path(tmp_pa
         MemoryDocumentRevisionStore(root),
         cast(QueueStore, _FileProjectionQueue(root)),
         test_hook=_CrashAt("intent_prepared"),
+        erasure_store=MemoryDocumentEraseStore(controls.root),
     )
     with pytest.raises(_InjectedCrash):
         crashing.commit(
@@ -724,6 +729,7 @@ def test_existing_document_store_crash_windows_roll_forward(
         revisions,
         cast(QueueStore, queue),
         test_hook=_CrashAt(fault_stage),
+        erasure_store=MemoryDocumentEraseStore(controls.root),
     )
 
     with pytest.raises(_InjectedCrash):
@@ -782,6 +788,7 @@ def test_rename_edit_partial_target_is_third_state_and_never_overwritten(tmp_pat
         revisions,
         cast(QueueStore, queue),
         test_hook=_CrashAt("rename_target_installed"),
+        erasure_store=MemoryDocumentEraseStore(controls.root),
     )
 
     with pytest.raises(_InjectedCrash):
@@ -844,8 +851,4 @@ def test_rename_edit_target_conflict_creates_no_intent_or_recovery_job(tmp_path:
     assert len(controls.intents("default", "owner-1")) == intent_count
     assert source.read_raw("default", "owner-1", relative_path=old_path) == before
     assert source.read_raw("default", "owner-1", relative_path=new_path) == occupied
-    assert not [
-        payload
-        for payload in queue.payloads()
-        if payload["queue_name"] == "memory_document_edit"
-    ]
+    assert not [payload for payload in queue.payloads() if payload["queue_name"] == "memory_document_edit"]

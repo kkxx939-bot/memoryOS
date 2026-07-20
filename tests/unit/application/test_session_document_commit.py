@@ -7,42 +7,37 @@ from typing import cast
 
 import pytest
 
-from memoryos.adapters.persistence.filesystem.memory_document_store import (
+from foundation.integrity import canonical_digest
+from infrastructure.context.session_commit_planner import ContextCommitPlanner
+from infrastructure.store.contracts.session_evidence import SessionEvidenceEvent
+from infrastructure.store.filesystem.memory_document_store import (
     FileSystemMemoryDocumentStore,
 )
-from memoryos.adapters.persistence.filesystem.session_archive import SessionArchiveStore
-from memoryos.adapters.persistence.in_memory.queue_store import InMemoryQueueStore
-from memoryos.application.session.commit_group import CommitGroupIntegrityError, CommitGroupStore
-from memoryos.application.session.commit_service import DerivedConsumerError, SessionCommitService
-from memoryos.application.session.planners.context_commit_planner import ContextCommitPlanner
-from memoryos.application.session.planners.memory_commit_planner import (
+from infrastructure.store.memory import (
+    MemoryDocumentControlStore,
+    MemoryDocumentRevisionStore,
+)
+from infrastructure.store.memory.erasure_store import MemoryDocumentEraseStore
+from infrastructure.store.model.context.context_type import ContextType
+from infrastructure.store.session.commit_group import CommitGroupIntegrityError, CommitGroupStore
+from memory.commit import DocumentCommitResult, MemoryDocumentCommitter
+from memory.commit.planner import (
     MemoryDocumentPlanningResult,
     PlannedMemoryEdit,
 )
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.session.evidence_encoder import (
-    SessionEvidenceEvent,
-    register_session_evidence_encoder,
-)
-from memoryos.contextdb.session.session_model import SessionArchive
-from memoryos.core.integrity import canonical_digest
-from memoryos.memory.documents import (
-    DocumentCommitResult,
-    DocumentConflictError,
-    DocumentEditPlan,
-    MemoryCandidateKind,
-    MemoryDocumentCommitter,
-    MemoryDocumentControlStore,
-    MemoryDocumentPlanner,
-    MemoryDocumentRevisionStore,
-    MemoryEditProposal,
-)
-from memoryos.memory.evidence import SessionArchiveEpisodeAdapter
-from memoryos.operations.commit.operation_committer import OperationCommitter
-from memoryos.operations.model.context_diff import ContextDiff
-from memoryos.operations.model.context_operation import ContextOperation
-from memoryos.operations.model.operation_action import OperationAction
-from memoryos.workers.session_commit_worker import SessionCommitWorker
+from memory.commit.session_commit import DerivedConsumerError, SessionCommitService
+from memory.core import DocumentEditPlan, MemoryCandidateKind, MemoryEditProposal
+from memory.execute import MemoryDocumentPlanner
+from memory.ports import DocumentConflictError
+from memory.worker.session_commit import SessionCommitWorker
+from pre.evidence import SessionArchiveEpisodeAdapter
+from pre.session import SessionArchive
+from tests.support.persistence.in_memory import InMemoryQueueStore
+from tests.support.session_archive import build_session_archive_store
+from transaction.commit.operation_committer import OperationCommitter
+from transaction.model.context_diff import ContextDiff
+from transaction.model.context_operation import ContextOperation
+from transaction.model.operation_action import OperationAction
 
 
 class _EvidenceEncoder:
@@ -263,8 +258,11 @@ def _service(
     document_hook=None,  # noqa: ANN001
     archive_hook=None,  # noqa: ANN001
 ):  # noqa: ANN202
-    register_session_evidence_encoder(_EvidenceEncoder())
-    archive_store = SessionArchiveStore(root, test_hook=archive_hook)
+    archive_store = build_session_archive_store(
+        root,
+        evidence_encoder=_EvidenceEncoder(),
+        test_hook=archive_hook,
+    )
     queue = InMemoryQueueStore()
     document_store = FileSystemMemoryDocumentStore(root)
     document_planner = MemoryDocumentPlanner(document_store)
@@ -275,6 +273,7 @@ def _service(
         MemoryDocumentRevisionStore(root),
         queue,
         test_hook=document_hook,
+        erasure_store=MemoryDocumentEraseStore(root),
     )
     service = SessionCommitService(
         archive_store,
@@ -361,7 +360,7 @@ def test_inline_failure_queues_same_task_and_worker_replay_is_idempotent(tmp_pat
 
     job = queue.get(archive.task_id)
     assert job is not None
-    assert job.queue_name == "session_commit"
+    assert job.queue_name == "commit"
     assert job.target_uri == archive.archive_uri
     assert job.payload["manifest_digest"] == archive.manifest_digest
     group_id = f"commit_group_{archive.task_id}"
@@ -487,8 +486,7 @@ def test_crash_after_document_completion_resumes_intent_without_second_revision(
 
 
 def test_cas_conflict_replans_only_from_same_sealed_proposal(tmp_path: Path) -> None:
-    register_session_evidence_encoder(_EvidenceEncoder())
-    archive_store = SessionArchiveStore(tmp_path)
+    archive_store = build_session_archive_store(tmp_path, evidence_encoder=_EvidenceEncoder())
     queue = InMemoryQueueStore()
     document_store = FileSystemMemoryDocumentStore(tmp_path)
     document_planner = _CountingDocumentPlanner(document_store)
@@ -498,6 +496,7 @@ def test_cas_conflict_replans_only_from_same_sealed_proposal(tmp_path: Path) -> 
         MemoryDocumentControlStore(tmp_path),
         MemoryDocumentRevisionStore(tmp_path),
         queue,
+        erasure_store=MemoryDocumentEraseStore(tmp_path),
     )
     conflict_committer = _ConflictOnceCommitter(delegate, document_planner)
     service = SessionCommitService(
@@ -521,8 +520,7 @@ def test_cas_conflict_replans_only_from_same_sealed_proposal(tmp_path: Path) -> 
 
 
 def test_projection_failure_after_archive_is_journaled_and_same_task_is_replayed(tmp_path: Path) -> None:
-    register_session_evidence_encoder(_EvidenceEncoder())
-    archive_store = SessionArchiveStore(tmp_path)
+    archive_store = build_session_archive_store(tmp_path, evidence_encoder=_EvidenceEncoder())
     queue = InMemoryQueueStore()
     journal_store = _ProjectionJournalStore()
     projector = _FailingSessionProjector(journal_store)
@@ -579,7 +577,7 @@ def test_startup_resume_publishes_outputs_after_process_crash_with_complete_grou
     assert service.archive_store.async_outputs_done_for_task(archive) is False
 
     restarted = SessionCommitService(
-        SessionArchiveStore(tmp_path),
+        build_session_archive_store(tmp_path),
         queue,
         memory_planner=planner,
         memory_committer=committer,
@@ -615,11 +613,10 @@ def test_commit_group_rejects_symlinked_control_directory(tmp_path: Path) -> Non
 
 
 def test_ordinary_session_operations_stay_on_operation_committer(tmp_path: Path) -> None:
-    register_session_evidence_encoder(_EvidenceEncoder())
     queue = InMemoryQueueStore()
     recorder = _RecordingOperationCommitter()
     service = SessionCommitService(
-        SessionArchiveStore(tmp_path),
+        build_session_archive_store(tmp_path, evidence_encoder=_EvidenceEncoder()),
         queue,
         committer=cast(OperationCommitter, recorder),
         context_planner=_OrdinaryContextPlanner(),
@@ -644,9 +641,12 @@ def test_ordinary_session_operations_stay_on_operation_committer(tmp_path: Path)
 
 
 def test_commit_group_control_root_is_physically_tenant_scoped(tmp_path: Path) -> None:
-    register_session_evidence_encoder(_EvidenceEncoder())
     service = SessionCommitService(
-        SessionArchiveStore(tmp_path, tenant_id="tenant-a"),
+        build_session_archive_store(
+            tmp_path,
+            tenant_id="tenant-a",
+            evidence_encoder=_EvidenceEncoder(),
+        ),
         InMemoryQueueStore(),
     )
     archive = _archive("tenant-scoped-group")

@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import json
 
-from memoryos.action_policy.model.action_policy import ActionPolicy
-from memoryos.api.sdk.client import MemoryOSClient
-from memoryos.behavior.model.observation import Observation
-from memoryos.connect import ConnectMetadata
-from memoryos.contextdb.model.context_object import ContextObject
-from memoryos.contextdb.model.context_relation import ContextRelation
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.prediction.model.prediction_request import PredictionRequest
-from memoryos.skill.tool_registry import ToolRegistry
+from behavior.core.model.observation import Observation
+from policy.action_policy.execution.tool_registry import ToolRegistry
+from infrastructure.store.model.context.context_object import ContextObject
+from infrastructure.store.model.context.context_relation import ContextRelation
+from infrastructure.store.model.context.context_type import ContextType
+from openApi.sdk.client import MemoryOSClient
+from policy.action_policy.decision.request import PredictionRequest
+from policy.action_policy.model.action_policy import ActionPolicy
+from pre.connect import ConnectMetadata
+from tests.support.persistence import seed_context_object
 
 
 def _seed_client(tmp_path, handler):
@@ -29,7 +30,9 @@ def _seed_client(tmp_path, handler):
     anchor_uri = "memoryos://user/u1/support/behavior/hot"
     resource_uri = "memoryos://resources/ac"
     skill_uri = "memoryos://skills/ac"
-    client.context_db.seed_object(
+    seed_context_object(
+        client.runtime.stores.source,
+        client.runtime.stores.index,
         ContextObject(
             uri=anchor_uri,
             context_type=ContextType.BEHAVIOR_SUPPORT,
@@ -41,7 +44,9 @@ def _seed_client(tmp_path, handler):
         ),
         content="hot anchor",
     )
-    client.context_db.seed_object(
+    seed_context_object(
+        client.runtime.stores.source,
+        client.runtime.stores.index,
         ContextObject(
             uri=resource_uri,
             context_type=ContextType.RESOURCE,
@@ -50,7 +55,9 @@ def _seed_client(tmp_path, handler):
         ),
         content="available",
     )
-    client.context_db.seed_object(
+    seed_context_object(
+        client.runtime.stores.source,
+        client.runtime.stores.index,
         ContextObject(
             uri=skill_uri,
             context_type=ContextType.SKILL,
@@ -72,7 +79,7 @@ def _seed_client(tmp_path, handler):
     policy = ActionPolicy(
         user_id="u1",
         scene_key=observation.scene_key,
-        action="turn_on_ac",
+        action="turn_on_fan",
         support_anchor_uri=anchor_uri,
         q_value=0.95,
         confidence=0.95,
@@ -81,26 +88,31 @@ def _seed_client(tmp_path, handler):
         required_resource_uris=[resource_uri],
         required_skill_uris=[skill_uri],
     )
-    client.context_db.seed_object(policy.to_context_object(), content=json.dumps(policy.to_dict()))
+    seed_context_object(
+        client.runtime.stores.source,
+        client.runtime.stores.index,
+        policy.to_context_object(),
+        content=json.dumps(policy.to_dict()),
+    )
     for relation_type, target_uri in (
         ("anchored_by", anchor_uri),
         ("requires_resource", resource_uri),
         ("requires_skill", skill_uri),
     ):
-        client.context_db.add_relation(
+        client.runtime.stores.relation.add_relation(
             ContextRelation(
                 source_uri=policy.uri,
                 relation_type=relation_type,
                 target_uri=target_uri,
                 metadata={"owner_user_id": "u1"},
-            )
+            ),
+            tenant_id="default",
         )
     request = PredictionRequest(
         user_id="u1",
         episode_id="ep-execute",
         observation=observation,
-        available_actions=["turn_on_ac", "ask_user", "do_nothing"],
-        token_budget=2000,
+        available_actions=["turn_on_fan", "ask_user", "do_nothing"],
         connect_metadata=ConnectMetadata.action_capable_embodied("reachy_mini").to_dict(),
     )
     return client, policy, request
@@ -112,17 +124,17 @@ def test_execute_success_writes_action_result_and_rewards_policy(tmp_path) -> No
     result = client.process_observation(request, archive_session=True, async_commit=True)
 
     assert result.prediction_result.decision.mode == "execute"
-    archived = client.session_archive_store.read_archive("memoryos://user/u1/sessions/history/ep-execute")
+    archived = client.runtime.session.archive_store.read_archive("memoryos://user/u1/sessions/history/ep-execute")
     action_result = archived.action_results[0]["action_result"]
     observation = archived.observations[0]
     assert action_result["status"] == "success"
     assert observation["episode_id"] == request.episode_id
     behavior_cases = [
-        obj for obj in client.source_store.list_objects() if obj.context_type == ContextType.BEHAVIOR_CASE
+        obj for obj in client.runtime.stores.source.list_objects() if obj.context_type == ContextType.BEHAVIOR_CASE
     ]
     assert behavior_cases[0].metadata["feedback_type"] == "execution_success"
     assert behavior_cases[0].metadata["reward"] == 1.0
-    assert client.source_store.read_object(policy.uri).metadata["success_count"] == 1
+    assert client.runtime.stores.source.read_object(policy.uri).metadata["success_count"] == 1
 
 
 def test_execute_failure_writes_failed_action_result_and_penalizes_policy(tmp_path) -> None:
@@ -133,21 +145,21 @@ def test_execute_failure_writes_failed_action_result_and_penalizes_policy(tmp_pa
 
     client.process_observation(request, archive_session=True, async_commit=True)
 
-    archived = client.session_archive_store.read_archive("memoryos://user/u1/sessions/history/ep-execute")
+    archived = client.runtime.session.archive_store.read_archive("memoryos://user/u1/sessions/history/ep-execute")
     action_result = archived.action_results[0]["action_result"]
     assert action_result["status"] == "failed"
     behavior_cases = [
-        obj for obj in client.source_store.list_objects() if obj.context_type == ContextType.BEHAVIOR_CASE
+        obj for obj in client.runtime.stores.source.list_objects() if obj.context_type == ContextType.BEHAVIOR_CASE
     ]
     assert behavior_cases[0].metadata["feedback_type"] == "execution_failure"
     assert behavior_cases[0].metadata["reward"] == -1.0
     assert behavior_cases[0].metadata["observation"]["episode_id"] == request.episode_id
-    assert client.source_store.read_object(policy.uri).metadata["failure_count"] == 1
+    assert client.runtime.stores.source.read_object(policy.uri).metadata["failure_count"] == 1
 
 
 def test_missing_required_skill_keeps_policy_gate_from_execute(tmp_path) -> None:
     client, policy, request = _seed_client(tmp_path, lambda payload: {"ok": True})
-    client.relation_store.delete_relation(
+    client.runtime.stores.relation.delete_relation(
         policy.uri,
         "requires_skill",
         policy.required_skill_uris[0],
@@ -157,6 +169,6 @@ def test_missing_required_skill_keeps_policy_gate_from_execute(tmp_path) -> None
     result = client.process_observation(request, archive_session=True, async_commit=True)
 
     assert result.prediction_result.decision.mode == "ask_user"
-    archived = client.session_archive_store.read_archive("memoryos://user/u1/sessions/history/ep-execute")
+    archived = client.runtime.session.archive_store.read_archive("memoryos://user/u1/sessions/history/ep-execute")
     action_result = archived.action_results[0]["action_result"]
     assert action_result["status"] == "skipped"

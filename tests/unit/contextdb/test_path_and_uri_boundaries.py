@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, cast
 
 import pytest
 
-from memoryos.contextdb.model.context_uri import ContextURI
-from memoryos.contextdb.retrieval.service import RetrievalService
-from memoryos.contextdb.store.local_stores import FileSystemSourceStore, InMemoryIndexStore
-from memoryos.core.errors import InvalidContextURI
-from memoryos.operations.commit.operation_committer import OperationCommitter
+from infrastructure.store.model.context.context_uri import ContextURI
+from infrastructure.store.model.context.errors import InvalidContextURI
+from infrastructure.store.trace import RecallTraceRepository
+from tests.support.persistence import FileSystemSourceStore, InMemoryIndexStore
+from tests.support.transaction import build_test_operation_committer as OperationCommitter
 
 
 @pytest.mark.parametrize(
@@ -60,12 +59,12 @@ def test_context_uri_canonical_form_unifies_lock_and_disk_identity(tmp_path: Pat
     ],
 )
 def test_recall_trace_validates_uuid_before_any_path_read(tmp_path: Path, trace_id: str) -> None:
-    service = RetrievalService(cast(Any, None), tmp_path / "traces")
+    service = RecallTraceRepository(tmp_path / "traces")
     with pytest.raises(ValueError, match="canonical UUID"):
-        service.read_trace(trace_id)
+        service.read(trace_id)
     assert not (tmp_path / "outside.json").exists()
 
 
 def test_trace_root_and_files_are_private(tmp_path: Path) -> None:
-    service = RetrievalService(cast(Any, None), tmp_path / "traces")
+    service = RecallTraceRepository(tmp_path / "traces")
     assert service.trace_root.stat().st_mode & 0o777 == 0o700

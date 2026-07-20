@@ -6,22 +6,22 @@ from typing import Any
 
 import pytest
 
-from memoryos.api.mcp.errors import exception_payload
-from memoryos.api.sdk.client import MemoryOSClient
-from memoryos.contextdb.catalog import CatalogRecord
-from memoryos.contextdb.retrieval.errors import CatalogCandidateBoundExceeded
-from memoryos.contextdb.retrieval.orchestrator import RetrievalUnavailableError
-from memoryos.contextdb.retrieval.query_plan import RetrievalOptions, RetrievalQueryIntent
-from memoryos.contextdb.store.vector_store import (
-    InMemoryVectorStore,
+from infrastructure.context.orchestrator import RetrievalUnavailableError
+from infrastructure.context.retrieval.query_plan import RetrievalOptions, RetrievalQueryIntent
+from infrastructure.store.contracts.vector import (
     VectorCapabilities,
     VectorHit,
     vector_row_id,
 )
-from memoryos.security.context_projection import (
+from infrastructure.store.model.catalog import CatalogRecord
+from infrastructure.store.query import CatalogCandidateBoundExceeded
+from openApi.mcp.errors import exception_payload
+from openApi.sdk.client import MemoryOSClient
+from sanitization.context_projection import (
     ContextProjectionSanitizationError,
     ContextProjectionSanitizer,
 )
+from tests.support.persistence import InMemoryVectorStore
 
 
 class _Embedding:
@@ -143,7 +143,7 @@ def test_vector_and_reranker_provider_egress_sanitizes_query_and_payload(
         reranker=reranker,
     )
     timestamp = "2026-07-14T12:00:00+00:00"
-    client.index_store.upsert_catalog(  # type: ignore[attr-defined]
+    client.runtime.stores.index.upsert_catalog(  # type: ignore[attr-defined]
         CatalogRecord(
             record_key=record_key,
             uri=public_uri,
@@ -166,8 +166,8 @@ def test_vector_and_reranker_provider_egress_sanitizes_query_and_payload(
     def forbidden_online_enumeration(*_args: Any, **_kwargs: Any) -> Any:
         raise AssertionError("online retrieval must not enumerate a whole store")
 
-    monkeypatch.setattr(client.source_store, "list_objects", forbidden_online_enumeration)
-    monkeypatch.setattr(client.vector_store, "vector_uris", forbidden_online_enumeration)
+    monkeypatch.setattr(client.runtime.stores.source, "list_objects", forbidden_online_enumeration)
+    monkeypatch.setattr(client.runtime.stores.vector, "vector_uris", forbidden_online_enumeration)
     query = (
         "quarterly report Authorization: Bearer super-secret-token "
         "password=hunter2 /Users/u1/Desktop/quarterly.txt"
@@ -212,7 +212,7 @@ def test_provider_egress_sanitization_failure_calls_no_provider(
         reranker=reranker,
     )
     timestamp = "2026-07-14T12:00:00+00:00"
-    client.index_store.upsert_catalog(  # type: ignore[attr-defined]
+    client.runtime.stores.index.upsert_catalog(  # type: ignore[attr-defined]
         CatalogRecord(
             record_key=record_key,
             uri=public_uri,
@@ -312,8 +312,8 @@ def test_sqlite_vm_guard_is_not_reported_as_empty_success(tmp_path) -> None:  # 
         )
         for index in range(150)
     )
-    client.index_store.upsert_catalog_batch(records, tenant_id="default")  # type: ignore[attr-defined]
-    client.index_store.online_vm_step_limit = 1  # type: ignore[attr-defined]
+    client.runtime.stores.index.upsert_catalog_batch(records, tenant_id="default")  # type: ignore[attr-defined]
+    client.runtime.stores.index.online_vm_step_limit = 1  # type: ignore[attr-defined]
 
     with pytest.raises(RetrievalUnavailableError, match="exceeded its online bound") as caught:
         client.search_context(
@@ -329,7 +329,7 @@ def test_required_temporal_structured_fallback_bound_is_explicitly_unavailable(
     monkeypatch,
 ) -> None:  # noqa: ANN001
     client = MemoryOSClient(str(tmp_path))
-    store = client.index_store
+    store = client.runtime.stores.index
     monkeypatch.setattr(store, "search_catalog", lambda *_args, **_kwargs: [])
 
     def exhaust_temporal_fallback(*_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202
@@ -357,7 +357,7 @@ def test_pending_composite_session_job_is_not_catalog_projection_lag(tmp_path) -
     )
 
     assert result.session_projection_status == "projected"
-    assert client.queue_store.stats(queue_name="session_commit").get("pending") == 1
+    assert client.runtime.stores.queue.stats(queue_name="commit").get("pending") == 1
     assembled = client.assemble_context(
         "definitely-not-in-the-projected-session",
         options=RetrievalOptions(query_intent=RetrievalQueryIntent.OPEN_RECALL),

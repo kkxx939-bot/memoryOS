@@ -7,10 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from memoryos.adapters.persistence.filesystem.memory_document_store import FileSystemMemoryDocumentStore
-from memoryos.memory.documents.frontmatter import adopt_raw_document, render_new_document
-from memoryos.memory.documents.layout import tenant_control_root, user_memory_root
-from memoryos.memory.documents.model import (
+from infrastructure.store.filesystem.memory_document_store import FileSystemMemoryDocumentStore
+from infrastructure.store.memory.layout import tenant_control_root, user_memory_root
+from memory.core.model import (
     ABSENT,
     ManagedDocument,
     PresentPath,
@@ -18,7 +17,8 @@ from memoryos.memory.documents.model import (
     UnmanagedDocument,
     UnsafePath,
 )
-from memoryos.memory.documents.store import (
+from memory.core.structure.frontmatter import adopt_raw_document, render_new_document
+from memory.ports.document_store import (
     DocumentConflictError,
     DocumentNotFoundError,
     DocumentUnsafeError,
@@ -108,10 +108,10 @@ def test_filesystem_capability_probe_cleanup_failure_is_not_cached(
 
     assert saw_probe_directory
     assert not list(probe_parent.glob(".filesystem-probe-*"))
-    assert (TENANT, "__control__") not in store._probed_scopes
+    assert (TENANT, "__control__") not in store._files._probed_scopes
 
     store.probe_write_capabilities(TENANT)
-    assert (TENANT, "__control__") in store._probed_scopes
+    assert (TENANT, "__control__") in store._files._probed_scopes
     assert not list(probe_parent.glob(".filesystem-probe-*"))
 
 
@@ -172,7 +172,7 @@ def test_read_state_marks_symlink_hardlink_directory_and_permission_failure_unsa
     def deny_read(*args: object, **kwargs: object) -> bytes:
         raise PermissionError("secret path")
 
-    monkeypatch.setattr(store, "_read_regular", deny_read)
+    monkeypatch.setattr(store._files, "read_regular", deny_read)
     denied = store.read_state(TENANT, OWNER, "profile.md")
     assert denied == UnsafePath("profile.md", "permission denied while reading memory tree")
     assert permission_path.read_bytes() == b"content"
@@ -205,8 +205,7 @@ def test_full_scan_classifies_empty_missing_id_invalid_encoding_and_bad_yaml(tmp
     _external_write(
         tmp_path,
         "knowledge/topics/duplicate-key.md",
-        b"---\nmemoryos_schema: 1\nmemoryos_schema: 1\n"
-        b"document_id: memdoc_CCCCCCCCCCCCCCCC\n---\n",
+        b"---\nmemoryos_schema: 1\nmemoryos_schema: 1\ndocument_id: memdoc_CCCCCCCCCCCCCCCC\n---\n",
     )
     _external_write(
         tmp_path,
@@ -239,9 +238,7 @@ def test_full_scan_quarantines_oversized_and_overdeep_front_matter(tmp_path: Pat
     _external_write(
         tmp_path,
         "knowledge/topics/header.md",
-        b"---\nmemoryos_schema: 1\ndocument_id: memdoc_AAAAAAAAAAAAAAAA\nnote: "
-        + (b"x" * 256)
-        + b"\n---\n",
+        b"---\nmemoryos_schema: 1\ndocument_id: memdoc_AAAAAAAAAAAAAAAA\nnote: " + (b"x" * 256) + b"\n---\n",
     )
     _external_write(
         tmp_path,
@@ -281,9 +278,7 @@ def test_full_scan_quarantines_duplicate_copied_and_changed_document_ids(tmp_pat
 
     assert len(duplicate.registrations) == 2
     assert all(isinstance(item, QuarantinedDocument) for item in duplicate.registrations)
-    duplicate_reasons = [
-        item.reason for item in duplicate.registrations if isinstance(item, QuarantinedDocument)
-    ]
+    duplicate_reasons = [item.reason for item in duplicate.registrations if isinstance(item, QuarantinedDocument)]
     assert all("duplicate document_id" in reason for reason in duplicate_reasons)
     with pytest.raises(DocumentNotFoundError):
         copied_store.read_raw(TENANT, OWNER, document_id=DOCUMENT_ID)
@@ -294,8 +289,7 @@ def test_full_scan_quarantines_unicode_casefold_path_collisions(
 ) -> None:
     store = FileSystemMemoryDocumentStore(tmp_path)
     monkeypatch.setattr(
-        "memoryos.adapters.persistence.filesystem.memory_document_store."
-        "MemoryDocumentPathPolicy.collision_key",
+        "infrastructure.store.filesystem.memory_document_store.MemoryDocumentPathPolicy.collision_key",
         lambda _relative: "same-logical-path",
     )
     _external_write(
@@ -686,12 +680,15 @@ def test_operation_bound_temp_is_durably_cleaned_after_crash(tmp_path: Path) -> 
         )
     assert len(tuple(user_memory_root(tmp_path, TENANT, OWNER).rglob("*.tmp"))) == 1
 
-    assert store.cleanup_operation_temps(
-        TENANT,
-        OWNER,
-        {relative: hashlib.sha256(raw).hexdigest()},
-        "mdintent_test_operation",
-    ) == 1
+    assert (
+        store.cleanup_operation_temps(
+            TENANT,
+            OWNER,
+            {relative: hashlib.sha256(raw).hexdigest()},
+            "mdintent_test_operation",
+        )
+        == 1
+    )
     assert tuple(user_memory_root(tmp_path, TENANT, OWNER).rglob("*.tmp")) == ()
 
 

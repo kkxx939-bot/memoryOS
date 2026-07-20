@@ -1,26 +1,19 @@
-"""Embedding protocol ownership and compatibility boundaries."""
+"""向量协议只能有一个所有者，生产代码不得内置伪向量实现。"""
 
 from __future__ import annotations
 
-import ast
 from pathlib import Path
 
 from tests.support.import_graph import production_imports
 
 ROOT = Path(__file__).resolve().parents[3]
 
-_PROVIDER_COMPATIBILITY_EXPORTS = {
-    "memoryos/providers/__init__.py",
-    "memoryos/providers/embedding/__init__.py",
-    "memoryos/providers/embedding/base.py",
-}
 
-
-def test_contextdb_does_not_import_provider_implementations() -> None:
+def test_context_does_not_import_provider_implementations() -> None:
     violations = [
         f"{edge.source.relative_to(ROOT)}:{edge.line} [{edge.kind}] -> {edge.target}"
         for edge in production_imports(ROOT)
-        if edge.source.relative_to(ROOT).as_posix().startswith("memoryos/contextdb/")
+        if edge.source.relative_to(ROOT).as_posix().startswith("infrastructure/context/")
         and (
             edge.target == "memoryos.providers"
             or edge.target.startswith("memoryos.providers.")
@@ -29,36 +22,19 @@ def test_contextdb_does_not_import_provider_implementations() -> None:
     assert violations == []
 
 
-def test_production_type_imports_use_embedding_protocol_owner() -> None:
-    violations: list[str] = []
-    for path in sorted((ROOT / "memoryos").rglob("*.py")):
-        relative = path.relative_to(ROOT).as_posix()
-        if relative in _PROVIDER_COMPATIBILITY_EXPORTS:
-            continue
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.ImportFrom) or node.module is None:
-                continue
-            if node.module != "memoryos.providers.embedding" and not node.module.startswith(
-                "memoryos.providers.embedding."
-            ):
-                continue
-            if any(alias.name == "EmbeddingProvider" for alias in node.names):
-                violations.append(f"{relative}:{node.lineno} -> {node.module}")
+def test_production_does_not_import_removed_embedding_providers() -> None:
+    violations = [
+        f"{edge.source.relative_to(ROOT)}:{edge.line} [{edge.kind}] -> {edge.target}"
+        for edge in production_imports(ROOT)
+        if edge.target == "memoryos.providers.embedding"
+        or edge.target.startswith("memoryos.providers.embedding.")
+    ]
     assert violations == []
 
 
-def test_historical_embedding_protocol_exports_keep_object_identity() -> None:
-    from memoryos.contextdb.retrieval import EmbeddingProvider as RetrievalPackageProtocol
-    from memoryos.contextdb.retrieval.embedding import EmbeddingProvider
-    from memoryos.providers import EmbeddingProvider as ProviderPackageProtocol
-    from memoryos.providers.embedding import EmbeddingProvider as EmbeddingPackageProtocol
-    from memoryos.providers.embedding.base import EmbeddingProvider as HistoricalBaseProtocol
+def test_embedding_protocol_has_one_owner_and_no_builtin_implementation() -> None:
+    from infrastructure.context.retrieval import EmbeddingProvider as RetrievalPackageProtocol
+    from infrastructure.context.retrieval.embedding import EmbeddingProvider
 
-    assert (
-        EmbeddingProvider
-        is RetrievalPackageProtocol
-        is ProviderPackageProtocol
-        is EmbeddingPackageProtocol
-        is HistoricalBaseProtocol
-    )
+    assert EmbeddingProvider is RetrievalPackageProtocol
+    assert not (ROOT / "memoryos" / "providers" / "embedding").exists()

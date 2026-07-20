@@ -5,16 +5,11 @@ import json
 from typing import Any
 from urllib.parse import urlencode
 
-from memoryos.api.http.app import MemoryOSASGI
-from memoryos.api.mcp.config import MCPServerConfig
-from memoryos.api.mcp.tools import MCPToolRouter
-from memoryos.api.sdk.client import MemoryOSClient
-from memoryos.api.trusted_context import (
-    AUTHORITATIVE_FORGET,
-    AUTHORITATIVE_REMEMBER,
-    READ_CONTEXT,
-    TrustedRequestContext,
-)
+from openApi.http.app import MemoryOSASGI
+from openApi.mcp.config import MCPServerConfig
+from openApi.mcp.tools import MCPToolRouter
+from openApi.sdk.client import MemoryOSClient
+from foundation.identity import LocalUserContext
 
 
 async def _request(
@@ -41,7 +36,7 @@ async def _request(
             "type": "http",
             "method": method,
             "path": path,
-            "headers": [(b"authorization", b"Bearer test-token")],
+            "headers": [],
             "query_string": query_string,
         },
         receive,
@@ -52,19 +47,11 @@ async def _request(
 
 
 def test_markdown_memory_http_sdk_mcp_smoke(tmp_path) -> None:  # noqa: ANN001
-    capabilities = frozenset({READ_CONTEXT, AUTHORITATIVE_REMEMBER, AUTHORITATIVE_FORGET})
-    caller = TrustedRequestContext(
-        tenant_id="default",
-        user_id="u1",
-        actor_kind="user",
-        actor_id="u1",
-        capabilities=capabilities,
-    )
+    caller = LocalUserContext(user_id="u1")
     client = MemoryOSClient(str(tmp_path), mode="server")
     app = MemoryOSASGI(
         client,
-        api_token="test-token",
-        trusted_context=caller,
+        local_context=caller,
     )
 
     remembered = asyncio.run(
@@ -104,9 +91,6 @@ def test_markdown_memory_http_sdk_mcp_smoke(tmp_path) -> None:  # noqa: ANN001
         MCPServerConfig(
             root=str(tmp_path),
             user_id="u1",
-            actor_kind="user",
-            actor_id="u1",
-            capabilities=capabilities,
         ),
     )
     forgotten = router.call(

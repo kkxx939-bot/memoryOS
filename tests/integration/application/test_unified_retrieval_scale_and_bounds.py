@@ -5,21 +5,21 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, cast
 
-from memoryos.api.sdk.client import MemoryOSClient
-from memoryos.contextdb.catalog import CatalogRecord, CatalogRecordKind, catalog_vector_metadata
-from memoryos.contextdb.context_db import ContextDB
-from memoryos.contextdb.model.context_object import ContextObject
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.retrieval.candidate_generator import CandidateGenerator
-from memoryos.contextdb.retrieval.orchestrator import UnifiedRetrievalOrchestrator
-from memoryos.contextdb.retrieval.query_plan import RetrievalOptions, RetrievalQueryIntent, RetrievalQueryPlan
-from memoryos.contextdb.store.local_stores import (
+from infrastructure.context.candidate import CandidateGenerator
+from infrastructure.context.orchestrator import UnifiedRetrievalOrchestrator
+from infrastructure.context.retrieval.query_plan import RetrievalOptions, RetrievalQueryIntent, RetrievalQueryPlan
+from infrastructure.store.contracts.vector import VectorHit, vector_row_id
+from infrastructure.store.model.catalog import CatalogRecord, CatalogRecordKind, catalog_vector_metadata
+from infrastructure.store.model.context.context_object import ContextObject
+from infrastructure.store.model.context.context_type import ContextType
+from infrastructure.store.sqlite.index_store import SQLiteIndexStore
+from openApi.sdk.client import MemoryOSClient
+from tests.support.persistence import (
     FileSystemSourceStore,
     InMemoryIndexStore,
     InMemoryRelationStore,
+    InMemoryVectorStore,
 )
-from memoryos.contextdb.store.sqlite_index_store import SQLiteIndexStore
-from memoryos.contextdb.store.vector_store import InMemoryVectorStore, VectorHit, vector_row_id
 
 _TIME = "2026-07-14T03:30:00+00:00"
 
@@ -69,9 +69,14 @@ def test_generic_in_memory_index_preserves_source_digest_for_bounded_l2(tmp_path
     content = "embedded-l2-marker exact source bytes"
     source.write_object(obj, content=content)
     index.upsert_index(obj, content=content, tenant_id="tenant-a")
+    relations = InMemoryRelationStore()
 
     result = UnifiedRetrievalOrchestrator(
-        ContextDB(source, index, InMemoryRelationStore())
+        index,
+        source_store=source,
+        relation_store=relations,
+        queue_store=None,
+        session_archive_store=None,
     ).execute(
         RetrievalQueryPlan(
             semantic_query="embedded-l2-marker",
@@ -80,7 +85,6 @@ def test_generic_in_memory_index_preserves_source_digest_for_bounded_l2(tmp_path
             owner_user_id="u1",
             candidate_limit=10,
             final_limit=10,
-            token_budget=1_024,
         )
     )
 
@@ -328,8 +332,13 @@ def test_sqlite_catalog_handles_1000_sessions_10000_tools_and_1000_memory_docume
     monkeypatch.setattr(source, "list_objects", prohibited)
     monkeypatch.setattr(Path, "glob", prohibited)
     monkeypatch.setattr(Path, "rglob", prohibited)
+    relations = InMemoryRelationStore()
     orchestrator = UnifiedRetrievalOrchestrator(
-        ContextDB(source, store, InMemoryRelationStore()),
+        store,
+        source_store=source,
+        relation_store=relations,
+        queue_store=None,
+        session_archive_store=None,
         vector_store=vector,
         embedding_provider=_Embedding(),
     )
@@ -347,7 +356,6 @@ def test_sqlite_catalog_handles_1000_sessions_10000_tools_and_1000_memory_docume
             query_intent=RetrievalQueryIntent.OPEN_RECALL,
             candidate_limit=25,
             final_limit=10,
-            token_budget=1_024,
         )
     )
     assert result.contexts
@@ -368,29 +376,7 @@ def test_document_identity_bounds_10000_blocks_before_document_and_block_top_k(
 ) -> None:
     store = SQLiteIndexStore(tmp_path / "large-memory-document.sqlite3")
     document = _memory_document(9_999)
-    private_scope = {
-        "visibility": {
-            "tenant_id": "tenant-a",
-            "private": True,
-            "allowed_principal_ids": ("u1",),
-            "allowed_service_ids": (),
-        }
-    }
-    document = CatalogRecord(
-        **{
-            **document.__dict__,
-            "metadata": {**dict(document.metadata), "scope": private_scope},
-        }
-    )
-    blocks = tuple(
-        CatalogRecord(
-            **{
-                **record.__dict__,
-                "metadata": {**dict(record.metadata), "scope": private_scope},
-            }
-        )
-        for record in (_memory_block(9_999, block_index) for block_index in range(10_000))
-    )
+    blocks = tuple(_memory_block(9_999, block_index) for block_index in range(10_000))
     store.replace_memory_document_projection(
         document,
         blocks,
@@ -429,7 +415,6 @@ def test_document_identity_bounds_10000_blocks_before_document_and_block_top_k(
             query_intent=RetrievalQueryIntent.EXACT,
             candidate_limit=3,
             final_limit=3,
-            token_budget=1_024,
         )
     )
     document_filters, document_limit = catalog_calls[-1]
@@ -454,7 +439,6 @@ def test_document_identity_bounds_10000_blocks_before_document_and_block_top_k(
             query_intent=RetrievalQueryIntent.CURRENT,
             candidate_limit=7,
             final_limit=7,
-            token_budget=1_024,
         )
     )
     block_filters, block_limit = catalog_calls[-1]
@@ -590,7 +574,6 @@ def test_online_sdk_chain_never_enumerates_sources_vectors_or_archive_tree(
     vector = _NoEnumerationVector()
     client = MemoryOSClient(
         str(tmp_path),
-        tenant_id="tenant-a",
         vector_store=vector,
         embedding_provider=_Embedding(),
     )
@@ -608,15 +591,14 @@ def test_online_sdk_chain_never_enumerates_sources_vectors_or_archive_tree(
         ],
         async_commit=False,
         project_id="memoryOS",
-        tenant_id="tenant-a",
     )
-    tool = cast(SQLiteIndexStore, client.index_store).list_catalog(
-        tenant_id="tenant-a",
-        filters={"tenant_id": "tenant-a", "record_kinds": (CatalogRecordKind.TOOL_RESULT.value,)},
+    tool = cast(SQLiteIndexStore, client.runtime.stores.index).list_catalog(
+        tenant_id="default",
+        filters={"tenant_id": "default", "record_kinds": (CatalogRecordKind.TOOL_RESULT.value,)},
         limit=10,
     )[0]
     vector.upsert_vector(
-        vector_row_id("tenant-a", tool.record_key),
+        vector_row_id("default", tool.record_key),
         [1.0, 1.0],
         catalog_vector_metadata(tool),
     )
@@ -625,7 +607,7 @@ def test_online_sdk_chain_never_enumerates_sources_vectors_or_archive_tree(
     def prohibited(*_args: Any, **_kwargs: Any) -> Any:
         raise AssertionError("online retrieval attempted a prohibited full scan")
 
-    monkeypatch.setattr(client.source_store, "list_objects", prohibited)
+    monkeypatch.setattr(client.runtime.stores.source, "list_objects", prohibited)
     monkeypatch.setattr(Path, "glob", prohibited)
     monkeypatch.setattr(Path, "rglob", prohibited)
 
@@ -633,20 +615,18 @@ def test_online_sdk_chain_never_enumerates_sources_vectors_or_archive_tree(
         target_paths=("resources/repository",),
         context_types=(ContextType.SESSION,),
         record_kinds=(CatalogRecordKind.TOOL_RESULT.value,),
-        tenant_id="tenant-a",
+        tenant_id="default",
         owner_user_id="u1",
         workspace_ids=("memoryOS",),
         query_intent=RetrievalQueryIntent.OPEN_RECALL,
         candidate_limit=25,
         final_limit=10,
-        token_budget=1_024,
     )
     hits = client.search_context(
         "bounded-report.txt",
         options=options,
         user_id="u1",
         project_id="memoryOS",
-        tenant_id="tenant-a",
     )
     trace = client.recall_trace(client.last_recall_trace_id)
 

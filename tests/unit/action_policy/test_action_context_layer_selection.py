@@ -3,13 +3,13 @@ from __future__ import annotations
 import tempfile
 import unittest
 
-from memoryos.action_policy.model.action_policy import ActionCandidate, ActionPolicy
-from memoryos.contextdb.model.context_layer import ContextLayers
-from memoryos.contextdb.model.context_object import ContextObject
-from memoryos.contextdb.model.context_relation import ContextRelation
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.store.local_stores import FileSystemSourceStore, InMemoryIndexStore, InMemoryRelationStore
-from memoryos.prediction.pipeline.action_context_builder import ActionContextBuilder
+from infrastructure.store.model.context.context_layer import ContextLayers
+from infrastructure.store.model.context.context_object import ContextObject
+from infrastructure.store.model.context.context_relation import ContextRelation
+from infrastructure.store.model.context.context_type import ContextType
+from policy.action_policy.decision.context_builder import ActionContextBuilder
+from policy.action_policy.model.action_policy import ActionCandidate, ActionPolicy
+from tests.support.persistence import FileSystemSourceStore, InMemoryIndexStore, InMemoryRelationStore
 
 
 class ActionContextLayerSelectionTest(unittest.TestCase):
@@ -43,8 +43,8 @@ class ActionContextLayerSelectionTest(unittest.TestCase):
                 ),
                 tenant_id="default",
             )
-            candidate = ActionCandidate(action="turn_on_ac", score=0.9, policy_uri=policy.uri, reason="test")
-            context = ActionContextBuilder(index, source_store=source, relation_store=relations).build("u1", [candidate], [policy], token_budget=1000)
+            candidate = ActionCandidate(action="turn_on_ac", score=0.8, policy_uri=policy.uri, reason="test")
+            context = ActionContextBuilder(index, source_store=source, relation_store=relations).build("u1", [candidate], [policy])
             anchor_item = context.packed_context["slices"]["support_anchor"]["items"][0]
             self.assertEqual(anchor_item["content"], "L1 text")
             policy_item = context.packed_context["slices"]["action_policy"]["items"][0]
@@ -76,7 +76,7 @@ class ActionContextLayerSelectionTest(unittest.TestCase):
                 tenant_id="default",
             )
             candidate = ActionCandidate(action="turn_on_ac", score=0.9, policy_uri=policy.uri, reason="test")
-            context = ActionContextBuilder(index, source_store=source, relation_store=relations).build("u1", [candidate], [policy], token_budget=100)
+            context = ActionContextBuilder(index, source_store=source, relation_store=relations).build("u1", [candidate], [policy])
             self.assertEqual(context.packed_context["slices"]["support_anchor"]["items"][0]["content"], "summary text")
 
 

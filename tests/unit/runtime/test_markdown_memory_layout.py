@@ -9,19 +9,13 @@ from pathlib import Path
 
 import pytest
 
-from memoryos.adapters.persistence.filesystem.memory_document_store import FileSystemMemoryDocumentStore
-from memoryos.contextdb.store.queue_store import QueueJob
-from memoryos.core.readiness import RuntimeNotReadyError
-from memoryos.memory.documents.bootstrap import MemoryDocumentBootstrapper
-from memoryos.memory.documents.control_store import MemoryDocumentControlStore
-from memoryos.memory.documents.erase import DocumentEraseStatus, MemoryDocumentEraseStore
-from memoryos.memory.documents.frontmatter import (
-    matches_adopted_source,
-    new_document_id,
-    parse_front_matter,
-    render_new_document,
-)
-from memoryos.memory.documents.layout import (
+from foundation.readiness import RuntimeNotReadyError
+from infrastructure.store.contracts.queue import QueueJob
+from infrastructure.store.filesystem.memory_document_store import FileSystemMemoryDocumentStore
+from infrastructure.store.memory.bootstrap import MemoryDocumentBootstrapper
+from infrastructure.store.memory.control_store import MemoryDocumentControlStore
+from infrastructure.store.memory.erasure_store import MemoryDocumentEraseStore
+from infrastructure.store.memory.layout import (
     RUNTIME_LAYOUT_SCHEMA,
     RuntimeLayout,
     RuntimeResetRequired,
@@ -29,16 +23,18 @@ from memoryos.memory.documents.layout import (
     tenant_control_root,
     user_memory_root,
 )
-from memoryos.memory.documents.model import ABSENT
-from memoryos.memory.documents.store import DocumentConflictError, DocumentUnsafeError
-from memoryos.runtime import RuntimeConfig
-from memoryos.runtime.container import build_runtime_container
-from memoryos.security.trusted_context import (
-    AUTHORITATIVE_FORGET,
-    AUTHORITATIVE_REMEMBER,
-    READ_CONTEXT,
-    TrustedRequestContext,
+from memory.commit.erase import DocumentEraseStatus
+from memory.core.model import ABSENT
+from memory.core.structure.frontmatter import (
+    matches_adopted_source,
+    new_document_id,
+    parse_front_matter,
+    render_new_document,
 )
+from memory.ports.document_store import DocumentConflictError, DocumentUnsafeError
+from foundation.identity import LocalUserContext
+from runtime.config import RuntimeConfig
+from tests.support.runtime import build_test_runtime
 
 
 def test_default_control_and_all_user_sources_follow_trusted_tenant_layout(tmp_path: Path) -> None:
@@ -91,7 +87,7 @@ def test_filesystem_probe_precedes_all_sqlite_serving_initialization(
         reject_probe,
     )
     with pytest.raises(DocumentUnsafeError, match="probe rejected"):
-        build_runtime_container(RuntimeConfig(root=str(root)))
+        build_test_runtime(RuntimeConfig(root=str(root)))
 
     assert (root / "system" / "runtime-layout.json").is_file()
     assert not list(root.rglob("*.sqlite3"))
@@ -225,9 +221,7 @@ def test_bootstrap_refuses_preexisting_unmanaged_tree(tmp_path: Path) -> None:
             tmp_path,
             FileSystemMemoryDocumentStore(tmp_path),
             control_store=MemoryDocumentControlStore(tmp_path),
-        ).ensure_user(
-            "default", "alice"
-        )
+        ).ensure_user("default", "alice")
 
     assert user_file.read_bytes() == b"# Existing user data\n"
 
@@ -372,17 +366,17 @@ def test_bootstrap_publishes_root_identity_before_completed_marker_and_replays(
 
 
 def test_startup_replays_durable_pending_erasure_before_scan_and_rebuild(tmp_path: Path) -> None:
-    first = build_runtime_container(RuntimeConfig(root=str(tmp_path)))
+    first = build_test_runtime(RuntimeConfig(root=str(tmp_path)))
     document_id = new_document_id()
     relative_path = "knowledge/topics/startup-erasure.md"
-    created = first.memory_document_store.create(
+    created = first.memory.document_store.create(
         "default",
         "u1",
         relative_path,
         render_new_document(document_id, "# Startup erasure\n\nSTARTUP_SECRET\n"),
         expected=ABSENT,
     )
-    first.memory_projection_worker.rebuild_owner("default", "u1")
+    first.memory.projection_worker.rebuild_owner("default", "u1")
     pending = MemoryDocumentEraseStore(tmp_path).begin(
         tenant_id="default",
         owner_user_id="u1",
@@ -397,16 +391,16 @@ def test_startup_replays_durable_pending_erasure_before_scan_and_rebuild(tmp_pat
     )
     assert pending.status is DocumentEraseStatus.ERASING
 
-    restarted = build_runtime_container(RuntimeConfig(root=str(tmp_path)))
+    restarted = build_test_runtime(RuntimeConfig(root=str(tmp_path)))
 
-    recovered = restarted.memory_document_eraser.erase_store.load("default", "u1", document_id)
+    recovered = restarted.memory.eraser.erase_store.load("default", "u1", document_id)
     assert recovered is not None and recovered.status is DocumentEraseStatus.ERASED
-    assert restarted.memory_document_store.read_state("default", "u1", relative_path) == ABSENT
+    assert restarted.memory.document_store.read_state("default", "u1", relative_path) == ABSENT
     assert restarted.readiness.details["memory_document_erasures"]["u1"] == {
         "completed": [document_id],
         "pending": [],
     }
-    assert restarted.memory_projection_worker._owner_document_records("default", "u1") == ()
+    assert restarted.memory.projection_worker._owner_document_records("default", "u1") == ()
 
 
 def test_startup_owner_discovery_fails_closed_at_explicit_bound(tmp_path: Path) -> None:
@@ -416,7 +410,7 @@ def test_startup_owner_discovery_fails_closed_at_explicit_bound(tmp_path: Path) 
     for index in range(1_001):
         (users_root / f"owner-{index:04d}").mkdir()
 
-    container = build_runtime_container(RuntimeConfig(root=str(tmp_path)))
+    container = build_test_runtime(RuntimeConfig(root=str(tmp_path)))
 
     snapshot = container.readiness.snapshot()
     assert snapshot["state"] == "NOT_READY"
@@ -430,15 +424,9 @@ def test_runtime_restart_resumes_exact_adoption_receipt_before_scanner(
     monkeypatch: pytest.MonkeyPatch,
     fault_stage: str,
 ) -> None:
-    first = build_runtime_container(RuntimeConfig(root=str(tmp_path)))
-    caller = TrustedRequestContext(
-        tenant_id="default",
+    first = build_test_runtime(RuntimeConfig(root=str(tmp_path)))
+    caller = LocalUserContext(
         user_id="u1",
-        actor_kind="user",
-        actor_id="u1",
-        capabilities=frozenset(
-            {READ_CONTEXT, AUTHORITATIVE_REMEMBER, AUTHORITATIVE_FORGET}
-        ),
     )
     relative_path = "knowledge/topics/runtime-restart-adopt.md"
     original = b"# Runtime restart\n\ntrusted adopt survives\n"
@@ -446,7 +434,7 @@ def test_runtime_restart_resumes_exact_adoption_receipt_before_scanner(
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(original)
     expected = hashlib.sha256(original).hexdigest()
-    durable_adopt = first.memory_document_store.adopt
+    durable_adopt = first.memory.document_store.adopt
 
     def terminate_during_source_cas(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202 - crash boundary.
         def stop_at_exact_store_stage(stage: str) -> None:
@@ -455,14 +443,14 @@ def test_runtime_restart_resumes_exact_adoption_receipt_before_scanner(
 
         return durable_adopt(*args, **kwargs, fault_hook=stop_at_exact_store_stage)
 
-    monkeypatch.setattr(first.memory_document_store, "adopt", terminate_during_source_cas)
+    monkeypatch.setattr(first.memory.document_store, "adopt", terminate_during_source_cas)
     with pytest.raises(RuntimeError, match="process terminated"):
-        first.memory_command_service.adopt_memory_document(
+        first.memory.command_service.adopt_memory_document(
             relative_path,
             expected,
             caller=caller,
         )
-    receipts = first.memory_document_control_store.adoption_receipts(
+    receipts = first.memory.control_store.adoption_receipts(
         "default",
         "u1",
     )
@@ -470,11 +458,14 @@ def test_runtime_restart_resumes_exact_adoption_receipt_before_scanner(
     receipt = receipts[0]
     assert receipt.relative_path == relative_path
     assert receipt.expected_raw_sha256 == expected
-    assert first.memory_document_control_store.load_control(
-        "default",
-        "u1",
-        receipt.document_id,
-    ) is None
+    assert (
+        first.memory.control_store.load_control(
+            "default",
+            "u1",
+            receipt.document_id,
+        )
+        is None
+    )
     if fault_stage == "temp_file_fsynced":
         assert path.read_bytes() == original
         assert len(tuple(path.parent.glob(f".{path.name}.memoryos-*.tmp"))) == 1
@@ -494,7 +485,7 @@ def test_runtime_restart_resumes_exact_adoption_receipt_before_scanner(
 
     monkeypatch.setattr(FileSystemMemoryDocumentStore, "adopt", observe_resumed_adopt)
 
-    restarted = build_runtime_container(RuntimeConfig(root=str(tmp_path)))
+    restarted = build_test_runtime(RuntimeConfig(root=str(tmp_path)))
 
     restarted.readiness.require_ready()
     if fault_stage == "temp_file_fsynced":
@@ -508,7 +499,7 @@ def test_runtime_restart_resumes_exact_adoption_receipt_before_scanner(
     else:
         assert resumed_adopts == []
     assert not tuple(path.parent.glob(f".{path.name}.memoryos-*.tmp"))
-    control = restarted.memory_document_control_store.load_control(
+    control = restarted.memory.control_store.load_control(
         "default",
         "u1",
         receipt.document_id,
@@ -521,7 +512,7 @@ def test_runtime_restart_resumes_exact_adoption_receipt_before_scanner(
         receipt.document_id,
         receipt.expected_raw_sha256,
     )
-    binding = restarted.memory_document_control_store.load_event_binding(
+    binding = restarted.memory.control_store.load_event_binding(
         "default",
         "u1",
         receipt.document_id,
@@ -534,7 +525,7 @@ def test_runtime_restart_resumes_exact_adoption_receipt_before_scanner(
     assert event.evidence_digest == receipt.evidence_digest
     projected = [
         record
-        for record in restarted.memory_projection_worker._owner_document_records(
+        for record in restarted.memory.projection_worker._owner_document_records(
             "default",
             "u1",
         )
@@ -546,10 +537,8 @@ def test_runtime_restart_resumes_exact_adoption_receipt_before_scanner(
     assert '"status":"COMPLETED"' in marker.read_text(encoding="utf-8")
     adoption_recovery = restarted.readiness.details["memory_document_adoptions"]
     assert adoption_recovery["published"] == 1
-    assert adoption_recovery[
-        "resumed_unmanaged" if fault_stage == "temp_file_fsynced" else "resumed_managed"
-    ] == 1
-    remembered = restarted.memory_command_service.remember(
+    assert adoption_recovery["resumed_unmanaged" if fault_stage == "temp_file_fsynced" else "resumed_managed"] == 1
+    remembered = restarted.memory.command_service.remember(
         "remember immediately after recovered startup",
         target_hint="topic:restarted-runtime",
         caller=caller,
@@ -561,20 +550,16 @@ def test_runtime_restart_finishes_committed_adoption_bootstrap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    first = build_runtime_container(RuntimeConfig(root=str(tmp_path)))
-    caller = TrustedRequestContext(
-        tenant_id="default",
+    first = build_test_runtime(RuntimeConfig(root=str(tmp_path)))
+    caller = LocalUserContext(
         user_id="u1",
-        actor_kind="user",
-        actor_id="u1",
-        capabilities=frozenset({READ_CONTEXT, AUTHORITATIVE_REMEMBER}),
     )
     relative_path = "knowledge/topics/adoption-control-before-bootstrap.md"
     path = user_memory_root(tmp_path, "default", "u1") / relative_path
     path.parent.mkdir(parents=True, exist_ok=True)
     unmanaged = b"# Control before bootstrap\n\ncommitted adoption survives\n"
     path.write_bytes(unmanaged)
-    interrupted_bootstrapper = first.memory_document_bootstrapper
+    interrupted_bootstrapper = first.memory.bootstrapper
     durable_ensure = MemoryDocumentBootstrapper.ensure_adopted_user
 
     def stop_before_bootstrap(self, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
@@ -588,28 +573,31 @@ def test_runtime_restart_finishes_committed_adoption_bootstrap(
         stop_before_bootstrap,
     )
     with pytest.raises(RuntimeError, match="after adoption control"):
-        first.memory_command_service.adopt_memory_document(
+        first.memory.command_service.adopt_memory_document(
             relative_path,
             hashlib.sha256(unmanaged).hexdigest(),
             caller=caller,
         )
-    receipt = first.memory_document_control_store.adoption_receipts("default", "u1")[0]
-    control = first.memory_document_control_store.load_control(
+    receipt = first.memory.control_store.adoption_receipts("default", "u1")[0]
+    control = first.memory.control_store.load_control(
         "default",
         "u1",
         receipt.document_id,
     )
     assert control is not None
-    assert first.memory_document_control_store.load_event_binding(
-        "default",
-        "u1",
-        receipt.document_id,
-        control.last_event_id,
-    ) is not None
+    assert (
+        first.memory.control_store.load_event_binding(
+            "default",
+            "u1",
+            receipt.document_id,
+            control.last_event_id,
+        )
+        is not None
+    )
     marker = tmp_path / "system" / "memory-documents" / "u1" / "bootstrap.json"
     assert not marker.exists()
 
-    restarted = build_runtime_container(RuntimeConfig(root=str(tmp_path)))
+    restarted = build_test_runtime(RuntimeConfig(root=str(tmp_path)))
 
     restarted.readiness.require_ready()
     assert '"status":"COMPLETED"' in marker.read_text(encoding="utf-8")
@@ -617,7 +605,7 @@ def test_runtime_restart_finishes_committed_adoption_bootstrap(
     assert recovery["already_committed"] == 1
     assert recovery["bootstrap_resumed"] == 1
     assert recovery["published"] == 0
-    remembered = restarted.memory_command_service.remember(
+    remembered = restarted.memory.command_service.remember(
         "remember works immediately after bootstrap-only recovery",
         target_hint="topic:bootstrap-recovered",
         caller=caller,
@@ -640,20 +628,16 @@ def test_runtime_adoption_receipt_preserves_unsafe_or_third_state(
     fault_stage: str,
     reason: str,
 ) -> None:
-    first = build_runtime_container(RuntimeConfig(root=str(tmp_path)))
-    caller = TrustedRequestContext(
-        tenant_id="default",
+    first = build_test_runtime(RuntimeConfig(root=str(tmp_path)))
+    caller = LocalUserContext(
         user_id="u1",
-        actor_kind="user",
-        actor_id="u1",
-        capabilities=frozenset({READ_CONTEXT, AUTHORITATIVE_REMEMBER}),
     )
     relative_path = "knowledge/topics/adoption-third-state.md"
     path = user_memory_root(tmp_path, "default", "u1") / relative_path
     path.parent.mkdir(parents=True, exist_ok=True)
     original = b"# Adoption third state\n\noriginal unmanaged bytes\n"
     path.write_bytes(original)
-    durable_adopt = first.memory_document_store.adopt
+    durable_adopt = first.memory.document_store.adopt
 
     def terminate_during_source_cas(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
         def stop_at_exact_store_stage(stage: str) -> None:
@@ -662,14 +646,14 @@ def test_runtime_adoption_receipt_preserves_unsafe_or_third_state(
 
         return durable_adopt(*args, **kwargs, fault_hook=stop_at_exact_store_stage)
 
-    monkeypatch.setattr(first.memory_document_store, "adopt", terminate_during_source_cas)
+    monkeypatch.setattr(first.memory.document_store, "adopt", terminate_during_source_cas)
     with pytest.raises(RuntimeError, match="process terminated"):
-        first.memory_command_service.adopt_memory_document(
+        first.memory.command_service.adopt_memory_document(
             relative_path,
             hashlib.sha256(original).hexdigest(),
             caller=caller,
         )
-    receipt = first.memory_document_control_store.adoption_receipts("default", "u1")[0]
+    receipt = first.memory.control_store.adoption_receipts("default", "u1")[0]
 
     duplicate_path: Path | None = None
     outside: Path | None = None
@@ -684,17 +668,20 @@ def test_runtime_adoption_receipt_preserves_unsafe_or_third_state(
         duplicate_path = path.with_name("adoption-duplicate.md")
         duplicate_path.write_bytes(path.read_bytes())
 
-    restarted = build_runtime_container(RuntimeConfig(root=str(tmp_path)))
+    restarted = build_test_runtime(RuntimeConfig(root=str(tmp_path)))
 
     snapshot = restarted.readiness.snapshot()
     assert snapshot["state"] == "NOT_READY"
     assert any(reason in item for item in snapshot["reasons"])
     assert "memory_full_scan" not in snapshot["details"]
-    assert restarted.memory_document_control_store.load_control(
-        "default",
-        "u1",
-        receipt.document_id,
-    ) is None
+    assert (
+        restarted.memory.control_store.load_control(
+            "default",
+            "u1",
+            receipt.document_id,
+        )
+        is None
+    )
     if third_state == "edited":
         assert b"user changed this after the crash" in path.read_bytes()
     elif third_state == "unsafe":
@@ -708,26 +695,22 @@ def test_runtime_adoption_receipt_preserves_unsafe_or_third_state(
 def test_runtime_restart_treats_renamed_edited_adoption_receipt_as_history(
     tmp_path: Path,
 ) -> None:
-    first = build_runtime_container(RuntimeConfig(root=str(tmp_path)))
-    caller = TrustedRequestContext(
-        tenant_id="default",
+    first = build_test_runtime(RuntimeConfig(root=str(tmp_path)))
+    caller = LocalUserContext(
         user_id="u1",
-        actor_kind="user",
-        actor_id="u1",
-        capabilities=frozenset({READ_CONTEXT, AUTHORITATIVE_REMEMBER}),
     )
     original_path = "knowledge/topics/adoption-history.md"
     source = user_memory_root(tmp_path, "default", "u1") / original_path
     source.parent.mkdir(parents=True, exist_ok=True)
     unmanaged = b"# Adoption history\n\noriginal unmanaged bytes\n"
     source.write_bytes(unmanaged)
-    adopted = first.memory_command_service.adopt_memory_document(
+    adopted = first.memory.command_service.adopt_memory_document(
         original_path,
         hashlib.sha256(unmanaged).hexdigest(),
         caller=caller,
     )
     renamed_path = "knowledge/topics/adoption-history-renamed.md"
-    renamed = first.memory_command_service.rename_memory_document(
+    renamed = first.memory.command_service.rename_memory_document(
         adopted.document_uri,
         renamed_path,
         adopted.source_digest,
@@ -735,10 +718,10 @@ def test_runtime_restart_treats_renamed_edited_adoption_receipt_as_history(
         caller=caller,
     )
 
-    restarted = build_runtime_container(RuntimeConfig(root=str(tmp_path)))
+    restarted = build_test_runtime(RuntimeConfig(root=str(tmp_path)))
 
     restarted.readiness.require_ready()
-    control = restarted.memory_document_control_store.load_control(
+    control = restarted.memory.control_store.load_control(
         "default",
         "u1",
         adopted.document_id,
@@ -748,8 +731,8 @@ def test_runtime_restart_treats_renamed_edited_adoption_receipt_as_history(
     assert control.raw_sha256 == renamed.source_digest
     assert restarted.readiness.details["memory_document_adoptions"]["already_committed"] == 1
     assert restarted.readiness.details["memory_document_adoptions"]["published"] == 0
-    assert restarted.memory_document_store.read_state("default", "u1", original_path) == ABSENT
-    assert b"legitimately changed later" in restarted.memory_document_store.read_raw(
+    assert restarted.memory.document_store.read_state("default", "u1", original_path) == ABSENT
+    assert b"legitimately changed later" in restarted.memory.document_store.read_raw(
         "default",
         "u1",
         document_id=adopted.document_id,
@@ -759,31 +742,27 @@ def test_runtime_restart_treats_renamed_edited_adoption_receipt_as_history(
 def test_runtime_restart_does_not_resurrect_hard_erased_adoption_receipt(
     tmp_path: Path,
 ) -> None:
-    first = build_runtime_container(RuntimeConfig(root=str(tmp_path)))
-    caller = TrustedRequestContext(
-        tenant_id="default",
+    first = build_test_runtime(RuntimeConfig(root=str(tmp_path)))
+    caller = LocalUserContext(
         user_id="u1",
-        actor_kind="user",
-        actor_id="u1",
-        capabilities=frozenset({READ_CONTEXT, AUTHORITATIVE_REMEMBER}),
     )
     relative_path = "knowledge/topics/adoption-hard-erased.md"
     path = user_memory_root(tmp_path, "default", "u1") / relative_path
     path.parent.mkdir(parents=True, exist_ok=True)
     unmanaged = b"# Erased adoption\n\nthis body must never return\n"
     path.write_bytes(unmanaged)
-    adopted = first.memory_command_service.adopt_memory_document(
+    adopted = first.memory.command_service.adopt_memory_document(
         relative_path,
         hashlib.sha256(unmanaged).hexdigest(),
         caller=caller,
     )
-    receipt = first.memory_document_control_store.load_adoption_receipt_for_document(
+    receipt = first.memory.control_store.load_adoption_receipt_for_document(
         "default",
         "u1",
         adopted.document_id,
     )
     assert receipt is not None
-    erased = first.memory_document_eraser.hard_erase(
+    erased = first.memory.eraser.hard_erase(
         tenant_id="default",
         owner_user_id="u1",
         document_id=adopted.document_id,
@@ -792,24 +771,30 @@ def test_runtime_restart_does_not_resurrect_hard_erased_adoption_receipt(
     )
     assert erased.completed is True
 
-    restarted = build_runtime_container(RuntimeConfig(root=str(tmp_path)))
+    restarted = build_test_runtime(RuntimeConfig(root=str(tmp_path)))
 
     restarted.readiness.require_ready()
-    assert restarted.memory_document_store.read_state("default", "u1", relative_path) == ABSENT
-    assert restarted.memory_document_control_store.load_control(
-        "default",
-        "u1",
-        adopted.document_id,
-    ) is None
-    assert restarted.memory_document_control_store.load_adoption_receipt_for_document(
-        "default",
-        "u1",
-        adopted.document_id,
-    ) == receipt
+    assert restarted.memory.document_store.read_state("default", "u1", relative_path) == ABSENT
+    assert (
+        restarted.memory.control_store.load_control(
+            "default",
+            "u1",
+            adopted.document_id,
+        )
+        is None
+    )
+    assert (
+        restarted.memory.control_store.load_adoption_receipt_for_document(
+            "default",
+            "u1",
+            adopted.document_id,
+        )
+        == receipt
+    )
     assert restarted.readiness.details["memory_document_adoptions"]["erasure_blocked"] == 1
     assert restarted.readiness.details["memory_document_adoptions"]["published"] == 0
     with pytest.raises(DocumentConflictError, match="durable erasure epoch"):
-        restarted.memory_document_committer.erasure_store.assert_mutation_allowed(
+        restarted.memory.committer.erasure_store.assert_mutation_allowed(
             "default",
             "u1",
             adopted.document_id,
@@ -821,17 +806,11 @@ def test_runtime_restart_seeds_scanner_from_durable_controls(
     tmp_path: Path,
     offline_change: str,
 ) -> None:
-    first = build_runtime_container(RuntimeConfig(root=str(tmp_path)))
-    caller = TrustedRequestContext(
-        tenant_id="default",
+    first = build_test_runtime(RuntimeConfig(root=str(tmp_path)))
+    caller = LocalUserContext(
         user_id="u1",
-        actor_kind="user",
-        actor_id="u1",
-        capabilities=frozenset(
-            {READ_CONTEXT, AUTHORITATIVE_REMEMBER, AUTHORITATIVE_FORGET}
-        ),
     )
-    remembered = first.memory_command_service.remember(
+    remembered = first.memory.command_service.remember(
         f"offline {offline_change} before",
         target_hint=f"topic:offline-{offline_change}",
         caller=caller,
@@ -864,19 +843,12 @@ def test_runtime_restart_seeds_scanner_from_durable_controls(
         # One startup observation is only a pending absence.  Durable control
         # remains live until the scanner worker sees the same absence again.
 
-    event_directory = (
-        tmp_path
-        / "system"
-        / "memory-documents"
-        / "u1"
-        / "events"
-        / remembered.document_id
-    )
+    event_directory = tmp_path / "system" / "memory-documents" / "u1" / "events" / remembered.document_id
     before_event_count = len(tuple(event_directory.glob("*.json")))
-    restarted = build_runtime_container(RuntimeConfig(root=str(tmp_path)))
+    restarted = build_test_runtime(RuntimeConfig(root=str(tmp_path)))
 
     restarted.readiness.require_ready()
-    control = restarted.memory_document_control_store.load_control(
+    control = restarted.memory.control_store.load_control(
         "default",
         "u1",
         remembered.document_id,
@@ -886,7 +858,7 @@ def test_runtime_restart_seeds_scanner_from_durable_controls(
     assert control.relative_path == expected_path
     assert control.raw_sha256 == expected_digest
     assert control.logical_revision == expected_revision
-    revision = restarted.memory_document_revision_store.load_revision(
+    revision = restarted.memory.revision_store.load_revision(
         "default",
         "u1",
         remembered.document_id,
@@ -902,21 +874,25 @@ def test_runtime_restart_seeds_scanner_from_durable_controls(
         assert event_payload["actor_binding"] == "external-editor:stable-full-scan"
         assert str(event_payload["evidence_reference"]).startswith("scan-generation:")
     if offline_change in {"edit", "rename_edit"}:
-        assert restarted.memory_document_revision_store.read_revision_blob(
-            "default",
-            "u1",
-            remembered.document_id,
-            2,
-        ) == updated_raw
+        assert (
+            restarted.memory.revision_store.read_revision_blob(
+                "default",
+                "u1",
+                remembered.document_id,
+                2,
+            )
+            == updated_raw
+        )
     if offline_change == "delete":
         assert restarted.readiness.details["memory_full_scan"]["u1"]["pending"] == 1
         verification = restarted.readiness.details["memory_document_verification"]["u1"]
         assert verification.get("pending_missing", 0) in {0, 1}
-        assert restarted.memory_document_control_store.load_publication_barrier(
-            "default", "u1", remembered.document_id
-        ) is None
-        restarted.memory_document_scanner.stability_seconds = 0
-        restarted.queue_store.enqueue(
+        assert (
+            restarted.memory.control_store.load_publication_barrier("default", "u1", remembered.document_id)
+            is None
+        )
+        restarted.memory.scanner.stability_seconds = 0
+        restarted.stores.queue.enqueue(
             QueueJob(
                 job_id=f"test_memory_rescan_{remembered.document_id}",
                 queue_name="memory_document_scan",
@@ -930,18 +906,16 @@ def test_runtime_restart_seeds_scanner_from_durable_controls(
                 },
             )
         )
-        scan_run = restarted.memory_document_scan_worker.process_pending()
+        scan_run = restarted.memory.scan_worker.process_pending()
         assert scan_run["processed"] == 1
-        projection_run = restarted.memory_projection_worker.process_pending(limit=10)
+        projection_run = restarted.memory.projection_worker.process_pending(limit=10)
         assert not projection_run.failed
-        deleted = restarted.memory_document_control_store.load_control(
-            "default", "u1", remembered.document_id
-        )
+        deleted = restarted.memory.control_store.load_control("default", "u1", remembered.document_id)
         assert deleted is not None
         assert deleted.status == "deleted"
         assert deleted.raw_sha256 == ""
         assert deleted.logical_revision == 2
-        deletion_revision = restarted.memory_document_revision_store.load_revision(
+        deletion_revision = restarted.memory.revision_store.load_revision(
             "default", "u1", remembered.document_id, 2
         )
         assert deletion_revision is not None
@@ -950,17 +924,11 @@ def test_runtime_restart_seeds_scanner_from_durable_controls(
 
 
 def test_runtime_restart_rejects_replaced_user_memory_root(tmp_path: Path) -> None:
-    first = build_runtime_container(RuntimeConfig(root=str(tmp_path)))
-    caller = TrustedRequestContext(
-        tenant_id="default",
+    first = build_test_runtime(RuntimeConfig(root=str(tmp_path)))
+    caller = LocalUserContext(
         user_id="u1",
-        actor_kind="user",
-        actor_id="u1",
-        capabilities=frozenset(
-            {READ_CONTEXT, AUTHORITATIVE_REMEMBER, AUTHORITATIVE_FORGET}
-        ),
     )
-    remembered = first.memory_command_service.remember(
+    remembered = first.memory.command_service.remember(
         "root replacement must not become delete authority",
         target_hint="topic:root-replacement",
         caller=caller,
@@ -971,11 +939,11 @@ def test_runtime_restart_rejects_replaced_user_memory_root(tmp_path: Path) -> No
     memory_root.rename(detached_root)
     memory_root.mkdir()
 
-    restarted = build_runtime_container(RuntimeConfig(root=str(tmp_path)))
+    restarted = build_test_runtime(RuntimeConfig(root=str(tmp_path)))
 
     with pytest.raises(RuntimeNotReadyError):
         restarted.readiness.require_ready()
-    control = restarted.memory_document_control_store.load_control(
+    control = restarted.memory.control_store.load_control(
         "default",
         "u1",
         remembered.document_id,
@@ -989,17 +957,11 @@ def test_runtime_restart_rejects_replaced_user_memory_root(tmp_path: Path) -> No
 
 
 def test_runtime_restart_pauses_delete_without_durable_root_identity(tmp_path: Path) -> None:
-    first = build_runtime_container(RuntimeConfig(root=str(tmp_path)))
-    caller = TrustedRequestContext(
-        tenant_id="default",
+    first = build_test_runtime(RuntimeConfig(root=str(tmp_path)))
+    caller = LocalUserContext(
         user_id="u1",
-        actor_kind="user",
-        actor_id="u1",
-        capabilities=frozenset(
-            {READ_CONTEXT, AUTHORITATIVE_REMEMBER, AUTHORITATIVE_FORGET}
-        ),
     )
-    remembered = first.memory_command_service.remember(
+    remembered = first.memory.command_service.remember(
         "missing identity must pause delete",
         target_hint="topic:missing-root-identity",
         caller=caller,
@@ -1010,11 +972,11 @@ def test_runtime_restart_pauses_delete_without_durable_root_identity(tmp_path: P
     source_path = user_memory_root(tmp_path, "default", "u1") / remembered.relative_path
     source_path.unlink()
 
-    restarted = build_runtime_container(RuntimeConfig(root=str(tmp_path)))
+    restarted = build_test_runtime(RuntimeConfig(root=str(tmp_path)))
 
     with pytest.raises(RuntimeNotReadyError):
         restarted.readiness.require_ready()
-    control = restarted.memory_document_control_store.load_control(
+    control = restarted.memory.control_store.load_control(
         "default",
         "u1",
         remembered.document_id,
@@ -1025,27 +987,21 @@ def test_runtime_restart_pauses_delete_without_durable_root_identity(tmp_path: P
 
 
 def test_completed_bootstrap_never_recreates_a_missing_root_identity(tmp_path: Path) -> None:
-    container = build_runtime_container(RuntimeConfig(root=str(tmp_path)))
-    caller = TrustedRequestContext(
-        tenant_id="default",
+    container = build_test_runtime(RuntimeConfig(root=str(tmp_path)))
+    caller = LocalUserContext(
         user_id="u1",
-        actor_kind="user",
-        actor_id="u1",
-        capabilities=frozenset(
-            {READ_CONTEXT, AUTHORITATIVE_REMEMBER, AUTHORITATIVE_FORGET}
-        ),
     )
-    container.memory_command_service.remember(
+    container.memory.command_service.remember(
         "completed marker cannot recreate root authority",
         target_hint="topic:completed-root-authority",
         caller=caller,
     )
-    assert container.memory_document_control_store.controls("default", "u1")
+    assert container.memory.control_store.controls("default", "u1")
     identity_path = tmp_path / "system" / "memory-documents" / "u1" / "scan-root.json"
     identity_path.unlink()
 
     with pytest.raises(RuntimeResetRequired, match="missing its durable document root identity"):
-        container.memory_document_bootstrapper.ensure_user("default", "u1")
+        container.memory.bootstrapper.ensure_user("default", "u1")
 
     assert not identity_path.exists()
 
@@ -1053,22 +1009,16 @@ def test_completed_bootstrap_never_recreates_a_missing_root_identity(tmp_path: P
 def test_missing_identity_cannot_bless_a_same_bytes_replacement_then_delete(
     tmp_path: Path,
 ) -> None:
-    first = build_runtime_container(RuntimeConfig(root=str(tmp_path)))
-    caller = TrustedRequestContext(
-        tenant_id="default",
+    first = build_test_runtime(RuntimeConfig(root=str(tmp_path)))
+    caller = LocalUserContext(
         user_id="u1",
-        actor_kind="user",
-        actor_id="u1",
-        capabilities=frozenset(
-            {READ_CONTEXT, AUTHORITATIVE_REMEMBER, AUTHORITATIVE_FORGET}
-        ),
     )
-    remembered = first.memory_command_service.remember(
+    remembered = first.memory.command_service.remember(
         "same bytes replacement must not gain delete authority",
         target_hint="topic:same-bytes-root-replacement",
         caller=caller,
     )
-    control_before = first.memory_document_control_store.load_control(
+    control_before = first.memory.control_store.load_control(
         "default",
         "u1",
         remembered.document_id,
@@ -1081,29 +1031,35 @@ def test_missing_identity_cannot_bless_a_same_bytes_replacement_then_delete(
     memory_root.rename(detached_root)
     shutil.copytree(detached_root, memory_root)
 
-    restarted = build_runtime_container(RuntimeConfig(root=str(tmp_path)))
+    restarted = build_test_runtime(RuntimeConfig(root=str(tmp_path)))
 
     with pytest.raises(RuntimeNotReadyError):
         restarted.readiness.require_ready()
     assert not identity_path.exists()
-    assert restarted.memory_document_control_store.load_control(
-        "default",
-        "u1",
-        remembered.document_id,
-    ) == control_before
+    assert (
+        restarted.memory.control_store.load_control(
+            "default",
+            "u1",
+            remembered.document_id,
+        )
+        == control_before
+    )
     replacement_path = memory_root / remembered.relative_path
     assert replacement_path.read_bytes() == (detached_root / remembered.relative_path).read_bytes()
 
     replacement_path.unlink()
-    second = restarted.memory_document_scanner.scan("default", "u1", force_stable=True)
+    second = restarted.memory.scanner.scan("default", "u1", force_stable=True)
 
     assert second.deletions_paused is True
     assert second.confirmed_changes == ()
-    assert restarted.memory_document_control_store.load_control(
-        "default",
-        "u1",
-        remembered.document_id,
-    ) == control_before
+    assert (
+        restarted.memory.control_store.load_control(
+            "default",
+            "u1",
+            remembered.document_id,
+        )
+        == control_before
+    )
     assert not identity_path.exists()
 
 
@@ -1112,17 +1068,11 @@ def test_runtime_restart_rejects_unsafe_root_identity_artifact(
     tmp_path: Path,
     artifact_kind: str,
 ) -> None:
-    first = build_runtime_container(RuntimeConfig(root=str(tmp_path)))
-    caller = TrustedRequestContext(
-        tenant_id="default",
+    first = build_test_runtime(RuntimeConfig(root=str(tmp_path)))
+    caller = LocalUserContext(
         user_id="u1",
-        actor_kind="user",
-        actor_id="u1",
-        capabilities=frozenset(
-            {READ_CONTEXT, AUTHORITATIVE_REMEMBER, AUTHORITATIVE_FORGET}
-        ),
     )
-    remembered = first.memory_command_service.remember(
+    remembered = first.memory.command_service.remember(
         "root artifact integrity",
         target_hint="topic:root-artifact-integrity",
         caller=caller,
@@ -1136,11 +1086,11 @@ def test_runtime_restart_rejects_unsafe_root_identity_artifact(
         target.write_text("{}", encoding="utf-8")
         identity_path.symlink_to(target)
 
-    restarted = build_runtime_container(RuntimeConfig(root=str(tmp_path)))
+    restarted = build_test_runtime(RuntimeConfig(root=str(tmp_path)))
 
     with pytest.raises(RuntimeNotReadyError):
         restarted.readiness.require_ready()
-    control = restarted.memory_document_control_store.load_control(
+    control = restarted.memory.control_store.load_control(
         "default",
         "u1",
         remembered.document_id,

@@ -4,18 +4,18 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from memoryos.action_policy.model.action_policy import ActionCandidate, ActionPolicy
-from memoryos.contextdb.model.context_object import ContextObject
-from memoryos.contextdb.model.context_relation import ContextRelation
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.model.lifecycle import LifecycleState
-from memoryos.contextdb.store.local_stores import (
+from infrastructure.store.model.context.context_object import ContextObject
+from infrastructure.store.model.context.context_relation import ContextRelation
+from infrastructure.store.model.context.context_type import ContextType
+from infrastructure.store.model.context.lifecycle import LifecycleState
+from infrastructure.store.contracts.index import IndexHit
+from policy.action_policy.decision.context_builder import ActionContextBuilder
+from policy.action_policy.model.action_policy import ActionCandidate, ActionPolicy
+from tests.support.persistence import (
     FileSystemSourceStore,
     InMemoryIndexStore,
     InMemoryRelationStore,
 )
-from memoryos.contextdb.store.source_store import IndexHit
-from memoryos.prediction.pipeline.action_context_builder import ActionContextBuilder
 
 
 class ActionContextBuilderRelationFirstTest(unittest.TestCase):
@@ -117,7 +117,7 @@ class ActionContextBuilderRelationFirstTest(unittest.TestCase):
         self.source.write_object(obj, content=content)
         return obj
 
-    def build(self, budget: int = 2000):  # noqa: ANN201
+    def build(self):  # noqa: ANN201
         builder = ActionContextBuilder(
             self.index,
             source_store=self.source,
@@ -129,7 +129,7 @@ class ActionContextBuilderRelationFirstTest(unittest.TestCase):
             policy_uri=self.policy.uri,
             reason="test",
         )
-        return builder.build("u1", [candidate], [self.policy], token_budget=budget)
+        return builder.build("u1", [candidate], [self.policy])
 
     def test_relation_first_fetches_verified_support_resource_and_skill(self) -> None:
         slices = self.build().packed_context["slices"]
@@ -160,7 +160,7 @@ class ActionContextBuilderRelationFirstTest(unittest.TestCase):
         )
         candidate = ActionCandidate(self.policy.action, 0.9, self.policy.uri, "test")
 
-        context = builder.build("u1", [candidate], [self.policy], token_budget=2000)
+        context = builder.build("u1", [candidate], [self.policy])
 
         self.assertFalse(context.packed_context["slices"]["support_anchor"]["items"])
 
@@ -238,7 +238,7 @@ class ActionContextBuilderRelationFirstTest(unittest.TestCase):
             relation_store=InMemoryRelationStore(),
         )
         candidate = ActionCandidate(self.policy.action, 0.9, self.policy.uri, "test")
-        context = builder.build("u1", [candidate], [self.policy], token_budget=2000)
+        context = builder.build("u1", [candidate], [self.policy])
 
         self.assertFalse(context.packed_context["slices"]["support_anchor"]["items"])
 
@@ -250,7 +250,7 @@ class ActionContextBuilderRelationFirstTest(unittest.TestCase):
         )
         candidate = ActionCandidate(self.policy.action, 0.9, self.policy.uri, "test")
 
-        context = builder.build("u1", [candidate], [self.policy], token_budget=2000)
+        context = builder.build("u1", [candidate], [self.policy])
 
         self.assertFalse(context.packed_context["slices"]["support_anchor"]["items"])
         self.assertFalse(context.packed_context["slices"]["support_rules"]["items"])
@@ -275,15 +275,10 @@ class ActionContextBuilderRelationFirstTest(unittest.TestCase):
             "u1",
             [candidate],
             [self.policy],
-            token_budget=2000,
             tenant_id="tenant-b",
         )
 
         self.assertEqual(seen_tenants, ["tenant-b"])
-
-    def test_token_budget_limits_context(self) -> None:
-        self.assertLessEqual(self.build(budget=160).packed_context["used"], 160)
-
 
 if __name__ == "__main__":
     unittest.main()

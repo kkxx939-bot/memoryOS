@@ -4,30 +4,39 @@ import json
 import subprocess
 import sys
 from inspect import getsource
+from pathlib import Path
+
+from tests.support.import_graph import production_imports
+
+ROOT = Path(__file__).resolve().parents[3]
 
 
-def test_domain_package_imports_do_not_register_commit_or_evidence_handlers() -> None:
+def test_only_composition_and_delivery_layers_import_runtime() -> None:
+    """领域模块不能反向依赖进程组合根。"""
+
+    allowed_roots = {"runtime", "openApi"}
+    violations = []
+    for edge in production_imports(ROOT):
+        if edge.target != "runtime" and not edge.target.startswith("runtime."):
+            continue
+        source_root = edge.source.relative_to(ROOT).parts[0]
+        if source_root not in allowed_roots:
+            violations.append(f"{edge.source.relative_to(ROOT)}:{edge.line} -> {edge.target}")
+    assert violations == []
+
+
+def test_domain_package_imports_do_not_trigger_hidden_runtime_registration() -> None:
     code = """
 import json
+import sys
 
-from memoryos.contextdb.session.evidence_encoder import session_evidence_encoder
-from memoryos.operations.commit.domain_registry import (
-    action_policy_commit_handlers,
-)
-
-import memoryos.action_policy
-import memoryos.memory
-
-try:
-    session_evidence_encoder()
-except RuntimeError as exc:
-    encoder_error = str(exc)
-else:
-    encoder_error = ""
+import policy.action_policy
+import pre.evidence
+import memory.core
 
 print(json.dumps({
-    "action_policy_handlers": action_policy_commit_handlers() is not None,
-    "encoder_error": encoder_error,
+    "commit_registration_loaded": "policy.action_policy.integration.commit_registration" in sys.modules,
+    "legacy_encoder_module_loaded": "memory.commit.evidence.encoder" in sys.modules,
 }))
 """
     result = subprocess.run(
@@ -38,41 +47,29 @@ print(json.dumps({
     )
 
     assert json.loads(result.stdout) == {
-        "action_policy_handlers": False,
-        "encoder_error": "Session evidence encoder is not registered",
+        "commit_registration_loaded": False,
+        "legacy_encoder_module_loaded": False,
     }
 
 
-def test_runtime_build_explicitly_registers_domain_handlers_and_encoder() -> None:
+def test_runtime_build_explicitly_injects_domain_handlers_and_archive_encoder() -> None:
     code = """
 import json
 import tempfile
 
-from memoryos.contextdb.session.evidence_encoder import session_evidence_encoder
-from memoryos.operations.commit.domain_registry import (
-    action_policy_commit_handlers,
-)
-from memoryos.runtime.config import RuntimeConfig
-from memoryos.runtime.container import build_runtime_container
-
-before = {
-    "action_policy_handlers": action_policy_commit_handlers() is not None,
-}
-try:
-    session_evidence_encoder()
-except RuntimeError:
-    before["encoder"] = False
-else:
-    before["encoder"] = True
+from runtime import RuntimeBuilder, RuntimeConfig
 
 with tempfile.TemporaryDirectory() as root:
-    build_runtime_container(RuntimeConfig(root=root))
+    container = RuntimeBuilder(RuntimeConfig(root=root)).build()
+    container.start()
+    handlers_injected = bool(container.transaction.committer.domain_extensions.handlers)
+    encoder_name = type(container.session.archive_store.evidence_encoder).__name__
 
 after = {
-    "action_policy_handlers": action_policy_commit_handlers() is not None,
-    "encoder": session_evidence_encoder() is not None,
+    "domain_extensions": handlers_injected,
+    "encoder": encoder_name,
 }
-print(json.dumps({"after": after, "before": before}))
+print(json.dumps({"after": after}))
 """
     result = subprocess.run(
         [sys.executable, "-c", code],
@@ -83,25 +80,22 @@ print(json.dumps({"after": after, "before": before}))
 
     assert json.loads(result.stdout) == {
         "after": {
-            "action_policy_handlers": True,
-            "encoder": True,
-        },
-        "before": {
-            "action_policy_handlers": False,
-            "encoder": False,
+            "domain_extensions": True,
+            "encoder": "SessionEvidenceArchiveEncoder",
         },
     }
 
 
 def test_runtime_calls_consolidation_recovery_before_projection_drain(tmp_path) -> None:  # noqa: ANN001
-    from memoryos.runtime.config import RuntimeConfig
-    from memoryos.runtime.container import _recover_runtime, build_runtime_container
+    from runtime import RuntimeBuilder, RuntimeConfig
+    from runtime.recovery.coordinator import RuntimeRecoveryCoordinator
 
-    container = build_runtime_container(RuntimeConfig(root=str(tmp_path)))
+    container = RuntimeBuilder(RuntimeConfig(root=str(tmp_path))).build()
+    container.start()
 
-    assert container.memory_command_service.consolidator is container.memory_document_consolidator
-    assert container.memory_document_consolidator.saga_store is container.memory_document_consolidation_store
-    recovery_source = getsource(_recover_runtime)
+    assert container.memory.command_service.consolidator is container.memory.consolidator
+    assert container.memory.consolidator.saga_store is container.memory.consolidation_store
+    recovery_source = getsource(RuntimeRecoveryCoordinator.recover)
     intent_recovery = recovery_source.index('details["document_intents"]')
     saga_recovery = recovery_source.index('details["memory_consolidations_pre_projection"]')
     projection_drain = recovery_source.index('details["memory_projection_queue"]')

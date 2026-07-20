@@ -4,22 +4,25 @@ from pathlib import Path
 
 import pytest
 
-from memoryos.adapters.persistence.filesystem.memory_document_store import FileSystemMemoryDocumentStore
-from memoryos.adapters.persistence.in_memory.queue_store import InMemoryQueueStore
-from memoryos.contextdb.store.queue_store import QueueJob
-from memoryos.memory.documents import (
+from infrastructure.store.contracts.queue import QueueJob
+from infrastructure.store.filesystem.memory_document_store import FileSystemMemoryDocumentStore
+from infrastructure.store.memory import (
+    DocumentIntentStatus,
+    MemoryDocumentControlStore,
+    MemoryDocumentRevisionStore,
+)
+from infrastructure.store.memory.erasure_store import MemoryDocumentEraseStore
+from memory.commit import MemoryDocumentCommitter
+from memory.core import (
     ABSENT,
     DocumentEditKind,
     DocumentEditPlan,
-    DocumentIntentStatus,
-    MemoryDocumentCommitter,
-    MemoryDocumentControlStore,
     MemoryDocumentPathPolicy,
-    MemoryDocumentRevisionStore,
     new_document_id,
     render_new_document,
 )
-from memoryos.workers.memory_document_edit_worker import MemoryDocumentEditWorker
+from memory.worker.document_edit import MemoryDocumentEditWorker
+from tests.support.persistence.in_memory import InMemoryQueueStore
 
 
 def _plan(document_id: str, *, key: str = "worker-intent") -> DocumentEditPlan:
@@ -50,6 +53,7 @@ def _committer(
         MemoryDocumentRevisionStore(root),
         queue,
         test_hook=hook,
+        erasure_store=MemoryDocumentEraseStore(root),
     )
 
 
@@ -87,7 +91,6 @@ def test_document_edit_worker_rolls_forward_exact_intent_and_acks(tmp_path: Path
     result = MemoryDocumentEditWorker(
         committer,
         queue,
-        tenant_id="default",
         worker_id="document-worker",
     ).process_pending()
 
@@ -120,7 +123,7 @@ def test_document_edit_worker_rejects_unproduced_sealed_review_variant(tmp_path:
             payload=payload,
         )
     )
-    result = MemoryDocumentEditWorker(committer, queue, tenant_id="default").process_pending()
+    result = MemoryDocumentEditWorker(committer, queue).process_pending()
 
     assert result == {
         "claimed": 1,
@@ -154,7 +157,7 @@ def test_document_edit_worker_dead_letters_payload_with_markdown_body(tmp_path: 
         )
     )
 
-    result = MemoryDocumentEditWorker(committer, queue, tenant_id="default").process_pending()
+    result = MemoryDocumentEditWorker(committer, queue).process_pending()
 
     assert result == {"claimed": 1, "committed": 0, "failed": 1, "dead_letter": 1}
     settled = queue.get(job_id)

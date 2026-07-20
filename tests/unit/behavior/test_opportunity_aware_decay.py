@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from memoryos.behavior.model.behavior_pattern import BehaviorPattern
-from memoryos.behavior.model.observation import Observation
-from memoryos.behavior.model.opportunity import OpportunityStats
-from memoryos.behavior.update.opportunity_decay import OpportunityAwareDecay
+from behavior.core.evaluation.opportunity_decay import OpportunityAwareDecay
+from behavior.core.model.behavior_pattern import BehaviorPattern
+from behavior.core.model.observation import Observation
+from behavior.core.model.opportunity import OpportunityStats
 
 
 def _pattern(stats: OpportunityStats | None = None) -> BehaviorPattern:

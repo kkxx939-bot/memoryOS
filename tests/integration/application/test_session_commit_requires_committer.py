@@ -5,22 +5,22 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from memoryos.action_policy.model.action_policy import ActionPolicy
-from memoryos.api.sdk.client import MemoryOSClient
-from memoryos.connect import ConnectMetadata
-from memoryos.contextdb.session.session_archive import SessionArchiveStore
-from memoryos.contextdb.session.session_commit import SessionCommitService
-from memoryos.contextdb.session.session_model import SessionArchive
-from memoryos.contextdb.store.local_stores import FileSystemSourceStore, InMemoryIndexStore, InMemoryQueueStore
-from memoryos.operations.commit.operation_committer import OperationCommitter
-from memoryos.prediction.model.prediction_request import PredictionRequest
+from memory.commit.session_commit import SessionCommitService
+from openApi.sdk.client import MemoryOSClient
+from policy.action_policy.decision.request import PredictionRequest
+from policy.action_policy.model.action_policy import ActionPolicy
+from pre.connect import ConnectMetadata
+from pre.session import SessionArchive
+from tests.support.persistence import FileSystemSourceStore, InMemoryIndexStore, InMemoryQueueStore
+from tests.support.session_archive import build_session_archive_store
+from tests.support.transaction import build_test_operation_committer as OperationCommitter
 
 
 class SessionCommitRequiresCommitterTest(unittest.TestCase):
     def test_archive_only_service_commits_empty_consumers_without_committer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             archive = SessionArchive(user_id="u1", session_id="s1", archive_uri="memoryos://user/u1/sessions/history/s1", messages=[{"content": "记住我喜欢 26 度"}])
-            store = SessionArchiveStore(tmp)
+            store = build_session_archive_store(tmp)
             service = SessionCommitService(store, InMemoryQueueStore())
 
             result = service.async_commit(archive)
@@ -38,7 +38,7 @@ class SessionCommitRequiresCommitterTest(unittest.TestCase):
             source = FileSystemSourceStore(root)
             index = InMemoryIndexStore()
             committer = OperationCommitter(source, index, str(root))
-            store = SessionArchiveStore(root)
+            store = build_session_archive_store(root)
             service = SessionCommitService(store, InMemoryQueueStore(), committer=committer)
             archive = SessionArchive(user_id="u1", session_id="s1", archive_uri="memoryos://user/u1/sessions/history/s1", messages=[{"content": "记住我喜欢 26 度"}])
             service.async_commit(archive)
@@ -46,8 +46,8 @@ class SessionCommitRequiresCommitterTest(unittest.TestCase):
             self.assertEqual(payload["status"], "committed")
             client = MemoryOSClient(str(root / "runtime"))
             policy = ActionPolicy(user_id="u1", scene_key="hot", action="turn_on_ac", support_anchor_uri="memoryos://user/u1/support/behavior/hot")
-            client.source_store.write_object(policy.to_context_object(), content=json.dumps(policy.to_dict()))
-            client.index_store.upsert_index(
+            client.runtime.stores.source.write_object(policy.to_context_object(), content=json.dumps(policy.to_dict()))
+            client.runtime.stores.index.upsert_index(
                 policy.to_context_object(),
                 content="hot turn_on_ac",
                 tenant_id="default",
@@ -63,11 +63,11 @@ class SessionCommitRequiresCommitterTest(unittest.TestCase):
                 [policy],
                 async_commit=True,
             )
-            self.assertEqual(result.prediction_result.memory_operations, [])
-            persisted = client.session_archive_store.read_archive(
+            self.assertNotIn("memory_operations", result.prediction_result.to_dict())
+            persisted = client.runtime.session.archive_store.read_archive(
                 "memoryos://user/u1/sessions/history/s2"
             )
-            diff = client.session_archive_store.read_async_outputs(persisted)["memory_diff"]
+            diff = client.runtime.session.archive_store.read_async_outputs(persisted)["memory_diff"]
             self.assertEqual(diff["status"], "committed")
 
 

@@ -2,15 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from memoryos.memory.documents.frontmatter import (
-    FrontMatterError,
-    MissingDocumentId,
-    MissingFrontMatter,
-    adopt_raw_document,
-    parse_front_matter,
-    render_new_document,
-)
-from memoryos.memory.documents.model import (
+from memory.core.model import (
     ABSENT,
     ManagedDocument,
     PresentPath,
@@ -20,6 +12,14 @@ from memoryos.memory.documents.model import (
     UnsafePath,
     raw_state_from_dict,
     raw_state_to_dict,
+)
+from memory.core.structure.frontmatter import (
+    FrontMatterError,
+    MissingDocumentId,
+    MissingFrontMatter,
+    adopt_raw_document,
+    parse_front_matter,
+    render_new_document,
 )
 
 DOCUMENT_ID = "memdoc_0123456789ABCDEF"

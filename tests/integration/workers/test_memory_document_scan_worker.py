@@ -1,41 +1,37 @@
 from __future__ import annotations
 
+import os
+import time
 from pathlib import Path
 from typing import cast
 
 import pytest
 
-from memoryos.adapters.persistence.sqlite import SQLiteIndexStore
-from memoryos.api.sdk.client import MemoryOSClient
-from memoryos.contextdb.catalog import CatalogRecordKind
-from memoryos.memory.documents import DocumentIntentStatus
-from memoryos.memory.documents.layout import user_memory_root
-from memoryos.security.trusted_context import (
-    AUTHORITATIVE_REMEMBER,
-    READ_CONTEXT,
-    TrustedRequestContext,
-)
-from memoryos.workers.runner import WorkerRunner
+from foundation.identity import LocalUserContext
+from infrastructure.context.trace import RecallTraceService
+from infrastructure.store.memory import DocumentIntentStatus
+from infrastructure.store.memory.layout import user_memory_root
+from infrastructure.store.model.catalog import CatalogRecordKind
+from infrastructure.store.sqlite import SQLiteIndexStore
+from infrastructure.store.trace import RecallTraceRepository, recall_trace_root
+from openApi.sdk.client import MemoryOSClient
+from runtime.worker.runner import WorkerRunner
 
 
-def _caller() -> TrustedRequestContext:
-    return TrustedRequestContext(
-        tenant_id="default",
+def _caller() -> LocalUserContext:
+    return LocalUserContext(
         user_id="u1",
-        actor_kind="user",
-        actor_id="u1",
-        capabilities=frozenset({READ_CONTEXT, AUTHORITATIVE_REMEMBER}),
     )
 
 
 def _project_all(client: MemoryOSClient) -> None:
-    while client.queue_store.stats(queue_name="memory_projection").get("pending", 0):
-        result = client.memory_projection_worker.process_pending(limit=10)
+    while client.runtime.stores.queue.stats(queue_name="memory_projection").get("pending", 0):
+        result = client.runtime.memory.projection_worker.process_pending(limit=10)
         assert not result.failed
 
 
 def _document_records(client: MemoryOSClient, document_id: str):  # noqa: ANN202
-    return cast(SQLiteIndexStore, client.index_store).list_catalog(
+    return cast(SQLiteIndexStore, client.runtime.stores.index).list_catalog(
         tenant_id="default",
         filters={
             "owner_user_id": "u1",
@@ -44,6 +40,21 @@ def _document_records(client: MemoryOSClient, document_id: str):  # noqa: ANN202
         },
         limit=100,
     )
+
+
+def test_maintenance_prunes_expired_recall_traces(tmp_path: Path) -> None:
+    client = MemoryOSClient(str(tmp_path))
+    repository = RecallTraceRepository(recall_trace_root(client.root, client.tenant_id))
+    trace_id = RecallTraceService(repository).record("expired maintenance trace")
+    trace_path = repository.trace_root / f"{trace_id}.json"
+    expired_at = time.time() - (31 * 24 * 60 * 60)
+    os.utime(trace_path, (expired_at, expired_at))
+
+    result = WorkerRunner(client).run_once("maintenance")
+
+    retention = result["maintenance"]["recall_trace_retention"]
+    assert retention["deleted"] == 1
+    assert not trace_path.exists()
 
 
 def test_retrieval_rescan_job_is_consumed_and_reprojects_live_markdown(tmp_path: Path) -> None:
@@ -63,12 +74,12 @@ def test_retrieval_rescan_job_is_consumed_and_reprojects_live_markdown(tmp_path:
     stale_results = client.archive_search(old_marker, user_id="u1", caller=caller)
 
     assert all(item.get("document_id") != remembered["document_id"] for item in stale_results)
-    assert client.queue_store.stats(queue_name="memory_document_scan").get("pending") == 1
+    assert client.runtime.stores.queue.stats(queue_name="memory_document_scan").get("pending") == 1
 
     run = WorkerRunner(client, batch_size=10).run_once("all")
 
     assert run["memory_document_scan"]["processed"] == 1
-    assert client.queue_store.stats(queue_name="memory_document_scan").get("done") == 1
+    assert client.runtime.stores.queue.stats(queue_name="memory_document_scan").get("done") == 1
     records = _document_records(client, remembered["document_id"])
     document = next(
         record for record in records if record.record_kind == CatalogRecordKind.MEMORY_DOCUMENT.value
@@ -93,21 +104,21 @@ def test_single_missing_scan_does_not_create_deletion_authority(tmp_path: Path) 
         user_id="u1",
         caller=caller,
     ) == []
-    assert client.queue_store.stats(queue_name="memory_document_scan").get("pending") == 1
+    assert client.runtime.stores.queue.stats(queue_name="memory_document_scan").get("pending") == 1
 
-    rebuilt = client.memory_projection_worker.rebuild_owner("default", "u1")
-    verified = client.memory_projection_worker.verify_owner("default", "u1")
+    rebuilt = client.runtime.memory.projection_worker.rebuild_owner("default", "u1")
+    verified = client.runtime.memory.projection_worker.verify_owner("default", "u1")
 
     assert rebuilt["pending_missing"] == 1
     assert rebuilt["deleted"] == 0
     assert verified["pending_missing"] == 1
     assert verified["degraded"] == 1
-    assert client.memory_document_control_store.load_publication_barrier(
+    assert client.runtime.memory.control_store.load_publication_barrier(
         "default", "u1", remembered["document_id"]
     ) is None
     assert _document_records(client, remembered["document_id"])
 
-    client.memory_document_scanner.stability_seconds = 0
+    client.runtime.memory.scanner.stability_seconds = 0
     runner = WorkerRunner(client, batch_size=10)
     first = runner.run_once("memory-document-scan")["memory_document_scan"]
 
@@ -116,10 +127,10 @@ def test_single_missing_scan_does_not_create_deletion_authority(tmp_path: Path) 
     assert first["pending"] == 1
     assert first["periodic_scanned"] == 0
     scan_job_id = first["released"][0]
-    scan_job = client.queue_store.get(scan_job_id)
+    scan_job = client.runtime.stores.queue.get(scan_job_id)
     assert scan_job is not None and scan_job.status == "pending"
     assert scan_job.retry_count == 0
-    assert client.memory_document_control_store.load_publication_barrier(
+    assert client.runtime.memory.control_store.load_publication_barrier(
         "default", "u1", remembered["document_id"]
     ) is None
 
@@ -128,15 +139,15 @@ def test_single_missing_scan_does_not_create_deletion_authority(tmp_path: Path) 
     assert second["claimed"] == 1
     assert second["processed"] == 1
     assert second["pending"] == 0
-    scan_job = client.queue_store.get(scan_job_id)
+    scan_job = client.runtime.stores.queue.get(scan_job_id)
     assert scan_job is not None and scan_job.status == "done"
     assert scan_job.retry_count == 0
-    barrier = client.memory_document_control_store.load_publication_barrier(
+    barrier = client.runtime.memory.control_store.load_publication_barrier(
         "default", "u1", remembered["document_id"]
     )
     assert barrier is not None
     _project_all(client)
-    active = cast(SQLiteIndexStore, client.index_store).list_catalog(
+    active = cast(SQLiteIndexStore, client.runtime.stores.index).list_catalog(
         tenant_id="default",
         filters={
             "owner_user_id": "u1",
@@ -162,7 +173,7 @@ def test_periodic_runner_projects_external_edit_without_retrieval_hint(tmp_path:
     document_path.write_bytes(
         document_path.read_bytes().replace(old_marker.encode(), new_marker.encode())
     )
-    assert client.queue_store.stats(queue_name="memory_document_scan").get("pending", 0) == 0
+    assert client.runtime.stores.queue.stats(queue_name="memory_document_scan").get("pending", 0) == 0
 
     run = WorkerRunner(client, batch_size=10).run_once("all")
 
@@ -189,20 +200,20 @@ def test_runtime_runner_recovers_real_document_edit_producer_job(tmp_path: Path)
         if stage == "intent_prepared":
             raise SimulatedRetryableInterruption
 
-    client.memory_document_committer.test_hook = interrupt_after_durable_intent
+    client.runtime.memory.committer.test_hook = interrupt_after_durable_intent
     with pytest.raises(SimulatedRetryableInterruption):
         client.remember(
             "Runtime producer must recover through the edit worker.",
             target_hint="topic:runtime edit recovery",
             caller=caller,
         )
-    client.memory_document_committer.test_hook = None
+    client.runtime.memory.committer.test_hook = None
 
-    intents = client.memory_document_control_store.incomplete_intents("default", "u1")
+    intents = client.runtime.memory.control_store.incomplete_intents("default", "u1")
     assert len(intents) == 1
     intent = intents[0]
     job_id = f"memory_document_edit_{intent.intent_id}"
-    job = client.queue_store.get(job_id)
+    job = client.runtime.stores.queue.get(job_id)
     assert job is not None and job.status == "pending"
     assert frozenset(job.payload) == {
         "tenant_id",
@@ -210,8 +221,8 @@ def test_runtime_runner_recovers_real_document_edit_producer_job(tmp_path: Path)
         "document_id",
         "intent_id",
     }
-    assert client.memory_document_edit_worker.committer is client.memory_document_committer
-    assert client.memory_document_scan_worker.scanner is client.memory_document_scanner
+    assert client.runtime.memory.edit_worker.committer is client.runtime.memory.committer
+    assert client.runtime.memory.scan_worker.scanner is client.runtime.memory.scanner
 
     result = WorkerRunner(client, batch_size=10).run_once("memory-document-edit")
 
@@ -221,9 +232,9 @@ def test_runtime_runner_recovers_real_document_edit_producer_job(tmp_path: Path)
         "failed": 0,
         "dead_letter": 0,
     }
-    settled = client.queue_store.get(job_id)
+    settled = client.runtime.stores.queue.get(job_id)
     assert settled is not None and settled.status == "done"
-    durable = client.memory_document_control_store.load_intent(
+    durable = client.runtime.memory.control_store.load_intent(
         "default",
         "u1",
         intent.intent_id,

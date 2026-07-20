@@ -14,7 +14,7 @@ def test_official_mcp_sdk_initialize_list_call(tmp_path) -> None:  # noqa: ANN00
     async def run() -> None:
         params = StdioServerParameters(
             command=sys.executable,
-            args=["-m", "memoryos.api.mcp.stdio"],
+            args=["-m", "openApi.mcp.stdio"],
             cwd=os.getcwd(),
             env={**os.environ, "MEMORYOS_ROOT": str(tmp_path), "MEMORYOS_ADAPTER_ID": "cursor"},
         )

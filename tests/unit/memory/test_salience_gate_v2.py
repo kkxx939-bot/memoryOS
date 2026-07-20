@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import pytest
 
-from memoryos.contextdb.session.session_model import SessionArchive
-from memoryos.memory.evidence import EpisodeSalienceGate, SessionArchiveEpisodeAdapter
+from memory.core.formation import EpisodeSalienceGate
+from pre.evidence import SessionArchiveEpisodeAdapter
+from pre.session import SessionArchive
 
 
 def _decision(

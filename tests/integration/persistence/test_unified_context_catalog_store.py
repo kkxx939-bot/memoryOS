@@ -6,10 +6,10 @@ from dataclasses import replace
 
 import pytest
 
-from memoryos.adapters.vector.in_memory.store import InMemoryVectorStore
-from memoryos.contextdb.catalog import CatalogRecord, CatalogRecordKind
-from memoryos.contextdb.store.sqlite_index_store import SQLiteIndexStore
-from memoryos.contextdb.store.vector import vector_row_id
+from infrastructure.store.contracts.vector import vector_row_id
+from infrastructure.store.model.catalog import CatalogRecord, CatalogRecordKind
+from infrastructure.store.sqlite.index_store import SQLiteIndexStore
+from tests.support.persistence import InMemoryVectorStore
 
 _NOW = "2026-07-17T02:00:00+00:00"
 

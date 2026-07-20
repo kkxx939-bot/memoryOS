@@ -5,18 +5,18 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from memoryos.contextdb.model.context_object import ContextObject
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.store.local_stores import FileSystemSourceStore, InMemoryIndexStore, InMemoryLockStore
-from memoryos.contextdb.store.source_store import LockLostError
-from memoryos.operations.commit.operation_committer import OperationCommitter
-from memoryos.operations.model.context_operation import ContextOperation
-from memoryos.operations.model.operation_action import OperationAction
+from infrastructure.store.contracts.lock import LockLostError
+from infrastructure.store.model.context.context_object import ContextObject
+from infrastructure.store.model.context.context_type import ContextType
+from tests.support.persistence import FileSystemSourceStore, InMemoryIndexStore, ProcessLocalLockStore
+from tests.support.transaction import build_test_operation_committer as OperationCommitter
+from transaction.model.context_operation import ContextOperation
+from transaction.model.operation_action import OperationAction
 
 
 class OperationCommitterPathLockTest(unittest.TestCase):
     def test_in_memory_fenced_section_renews_same_fence_after_ttl_elapses(self) -> None:
-        store = InMemoryLockStore()
+        store = ProcessLocalLockStore()
         token = store.acquire("long-section", ttl_seconds=1)
 
         with store.fenced((token,), ttl_seconds=1):
@@ -32,7 +32,7 @@ class OperationCommitterPathLockTest(unittest.TestCase):
     def test_same_target_write_is_lock_protected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            lock_store = InMemoryLockStore()
+            lock_store = ProcessLocalLockStore()
             source = FileSystemSourceStore(root)
             index = InMemoryIndexStore()
             committer = OperationCommitter(source, index, str(root), lock_store=lock_store)
@@ -62,7 +62,7 @@ class OperationCommitterPathLockTest(unittest.TestCase):
     def test_lost_fence_stops_before_index_audit_diff_and_marker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            lock_store = InMemoryLockStore()
+            lock_store = ProcessLocalLockStore()
             source = FileSystemSourceStore(root)
             index = InMemoryIndexStore()
             committer = OperationCommitter(source, index, str(root), lock_store=lock_store)
@@ -110,7 +110,7 @@ class OperationCommitterPathLockTest(unittest.TestCase):
     def test_regular_batch_holds_all_target_locks_through_diff_write(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            lock_store = InMemoryLockStore()
+            lock_store = ProcessLocalLockStore()
             source = FileSystemSourceStore(root)
             index = InMemoryIndexStore()
             committer = OperationCommitter(source, index, str(root), lock_store=lock_store)

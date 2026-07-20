@@ -5,9 +5,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from memoryos.action_policy.model.action_policy import ActionPolicy
-from memoryos.api.sdk.client import MemoryOSClient
-from memoryos.contextdb.session.session_model import SessionArchive
+from openApi.sdk.client import MemoryOSClient
+from policy.action_policy.model.action_policy import ActionPolicy
+from pre.session import SessionArchive
 
 
 class SessionCommitGeneratesDiffsTest(unittest.TestCase):
@@ -15,10 +15,10 @@ class SessionCommitGeneratesDiffsTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.client = MemoryOSClient(str(self.root))
-        self.store = self.client.session_archive_store
-        self.source = self.client.source_store
-        self.index = self.client.index_store
-        self.service = self.client.session_commit_service
+        self.store = self.client.runtime.session.archive_store
+        self.source = self.client.runtime.stores.source
+        self.index = self.client.runtime.stores.index
+        self.service = self.client.runtime.session.commit_service
         self.archive_uri = "memoryos://user/u1/sessions/history/archive_001"
 
     def tearDown(self) -> None:
@@ -84,7 +84,7 @@ class SessionCommitGeneratesDiffsTest(unittest.TestCase):
         self.assertGreater(action_policy_diff["operation_count"], 0)
         self.assertTrue(behavior_diff["operation_ids"])
         self.assertTrue(action_policy_diff["operation_ids"])
-        preference = self.client.memory_document_store.read_raw(
+        preference = self.client.runtime.memory.document_store.read_raw(
             "default",
             "u1",
             relative_path="preferences.md",

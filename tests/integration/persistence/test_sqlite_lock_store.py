@@ -8,8 +8,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from memoryos.contextdb.store.source_store import LockLostError, LockToken
-from memoryos.contextdb.store.sqlite_lock_store import SQLiteLockStore
+from infrastructure.store.contracts.lock import LockLostError, LockToken
+from infrastructure.store.sqlite.lock_store import SQLiteLockStore
 
 
 def test_sqlite_lock_store_acquire_release_and_expiry(tmp_path) -> None:

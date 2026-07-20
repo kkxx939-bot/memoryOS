@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import math
 
-from memoryos.contextdb.model.context_object import ContextObject
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.store.sqlite_index_store import SQLiteIndexStore
+from infrastructure.store.model.context.context_object import ContextObject
+from infrastructure.store.model.context.context_type import ContextType
+from infrastructure.store.sqlite.index_store import SQLiteIndexStore
 
 
 def test_fts_query_escapes_uri_punctuation(tmp_path) -> None:

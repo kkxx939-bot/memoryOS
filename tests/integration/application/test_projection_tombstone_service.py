@@ -6,24 +6,37 @@ from typing import cast
 
 import pytest
 
-from memoryos.api.sdk.client import MemoryOSClient
-from memoryos.contextdb.catalog import CatalogRecord, CatalogRecordKind
-from memoryos.contextdb.context_db import ContextDB
-from memoryos.contextdb.model.context_object import ContextObject
-from memoryos.contextdb.model.context_relation import ContextRelation
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.session.context_projector import SessionContextProjector
-from memoryos.contextdb.session.session_archive import SessionArchiveStore
-from memoryos.contextdb.session.session_model import SessionArchive
-from memoryos.contextdb.store.local_stores import FileSystemSourceStore
-from memoryos.contextdb.store.sqlite_index_store import SQLiteIndexStore
-from memoryos.contextdb.store.sqlite_relation_store import SQLiteRelationStore
-from memoryos.contextdb.store.vector_store import InMemoryVectorStore, vector_row_id
-from memoryos.contextdb.tombstone import ProjectionTombstoneService
-from memoryos.operations.commit.operation_committer import OperationCommitter
-from memoryos.operations.commit.redo_log import RedoIntegrityError
-from memoryos.operations.model.context_operation import ContextOperation
-from memoryos.operations.model.operation_action import OperationAction
+from infrastructure.context.maintenance.lifecycle_service import ContextLifecycleService
+from infrastructure.context.maintenance.tombstone import ProjectionTombstoneService
+from infrastructure.context.session_projector import SessionContextProjector
+from infrastructure.store.contracts.vector import vector_row_id
+from infrastructure.store.model.catalog import CatalogRecord, CatalogRecordKind
+from infrastructure.store.model.context.context_object import ContextObject
+from infrastructure.store.model.context.context_relation import ContextRelation
+from infrastructure.store.model.context.context_type import ContextType
+from infrastructure.store.operation.redo import RedoIntegrityError
+from infrastructure.store.sqlite.index_store import SQLiteIndexStore
+from infrastructure.store.sqlite.relation_store import SQLiteRelationStore
+from openApi.sdk.client import MemoryOSClient
+from pre.session import SessionArchive
+from tests.support.persistence import FileSystemSourceStore, InMemoryVectorStore, seed_context_object
+from tests.support.session_archive import build_session_archive_store
+from tests.support.transaction import build_test_operation_committer as OperationCommitter
+from transaction.model.context_operation import ContextOperation
+from transaction.model.operation_action import OperationAction
+
+
+def _seed_client_context(
+    client: MemoryOSClient,
+    obj: ContextObject,
+    *,
+    content: str | bytes = "",
+) -> None:
+    seed_context_object(client.runtime.stores.source, client.runtime.stores.index, obj, content=content)
+
+
+def _commit_client_operation(client: MemoryOSClient, operation: ContextOperation):  # noqa: ANN201
+    return client.runtime.transaction.committer.commit(operation.user_id, [operation])
 
 
 def test_tombstone_fails_closed_then_replays_all_derived_cleanup(tmp_path) -> None:  # noqa: ANN001
@@ -100,6 +113,29 @@ def test_tombstone_fails_closed_then_replays_all_derived_cleanup(tmp_path) -> No
     assert row_id not in vectors.vector_uris()
     assert relations.relations_of(uri, tenant_id="tenant-a") == []
     assert source.read_object(uri).lifecycle_state.value == "deleted"
+
+
+def test_context_lifecycle_service_owns_fact_and_projection_deletion(tmp_path) -> None:  # noqa: ANN001
+    source = FileSystemSourceStore(tmp_path, tenant_id="tenant-a")
+    index = SQLiteIndexStore(tmp_path / "indexes" / "catalog.sqlite3")
+    relations = SQLiteRelationStore(tmp_path / "indexes" / "relations.sqlite3")
+    obj = ContextObject(
+        uri="memoryos://user/u1/resources/lifecycle-owned-delete",
+        context_type=ContextType.RESOURCE,
+        title="lifecycle owned delete",
+        tenant_id="tenant-a",
+        owner_user_id="u1",
+    )
+    seed_context_object(source, index, obj, content="lifecycle marker")
+    tombstones = ProjectionTombstoneService(index, source_store=source, relation_store=relations)
+    lifecycle = ContextLifecycleService(source, tombstones, tenant_id="tenant-a")
+
+    result = lifecycle.delete_context(obj.uri)
+
+    assert result["uri"] == obj.uri
+    assert result["processed"]
+    assert source.read_object(obj.uri).lifecycle_state.value == "deleted"
+    assert index.get_catalog_by_uri(obj.uri, tenant_id="tenant-a") == []
 
 
 def test_orphan_tombstone_deletes_hashed_vector_without_catalog_scan(tmp_path) -> None:  # noqa: ANN001
@@ -205,7 +241,7 @@ def test_orphan_tombstone_deletes_owned_relations_without_crossing_tenant(tmp_pa
 
 
 def test_session_tombstone_removes_catalog_but_preserves_archive_evidence(tmp_path) -> None:  # noqa: ANN001
-    archive_store = SessionArchiveStore(tmp_path, tenant_id="tenant-a")
+    archive_store = build_session_archive_store(tmp_path, tenant_id="tenant-a")
     archive = SessionArchive(
         user_id="u1",
         session_id="s-delete",
@@ -220,9 +256,9 @@ def test_session_tombstone_removes_catalog_but_preserves_archive_evidence(tmp_pa
     source = FileSystemSourceStore(tmp_path, tenant_id="tenant-a")
     relations = SQLiteRelationStore(tmp_path / "indexes" / "relations.sqlite3")
     service = ProjectionTombstoneService(index, source_store=source, relation_store=relations)
-    db = ContextDB(source, index, relations, tombstone_service=service)
+    lifecycle = ContextLifecycleService(source, service, tenant_id="tenant-a")
 
-    result = db.delete_session_context("s-delete")
+    result = lifecycle.delete_session_context("s-delete")
 
     assert result["evidence_retained"] is True
     assert index.list_catalog(
@@ -263,9 +299,9 @@ def test_session_tombstone_keyset_pages_past_one_thousand_records(tmp_path) -> N
     source = FileSystemSourceStore(tmp_path, tenant_id="tenant-a")
     relations = SQLiteRelationStore(tmp_path / "indexes" / "relations.sqlite3")
     service = ProjectionTombstoneService(index, source_store=source, relation_store=relations)
-    db = ContextDB(source, index, relations, tombstone_service=service)
+    lifecycle = ContextLifecycleService(source, service, tenant_id="tenant-a")
 
-    result = db.delete_session_context("s-large")
+    result = lifecycle.delete_session_context("s-large")
 
     # One durable Session barrier prevents a future projector version from
     # resurrecting newly introduced record kinds from immutable Archive data.
@@ -300,9 +336,9 @@ def test_ordinary_delete_uses_durable_tombstone_and_drains_all_relations(tmp_pat
         owner_user_id="u1",
         metadata={"tree_paths": ["resources/desktop"], "source_kind": "resource"},
     )
-    client.context_db.write_object(obj, content="durable delete marker")
-    vectors = cast(InMemoryVectorStore, client.vector_store)
-    index = cast(SQLiteIndexStore, client.index_store)
+    _seed_client_context(client, obj, content="durable delete marker")
+    vectors = cast(InMemoryVectorStore, client.runtime.stores.vector)
+    index = cast(SQLiteIndexStore, client.runtime.stores.index)
     record = index.get_catalog_by_uri(uri, tenant_id="default")[0]
     row_id = vector_row_id("default", record.record_key)
     vectors.upsert_vector(
@@ -316,7 +352,7 @@ def test_ordinary_delete_uses_durable_tombstone_and_drains_all_relations(tmp_pat
         },
     )
     for ordinal in range(1_005):
-        client.relation_store.add_relation(
+        client.runtime.stores.relation.add_relation(
             ContextRelation(
                 source_uri=uri,
                 relation_type="references",
@@ -330,20 +366,19 @@ def test_ordinary_delete_uses_durable_tombstone_and_drains_all_relations(tmp_pat
             tenant_id="default",
         )
 
-    result = client.context_db.commit_operation(
-        ContextOperation(
+    operation = ContextOperation(
             operation_id="op_public_ordinary_delete",
             user_id="u1",
             context_type=ContextType.RESOURCE,
             action=OperationAction.DELETE,
             target_uri=uri,
             payload={"reason": "ordinary_delete"},
-        )
     )
+    result = _commit_client_operation(client, operation)
 
     assert result.operations[0].status.value == "committed"
     assert result.operations[0].payload["projection_tombstone_ids"]
-    assert client.source_store.read_object(uri).lifecycle_state.value == "deleted"
+    assert client.runtime.stores.source.read_object(uri).lifecycle_state.value == "deleted"
     assert index.get_catalog_by_uri(uri, tenant_id="default") == []
     assert index.search_catalog(
         "durable delete marker",
@@ -351,7 +386,7 @@ def test_ordinary_delete_uses_durable_tombstone_and_drains_all_relations(tmp_pat
         filters={"tenant_id": "default"},
     ) == []
     assert vectors.get_vector_metadata(row_id) is None
-    assert client.relation_store.relations_of(uri, tenant_id="default") == []
+    assert client.runtime.stores.relation.relations_of(uri, tenant_id="default") == []
     with sqlite3.connect(index.path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM context_paths WHERE uri = ?", (uri,)).fetchone()[0] == 0
         assert (
@@ -366,7 +401,7 @@ def test_ordinary_delete_uses_durable_tombstone_and_drains_all_relations(tmp_pat
 def test_contextdb_batch_delete_tombstones_every_serving_layer(tmp_path) -> None:  # noqa: ANN001
     vectors = InMemoryVectorStore()
     client = MemoryOSClient(str(tmp_path), vector_store=vectors)
-    index = cast(SQLiteIndexStore, client.index_store)
+    index = cast(SQLiteIndexStore, client.runtime.stores.index)
     operations: list[ContextOperation] = []
     vector_ids: list[str] = []
     uris = (
@@ -382,7 +417,7 @@ def test_contextdb_batch_delete_tombstones_every_serving_layer(tmp_path) -> None
             owner_user_id="u1",
             metadata={"tree_paths": ["resources/desktop"], "source_kind": "resource"},
         )
-        client.context_db.write_object(obj, content=f"batch tombstone marker {ordinal}")
+        _seed_client_context(client, obj, content=f"batch tombstone marker {ordinal}")
         record = index.get_catalog_by_uri(uri, tenant_id="default")[0]
         row_id = vector_row_id("default", record.record_key)
         vector_ids.append(row_id)
@@ -396,7 +431,7 @@ def test_contextdb_batch_delete_tombstones_every_serving_layer(tmp_path) -> None
                 "projection_effect_hash": record.projection_effect_hash,
             },
         )
-        client.relation_store.add_relation(
+        client.runtime.stores.relation.add_relation(
             ContextRelation(
                 source_uri=uri,
                 relation_type="references",
@@ -420,16 +455,15 @@ def test_contextdb_batch_delete_tombstones_every_serving_layer(tmp_path) -> None
             )
         )
 
-    results = client.context_db.commit_operations(operations)
+    result = client.runtime.transaction.committer.commit("u1", operations)
 
-    assert len(results) == 1
-    assert {item.operation_id for item in results[0].operations} == {
+    assert {item.operation_id for item in result.operations} == {
         "op_batch_delete_0",
         "op_batch_delete_1",
     }
-    assert all(item.payload["projection_tombstone_ids"] for item in results[0].operations)
+    assert all(item.payload["projection_tombstone_ids"] for item in result.operations)
     for uri, row_id in zip(uris, vector_ids, strict=True):
-        assert client.source_store.read_object(uri).lifecycle_state.value == "deleted"
+        assert client.runtime.stores.source.read_object(uri).lifecycle_state.value == "deleted"
         assert index.get_catalog_by_uri(uri, tenant_id="default") == []
         assert index.search_catalog(
             "batch tombstone",
@@ -437,7 +471,7 @@ def test_contextdb_batch_delete_tombstones_every_serving_layer(tmp_path) -> None
             filters={"tenant_id": "default"},
         ) == []
         assert vectors.get_vector_metadata(row_id) is None
-        assert client.relation_store.relations_of(uri, tenant_id="default") == []
+        assert client.runtime.stores.relation.relations_of(uri, tenant_id="default") == []
     with sqlite3.connect(index.path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM context_paths").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM context_tombstones WHERE status = 'APPLIED'").fetchone()[0] == 2
@@ -448,7 +482,6 @@ def test_production_committer_rejects_delete_without_tombstone_service(tmp_path)
     index = SQLiteIndexStore(tmp_path / "indexes" / "catalog.sqlite3")
     relations = SQLiteRelationStore(tmp_path / "indexes" / "relations.sqlite3")
     committer = OperationCommitter(source, index, str(tmp_path), relation_store=relations)
-    db = ContextDB(source, index, relations, committer=committer)
     uri = "memoryos://user/u1/resources/no-delete-bypass"
     obj = ContextObject(
         uri=uri,
@@ -456,7 +489,7 @@ def test_production_committer_rejects_delete_without_tombstone_service(tmp_path)
         title="no delete bypass",
         owner_user_id="u1",
     )
-    db.seed_object(obj, content="must remain searchable")
+    seed_context_object(source, index, obj, content="must remain searchable")
     operation = ContextOperation(
         user_id="u1",
         context_type=ContextType.RESOURCE,
@@ -466,7 +499,7 @@ def test_production_committer_rejects_delete_without_tombstone_service(tmp_path)
     )
 
     with pytest.raises(RuntimeError, match="requires ProjectionTombstoneService"):
-        db.commit_operation(operation)
+        committer.commit(operation.user_id, [operation])
 
     assert source.read_object(uri).lifecycle_state.value == "active"
     assert index.search_catalog(
@@ -479,11 +512,12 @@ def test_production_committer_rejects_delete_without_tombstone_service(tmp_path)
 
 def test_resume_cannot_substitute_an_unrelated_projection_tombstone(tmp_path) -> None:  # noqa: ANN001
     client = MemoryOSClient(str(tmp_path), vector_store=InMemoryVectorStore())
-    index = cast(SQLiteIndexStore, client.index_store)
+    index = cast(SQLiteIndexStore, client.runtime.stores.index)
     uri_a = "memoryos://user/u1/resources/resume-target-a"
     uri_b = "memoryos://user/u1/resources/resume-target-b"
     for uri in (uri_a, uri_b):
-        client.context_db.write_object(
+        _seed_client_context(
+            client,
             ContextObject(
                 uri=uri,
                 context_type=ContextType.RESOURCE,
@@ -494,8 +528,7 @@ def test_resume_cannot_substitute_an_unrelated_projection_tombstone(tmp_path) ->
             ),
             content=f"serving record for {uri}",
         )
-    service = client.context_db.tombstone_service
-    assert service is not None
+    service = client.runtime.context.lifecycle_service.tombstone_service
     unrelated_ids = service.enqueue_uri(
         uri_b,
         tenant_id="default",
@@ -514,29 +547,30 @@ def test_resume_cannot_substitute_an_unrelated_projection_tombstone(tmp_path) ->
             "projection_tombstone_ids": list(unrelated_ids),
         },
     )
-    manifest = client.committer._build_regular_relation_manifest(forged)
+    manifest = client.runtime.transaction.committer._build_regular_relation_manifest(forged)
 
     with pytest.raises(RedoIntegrityError, match="exactly one durable"):
-        client.committer.resume("u1", forged, "started", relation_manifest=manifest)
+        client.runtime.transaction.committer.resume("u1", forged, "started", relation_manifest=manifest)
 
     durable = ContextOperation.from_dict(forged.to_dict())
     durable.payload.pop("projection_tombstone_ids")
-    durable_manifest = client.committer._build_regular_relation_manifest(durable)
-    client.committer.redo.begin(durable, phase="started", relation_manifest=durable_manifest)
+    durable_manifest = client.runtime.transaction.committer._build_regular_relation_manifest(durable)
+    client.runtime.transaction.committer.redo.begin(durable, phase="started", relation_manifest=durable_manifest)
     with pytest.raises(RedoIntegrityError, match="does not match its durable entry"):
-        client.committer.resume("u1", forged, "started", relation_manifest=manifest)
+        client.runtime.transaction.committer.resume("u1", forged, "started", relation_manifest=manifest)
 
-    assert client.source_store.read_object(uri_a).lifecycle_state.value == "active"
-    assert client.source_store.read_object(uri_b).lifecycle_state.value == "active"
+    assert client.runtime.stores.source.read_object(uri_a).lifecycle_state.value == "active"
+    assert client.runtime.stores.source.read_object(uri_b).lifecycle_state.value == "active"
     assert index.get_catalog_by_uri(uri_a, tenant_id="default")
     assert index.get_catalog_by_uri(uri_b, tenant_id="default")
 
 
 def test_successful_delete_with_relations_is_idempotently_replayable(tmp_path) -> None:  # noqa: ANN001
     client = MemoryOSClient(str(tmp_path), vector_store=InMemoryVectorStore())
-    index = cast(SQLiteIndexStore, client.index_store)
+    index = cast(SQLiteIndexStore, client.runtime.stores.index)
     uri = "memoryos://user/u1/resources/relation-delete-retry"
-    client.context_db.write_object(
+    _seed_client_context(
+        client,
         ContextObject(
             uri=uri,
             context_type=ContextType.RESOURCE,
@@ -558,10 +592,10 @@ def test_successful_delete_with_relations_is_idempotently_replayable(tmp_path) -
             "catalog_record_key": record.record_key,
         },
     )
-    stored = client.source_store.read_object(uri)
+    stored = client.runtime.stores.source.read_object(uri)
     stored.relations = [relation]
-    client.source_store.write_object(stored, content="relation-backed delete retry")
-    client.relation_store.add_relation(relation, tenant_id="default")
+    client.runtime.stores.source.write_object(stored, content="relation-backed delete retry")
+    client.runtime.stores.relation.add_relation(relation, tenant_id="default")
     operation = ContextOperation(
         operation_id="op_relation_delete_retry",
         user_id="u1",
@@ -572,21 +606,22 @@ def test_successful_delete_with_relations_is_idempotently_replayable(tmp_path) -
     )
     retry_payload = operation.to_dict()
 
-    first = client.context_db.commit_operation(operation)
-    second = client.context_db.commit_operation(ContextOperation.from_dict(retry_payload))
+    first = _commit_client_operation(client, operation)
+    second = _commit_client_operation(client, ContextOperation.from_dict(retry_payload))
 
     assert [item.operation_id for item in first.operations] == ["op_relation_delete_retry"]
     assert [item.operation_id for item in second.operations] == ["op_relation_delete_retry"]
-    assert client.relation_store.relations_of(uri, tenant_id="default") == []
+    assert client.runtime.stores.relation.relations_of(uri, tenant_id="default") == []
 
 
 def test_normal_commit_cannot_overwrite_an_early_delete_redo_entry(tmp_path) -> None:  # noqa: ANN001
     client = MemoryOSClient(str(tmp_path), vector_store=InMemoryVectorStore())
-    index = cast(SQLiteIndexStore, client.index_store)
+    index = cast(SQLiteIndexStore, client.runtime.stores.index)
     uri_a = "memoryos://user/u1/resources/durable-delete-a"
     uri_b = "memoryos://user/u1/resources/forged-delete-b"
     for uri in (uri_a, uri_b):
-        client.context_db.write_object(
+        _seed_client_context(
+            client,
             ContextObject(
                 uri=uri,
                 context_type=ContextType.RESOURCE,
@@ -605,10 +640,10 @@ def test_normal_commit_cannot_overwrite_an_early_delete_redo_entry(tmp_path) -> 
         target_uri=uri_a,
         payload={"tenant_id": "default", "reason": "durable_a"},
     )
-    manifest = client.committer._build_regular_relation_manifest(durable)
-    client.committer.redo.begin(durable, phase="started", relation_manifest=manifest)
-    assert client.committer._prepare_delete_tombstones(durable)
-    client.committer.redo.advance(
+    manifest = client.runtime.transaction.committer._build_regular_relation_manifest(durable)
+    client.runtime.transaction.committer.redo.begin(durable, phase="started", relation_manifest=manifest)
+    assert client.runtime.transaction.committer._prepare_delete_tombstones(durable)
+    client.runtime.transaction.committer.redo.advance(
         durable,
         phase="tombstones_enqueued",
         relation_manifest=manifest,
@@ -623,17 +658,18 @@ def test_normal_commit_cannot_overwrite_an_early_delete_redo_entry(tmp_path) -> 
     )
 
     with pytest.raises(RedoIntegrityError, match="different durable effect"):
-        client.context_db.commit_operation(forged)
+        _commit_client_operation(client, forged)
 
-    assert client.source_store.read_object(uri_a).lifecycle_state.value == "active"
-    assert client.source_store.read_object(uri_b).lifecycle_state.value == "active"
+    assert client.runtime.stores.source.read_object(uri_a).lifecycle_state.value == "active"
+    assert client.runtime.stores.source.read_object(uri_b).lifecycle_state.value == "active"
     assert index.get_catalog_by_uri(uri_a, tenant_id="default")
     assert index.get_catalog_by_uri(uri_b, tenant_id="default")
-    entry = client.committer.redo.pending_entries()[0]
+    entry = client.runtime.transaction.committer.redo.pending_entries()[0]
     assert entry.operation.target_uri == uri_a
     assert entry.phase == "tombstones_enqueued"
 
-    recovered = client.context_db.commit_operation(
+    recovered = _commit_client_operation(
+        client,
         ContextOperation(
             operation_id=durable.operation_id,
             user_id="u1",
@@ -641,11 +677,11 @@ def test_normal_commit_cannot_overwrite_an_early_delete_redo_entry(tmp_path) -> 
             action=OperationAction.DELETE,
             target_uri=uri_a,
             payload={"tenant_id": "default", "reason": "durable_a"},
-        )
+        ),
     )
     assert [item.operation_id for item in recovered.operations] == [durable.operation_id]
-    assert client.source_store.read_object(uri_a).lifecycle_state.value == "deleted"
-    assert client.source_store.read_object(uri_b).lifecycle_state.value == "active"
+    assert client.runtime.stores.source.read_object(uri_a).lifecycle_state.value == "deleted"
+    assert client.runtime.stores.source.read_object(uri_b).lifecycle_state.value == "active"
     assert index.get_catalog_by_uri(uri_a, tenant_id="default") == []
     assert index.get_catalog_by_uri(uri_b, tenant_id="default")
 
@@ -655,7 +691,8 @@ def test_implicit_target_retry_resumes_exact_resolver_bound_redo(tmp_path) -> No
     uri_a = "memoryos://user/u1/resources/implicit-redo-a"
     uri_b = "memoryos://user/u1/resources/implicit-redo-b"
     for uri in (uri_a, uri_b):
-        client.context_db.write_object(
+        _seed_client_context(
+            client,
             ContextObject(
                 uri=uri,
                 context_type=ContextType.RESOURCE,
@@ -666,7 +703,7 @@ def test_implicit_target_retry_resumes_exact_resolver_bound_redo(tmp_path) -> No
             ),
             content="before update",
         )
-    updated = client.source_store.read_object(uri_a)
+    updated = client.runtime.stores.source.read_object(uri_a)
     updated.title = "resolver-bound update"
     request = ContextOperation(
         operation_id="op_implicit_target_redo",
@@ -682,30 +719,31 @@ def test_implicit_target_retry_resumes_exact_resolver_bound_redo(tmp_path) -> No
     )
     retry_payload = request.to_dict()
     durable_request = ContextOperation.from_dict(request.to_dict())
-    client.committer._validate_and_bind_operations("u1", [durable_request])
-    resolved = client.committer.target_resolver.resolve(durable_request, user_id="u1")
+    client.runtime.transaction.committer._validate_and_bind_operations("u1", [durable_request])
+    resolved = client.runtime.transaction.committer.target_resolver.resolve(durable_request, user_id="u1")
     assert resolved.resolved and resolved.operation.target_uri == uri_a
-    manifest = client.committer._build_regular_relation_manifest(resolved.operation)
-    client.committer.redo.begin(resolved.operation, phase="started", relation_manifest=manifest)
+    manifest = client.runtime.transaction.committer._build_regular_relation_manifest(resolved.operation)
+    client.runtime.transaction.committer.redo.begin(resolved.operation, phase="started", relation_manifest=manifest)
 
     explicit_substitution = ContextOperation.from_dict(retry_payload)
     explicit_substitution.target_uri = uri_b
     with pytest.raises(RedoIntegrityError, match="different durable effect"):
-        client.context_db.commit_operation(explicit_substitution)
+        _commit_client_operation(client, explicit_substitution)
 
-    recovered = client.context_db.commit_operation(ContextOperation.from_dict(retry_payload))
+    recovered = _commit_client_operation(client, ContextOperation.from_dict(retry_payload))
 
     assert [item.operation_id for item in recovered.operations] == [request.operation_id]
-    assert client.source_store.read_object(uri_a).title == "resolver-bound update"
-    assert client.source_store.read_object(uri_b).title == "before update"
-    assert not client.committer.redo.pending_entries()
+    assert client.runtime.stores.source.read_object(uri_a).title == "resolver-bound update"
+    assert client.runtime.stores.source.read_object(uri_b).title == "before update"
+    assert not client.runtime.transaction.committer.redo.pending_entries()
 
 
 def test_fuzzy_delete_retry_returns_durable_committed_target_not_pending(tmp_path) -> None:  # noqa: ANN001
     client = MemoryOSClient(str(tmp_path), vector_store=InMemoryVectorStore())
     uri_a = "memoryos://user/u1/resources/fuzzy-redo-a"
     uri_b = "memoryos://user/u1/resources/fuzzy-redo-b"
-    client.context_db.write_object(
+    _seed_client_context(
+        client,
         ContextObject(
             uri=uri_a,
             context_type=ContextType.RESOURCE,
@@ -716,7 +754,8 @@ def test_fuzzy_delete_retry_returns_durable_committed_target_not_pending(tmp_pat
         ),
         content="uniquefuzzydeleteme",
     )
-    client.context_db.write_object(
+    _seed_client_context(
+        client,
         ContextObject(
             uri=uri_b,
             context_type=ContextType.RESOURCE,
@@ -741,32 +780,32 @@ def test_fuzzy_delete_retry_returns_durable_committed_target_not_pending(tmp_pat
     )
     retry_payload = request.to_dict()
     durable_request = ContextOperation.from_dict(request.to_dict())
-    client.committer._validate_and_bind_operations("u1", [durable_request])
-    resolved = client.committer.target_resolver.resolve(durable_request, user_id="u1")
+    client.runtime.transaction.committer._validate_and_bind_operations("u1", [durable_request])
+    resolved = client.runtime.transaction.committer.target_resolver.resolve(durable_request, user_id="u1")
     assert resolved.resolved and resolved.operation.target_uri == uri_a
-    manifest = client.committer._build_regular_relation_manifest(resolved.operation)
-    client.committer.redo.begin(resolved.operation, phase="started", relation_manifest=manifest)
-    assert client.committer._prepare_delete_tombstones(resolved.operation)
-    client.committer.redo.advance(
+    manifest = client.runtime.transaction.committer._build_regular_relation_manifest(resolved.operation)
+    client.runtime.transaction.committer.redo.begin(resolved.operation, phase="started", relation_manifest=manifest)
+    assert client.runtime.transaction.committer._prepare_delete_tombstones(resolved.operation)
+    client.runtime.transaction.committer.redo.advance(
         resolved.operation,
         phase="tombstones_enqueued",
         relation_manifest=manifest,
     )
 
-    recovered = client.context_db.commit_operation(ContextOperation.from_dict(retry_payload))
+    recovered = _commit_client_operation(client, ContextOperation.from_dict(retry_payload))
 
     assert [item.operation_id for item in recovered.operations] == [request.operation_id]
     assert recovered.pending_operations == []
     assert recovered.operations[0].target_uri == uri_a
-    assert client.source_store.read_object(uri_a).lifecycle_state.value == "deleted"
-    assert client.source_store.read_object(uri_b).lifecycle_state.value == "active"
-    assert not client.committer.redo.pending_entries()
+    assert client.runtime.stores.source.read_object(uri_a).lifecycle_state.value == "deleted"
+    assert client.runtime.stores.source.read_object(uri_b).lifecycle_state.value == "active"
+    assert not client.runtime.transaction.committer.redo.pending_entries()
 
 
 def test_failed_commit_delete_tombstone_replays_exact_binding_on_retry(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     vectors = InMemoryVectorStore()
     client = MemoryOSClient(str(tmp_path), vector_store=vectors)
-    index = cast(SQLiteIndexStore, client.index_store)
+    index = cast(SQLiteIndexStore, client.runtime.stores.index)
     uri = "memoryos://user/u1/resources/retry-report"
     obj = ContextObject(
         uri=uri,
@@ -776,7 +815,7 @@ def test_failed_commit_delete_tombstone_replays_exact_binding_on_retry(tmp_path,
         owner_user_id="u1",
         metadata={"tree_paths": ["resources/desktop"], "source_kind": "resource"},
     )
-    client.context_db.write_object(obj, content="retry tombstone marker")
+    _seed_client_context(client, obj, content="retry tombstone marker")
     record = index.get_catalog_by_uri(uri, tenant_id="default")[0]
     row_id = vector_row_id("default", record.record_key)
     vectors.upsert_vector(
@@ -805,9 +844,9 @@ def test_failed_commit_delete_tombstone_replays_exact_binding_on_retry(tmp_path,
 
     monkeypatch.setattr(vectors, "delete_vector", fail_delete)
     with pytest.raises(RuntimeError, match="retryable but incomplete"):
-        client.context_db.commit_operation(operation)
+        _commit_client_operation(client, operation)
 
-    assert client.source_store.read_object(uri).lifecycle_state.value == "deleted"
+    assert client.runtime.stores.source.read_object(uri).lifecycle_state.value == "deleted"
     assert index.get_catalog_by_uri(uri, tenant_id="default") == []
     assert vectors.get_vector_metadata(row_id) is not None
     with sqlite3.connect(index.path) as conn:
@@ -821,7 +860,7 @@ def test_failed_commit_delete_tombstone_replays_exact_binding_on_retry(tmp_path,
     assert int(row[2]) >= 1
 
     monkeypatch.setattr(vectors, "delete_vector", original_delete)
-    retried = client.context_db.commit_operation(ContextOperation.from_dict(retry_payload))
+    retried = _commit_client_operation(client, ContextOperation.from_dict(retry_payload))
 
     committed = next(item for item in retried.operations if item.operation_id == "op_retryable_projection_delete")
     assert committed.payload["projection_tombstone_ids"] == [tombstone_id]
@@ -839,7 +878,7 @@ def test_failed_commit_delete_tombstone_replays_exact_binding_on_retry(tmp_path,
 def test_startup_replays_committed_pending_delete_tombstone(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     vectors = InMemoryVectorStore()
     client = MemoryOSClient(str(tmp_path), vector_store=vectors)
-    index = cast(SQLiteIndexStore, client.index_store)
+    index = cast(SQLiteIndexStore, client.runtime.stores.index)
     uri = "memoryos://user/u1/resources/startup-replay-report"
     obj = ContextObject(
         uri=uri,
@@ -849,7 +888,7 @@ def test_startup_replays_committed_pending_delete_tombstone(tmp_path, monkeypatc
         owner_user_id="u1",
         metadata={"tree_paths": ["resources/desktop"], "source_kind": "resource"},
     )
-    client.context_db.write_object(obj, content="startup replay tombstone marker")
+    _seed_client_context(client, obj, content="startup replay tombstone marker")
     record = index.get_catalog_by_uri(uri, tenant_id="default")[0]
     row_id = vector_row_id("default", record.record_key)
     vectors.upsert_vector(
@@ -877,14 +916,14 @@ def test_startup_replays_committed_pending_delete_tombstone(tmp_path, monkeypatc
         lambda _row_id: (_ for _ in ()).throw(RuntimeError("vector backend unavailable")),
     )
     with pytest.raises(RuntimeError, match="retryable but incomplete"):
-        client.context_db.commit_operation(operation)
+        _commit_client_operation(client, operation)
     monkeypatch.setattr(vectors, "delete_vector", original_delete)
 
     restarted = MemoryOSClient(str(tmp_path), vector_store=vectors)
 
-    assert restarted.readiness.snapshot()["ready"] is True
+    assert restarted.runtime.readiness.snapshot()["ready"] is True
     assert vectors.get_vector_metadata(row_id) is None
-    assert restarted.readiness.details["generic_tombstones"] == {
+    assert restarted.runtime.readiness.details["generic_tombstones"] == {
         "processed": 1,
         "stale": 0,
     }

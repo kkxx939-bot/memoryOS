@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from memoryos.contextdb.model.context_object import ContextObject
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.model.lifecycle import LifecycleState
-from memoryos.contextdb.store.sqlite_index_store import SQLiteIndexStore
+from infrastructure.store.model.context.context_object import ContextObject
+from infrastructure.store.model.context.context_type import ContextType
+from infrastructure.store.model.context.lifecycle import LifecycleState
+from infrastructure.store.sqlite.index_store import SQLiteIndexStore
 
 
 def test_sqlite_index_store_fts_or_fallback_search_and_filters(tmp_path) -> None:

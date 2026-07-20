@@ -1,22 +1,33 @@
-"""Explicit test composition for immutable Session evidence archives."""
+"""SessionArchive 测试使用的显式证据编码器。"""
 
 from __future__ import annotations
 
-from memoryos.action_policy.integration.commit_registration import (
-    build_action_policy_commit_handlers,
-)
-from memoryos.contextdb.session.evidence_encoder import register_session_evidence_encoder
-from memoryos.memory.evidence import SessionEvidenceArchiveEncoder
-from memoryos.operations.commit.domain_registry import (
-    register_action_policy_commit_handlers,
-)
+from infrastructure.store.contracts.session_evidence import SessionEvidenceEncoder
+from infrastructure.store.filesystem.session_archive import SessionArchiveStore
+from memory.commit.evidence.archive_encoder import SessionEvidenceArchiveEncoder
 
 
-def compose_domain_runtime_bindings() -> None:
-    """Reproduce runtime's domain bindings for explicitly composed tests."""
+def session_evidence_encoder() -> SessionEvidenceArchiveEncoder:
+    """为每个 Store 返回独立、无全局状态的领域编码器。"""
 
-    register_session_evidence_encoder(SessionEvidenceArchiveEncoder())
-    register_action_policy_commit_handlers(build_action_policy_commit_handlers())
+    return SessionEvidenceArchiveEncoder()
 
 
-__all__ = ["compose_domain_runtime_bindings"]
+def build_session_archive_store(
+    root,  # noqa: ANN001
+    tenant_id: str = "default",
+    *,
+    evidence_encoder: SessionEvidenceEncoder | None = None,
+    test_hook=None,  # noqa: ANN001
+) -> SessionArchiveStore:
+    """构造显式注入 Encoder 的真实文件 SessionArchiveStore。"""
+
+    return SessionArchiveStore(
+        root,
+        tenant_id=tenant_id,
+        evidence_encoder=evidence_encoder or session_evidence_encoder(),
+        test_hook=test_hook,
+    )
+
+
+__all__ = ["build_session_archive_store", "session_evidence_encoder"]

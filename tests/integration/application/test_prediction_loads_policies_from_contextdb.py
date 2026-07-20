@@ -2,17 +2,19 @@ from __future__ import annotations
 
 import json
 
-from memoryos.action_policy.model.action_policy import ActionPolicy, ActionPolicyStatus
-from memoryos.api.sdk.client import MemoryOSClient
-from memoryos.behavior.model.behavior_pattern import BehaviorPattern
-from memoryos.connect import ConnectMetadata
-from memoryos.contextdb.model.context_object import ContextObject
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.model.lifecycle import LifecycleState
-from memoryos.operations.model.context_operation import ContextOperation
-from memoryos.operations.model.operation_action import OperationAction
-from memoryos.prediction.model.prediction_request import PredictionRequest
-from memoryos.prediction.pipeline.observation_normalizer import ObservationNormalizer
+from behavior.core.model.behavior_pattern import BehaviorPattern
+from behavior.projection import behavior_pattern_to_context_object
+from infrastructure.store.model.context.context_object import ContextObject
+from infrastructure.store.model.context.context_type import ContextType
+from infrastructure.store.model.context.lifecycle import LifecycleState
+from openApi.sdk.client import MemoryOSClient
+from policy.action_policy.decision.observation_normalizer import ObservationNormalizer
+from policy.action_policy.decision.request import PredictionRequest
+from policy.action_policy.model.action_policy import ActionPolicy, ActionPolicyStatus
+from pre.connect import ConnectMetadata
+from tests.support.persistence import seed_context_object
+from transaction.model.context_operation import ContextOperation
+from transaction.model.operation_action import OperationAction
 
 
 def _seed_policy(
@@ -27,9 +29,8 @@ def _seed_policy(
     )
     obj = policy.to_context_object()
     obj.lifecycle_state = lifecycle
-    client.context_db.seed_object(anchor, content="anchor")
-    client.context_db.commit_operation(
-        ContextOperation(
+    seed_context_object(client.runtime.stores.source, client.runtime.stores.index, anchor, content="anchor")
+    operation = ContextOperation(
             user_id=policy.user_id,
             context_type=ContextType.ACTION_POLICY,
             action=OperationAction.ADD,
@@ -39,7 +40,7 @@ def _seed_policy(
                 "content": json.dumps(policy.to_dict()),
             },
         )
-    )
+    client.runtime.transaction.committer.commit(operation.user_id, [operation])
 
 
 def _request(actions: list[str]) -> PredictionRequest:
@@ -67,7 +68,7 @@ def test_prediction_loads_policy_from_contextdb_without_manual_policies(tmp_path
     result = client.predict(_request(["turn_on_ac", "ask_user", "do_nothing"]))
 
     assert result.candidates[0].action == "turn_on_ac"
-    assert result.memory_operations == []
+    assert "memory_operations" not in result.to_dict()
 
 
 def test_available_actions_and_deleted_obsolete_filtering(tmp_path) -> None:
@@ -108,13 +109,13 @@ def test_available_actions_and_deleted_obsolete_filtering(tmp_path) -> None:
     # Source fact.  A rebuild can still inspect the Source relation, while
     # online ActionPolicy lookup cannot traverse either retired endpoint.
     for policy in (deleted_policy, obsolete_policy):
-        source = client.source_store.read_object(policy.uri)
+        source = client.runtime.stores.source.read_object(policy.uri)
         assert any(
             relation.relation_type == "anchored_by"
             and relation.target_uri == policy.support_anchor_uri
             for relation in source.relations
         )
-        assert client.relation_store.relations_of(policy.uri, tenant_id="default") == []
+        assert client.runtime.stores.relation.relations_of(policy.uri, tenant_id="default") == []
 
     result = client.predict(_request(["turn_on_fan", "smoke", "ask_user", "do_nothing"]))
 
@@ -187,7 +188,12 @@ def test_packed_fallback_behavior_hit_enters_source_uris_and_archive_used_contex
         case_refs=["case-1"],
         action_distribution=[{"action": "turn_on_ac", "count": 1}],
     )
-    client.context_db.seed_object(behavior.to_context_object(), content="hot turn_on_ac behavior")
+    seed_context_object(
+        client.runtime.stores.source,
+        client.runtime.stores.index,
+        behavior_pattern_to_context_object(behavior),
+        content="hot turn_on_ac behavior",
+    )
     policy = ActionPolicy(
         user_id="u1",
         scene_key=scene_key,
@@ -204,7 +210,6 @@ def test_packed_fallback_behavior_hit_enters_source_uris_and_archive_used_contex
             episode_id="fallback-hit",
             observation={"scene_key": scene_key, "raw_text": "hot room", "location": "home"},
             available_actions=["turn_on_ac", "ask_user", "do_nothing"],
-            token_budget=2000,
             connect_metadata=ConnectMetadata.action_capable_embodied("reachy_mini").to_dict(),
         ),
         policies=[policy],
@@ -217,5 +222,5 @@ def test_packed_fallback_behavior_hit_enters_source_uris_and_archive_used_contex
     assert behavior.uri in action_context.source_uris
 
     assert result.archive_uri is not None
-    archived = client.session_archive_store.read_archive(result.archive_uri)
+    archived = client.runtime.session.archive_store.read_archive(result.archive_uri)
     assert behavior.uri in {item["uri"] for item in archived.used_contexts}

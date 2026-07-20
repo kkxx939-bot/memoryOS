@@ -4,18 +4,20 @@ import hashlib
 
 import pytest
 
-from memoryos.adapters.persistence.filesystem.memory_document_store import FileSystemMemoryDocumentStore
-from memoryos.memory.documents import (
+from infrastructure.store.filesystem.memory_document_store import FileSystemMemoryDocumentStore
+from memory.core import (
     ABSENT,
     DocumentEditKind,
     MemoryCandidateKind,
-    MemoryDocumentPlanner,
     MemoryEditProposal,
     PresentPath,
-    RelatedDocumentCandidate,
-    explicit_evidence_digest,
     new_document_id,
     render_new_document,
+)
+from memory.execute import (
+    MemoryDocumentPlanner,
+    RelatedDocumentCandidate,
+    explicit_evidence_digest,
 )
 
 

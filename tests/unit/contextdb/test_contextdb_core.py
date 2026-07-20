@@ -4,10 +4,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from memoryos.contextdb.layers import ContextPacker
-from memoryos.contextdb.model import ContextObject, ContextType, ContextURI
-from memoryos.contextdb.store import FileSystemSourceStore, IndexConsistencyService, InMemoryIndexStore
-from memoryos.core.errors import InvalidContextURI
+from infrastructure.context.maintenance.index_consistency import IndexConsistencyService
+from infrastructure.store.model.context import ContextObject, ContextType, ContextURI
+from infrastructure.store.model.context.errors import InvalidContextURI
+from tests.support.persistence import FileSystemSourceStore, InMemoryIndexStore
 
 
 class ContextDBCoreTest(unittest.TestCase):
@@ -84,14 +84,6 @@ class ContextDBCoreTest(unittest.TestCase):
                 filters={"owner_user_id": "gulf"},
             )
             self.assertEqual([hit.uri for hit in gulf_hits], [gulf_obj.uri])
-
-    def test_context_packer_respects_section_budget(self) -> None:
-        packed = ContextPacker(100, allocations={"support_rules": 20}).pack(
-            {"support_rules": [{"content": "x" * 200, "token_estimate": 50}, {"content": "small", "token_estimate": 5}]}
-        )
-        self.assertLessEqual(packed["slices"]["support_rules"]["used"], 50)
-        self.assertEqual(packed["total_budget"], 100)
-
 
 if __name__ == "__main__":
     unittest.main()

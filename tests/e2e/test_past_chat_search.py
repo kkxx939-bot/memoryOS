@@ -2,17 +2,13 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from memoryos.api.sdk.client import MemoryOSClient
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.retrieval.query_plan import (
+from infrastructure.context.retrieval.query_plan import (
     RetrievalOptions,
     RetrievalQueryIntent,
 )
-from memoryos.security.trusted_context import (
-    AUTHORITATIVE_REMEMBER,
-    READ_CONTEXT,
-    TrustedRequestContext,
-)
+from infrastructure.store.model.context.context_type import ContextType
+from foundation.identity import LocalUserContext
+from openApi.sdk.client import MemoryOSClient
 
 _MARKER = "PastChatJavaRaftMarker"
 _PROJECT_MARKER = "MemoryOSCrossSourceMarker"
@@ -35,14 +31,8 @@ class _FixedPromptDateTime(datetime):
         return fixed if tz is None else fixed.astimezone(tz)
 
 
-def _caller() -> TrustedRequestContext:
-    return TrustedRequestContext(
-        tenant_id="default",
-        user_id="u1",
-        actor_kind="user",
-        actor_id="u1",
-        capabilities=frozenset({READ_CONTEXT, AUTHORITATIVE_REMEMBER}),
-    )
+def _caller() -> LocalUserContext:
+    return LocalUserContext(user_id="u1")
 
 
 def _options() -> RetrievalOptions:
@@ -56,13 +46,12 @@ def _options() -> RetrievalOptions:
         timezone="Asia/Singapore",
         candidate_limit=100,
         final_limit=100,
-        token_budget=4_096,
     )
 
 
 def _project_all(client: MemoryOSClient) -> None:
-    while client.queue_store.stats(queue_name="memory_projection").get("pending", 0):
-        result = client.memory_projection_worker.process_pending(limit=20)
+    while client.runtime.stores.queue.stats(queue_name="memory_projection").get("pending", 0):
+        result = client.runtime.memory.projection_worker.process_pending(limit=20)
         assert not result.failed
 
 
@@ -79,7 +68,7 @@ def test_fixed_past_chat_query_uses_one_catalog_chain_for_memory_and_session(
     monkeypatch,
 ) -> None:  # noqa: ANN001
     monkeypatch.setattr(
-        "memoryos.application.context.query_planner.datetime",
+        "infrastructure.context.query_planner.datetime",
         _FixedPromptDateTime,
     )
     client = MemoryOSClient(str(tmp_path))

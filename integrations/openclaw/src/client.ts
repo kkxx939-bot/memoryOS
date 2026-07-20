@@ -1,9 +1,8 @@
 export type MemoryOSResponse = Record<string, unknown>;
 export class MemoryOSHttpClient {
-  constructor(readonly baseUrl: string, readonly token?: string, readonly timeoutMs = 2500) {}
+  constructor(readonly baseUrl: string, readonly timeoutMs = 2500) {}
   async request(path: string, payload?: unknown, method = "POST"): Promise<MemoryOSResponse> {
     const headers: Record<string,string> = {"content-type":"application/json", "x-request-id": crypto.randomUUID()};
-    if (this.token) headers.authorization = `Bearer ${this.token}`;
     try {
       const response = await fetch(`${this.baseUrl.replace(/\/$/, "")}${path}`, {method, headers, body: method === "GET" ? undefined : JSON.stringify(payload ?? {}), signal: AbortSignal.timeout(this.timeoutMs)});
       const body = await response.json() as MemoryOSResponse;

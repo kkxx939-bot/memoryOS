@@ -5,35 +5,34 @@ from threading import Event, Thread
 
 import pytest
 
-from memoryos.adapters.persistence.filesystem.memory_document_store import (
+from infrastructure.store.contracts.vector import vector_row_id
+from infrastructure.store.filesystem.memory_document_store import (
     FileSystemMemoryDocumentStore,
 )
-from memoryos.adapters.persistence.in_memory.queue_store import InMemoryQueueStore
-from memoryos.adapters.persistence.in_memory.relation_store import InMemoryRelationStore
-from memoryos.contextdb.catalog import CatalogRecordKind
-from memoryos.contextdb.model.context_relation import ContextRelation
-from memoryos.contextdb.store.sqlite_index_store import SQLiteIndexStore
-from memoryos.contextdb.store.vector_store import InMemoryVectorStore, vector_row_id
-from memoryos.memory.documents import (
-    ABSENT,
+from infrastructure.store.memory import (
     DocumentControlRecord,
     DocumentDeletionStatus,
-    DocumentEraseStatus,
     DocumentPublicationBarrier,
     MemoryDocumentControlStore,
-    MemoryDocumentEraser,
-    MemoryDocumentEraseStore,
     MemoryDocumentRevisionStore,
+)
+from infrastructure.store.memory.erasure_store import MemoryDocumentEraseStore
+from infrastructure.store.model.catalog import CatalogRecordKind
+from infrastructure.store.model.context.context_relation import ContextRelation
+from infrastructure.store.sqlite.index_store import SQLiteIndexStore
+from memory.commit import DocumentEraseStatus, MemoryDocumentEraser
+from memory.core import (
+    ABSENT,
     PresentPath,
     new_document_id,
     render_new_document,
 )
-from memoryos.memory.documents.path_policy import MemoryDocumentPathPolicy
-from memoryos.providers.embedding import HashingEmbeddingProvider
-from memoryos.workers.memory_document_projection_worker import (
-    MemoryDocumentCatalogEraseBackend,
-    MemoryDocumentProjectionWorker,
-)
+from memory.core.structure.path_policy import MemoryDocumentPathPolicy
+from memory.worker.projection.erase_backend import MemoryDocumentCatalogEraseBackend
+from memory.worker.projection.worker import MemoryDocumentProjectionWorker
+from tests.support.embedding import DeterministicEmbeddingProvider
+from tests.support.persistence import InMemoryVectorStore
+from tests.support.persistence.in_memory import InMemoryQueueStore, InMemoryRelationStore
 
 
 def _components(root: Path):  # noqa: ANN202
@@ -61,7 +60,7 @@ def _rich_components(root: Path):  # noqa: ANN202
         catalog,
         InMemoryQueueStore(),
         vector_store=vectors,
-        embedding_provider=HashingEmbeddingProvider(),
+        embedding_provider=DeterministicEmbeddingProvider(),
         relation_store=relations,
     )
     return documents, controls, catalog, relations, vectors, worker
@@ -236,6 +235,7 @@ def test_hard_erased_identity_stays_blocked_after_sqlite_recreation(tmp_path: Pa
         controls,
         MemoryDocumentRevisionStore(tmp_path),
         cleanup_backends=(MemoryDocumentCatalogEraseBackend(worker),),
+        erase_store=MemoryDocumentEraseStore(controls.root),
     )
 
     erased = eraser.hard_erase(
@@ -348,6 +348,7 @@ def test_hard_erase_seals_barrier_above_full_rebuild_serving_generation(tmp_path
         worker.control_store,
         MemoryDocumentRevisionStore(tmp_path),
         cleanup_backends=(MemoryDocumentCatalogEraseBackend(worker),),
+        erase_store=MemoryDocumentEraseStore(worker.control_store.root),
     )
 
     result = eraser.hard_erase(
@@ -419,7 +420,7 @@ def test_hard_erase_replays_derived_cleanup_after_catalog_commit_crash(
         catalog,
         InMemoryQueueStore(),
         vector_store=vectors,
-        embedding_provider=HashingEmbeddingProvider(),
+        embedding_provider=DeterministicEmbeddingProvider(),
         relation_store=relations,
     )
     target_id = new_document_id()
@@ -461,6 +462,7 @@ def test_hard_erase_replays_derived_cleanup_after_catalog_commit_crash(
         controls,
         MemoryDocumentRevisionStore(tmp_path),
         cleanup_backends=(MemoryDocumentCatalogEraseBackend(worker),),
+        erase_store=MemoryDocumentEraseStore(controls.root),
     )
 
     first = eraser.hard_erase(
@@ -545,6 +547,7 @@ def test_owner_relation_lock_orders_cross_document_link_add_after_target_erase(
         controls,
         MemoryDocumentRevisionStore(tmp_path),
         cleanup_backends=(MemoryDocumentCatalogEraseBackend(worker),),
+        erase_store=MemoryDocumentEraseStore(controls.root),
     )
     errors: list[BaseException] = []
     erase_results = []
@@ -712,7 +715,7 @@ def test_soft_barrier_rebuild_after_sqlite_loss_purges_orphan_derivatives(tmp_pa
         recreated_catalog,
         InMemoryQueueStore(),
         vector_store=vectors,
-        embedding_provider=HashingEmbeddingProvider(),
+        embedding_provider=DeterministicEmbeddingProvider(),
         relation_store=relations,
     )
 
@@ -932,7 +935,7 @@ def test_remove_obsolete_uses_exact_metadata_fallback_for_noncanonical_vector_ro
         catalog,
         InMemoryQueueStore(),
         vector_store=vectors,
-        embedding_provider=HashingEmbeddingProvider(),
+        embedding_provider=DeterministicEmbeddingProvider(),
     )
     record_key = "memory-document:u1:legacy-vector"
     expected_row_id = vector_row_id("t1", record_key)

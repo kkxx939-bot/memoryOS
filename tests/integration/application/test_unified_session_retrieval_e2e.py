@@ -4,16 +4,16 @@ import json
 from pathlib import Path
 from typing import cast
 
-from memoryos.api.sdk.client import MemoryOSClient
-from memoryos.contextdb.catalog import CatalogRecord, CatalogRecordKind
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.retrieval.candidate_generator import CandidateGenerator
-from memoryos.contextdb.retrieval.query_plan import (
+from infrastructure.context.candidate import CandidateGenerator
+from infrastructure.context.query_planner import QueryPlanner
+from infrastructure.context.retrieval.query_plan import (
     RetrievalOptions,
     RetrievalQueryIntent,
 )
-from memoryos.contextdb.retrieval.query_planner import QueryPlanner
-from memoryos.contextdb.store.sqlite_index_store import SQLiteIndexStore
+from infrastructure.store.model.catalog import CatalogRecord, CatalogRecordKind
+from infrastructure.store.model.context.context_type import ContextType
+from infrastructure.store.sqlite.index_store import SQLiteIndexStore
+from openApi.sdk.client import MemoryOSClient
 
 
 def _session_options(
@@ -25,7 +25,7 @@ def _session_options(
         target_paths=("timeline/2026/07/14", "resources/desktop"),
         context_types=(ContextType.SESSION,),
         record_kinds=record_kinds,
-        tenant_id="tenant-a",
+        tenant_id="default",
         owner_user_id="u1",
         workspace_ids=("memoryOS",),
         event_time_from="2026-07-14",
@@ -34,12 +34,11 @@ def _session_options(
         query_intent=RetrievalQueryIntent.OPEN_RECALL,
         candidate_limit=100,
         final_limit=final_limit,
-        token_budget=4_096,
     )
 
 
 def test_tool_result_file_name_uses_unified_catalog_as_ordinary_session_context(tmp_path: Path) -> None:
-    client = MemoryOSClient(str(tmp_path), tenant_id="tenant-a")
+    client = MemoryOSClient(str(tmp_path))
     result = client.commit_agent_session(
         user_id="u1",
         session_id="session-20260714",
@@ -60,7 +59,6 @@ def test_tool_result_file_name_uses_unified_catalog_as_ordinary_session_context(
         ],
         async_commit=False,
         project_id="memoryOS",
-        tenant_id="tenant-a",
     )
     assert result.session_projection_status == "projected"
 
@@ -69,7 +67,6 @@ def test_tool_result_file_name_uses_unified_catalog_as_ordinary_session_context(
         options=_session_options(),
         user_id="u1",
         project_id="memoryOS",
-        tenant_id="tenant-a",
     )
 
     assert len(hits) == 1
@@ -82,9 +79,9 @@ def test_tool_result_file_name_uses_unified_catalog_as_ordinary_session_context(
     assert "top-secret" not in json.dumps(hit, ensure_ascii=False)
     assert "/Users/u1" not in json.dumps(hit, ensure_ascii=False)
 
-    record = cast(SQLiteIndexStore, client.index_store).get_catalog(
+    record = cast(SQLiteIndexStore, client.runtime.stores.index).get_catalog(
         str(metadata["catalog_record_key"]),
-        tenant_id="tenant-a",
+        tenant_id="default",
     )
     assert record is not None
     assert record.record_kind == CatalogRecordKind.TOOL_RESULT.value
@@ -100,7 +97,7 @@ def test_tool_result_file_name_uses_unified_catalog_as_ordinary_session_context(
     assert "/Users/u1" not in serialized_trace
 
 def test_default_history_retrieves_ordinary_session_event_resource_and_tool_rows(tmp_path: Path) -> None:
-    client = MemoryOSClient(str(tmp_path), tenant_id="tenant-a")
+    client = MemoryOSClient(str(tmp_path))
     result = client.commit_agent_session(
         user_id="u1",
         session_id="history-session-20260714",
@@ -121,7 +118,6 @@ def test_default_history_retrieves_ordinary_session_event_resource_and_tool_rows
         ],
         async_commit=False,
         project_id="memoryOS",
-        tenant_id="tenant-a",
     )
     assert result.session_projection_status == "projected"
 
@@ -131,7 +127,7 @@ def test_default_history_retrieves_ordinary_session_event_resource_and_tool_rows
             options=RetrievalOptions(
                 target_paths=(path,),
                 record_kinds=(record_kind,),
-                tenant_id="tenant-a",
+                tenant_id="default",
                 owner_user_id="u1",
                 workspace_ids=("memoryOS",),
                 event_time_from="2026-07-14",
@@ -143,7 +139,6 @@ def test_default_history_retrieves_ordinary_session_event_resource_and_tool_rows
             ),
             user_id="u1",
             project_id="memoryOS",
-            tenant_id="tenant-a",
         )
 
     expected = {
@@ -161,7 +156,7 @@ def test_default_history_retrieves_ordinary_session_event_resource_and_tool_rows
 def test_public_session_event_time_alias_and_occurred_at_precedence_use_matching_timeline_days(
     tmp_path: Path,
 ) -> None:
-    client = MemoryOSClient(str(tmp_path), tenant_id="tenant-a")
+    client = MemoryOSClient(str(tmp_path))
     result = client.commit_agent_session(
         user_id="u1",
         session_id="event-time-alias-public",
@@ -180,7 +175,6 @@ def test_public_session_event_time_alias_and_occurred_at_precedence_use_matching
         ],
         async_commit=False,
         project_id="memoryOS",
-        tenant_id="tenant-a",
     )
     assert result.session_projection_status == "projected"
 
@@ -191,7 +185,7 @@ def test_public_session_event_time_alias_and_occurred_at_precedence_use_matching
                 target_paths=(f"timeline/{day.replace('-', '/')}",),
                 context_types=(ContextType.SESSION,),
                 record_kinds=(CatalogRecordKind.MESSAGE.value,),
-                tenant_id="tenant-a",
+                tenant_id="default",
                 owner_user_id="u1",
                 workspace_ids=("memoryOS",),
                 event_time_from=day,
@@ -203,7 +197,6 @@ def test_public_session_event_time_alias_and_occurred_at_precedence_use_matching
             ),
             user_id="u1",
             project_id="memoryOS",
-            tenant_id="tenant-a",
         )
 
     july_14 = recalled("public alias-only marker", "2026-07-14")
@@ -217,7 +210,7 @@ def test_public_session_event_time_alias_and_occurred_at_precedence_use_matching
 
 
 def test_natural_event_date_uses_real_session_projection_without_lexical_overlap(tmp_path: Path) -> None:
-    client = MemoryOSClient(str(tmp_path), tenant_id="tenant-a")
+    client = MemoryOSClient(str(tmp_path))
     result = client.commit_agent_session(
         user_id="u1",
         session_id="natural-event-session",
@@ -230,7 +223,6 @@ def test_natural_event_date_uses_real_session_projection_without_lexical_overlap
         ],
         async_commit=False,
         project_id="memoryOS",
-        tenant_id="tenant-a",
     )
     assert result.session_projection_status == "projected"
 
@@ -238,7 +230,7 @@ def test_natural_event_date_uses_real_session_projection_without_lexical_overlap
         "2026年7月14日发生了什么",
         options=RetrievalOptions(
             context_types=(ContextType.SESSION,),
-            tenant_id="tenant-a",
+            tenant_id="default",
             owner_user_id="u1",
             workspace_ids=("memoryOS",),
             timezone="Asia/Singapore",
@@ -247,7 +239,6 @@ def test_natural_event_date_uses_real_session_projection_without_lexical_overlap
         ),
         user_id="u1",
         project_id="memoryOS",
-        tenant_id="tenant-a",
     )
 
     assert any(item["text"] == "Read the quarterly operations report" for item in recalled)
@@ -265,7 +256,7 @@ def test_natural_event_date_uses_real_session_projection_without_lexical_overlap
 
 
 def test_temporal_structured_fallback_marks_fts_unavailable_in_recall_trace(tmp_path: Path) -> None:
-    client = MemoryOSClient(str(tmp_path), tenant_id="tenant-a")
+    client = MemoryOSClient(str(tmp_path))
     committed = client.commit_agent_session(
         user_id="u1",
         session_id="temporal-fts-unavailable",
@@ -278,16 +269,15 @@ def test_temporal_structured_fallback_marks_fts_unavailable_in_recall_trace(tmp_
         ],
         async_commit=False,
         project_id="memoryOS",
-        tenant_id="tenant-a",
     )
     assert committed.session_projection_status == "projected"
-    cast(SQLiteIndexStore, client.index_store).fts_enabled = False
+    cast(SQLiteIndexStore, client.runtime.stores.index).fts_enabled = False
 
     recalled = client.search_context(
         "2026年7月14日发生了什么",
         options=RetrievalOptions(
             context_types=(ContextType.SESSION,),
-            tenant_id="tenant-a",
+            tenant_id="default",
             owner_user_id="u1",
             workspace_ids=("memoryOS",),
             timezone="Asia/Singapore",
@@ -296,7 +286,6 @@ def test_temporal_structured_fallback_marks_fts_unavailable_in_recall_trace(tmp_
         ),
         user_id="u1",
         project_id="memoryOS",
-        tenant_id="tenant-a",
     )
 
     assert any(item["text"] == "Review the operational handoff" for item in recalled)
@@ -307,10 +296,10 @@ def test_temporal_structured_fallback_marks_fts_unavailable_in_recall_trace(tmp_
     assert all("fts_unavailable" in str(item["degraded_mode"]) for item in recalled)
 
 
-def test_transaction_date_structured_candidate_applies_acl_before_sql_limit(
+def test_transaction_date_structured_candidate_applies_owner_before_sql_limit(
     tmp_path: Path,
 ) -> None:
-    client = MemoryOSClient(str(tmp_path), tenant_id="tenant-a")
+    client = MemoryOSClient(str(tmp_path))
     query = "2026年7月14日系统新增了哪些记忆"
 
     def memory_document_record(
@@ -325,7 +314,7 @@ def test_transaction_date_structured_candidate_applies_acl_before_sql_limit(
         return CatalogRecord(
             record_key=key,
             uri=uri,
-            tenant_id="tenant-a",
+            tenant_id="default",
             owner_user_id=owner_user_id,
             workspace_id="memoryOS",
             context_type="memory",
@@ -350,17 +339,7 @@ def test_transaction_date_structured_candidate_applies_acl_before_sql_limit(
             document_revision=1,
             projection_generation=1,
             projection_effect_hash=f"digest-{document_id}",
-            metadata={
-                "relative_path": f"knowledge/topics/{document_id}.md",
-                "scope": {
-                    "visibility": {
-                        "tenant_id": "tenant-a",
-                        "private": True,
-                        "allowed_principal_ids": [owner_user_id],
-                        "allowed_service_ids": [],
-                    }
-                }
-            },
+            metadata={"relative_path": f"knowledge/topics/{document_id}.md"},
         )
 
     rows = (
@@ -383,13 +362,13 @@ def test_transaction_date_structured_candidate_applies_acl_before_sql_limit(
             updated_at="2026-07-15T04:00:00+00:00",
         ),
     )
-    index_store = cast(SQLiteIndexStore, client.index_store)
+    index_store = cast(SQLiteIndexStore, client.runtime.stores.index)
     for row in rows:
         index_store.replace_memory_document_projection(
             row,
             (),
             None,
-            tenant_id="tenant-a",
+            tenant_id="default",
             owner_user_id=row.owner_user_id,
         )
 
@@ -398,7 +377,7 @@ def test_transaction_date_structured_candidate_applies_acl_before_sql_limit(
         options=RetrievalOptions(
             context_types=(ContextType.MEMORY,),
             record_kinds=(CatalogRecordKind.MEMORY_DOCUMENT.value,),
-            tenant_id="tenant-a",
+            tenant_id="default",
             owner_user_id="u1",
             workspace_ids=("memoryOS",),
             timezone="Asia/Singapore",
@@ -421,7 +400,7 @@ def test_transaction_date_structured_candidate_applies_acl_before_sql_limit(
 def test_multiple_desktop_files_are_individually_recallable_and_broad_recall_is_bounded(
     tmp_path: Path,
 ) -> None:
-    client = MemoryOSClient(str(tmp_path), tenant_id="tenant-a")
+    client = MemoryOSClient(str(tmp_path))
     names = [f"quarterly-{index:02d}.txt" for index in range(6)]
     markers = (
         "quartzalpha",
@@ -446,7 +425,6 @@ def test_multiple_desktop_files_are_individually_recallable_and_broad_recall_is_
         ],
         async_commit=False,
         project_id="memoryOS",
-        tenant_id="tenant-a",
     )
 
     for name, marker in zip(names, markers, strict=True):
@@ -455,7 +433,6 @@ def test_multiple_desktop_files_are_individually_recallable_and_broad_recall_is_
             options=_session_options(final_limit=5),
             user_id="u1",
             project_id="memoryOS",
-            tenant_id="tenant-a",
         )
         assert any(dict(item["metadata"]).get("resource_name") == name for item in exact)
 
@@ -464,14 +441,12 @@ def test_multiple_desktop_files_are_individually_recallable_and_broad_recall_is_
         options=_session_options(final_limit=20),
         user_id="u1",
         project_id="memoryOS",
-        tenant_id="tenant-a",
     )
     second = client.search_context(
         "quarterly",
         options=_session_options(final_limit=20),
         user_id="u1",
         project_id="memoryOS",
-        tenant_id="tenant-a",
     )
 
     assert [item["record_key"] for item in first] == [item["record_key"] for item in second]

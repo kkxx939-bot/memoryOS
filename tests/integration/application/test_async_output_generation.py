@@ -6,11 +6,10 @@ from typing import Any
 
 import pytest
 
-from memoryos.contextdb.session.session_archive import (
-    AsyncOutputIntegrityError,
-    SessionArchiveStore,
-)
-from memoryos.contextdb.session.session_model import SessionArchive
+from infrastructure.store.filesystem import SessionArchiveStore
+from memory.commit.evidence.errors import AsyncOutputIntegrityError
+from pre.session import SessionArchive
+from tests.support.session_archive import build_session_archive_store
 
 ARCHIVE_URI = "memoryos://user/u1/sessions/history/generation-race"
 
@@ -71,7 +70,7 @@ def _publish_process(
 ) -> None:
     try:
         barrier.wait(timeout=15)
-        _publish(SessionArchiveStore(root), _archive(task_id), created_at=created_at)
+        _publish(build_session_archive_store(root), _archive(task_id), created_at=created_at)
         results.put((task_id, "ok"))
     except BaseException as exc:  # pragma: no cover - surfaced in the parent.
         results.put((task_id, type(exc).__name__))
@@ -100,7 +99,7 @@ def test_async_generation_crash_never_mixes_tasks(
 ) -> None:
     archive_a = _archive("task-a")
     archive_b = _archive("task-b")
-    store = SessionArchiveStore(tmp_path)
+    store = build_session_archive_store(tmp_path)
     _publish(store, archive_a, created_at="2026-07-12T00:00:00+00:00")
 
     def crash(stage: str, task_id: str) -> None:
@@ -111,7 +110,7 @@ def test_async_generation_crash_never_mixes_tasks(
     with pytest.raises(InjectedAsyncCrash, match=crash_stage.replace(".", r"\.")):
         _publish(store, archive_b, created_at="2026-07-12T00:01:00+00:00")
 
-    restarted = SessionArchiveStore(tmp_path)
+    restarted = build_session_archive_store(tmp_path)
     assert restarted.async_outputs_done_for_task(archive_b) is b_is_current
     assert restarted.async_outputs_done_for_task(archive_a) is (not b_is_current)
     selected = restarted.read_async_outputs(archive_b if b_is_current else archive_a)
@@ -128,7 +127,7 @@ def test_async_generation_crash_never_mixes_tasks(
 
 def test_async_manifest_tamper_is_quarantined_and_not_reprocessed(tmp_path: Path) -> None:
     archive = _archive("task-tamper")
-    store = SessionArchiveStore(tmp_path)
+    store = build_session_archive_store(tmp_path)
     _publish(store, archive, created_at="2026-07-12T00:00:00+00:00")
     generation = store._dir(ARCHIVE_URI) / "async_outputs" / archive.task_id
     (generation / "memory_diff.json").write_text("{}", encoding="utf-8")
@@ -174,7 +173,7 @@ def test_concurrent_async_publish_uses_deterministic_head_cas(tmp_path: Path) ->
         ("task-new", "ok"),
     }
 
-    store = SessionArchiveStore(tmp_path)
+    store = build_session_archive_store(tmp_path)
     assert store.async_outputs_done_for_task(_archive("task-new")) is True
     assert store.async_outputs_done_for_task(_archive("task-old")) is False
     selected = store.read_async_outputs(_archive("task-new"))

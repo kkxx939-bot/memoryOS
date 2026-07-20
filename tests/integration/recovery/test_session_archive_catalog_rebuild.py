@@ -5,15 +5,13 @@ from typing import cast
 
 import pytest
 
-from memoryos.adapters.persistence.filesystem.session_archive import SessionArchiveStore
-from memoryos.adapters.persistence.in_memory.queue_store import InMemoryQueueStore
-from memoryos.adapters.persistence.sqlite.index_store import SQLiteIndexStore
-from memoryos.api.sdk.client import MemoryOSClient
-from memoryos.application.session.commit_service import SessionCommitService
-from memoryos.application.session.context_projector import SessionContextProjector
-from memoryos.contextdb.session.evidence_encoder import register_session_evidence_encoder
-from memoryos.contextdb.session.session_model import SessionArchive
-from memoryos.memory.evidence import SessionEvidenceArchiveEncoder
+from infrastructure.context.session_projector import SessionContextProjector
+from infrastructure.store.sqlite.index_store import SQLiteIndexStore
+from memory.commit.session_commit import SessionCommitService
+from openApi.sdk.client import MemoryOSClient
+from pre.session import SessionArchive
+from tests.support.persistence.in_memory import InMemoryQueueStore
+from tests.support.session_archive import build_session_archive_store
 
 
 def _archive(session_id: str) -> SessionArchive:
@@ -27,8 +25,7 @@ def _archive(session_id: str) -> SessionArchive:
 
 
 def test_archive_listing_is_tenant_bound_cursor_ordered_and_limited(tmp_path: Path) -> None:
-    register_session_evidence_encoder(SessionEvidenceArchiveEncoder())
-    store = SessionArchiveStore(tmp_path, tenant_id="default")
+    store = build_session_archive_store(tmp_path, tenant_id="default")
     for session_id in ("c", "a", "b"):
         store.write_sync_archive(_archive(session_id))
 
@@ -44,8 +41,7 @@ def test_archive_listing_is_tenant_bound_cursor_ordered_and_limited(tmp_path: Pa
 
 
 def test_async_summaries_reproject_and_rebuild_after_catalog_loss(tmp_path: Path) -> None:
-    register_session_evidence_encoder(SessionEvidenceArchiveEncoder())
-    archive_store = SessionArchiveStore(tmp_path, tenant_id="default")
+    archive_store = build_session_archive_store(tmp_path, tenant_id="default")
     database = tmp_path / "context.sqlite3"
     index = SQLiteIndexStore(database)
     service = SessionCommitService(
@@ -96,10 +92,10 @@ def test_async_summaries_reproject_and_rebuild_after_catalog_loss(tmp_path: Path
 def test_runtime_startup_rebuilds_session_catalog_after_sqlite_loss(tmp_path: Path) -> None:
     client = MemoryOSClient(str(tmp_path))
     archive = _archive("runtime-rebuild")
-    result = client.session_commit_service.commit_session(archive, async_commit=True)
+    result = client.runtime.session.commit_service.commit_session(archive, async_commit=True)
     assert result.done is True
-    outputs = client.session_archive_store.read_async_outputs(archive)
-    projection_worker = client.session_commit_service.session_projector
+    outputs = client.runtime.session.archive_store.read_async_outputs(archive)
+    projection_worker = client.runtime.session.commit_service.session_projector
     assert projection_worker is not None
     expected = projection_worker.build_records(
         archive,
@@ -117,9 +113,9 @@ def test_runtime_startup_rebuilds_session_catalog_after_sqlite_loss(tmp_path: Pa
 
     restarted = MemoryOSClient(str(tmp_path))
 
-    restarted.readiness.require_ready()
-    assert restarted.readiness.details["session_archive_rebuild"]["projected_archives"] == 1
-    rebuilt_index = cast(SQLiteIndexStore, restarted.index_store)
+    restarted.runtime.readiness.require_ready()
+    assert restarted.runtime.readiness.details["session_archive_rebuild"]["projected_archives"] == 1
+    rebuilt_index = cast(SQLiteIndexStore, restarted.runtime.stores.index)
     for record in summary_records:
         actual = rebuilt_index.get_catalog(record.record_key, tenant_id="default")
         assert actual is not None

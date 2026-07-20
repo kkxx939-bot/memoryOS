@@ -5,9 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from memoryos.core.durable_io import ImmutableArtifactConflictError, atomic_create_json
-from memoryos.core.integrity import canonical_digest, canonical_json
-from memoryos.operations.commit.effect_marker import atomic_create_json as legacy_atomic_create_json
+from infrastructure.store.filesystem.durable_io import ImmutableArtifactConflictError, atomic_create_json
+from foundation.integrity import canonical_digest, canonical_json
 
 
 def test_integrity_json_bytes_and_digest_are_deterministic() -> None:
@@ -22,11 +21,10 @@ def test_integrity_json_bytes_and_digest_are_deterministic() -> None:
     assert canonical_digest(payload) == "ca8e9a4141cfcf6ad8c2d40eeab813f707ced4c1b6bb841045c6d59450031cb4"
 
 
-def test_atomic_json_legacy_export_preserves_create_only_identity(tmp_path: Path) -> None:
+def test_atomic_json_create_only_identity(tmp_path: Path) -> None:
     path = tmp_path / "proof.json"
     payload = {"status": "committed", "revision": 1}
 
-    assert legacy_atomic_create_json is atomic_create_json
     assert atomic_create_json(path, payload, artifact_root=tmp_path) is True
     assert atomic_create_json(path, payload, artifact_root=tmp_path) is False
     with pytest.raises(ImmutableArtifactConflictError):

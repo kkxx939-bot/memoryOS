@@ -6,26 +6,29 @@ from pathlib import Path
 
 import pytest
 
-from memoryos.adapters.persistence.filesystem.memory_document_store import FileSystemMemoryDocumentStore
-from memoryos.adapters.persistence.in_memory.queue_store import InMemoryQueueStore
-from memoryos.application.session.planners.memory_commit_planner import MemoryCommitPlanner
-from memoryos.contextdb.session.session_model import SessionArchive
-from memoryos.core.integrity import canonical_digest
-from memoryos.memory.documents import (
+from foundation.integrity import canonical_digest
+from infrastructure.store.filesystem.memory_document_store import FileSystemMemoryDocumentStore
+from infrastructure.store.memory import MemoryDocumentControlStore, MemoryDocumentRevisionStore
+from infrastructure.store.memory.erasure_store import MemoryDocumentEraseStore
+from infrastructure.store.memory.evidence import SealedProposalEraseBackend, SealedProposalStore
+from memory.commit import (
     DerivedEraseRequest,
     DocumentErasedError,
     DocumentEraseStatus,
-    MemoryCandidateKind,
     MemoryDocumentCommitter,
-    MemoryDocumentControlStore,
     MemoryDocumentEraser,
-    MemoryDocumentPlanner,
-    MemoryDocumentRevisionStore,
+)
+from memory.commit.planner import MemoryCommitPlanner
+from memory.core import (
+    MemoryCandidateKind,
     MemoryEditProposal,
     PresentPath,
 )
-from memoryos.memory.evidence import SealedProposalEraseBackend, SealedProposalStore
-from memoryos.memory.extraction import FakeMemoryModelProvider, LLMMemoryExtractorBackend
+from memory.execute import MemoryDocumentPlanner
+from memory.formation.llm import LLMMemoryExtractorBackend
+from pre.session import SessionArchive
+from tests.support.memory import FakeMemoryModelProvider
+from tests.support.persistence.in_memory import InMemoryQueueStore
 
 _SECRET = "sealed-session-proposal-secret"
 _DOCUMENT_A = "memdoc_AAAAAAAAAAAAAAAA"
@@ -109,14 +112,10 @@ def test_exact_document_binding_erases_whole_multi_document_task_without_danglin
     assert not store.path("user-a", "task-multi").exists()
     assert store.bindings_for_document("user-a", _DOCUMENT_A) == ()
     assert store.bindings_for_document("user-a", _DOCUMENT_B) == ()
-    assert [item.task_id for item in store.bindings_for_document("user-a", _DOCUMENT_C)] == [
-        "task-other"
-    ]
+    assert [item.task_id for item in store.bindings_for_document("user-a", _DOCUMENT_C)] == ["task-other"]
     assert store.path("user-a", "task-other").exists()
     assert store.path("user-b", "task-multi").exists()
-    assert [item.task_id for item in store.bindings_for_document("user-b", _DOCUMENT_A)] == [
-        "task-multi"
-    ]
+    assert [item.task_id for item in store.bindings_for_document("user-b", _DOCUMENT_A)] == ["task-multi"]
     barrier = store.erasure_barrier_path("user-a", "task-multi")
     assert barrier.exists()
     assert _SECRET.encode() not in barrier.read_bytes()
@@ -198,7 +197,13 @@ def test_unsafe_sealed_set_keeps_durable_eraser_pending_until_safe_retry(
     source = FileSystemMemoryDocumentStore(tmp_path)
     controls = MemoryDocumentControlStore(tmp_path)
     revisions = MemoryDocumentRevisionStore(tmp_path)
-    committer = MemoryDocumentCommitter(source, controls, revisions, InMemoryQueueStore())
+    committer = MemoryDocumentCommitter(
+        source,
+        controls,
+        revisions,
+        InMemoryQueueStore(),
+        erasure_store=MemoryDocumentEraseStore(controls.root),
+    )
     proposal = _proposal()
     plan = MemoryDocumentPlanner(source).plan(
         proposal,
@@ -236,6 +241,7 @@ def test_unsafe_sealed_set_keeps_durable_eraser_pending_until_safe_retry(
         controls,
         revisions,
         cleanup_backends=(SealedProposalEraseBackend(proposal_store),),
+        erase_store=MemoryDocumentEraseStore(controls.root),
     )
     first = eraser.hard_erase(
         tenant_id="default",

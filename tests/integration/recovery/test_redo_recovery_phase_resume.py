@@ -4,18 +4,17 @@ import json
 
 import pytest
 
-from memoryos.contextdb.model.context_object import ContextObject
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.store.local_stores import FileSystemSourceStore, InMemoryIndexStore
-from memoryos.contextdb.transaction.recovery import RecoveryService
-from memoryos.core.ids import require_safe_path_segment
-from memoryos.operations.commit.audit_writer import AuditWriter
-from memoryos.operations.commit.diff_writer import DiffWriter
-from memoryos.operations.commit.operation_committer import OperationCommitter
-from memoryos.operations.commit.redo_log import RedoControlFileError, RedoIntegrityError, RedoLog
-from memoryos.operations.model.context_diff import ContextDiff
-from memoryos.operations.model.context_operation import ContextOperation
-from memoryos.operations.model.operation_action import OperationAction
+from foundation.ids import require_safe_path_segment
+from infrastructure.store.model.context.context_object import ContextObject
+from infrastructure.store.model.context.context_type import ContextType
+from infrastructure.store.operation.audit import AuditWriter
+from infrastructure.store.operation.diff import DiffWriter
+from infrastructure.store.operation.redo import RedoControlFileError, RedoIntegrityError, RedoLog
+from tests.support.persistence import FileSystemSourceStore, InMemoryIndexStore
+from tests.support.transaction import build_test_operation_committer as OperationCommitter
+from transaction.commit.recovery import RecoveryService
+from transaction.model.context_operation import ContextOperation
+from transaction.model.operation_action import OperationAction
 
 
 def _add(tenant_id: str = "default", *, operation_id: str = "ordinary-add") -> ContextOperation:
@@ -53,10 +52,8 @@ def test_artifact_identifiers_reject_path_escape_before_io(tmp_path) -> None:  #
     safe.operation_id = "../redo"
     with pytest.raises(ValueError, match="operation_id"):
         RedoLog(tmp_path).begin(safe)
-    diff = ContextDiff(user_id="u1", diff_id="safe-diff")
-    diff.diff_id = "../diff"
-    with pytest.raises(ValueError, match="diff_id"):
-        DiffWriter(tmp_path).write(diff)
+        with pytest.raises(ValueError, match="diff_id"):
+            DiffWriter(tmp_path).write({"diff_id": "../diff"})
     with pytest.raises(ValueError, match="user_id"):
         AuditWriter(tmp_path).record("../user", "event", {})
 

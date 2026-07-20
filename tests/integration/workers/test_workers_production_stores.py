@@ -3,19 +3,19 @@ from __future__ import annotations
 import json
 import sqlite3
 
-from memoryos.contextdb.model.context_object import ContextObject
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.store.local_stores import FileSystemSourceStore
-from memoryos.contextdb.store.source_store import QueueJob
-from memoryos.contextdb.store.sqlite_queue_store import SQLiteQueueStore
-from memoryos.contextdb.store.vector_store import InMemoryVectorStore, vector_row_id
-from memoryos.providers.embedding import HashingEmbeddingProvider
-from memoryos.security.context_projection import (
+from infrastructure.context.maintenance.embedding_worker import EmbeddingWorker
+from infrastructure.context.maintenance.semantic_worker import SemanticWorker
+from infrastructure.store.contracts.queue import QueueJob
+from infrastructure.store.contracts.vector import vector_row_id
+from infrastructure.store.model.context.context_object import ContextObject
+from infrastructure.store.model.context.context_type import ContextType
+from infrastructure.store.sqlite.queue_store import SQLiteQueueStore
+from sanitization.context_projection import (
     ContextProjectionSanitizationError,
     ContextProjectionSanitizer,
 )
-from memoryos.workers.embedding_worker import EmbeddingWorker
-from memoryos.workers.semantic_worker import SemanticWorker
+from tests.support.embedding import DeterministicEmbeddingProvider
+from tests.support.persistence import FileSystemSourceStore, InMemoryVectorStore
 
 
 class _CapturingEmbeddingProvider:
@@ -61,10 +61,10 @@ def test_embedding_worker_uses_provider_metadata_and_sqlite_ack(tmp_path) -> Non
     source.write_object(ContextObject(uri=uri, context_type=ContextType.RESOURCE, title="M", owner_user_id="u1"), content="hot room")
     queue.enqueue(QueueJob(job_id="j2", queue_name="embedding", action="embed", target_uri=uri))
 
-    assert EmbeddingWorker(source, queue, vector, HashingEmbeddingProvider()).process_pending()["processed"] == ["j2"]
+    assert EmbeddingWorker(source, queue, vector, DeterministicEmbeddingProvider()).process_pending()["processed"] == ["j2"]
     assert _status(queue_path, "j2") == "done"
     metadata = vector.rows[vector_row_id("default", uri)][1]
-    assert metadata["embedding_model"] == "hashing-v1"
+    assert metadata["embedding_model"] == "test-deterministic"
     assert metadata["embedding_dimension"] == 16
     assert metadata["source_uri"] == uri
     assert metadata["schema_version"] == "vector_embedding_v1"

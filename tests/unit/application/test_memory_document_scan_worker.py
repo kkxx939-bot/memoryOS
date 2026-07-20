@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from memoryos.adapters.persistence.in_memory.queue_store import InMemoryQueueStore
-from memoryos.contextdb.store.queue_store import QueueJob
-from memoryos.memory.documents import MemoryDocumentPathPolicy, new_document_id
-from memoryos.workers.memory_document_scan_worker import MemoryDocumentScanWorker
+from infrastructure.store.contracts.queue import QueueJob
+from memory.core import MemoryDocumentPathPolicy, new_document_id
+from memory.worker.document_scan import MemoryDocumentScanWorker
+from tests.support.persistence.in_memory import InMemoryQueueStore
 
 
 @dataclass(frozen=True)
@@ -57,7 +57,6 @@ def test_periodic_owner_scan_is_bounded_and_rotates_without_jobs() -> None:
     worker = MemoryDocumentScanWorker(
         scanner,  # type: ignore[arg-type]
         InMemoryQueueStore(),
-        tenant_id="default",
         owner_user_ids=lambda _tenant, _limit: ("u1", "u2", "u3"),
         max_owners_per_run=2,
         owner_enumeration_limit=3,
@@ -84,7 +83,6 @@ def test_queue_hints_and_periodic_scan_share_one_owner_budget() -> None:
     worker = MemoryDocumentScanWorker(
         scanner,  # type: ignore[arg-type]
         queue,
-        tenant_id="default",
         owner_user_ids=lambda _tenant, _limit: ("u1", "u2", "u3"),
         max_owners_per_run=2,
         owner_enumeration_limit=3,
@@ -98,4 +96,3 @@ def test_queue_hints_and_periodic_scan_share_one_owner_budget() -> None:
     assert result["scanned_owners"] == 2
     assert scanner.calls == [("default", "u2"), ("default", "u1")]
     assert scanner.notifications == [("default", "u2")]
-

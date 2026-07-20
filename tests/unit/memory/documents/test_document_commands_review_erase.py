@@ -7,48 +7,46 @@ from typing import cast
 
 import pytest
 
-from memoryos.adapters.persistence.filesystem.memory_document_store import FileSystemMemoryDocumentStore
-from memoryos.adapters.persistence.in_memory.queue_store import InMemoryQueueStore
-from memoryos.application.memory.command_service import MemoryCommandService
-from memoryos.application.memory.pending_review_service import MemoryEditReviewService
-from memoryos.contextdb.store.queue_store import QueueJob, QueueStore
-from memoryos.core.readiness import RuntimeNotReadyError, RuntimeReadiness, RuntimeReadinessState
-from memoryos.memory.documents import (
-    ABSENT,
-    DocumentConflictError,
+from foundation.identity import LocalUserContext
+from foundation.readiness import RuntimeNotReadyError, RuntimeReadiness, RuntimeReadinessState
+from infrastructure.store.contracts.queue import QueueJob, QueueStore
+from infrastructure.store.filesystem.memory_document_io import MemoryDocumentFileIO
+from infrastructure.store.filesystem.memory_document_store import FileSystemMemoryDocumentStore
+from infrastructure.store.memory import (
     DocumentControlIntegrityError,
     DocumentDeletionStatus,
-    DocumentEditKind,
-    DocumentEditPlan,
-    DocumentErasedError,
-    DocumentEraseStatus,
     MemoryDocumentBootstrapper,
-    MemoryDocumentCommitter,
     MemoryDocumentControlStore,
-    MemoryDocumentEraser,
-    MemoryDocumentPlanner,
     MemoryDocumentRevisionStore,
     MemoryDocumentScanner,
     MemoryEditReviewStatus,
     MemoryEditReviewStore,
+)
+from infrastructure.store.memory.erasure_store import MemoryDocumentEraseStore
+from infrastructure.store.memory.layout import user_memory_root
+from memory.commit import (
+    DocumentErasedError,
+    DocumentEraseStatus,
+    MemoryDocumentCommitter,
+    MemoryDocumentEraser,
+)
+from memory.core import (
+    ABSENT,
+    DocumentEditKind,
+    DocumentEditPlan,
     PresentPath,
     adopt_raw_document,
     new_document_id,
     parse_front_matter,
     render_new_document,
 )
-from memoryos.memory.documents.layout import user_memory_root
-from memoryos.runtime.container import _publish_external_change
-from memoryos.security.trusted_context import (
-    AUTHORITATIVE_FORGET,
-    AUTHORITATIVE_REMEMBER,
-    DEFAULT_AGENT_CAPABILITIES,
-    HARD_ERASE_MEMORY,
-    KNOWN_CAPABILITIES,
-    READ_CONTEXT,
-    TrustedRequestContext,
-)
-from memoryos.workers.memory_document_edit_worker import MemoryDocumentEditWorker
+from memory.execute import MemoryDocumentPlanner
+from memory.execute.command_service import MemoryCommandService
+from memory.execute.external_change import publish_external_change
+from memory.execute.pending_review_service import MemoryEditReviewService
+from memory.ports import DocumentConflictError
+from memory.worker.document_edit import MemoryDocumentEditWorker
+from tests.support.persistence.in_memory import InMemoryQueueStore
 
 
 class _Queue:
@@ -72,17 +70,8 @@ class _CleanupBackend:
         return self.acknowledgements.pop(0)
 
 
-def _caller(*, hard_erase: bool = True) -> TrustedRequestContext:
-    capabilities = {READ_CONTEXT, AUTHORITATIVE_REMEMBER, AUTHORITATIVE_FORGET}
-    if hard_erase:
-        capabilities.add(HARD_ERASE_MEMORY)
-    return TrustedRequestContext(
-        tenant_id="default",
-        user_id="user-a",
-        actor_kind="user",
-        actor_id="user-a",
-        capabilities=frozenset(capabilities),
-    )
+def _caller() -> LocalUserContext:
+    return LocalUserContext(user_id="user-a")
 
 
 def _components(root: Path, *, backend: _CleanupBackend | None = None):  # noqa: ANN202
@@ -90,13 +79,20 @@ def _components(root: Path, *, backend: _CleanupBackend | None = None):  # noqa:
     controls = MemoryDocumentControlStore(root)
     revisions = MemoryDocumentRevisionStore(root)
     reviews = MemoryEditReviewStore(root)
-    committer = MemoryDocumentCommitter(source, controls, revisions, cast(QueueStore, _Queue()))
+    committer = MemoryDocumentCommitter(
+        source,
+        controls,
+        revisions,
+        cast(QueueStore, _Queue()),
+        erasure_store=MemoryDocumentEraseStore(controls.root),
+    )
     eraser = MemoryDocumentEraser(
         source,
         controls,
         revisions,
         review_store=reviews,
         cleanup_backends=(backend,) if backend is not None else (),
+        erase_store=MemoryDocumentEraseStore(controls.root),
     )
     commands = MemoryCommandService(
         MemoryDocumentPlanner(source),
@@ -231,15 +227,6 @@ def test_adopt_unmanaged_document_binds_caller_and_enqueues_content_free_create(
     assert path.read_bytes() == original
     readiness.transition(RuntimeReadinessState.READY)
 
-    without_capability = TrustedRequestContext(
-        tenant_id=caller.tenant_id,
-        user_id=caller.user_id,
-        actor_kind="user",
-        actor_id=caller.user_id,
-        capabilities=frozenset({READ_CONTEXT}),
-    )
-    with pytest.raises(PermissionError, match="memory.authoritative.remember"):
-        commands.adopt_memory_document(relative_path, expected, caller=without_capability)
     with pytest.raises(DocumentConflictError, match="expected_raw_sha256"):
         commands.adopt_memory_document(relative_path, "f" * 64, caller=caller)
     assert path.read_bytes() == original
@@ -277,7 +264,7 @@ def test_adopt_unmanaged_document_binds_caller_and_enqueues_content_free_create(
     event = controls.load_event(intent)
     assert event is not None
     assert event.edit_kind is DocumentEditKind.CREATE
-    assert event.actor_binding == "trusted:user:user-a:user-a"
+    assert event.actor_binding == "local:user-a"
     assert event.evidence_reference.startswith("adoption-receipt:mdadopt_")
     assert event.evidence_digest == expected
     assert not ({"content", "body", "raw_bytes"} & set(event.to_dict()))
@@ -432,7 +419,7 @@ def test_adopt_receipt_reuses_deterministic_store_temp_after_process_boundary(
     receipts = controls.adoption_receipts(caller.tenant_id, caller.user_id)
     assert len(receipts) == 1
     assert operation_ids == [receipts[0].receipt_id]
-    deterministic_temp = source._temporary_name(path.name, receipts[0].receipt_id)
+    deterministic_temp = MemoryDocumentFileIO.temporary_name(path.name, receipts[0].receipt_id)
     if crash_stage == "temp_file_fsynced":
         assert (path.parent / deterministic_temp).exists()
         assert path.read_bytes() == original
@@ -481,7 +468,7 @@ def test_restart_scanner_uses_durable_adoption_identity_before_retry(
     assert root_identity.root_identity == source.full_scan("default", "user-a").root_identity
 
     # Recreate every process-local component. Startup's forced full scan must
-    # recognize the indexed receipt and finish the trusted adoption intent.
+    # recognize the indexed receipt and finish the local adoption intent.
     restarted_source = FileSystemMemoryDocumentStore(tmp_path)
     restarted_controls = MemoryDocumentControlStore(tmp_path)
     restarted_revisions = MemoryDocumentRevisionStore(tmp_path)
@@ -491,6 +478,7 @@ def test_restart_scanner_uses_durable_adoption_identity_before_retry(
         restarted_controls,
         restarted_revisions,
         cast(QueueStore, restarted_queue),
+        erasure_store=MemoryDocumentEraseStore(restarted_controls.root),
     )
     restarted_bootstrapper = MemoryDocumentBootstrapper(
         tmp_path,
@@ -502,7 +490,7 @@ def test_restart_scanner_uses_durable_adoption_identity_before_retry(
         restarted_source,
         stability_seconds=60,
         change_publisher=lambda change: scan_results.append(
-            _publish_external_change(
+            publish_external_change(
                 change,
                 committer=restarted_committer,
                 control_store=restarted_controls,
@@ -517,7 +505,7 @@ def test_restart_scanner_uses_durable_adoption_identity_before_retry(
     assert len(scan_results) == 1 and scan_results[0] is not None
     event = scan_results[0].event
     assert event is not None
-    assert event.actor_binding == "trusted:user:user-a:user-a"
+    assert event.actor_binding == "local:user-a"
     assert event.evidence_reference.startswith("adoption-receipt:mdadopt_")
     assert event.evidence_digest == expected
     assert len(restarted_queue.jobs) == 1
@@ -526,6 +514,7 @@ def test_restart_scanner_uses_durable_adoption_identity_before_retry(
         restarted_source,
         restarted_controls,
         restarted_revisions,
+        erase_store=MemoryDocumentEraseStore(restarted_controls.root),
     )
     restarted_commands = MemoryCommandService(
         MemoryDocumentPlanner(restarted_source),
@@ -554,8 +543,19 @@ def test_adopt_first_bootstrap_preserves_template_and_survives_restart(tmp_path:
     source = FileSystemMemoryDocumentStore(tmp_path)
     controls = MemoryDocumentControlStore(tmp_path)
     revisions = MemoryDocumentRevisionStore(tmp_path)
-    committer = MemoryDocumentCommitter(source, controls, revisions, cast(QueueStore, _Queue()))
-    eraser = MemoryDocumentEraser(source, controls, revisions)
+    committer = MemoryDocumentCommitter(
+        source,
+        controls,
+        revisions,
+        cast(QueueStore, _Queue()),
+        erasure_store=MemoryDocumentEraseStore(controls.root),
+    )
+    eraser = MemoryDocumentEraser(
+        source,
+        controls,
+        revisions,
+        erase_store=MemoryDocumentEraseStore(controls.root),
+    )
     bootstrapper = MemoryDocumentBootstrapper(
         tmp_path,
         source,
@@ -596,9 +596,7 @@ def test_adopt_first_bootstrap_preserves_template_and_survives_restart(tmp_path:
         "knowledge/open-loops.md",
     }
     first_templates = {
-        item.relative_path: item.document_id
-        for item in first_scan.managed
-        if item.relative_path in template_paths
+        item.relative_path: item.document_id for item in first_scan.managed if item.relative_path in template_paths
     }
     assert set(first_templates) == template_paths
     assert first_templates[relative_path] == adopted.document_id
@@ -616,6 +614,7 @@ def test_adopt_first_bootstrap_preserves_template_and_survives_restart(tmp_path:
         restarted_controls,
         restarted_revisions,
         cast(QueueStore, _Queue()),
+        erasure_store=MemoryDocumentEraseStore(restarted_controls.root),
     )
     restarted_bootstrapper = MemoryDocumentBootstrapper(
         tmp_path,
@@ -625,7 +624,12 @@ def test_adopt_first_bootstrap_preserves_template_and_survives_restart(tmp_path:
     restarted_commands = MemoryCommandService(
         MemoryDocumentPlanner(restarted_source),
         restarted_committer,
-        MemoryDocumentEraser(restarted_source, restarted_controls, restarted_revisions),
+        MemoryDocumentEraser(
+            restarted_source,
+            restarted_controls,
+            restarted_revisions,
+            erase_store=MemoryDocumentEraseStore(restarted_controls.root),
+        ),
         bootstrapper=restarted_bootstrapper,
     )
 
@@ -638,9 +642,7 @@ def test_adopt_first_bootstrap_preserves_template_and_survives_restart(tmp_path:
     ).changed
     restarted_scan = restarted_source.full_scan("default", "user-a")
     restarted_templates = {
-        item.relative_path: item.document_id
-        for item in restarted_scan.managed
-        if item.relative_path in template_paths
+        item.relative_path: item.document_id for item in restarted_scan.managed if item.relative_path in template_paths
     }
     assert restarted_templates == first_templates
     assert path.read_bytes() == exact_adopted
@@ -679,7 +681,6 @@ def test_adopt_retry_recovers_control_to_projection_tail(tmp_path: Path) -> None
     worker_result = MemoryDocumentEditWorker(
         commands.committer,
         queue,
-        tenant_id="default",
         worker_id="adopt-recovery-worker",
     ).process_pending()
     assert worker_result == {"claimed": 1, "committed": 1, "failed": 0, "dead_letter": 0}
@@ -693,9 +694,7 @@ def test_adopt_retry_recovers_control_to_projection_tail(tmp_path: Path) -> None
     projection_jobs = [job for job in queue.jobs.values() if job.queue_name == "memory_projection"]
     assert len(projection_jobs) == 1
     intents = [
-        intent
-        for intent in controls.incomplete_intents("default", "user-a")
-        if intent.document_id == assigned_id
+        intent for intent in controls.incomplete_intents("default", "user-a") if intent.document_id == assigned_id
     ]
     assert intents == []
 
@@ -999,9 +998,7 @@ def test_hard_erase_is_replayable_purges_body_blobs_and_blocks_resurrection(tmp_
     assert completed.erasure_status == DocumentEraseStatus.ERASED.value
     assert completed.pending_backends == ()
     assert len(backend.requests) == 2
-    completed_barrier = controls.load_publication_barrier(
-        "default", "user-a", remembered.document_id
-    )
+    completed_barrier = controls.load_publication_barrier("default", "user-a", remembered.document_id)
     assert completed_barrier is not None
     assert completed_barrier.status is DocumentDeletionStatus.HARD_ERASED
     assert completed_barrier.relative_path == ""
@@ -1013,20 +1010,11 @@ def test_hard_erase_is_replayable_purges_body_blobs_and_blocks_resurrection(tmp_
     assert completed_record.independent_evidence_retained == first.independent_evidence_retained
 
 
-def test_hard_erase_requires_distinct_capability_and_whole_document(tmp_path: Path) -> None:
-    assert HARD_ERASE_MEMORY in KNOWN_CAPABILITIES
-    assert HARD_ERASE_MEMORY not in DEFAULT_AGENT_CAPABILITIES
+def test_hard_erase_requires_whole_document(tmp_path: Path) -> None:
     _, _, _, _, commands, _, _ = _components(tmp_path)
     privileged = _caller()
     remembered = commands.remember("body", target_hint="topic:capability", caller=privileged)
 
-    with pytest.raises(PermissionError, match="memory.hard_erase"):
-        commands.forget(
-            remembered.document_uri,
-            mode="HARD_ERASE",
-            expected_digest=remembered.source_digest,
-            caller=_caller(hard_erase=False),
-        )
     with pytest.raises(ValueError, match="whole-document"):
         commands.forget(
             remembered.document_uri,

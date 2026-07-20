@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tests.support.import_graph import production_imports
+from tests.support.import_graph import production_imports, production_paths
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -24,7 +24,7 @@ def _resolve_module(target: str, modules: set[str]) -> str | None:
 
 
 def _eager_components() -> list[tuple[str, ...]]:
-    paths = sorted((ROOT / "memoryos").rglob("*.py"))
+    paths = production_paths(ROOT)
     path_modules = {path: _module_name(path) for path in paths}
     modules = set(path_modules.values())
     graph: dict[str, set[str]] = {module: set() for module in modules}

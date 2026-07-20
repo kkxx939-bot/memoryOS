@@ -10,14 +10,14 @@ from typing import Any
 
 import pytest
 
-from memoryos.contextdb.store.local_stores import InMemoryQueueStore
-from memoryos.contextdb.store.source_store import (
+from infrastructure.store.contracts.queue import (
     LeaseLostError,
     QueueIdempotencyConflictError,
     QueueJob,
     QueueLeaseIdentityError,
 )
-from memoryos.contextdb.store.sqlite_queue_store import SQLiteQueueStore
+from infrastructure.store.sqlite.queue_store import SQLiteQueueStore
+from tests.support.persistence import InMemoryQueueStore
 
 
 def _lease_once(
@@ -556,7 +556,7 @@ def test_expired_lease_recovery_and_stats_are_queue_scoped(
 ) -> None:
     store = InMemoryQueueStore() if store_kind == "memory" else SQLiteQueueStore(tmp_path / "queue.sqlite3")
     projection = store.enqueue(_job("projection-expired", queue_name="memory_projection"))
-    unrelated = store.enqueue(_job("session-expired", queue_name="session_commit"))
+    unrelated = store.enqueue(_job("session-expired", queue_name="commit"))
     projection_lease = store.lease(
         projection.queue_name,
         lease_owner="projection-worker",
@@ -588,7 +588,7 @@ def test_expired_lease_recovery_and_stats_are_queue_scoped(
     assert recovered.lease_token == recovered.lease_owner == ""
     assert untouched is not None and untouched.status == "leased"
     assert store.stats(queue_name="memory_projection") == {"pending": 1}
-    assert store.stats(queue_name="session_commit") == {"leased": 1}
+    assert store.stats(queue_name="commit") == {"leased": 1}
     assert store.stats() == {"pending": 1, "leased": 1}
     with pytest.raises(LeaseLostError):
         store.ack(projection_lease)

@@ -8,19 +8,19 @@ from typing import Any
 
 import pytest
 
-import memoryos.adapters.agent_hooks.composition as hook_composition
-import memoryos.adapters.agent_hooks.queue as queue_module
-from memoryos.adapters.agent_hooks.base import format_injection
-from memoryos.adapters.agent_hooks.claude_code import ClaudeCodeHookAdapter
-from memoryos.adapters.agent_hooks.codex import CodexHookAdapter
-from memoryos.adapters.agent_hooks.composition import AgentHookCompositionError
-from memoryos.adapters.agent_hooks.config import AgentHookConfig
-from memoryos.adapters.agent_hooks.cursor import CursorHookAdapter
-from memoryos.adapters.agent_hooks.events import AgentHookEvent
-from memoryos.adapters.agent_hooks.mcp_client import AgentHookMCPClient
-from memoryos.adapters.agent_hooks.queue import PendingItem, PendingQueue, PendingQueueIntegrityError
-from memoryos.adapters.agent_hooks.sanitizer import sanitize_changed_files, sanitize_payload, summarize_tool_result
-from memoryos.api.cli import agent_hooks as cli
+import agent_hook.composition as hook_composition
+import agent_hook.queue as queue_module
+from agent_hook.base import format_injection
+from agent_hook.claude_code import ClaudeCodeHookAdapter
+from agent_hook.codex import CodexHookAdapter
+from agent_hook.composition import AgentHookCompositionError
+from agent_hook.config import AgentHookConfig
+from agent_hook.cursor import CursorHookAdapter
+from agent_hook.events import AgentHookEvent
+from agent_hook.queue import PendingItem, PendingQueue, PendingQueueIntegrityError
+from openApi.cli import agent_hooks as cli
+from openApi.cli.agent_hook_transport import AgentHookMCPClient
+from sanitization import sanitize_changed_files, sanitize_payload, summarize_tool_result
 
 
 class FakeHookMCPClient:
@@ -63,25 +63,12 @@ class QueuedHookMCPClient(FakeHookMCPClient):
 
 
 def _config(tmp_path: Path, adapter_id: str = "codex") -> AgentHookConfig:
-    derived_workspaces = {
-        AgentHookEvent.from_payload(
-            payload,
-            adapter_id=adapter_id,
-            hook_name="after_turn",
-            user_id="u1",
-        )
-        .normalize()
-        .project_id
-        for payload in ({}, {"cwd": str(tmp_path)})
-    }
     return AgentHookConfig(
         root=str(tmp_path / "memory"),
         user_id="u1",
         adapter_id=adapter_id,
         agent_name=adapter_id,
-        token_budget=128,
         queue_path=str(tmp_path / "queue.jsonl"),
-        allowed_workspace_ids=frozenset(derived_workspaces),
     )
 
 
@@ -127,7 +114,7 @@ def test_codex_post_tool_use_appends_without_session_commit(tmp_path: Path) -> N
             "session_id": "s1",
             "tool_name": "shell",
             "tool_output": "ok",
-            "changed_files": ["memoryos/api/mcp/server.py"],
+            "changed_files": ["openApi/mcp/server.py"],
         },
     ).to_dict()
 
@@ -141,7 +128,7 @@ def test_codex_post_tool_use_appends_without_session_commit(tmp_path: Path) -> N
 def test_codex_stop_commits_and_flushes_queue(tmp_path: Path) -> None:
     fake = FakeHookMCPClient()
     config = _config(tmp_path)
-    queue = PendingQueue(config.queue_path, tenant_id=config.tenant_id, user_id=config.user_id)
+    queue = PendingQueue(config.queue_path, user_id=config.user_id)
     queue.enqueue(
         PendingItem(
             event_id="e1",
@@ -614,7 +601,7 @@ def test_sanitizer_redacts_secret_truncates_logs_and_filters_paths() -> None:
             "ordinary context remains",
         ]
     )
-    summary = summarize_tool_result("shell", {"password": "pw"}, output, ["dist/out.js", "memoryos/api/mcp/server.py"])
+    summary = summarize_tool_result("shell", {"password": "pw"}, output, ["dist/out.js", "openApi/mcp/server.py"])
 
     assert sanitized["api_key"] == "<redacted>"
     assert "<redacted-private-key>" in sanitized["private"]
@@ -626,7 +613,7 @@ def test_sanitizer_redacts_secret_truncates_logs_and_filters_paths() -> None:
     assert "api_key: <redacted>" in summary["tool_output"]
     assert "password=<redacted>" in summary["tool_output"]
     assert "ordinary context remains" in summary["tool_output"]
-    assert summary["changed_files"] == ["memoryos/api/mcp/server.py"]
+    assert summary["changed_files"] == ["openApi/mcp/server.py"]
     assert sanitize_changed_files([".venv/bin/python", "a.py"]) == ["a.py"]
 
 
@@ -649,7 +636,6 @@ def test_hook_fail_safe_when_mcp_unavailable(tmp_path: Path) -> None:
 def test_from_env_requires_registered_delivery_composition(tmp_path: Path, monkeypatch: Any) -> None:
     monkeypatch.setattr(hook_composition, "_transport_factory", None)
     monkeypatch.setenv("MEMORYOS_ROOT", str(tmp_path))
-    monkeypatch.setenv("MEMORYOS_TENANT_ID", "default")
     monkeypatch.setenv("MEMORYOS_USER_ID", "default")
 
     with pytest.raises(AgentHookCompositionError, match="memoryos-agent-hook"):
@@ -672,9 +658,9 @@ def test_cli_supports_stdin_json_payload_file_and_text_output(tmp_path: Path, mo
     monkeypatch.setattr(cli, "CursorHookAdapter", FakeCursor)
     payload_file = tmp_path / "payload.json"
     payload_file.write_text(json.dumps({"prompt": "from-file"}), encoding="utf-8")
-    assert cli.main(["cursor", "before_prompt", "--payload-file", str(payload_file), "--format", "text"]) == 0
+    assert cli.run(["cursor", "before_prompt", "--payload-file", str(payload_file), "--format", "text"]) == 0
     assert "ctx:from-file" in capsys.readouterr().out
 
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"prompt": "from-stdin"})))
-    assert cli.main(["cursor", "before_prompt"]) == 0
+    assert cli.run(["cursor", "before_prompt"]) == 0
     assert json.loads(capsys.readouterr().out)["injection_text"] == "ctx:from-stdin"

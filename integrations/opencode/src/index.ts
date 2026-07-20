@@ -19,12 +19,10 @@ export function createSessionSync(request: MemoryRequest) {
 export async function MemoryOSOpenCodePlugin({directory}:{directory:string}) {
   const baseUrl=(process.env.MEMORYOS_BASE_URL ?? "http://127.0.0.1:8765").replace(/\/$/,"");
   const timeoutMs=Number(process.env.MEMORYOS_TIMEOUT_MS ?? 2500);
-  const token=process.env.MEMORYOS_API_TOKEN;
-  const userId=process.env.MEMORYOS_USER_ID ?? "default";
+  const userId=process.env.MEMORYOS_USER_ID ?? "local-user";
   const projectId=process.env.MEMORYOS_PROJECT_ID ?? projectIdentity(directory);
   const request:MemoryRequest=async(path,body,method="POST")=>{
     const headers:Record<string,string>={"content-type":"application/json","x-request-id":crypto.randomUUID()};
-    if(token) headers.authorization=`Bearer ${token}`;
     try {
       const response=await fetch(`${baseUrl}${path}`,{method,headers,body:method==="GET"?undefined:JSON.stringify(body ?? {}),signal:AbortSignal.timeout(timeoutMs)});
       const payload=await response.json() as Record<string,unknown>;

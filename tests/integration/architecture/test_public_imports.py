@@ -15,20 +15,19 @@ def _loaded_modules(code: str) -> list[str]:
     return list(json.loads(result.stdout))
 
 
-def test_root_import_does_not_load_delivery_persistence_or_worker_graph() -> None:
+def test_openapi_root_import_does_not_load_sdk_persistence_or_worker_graph() -> None:
     loaded = _loaded_modules(
         """
 import json
 import sys
-import memoryos
+import openApi
 
 blocked = (
-    "memoryos.adapters.persistence.sqlite",
-    "memoryos.api.http",
-    "memoryos.api.mcp",
-    "memoryos.api.sdk",
-    "memoryos.contextdb.store.sqlite",
-    "memoryos.workers",
+    "infrastructure.store.sqlite",
+    "openApi.http",
+    "openApi.mcp",
+    "openApi.sdk",
+    "runtime.worker",
 )
 print(json.dumps(sorted(name for name in sys.modules if name.startswith(blocked))))
 """
@@ -41,46 +40,46 @@ def test_contextdb_facade_import_does_not_load_operations_graph() -> None:
         """
 import json
 import sys
-import memoryos.contextdb.context_db
+import infrastructure.context.facade
 
-print(json.dumps(sorted(name for name in sys.modules if name.startswith("memoryos.operations"))))
+print(json.dumps(sorted(name for name in sys.modules if name.startswith("transaction"))))
 """
     )
     assert loaded == []
 
 
-def test_prediction_pipeline_package_does_not_eagerly_load_execution() -> None:
+def test_action_policy_decision_package_does_not_eagerly_load_execution() -> None:
     loaded = _loaded_modules(
         """
 import json
 import sys
-import memoryos.prediction.pipeline
+import policy.action_policy.decision
 
-print(json.dumps(sorted(name for name in sys.modules if name.startswith("memoryos.execution"))))
+print(json.dumps(sorted(name for name in sys.modules if name.startswith("policy.action_policy.execution"))))
 """
     )
     assert loaded == []
 
 
-def test_root_public_imports_resolve_current_objects() -> None:
-    import memoryos
-    from memoryos.api.sdk import MemoryOSClient as PackageClient
-    from memoryos.api.sdk.client import MemoryOSClient
-    from memoryos.contextdb.context_db import ContextDB
-    from memoryos.contextdb.retrieval.query_plan import RetrievalOptions, RetrievalQueryPlan
-    from memoryos.prediction.model.prediction_request import PredictionRequest
+def test_openapi_public_imports_resolve_current_objects() -> None:
+    import openApi
+    import openApi.sdk as sdk
+    from openApi.sdk.client import MemoryOSClient
+    from policy.action_policy.decision.request import PredictionRequest
+    from policy.action_policy.model.action_policy import ActionCandidate, ActionPolicy
 
-    assert memoryos.MemoryOSClient is PackageClient is MemoryOSClient
-    assert memoryos.ContextDB is ContextDB
-    assert memoryos.RetrievalOptions is RetrievalOptions
-    assert memoryos.RetrievalQueryPlan is RetrievalQueryPlan
-    assert memoryos.PredictionRequest is PredictionRequest
-    assert set(memoryos.__all__) == {
-        "__version__",
+    assert openApi.__version__ == "0.1.0"
+    assert sdk.MemoryOSClient is MemoryOSClient
+    assert sdk.PredictionRequest is PredictionRequest
+    assert sdk.ActionCandidate is ActionCandidate
+    assert sdk.ActionPolicy is ActionPolicy
+    assert set(sdk.__all__) == {
         "ActionCandidate",
         "ActionPolicy",
-        "ContextDB",
+        "HTTPMemoryOSClient",
+        "LocalMemoryOSClient",
         "MemoryOSClient",
+        "ProcessObservationResult",
         "PredictionRequest",
         "RetrievalOptions",
         "RetrievalQueryPlan",

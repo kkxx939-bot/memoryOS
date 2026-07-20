@@ -34,16 +34,13 @@ const plugin = {
   kind:"context-engine" as const,
   register(api:OpenClawPluginApi) {
     const raw = (api.pluginConfig && typeof api.pluginConfig === "object" ? api.pluginConfig : {}) as Record<string,unknown>;
-    const tokenEnv = String(raw.apiTokenEnv ?? "MEMORYOS_API_TOKEN");
     const cfg = normalizeConfig({
       baseUrl:String(raw.baseUrl ?? "http://127.0.0.1:8765"),
-      apiToken:typeof raw.apiToken === "string" ? raw.apiToken : process.env[tokenEnv],
       timeoutMs:typeof raw.timeoutMs === "number" ? raw.timeoutMs : undefined,
-      tokenBudget:typeof raw.tokenBudget === "number" ? raw.tokenBudget : undefined,
     });
-    const client = new MemoryOSHttpClient(cfg.baseUrl,cfg.apiToken,cfg.timeoutMs);
-    const engine = new MemoryOSContextEngine(client,cfg.tokenBudget);
-    const defaultUserId=String(raw.userId ?? process.env.MEMORYOS_USER_ID ?? "default");
+    const client = new MemoryOSHttpClient(cfg.baseUrl,cfg.timeoutMs);
+    const engine = new MemoryOSContextEngine(client);
+    const defaultUserId=String(raw.userId ?? process.env.MEMORYOS_USER_ID ?? "local-user");
     const defaultProjectId=String(raw.projectId ?? process.env.MEMORYOS_PROJECT_ID ?? projectIdentity(process.cwd()));
     api.registerContextEngine?.("memoryos",()=>engine);
     for (const [name,execute] of Object.entries(memoryTools(client))) {

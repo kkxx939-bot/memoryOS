@@ -2,15 +2,15 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from memoryos.api.sdk.client import MemoryOSClient
-from memoryos.behavior.model.behavior_case import BehaviorCase
-from memoryos.behavior.model.observation import Observation
-from memoryos.behavior.update.behavior_case_writer import BehaviorCaseWriter
-from memoryos.connect import ConnectMetadata
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.session.session_model import SessionArchive
-from memoryos.operations.model.operation_action import OperationAction
-from memoryos.prediction.model.prediction_request import PredictionRequest
+from behavior.core.model.behavior_case import BehaviorCase
+from behavior.core.model.observation import Observation
+from behavior.projection.behavior_case import BehaviorCaseWriter
+from infrastructure.store.model.context.context_type import ContextType
+from openApi.sdk.client import MemoryOSClient
+from policy.action_policy.decision.request import PredictionRequest
+from pre.connect import ConnectMetadata
+from pre.session import SessionArchive
+from transaction.model.operation_action import OperationAction
 
 NOW = datetime.now(timezone.utc)
 
@@ -29,7 +29,7 @@ def _seed_case(client: MemoryOSClient, case_id: str, days_ago: int) -> None:
         case_id=case_id,
         created_at=(NOW - timedelta(days=days_ago)).isoformat(),
     )
-    client.committer.commit("u1", [BehaviorCaseWriter().add_case(case)])
+    client.runtime.transaction.committer.commit("u1", [BehaviorCaseWriter().add_case(case)])
 
 
 def _archive(session_id: str) -> SessionArchive:
@@ -55,26 +55,35 @@ def test_behavior_windows_auto_generate_and_update_action_policy(tmp_path) -> No
     _seed_case(client, "h1", 2)
     _seed_case(client, "h2", 6)
 
-    result = client.context_db.commit_session(_archive("s1"), async_commit=True)
+    result = client.runtime.session.commit_service.commit_session(_archive("s1"), async_commit=True)
     assert result.done
 
     obs = _observation()
     policy_uri = f"memoryos://user/u1/action_policies/{obs.scene_key}/turn_on_ac"
-    policy = client.context_db.read_object(policy_uri)
+    policy = client.runtime.stores.source.read_object(policy_uri)
     assert policy.context_type == ContextType.ACTION_POLICY
     assert policy.metadata["support_anchor_uri"]
     assert policy.metadata["supported_behavior_pattern_uris"]
     assert policy.metadata["auto_execute_allowed"] is False
 
-    patterns = client.context_db.search(obs.scene_key, owner_user_id="u1", context_type=ContextType.BEHAVIOR_PATTERN)
-    clusters = client.context_db.search(obs.scene_key, owner_user_id="u1", context_type=ContextType.BEHAVIOR_CLUSTER)
+    patterns = client.runtime.stores.index.search(
+        obs.scene_key,
+        tenant_id="default",
+        filters={"owner_user_id": "u1", "context_type": ContextType.BEHAVIOR_PATTERN.value},
+    )
+    clusters = client.runtime.stores.index.search(
+        obs.scene_key,
+        tenant_id="default",
+        filters={"owner_user_id": "u1", "context_type": ContextType.BEHAVIOR_CLUSTER.value},
+    )
     assert patterns
     assert clusters
+    assert policy.metadata["support_anchor_uri"] == patterns[0].metadata["support_anchor_uri"]
 
-    first_ops = client.session_commit_service.action_policy_planner.plan(_archive("s2"))
+    first_ops = client.runtime.session.commit_service.action_policy_planner.plan(_archive("s2"))
     assert any(operation.action == OperationAction.UPDATE and operation.target_uri == policy_uri for operation in first_ops)
     assert not any(operation.action == OperationAction.ADD and operation.target_uri == policy_uri for operation in first_ops)
-    client.context_db.commit_session(_archive("s2"), async_commit=True)
+    client.runtime.session.commit_service.commit_session(_archive("s2"), async_commit=True)
 
     prediction = client.predict(
         PredictionRequest(
@@ -86,4 +95,4 @@ def test_behavior_windows_auto_generate_and_update_action_policy(tmp_path) -> No
         )
     )
     assert prediction.candidates[0].policy_uri == policy_uri
-    assert prediction.memory_operations == []
+    assert "memory_operations" not in prediction.to_dict()

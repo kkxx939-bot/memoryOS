@@ -3,6 +3,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from tests.support.import_graph import production_paths
+
 ROOT = Path(__file__).resolve().parents[3]
 
 
@@ -29,7 +31,7 @@ def test_test_modules_do_not_import_other_test_modules() -> None:
 def test_production_modules_do_not_import_test_support() -> None:
     violations = [
         f"{path.relative_to(ROOT)} -> {module}"
-        for path in sorted((ROOT / "memoryos").rglob("*.py"))
+        for path in production_paths(ROOT)
         for module in _imports(path)
         if module == "tests" or module.startswith("tests.")
     ]

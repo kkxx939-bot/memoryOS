@@ -2,26 +2,32 @@ from __future__ import annotations
 
 import json
 
-from memoryos.action_policy.integration.commit_registration import (
-    register_default_action_policy_commit_handlers,
+from infrastructure.store.model.context.context_object import ContextObject
+from infrastructure.store.model.context.context_type import ContextType
+from policy.action_policy.integration.commit_registration import (
+    build_action_policy_transaction_extensions,
 )
-from memoryos.action_policy.model.action_policy import ActionPolicy
-from memoryos.contextdb.model.context_object import ContextObject
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.store.local_stores import FileSystemSourceStore, InMemoryIndexStore
-from memoryos.contextdb.transaction.recovery import RecoveryService
-from memoryos.operations.commit.operation_committer import OperationCommitter
-from memoryos.operations.model.context_diff import ContextDiff
-from memoryos.operations.model.context_operation import ContextOperation
-from memoryos.operations.model.operation_action import OperationAction
-from memoryos.workers.recovery_worker import RecoveryWorker
+from policy.action_policy.model.action_policy import ActionPolicy
+from runtime.recovery.transaction_worker import RecoveryWorker
+from tests.support.persistence import FileSystemSourceStore, InMemoryIndexStore
+from tests.support.transaction import build_test_operation_committer as OperationCommitter
+from transaction.commit.control_record import diff_control_record, operation_control_record
+from transaction.commit.recovery import RecoveryService
+from transaction.model.context_diff import ContextDiff
+from transaction.model.context_operation import ContextOperation
+from transaction.model.operation_action import OperationAction
+from transaction.model.operation_status import OperationStatus
 
 
 def _committer(tmp_path):  # noqa: ANN001, ANN202
-    register_default_action_policy_commit_handlers()
     source = FileSystemSourceStore(tmp_path)
     index = InMemoryIndexStore()
-    committer = OperationCommitter(source, index, str(tmp_path))
+    committer = OperationCommitter(
+        source,
+        index,
+        str(tmp_path),
+        domain_extensions=build_action_policy_transaction_extensions(),
+    )
     return source, index, committer, RecoveryWorker(RecoveryService(committer.redo, committer))
 
 
@@ -64,16 +70,35 @@ def test_worker_resumes_each_post_source_phase_once(tmp_path) -> None:  # noqa: 
         if phase in {"index_written", "audit_written", "diff_written"}:
             committer._apply_index(operation)
         if phase in {"audit_written", "diff_written"}:
-            committer.audit.record("u1", "context_operation_committed", operation.to_dict())
+            committer.audit.record(
+                "u1",
+                "context_operation_committed",
+                operation_control_record(
+                    operation,
+                    tenant_id=committer.tenant_id,
+                    fingerprint=committer._operation_effect_fingerprint,
+                ),
+            )
         if phase == "diff_written":
+            operation.status = OperationStatus.COMMITTED
+            diff = ContextDiff(
+                user_id="u1",
+                operations=[operation],
+                diff_id=f"diff_{operation.operation_id}",
+                created_at=operation.created_at,
+            )
             committer.diff_writer.write(
-                ContextDiff(user_id="u1", operations=[operation], diff_id=f"diff_{operation.operation_id}")
+                diff_control_record(
+                    diff,
+                    tenant_id=committer.tenant_id,
+                    fingerprint=committer._operation_effect_fingerprint,
+                )
             )
         committer.redo.begin(operation, phase=phase, source_effect=source_effect)
 
         result = worker.process_pending("u1")
 
-        assert result["operation_ids"] == [operation.operation_id]
+        assert result["operation_ids"] == [operation.operation_id], result
         assert index.search("alpha", tenant_id="default", filters={"owner_user_id": "u1"})
         assert not committer.redo.pending_entries()
         assert (root / "system" / "operations" / f"{operation.operation_id}.json").exists()

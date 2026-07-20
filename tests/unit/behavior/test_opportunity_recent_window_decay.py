@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from memoryos.behavior.model.behavior_pattern import BehaviorPattern
-from memoryos.behavior.model.observation import Observation
-from memoryos.behavior.model.opportunity import OpportunityStats
-from memoryos.behavior.update.opportunity_decay import OpportunityAwareDecay
-from memoryos.contextdb.store.local_stores import FileSystemSourceStore, InMemoryIndexStore
-from memoryos.operations.commit.operation_committer import OperationCommitter
-from memoryos.workers.cooling_worker import CoolingWorker
+from behavior.core.evaluation.opportunity_decay import OpportunityAwareDecay
+from behavior.core.model.behavior_pattern import BehaviorPattern
+from behavior.core.model.observation import Observation
+from behavior.core.model.opportunity import OpportunityStats
+from behavior.execute.cooling_worker import CoolingWorker
+from behavior.projection import behavior_pattern_to_context_object
+from infrastructure.context.operation_effects import InfrastructureContextOperationEffects
+from tests.support.persistence import FileSystemSourceStore, InMemoryIndexStore
+from tests.support.transaction import build_test_operation_committer as OperationCommitter
 
 
 def _pattern(stats: OpportunityStats | None = None, trigger_conditions: dict | None = None) -> BehaviorPattern:
@@ -29,9 +31,18 @@ def test_recent_no_opportunity_ignores_old_negative_feedback_and_no_penalty(tmp_
 
     source = FileSystemSourceStore(tmp_path)
     index = InMemoryIndexStore()
-    source.write_object(pattern.to_context_object(), content="hot room")
-    index.upsert_index(pattern.to_context_object(), content="hot room", tenant_id="default")
-    worker_result = CoolingWorker(source, index, OperationCommitter(source, index, str(tmp_path))).process_behavior_patterns(
+    source.write_object(behavior_pattern_to_context_object(pattern), content="hot room")
+    index.upsert_index(behavior_pattern_to_context_object(pattern), content="hot room", tenant_id="default")
+    worker_result = CoolingWorker(
+        source,
+        index,
+        OperationCommitter(
+            source,
+            index,
+            str(tmp_path),
+            context_effects=InfrastructureContextOperationEffects(),
+        ),
+    ).process_behavior_patterns(
         "u1", [Observation(user_id="u1", raw_text="hot room", location="office")]
     )
     assert worker_result["operations"] == []

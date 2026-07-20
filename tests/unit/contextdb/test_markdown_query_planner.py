@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from memoryos.application.context.query_planner import QueryPlanner
-from memoryos.contextdb.retrieval.query_plan import RetrievalOptions, RetrievalQueryIntent
+from infrastructure.context.query_planner import QueryPlanner
+from infrastructure.context.retrieval.query_plan import RetrievalOptions, RetrievalQueryIntent
+from openApi.retrieval_contract import retrieval_options_json_schema
 
 
 def _planner(now: datetime) -> QueryPlanner:
@@ -73,3 +74,27 @@ def test_query_contract_contains_document_filters_and_no_removed_state_fields() 
     assert payload["record_kinds"] == ["memory_document", "memory_block"]
     assert "canonical_resolution_mode" not in payload
     assert "valid_at" not in payload
+    assert "token_budget" not in payload
+
+
+def test_planner_preserves_identity_conditions_supplied_by_upper_service() -> None:
+    plan = QueryPlanner().build(
+        "query",
+        options=RetrievalOptions(
+            tenant_id="tenant-a",
+            owner_user_id="u1",
+            workspace_ids=("project-a",),
+        ),
+    )
+
+    assert plan.tenant_id == "tenant-a"
+    assert plan.owner_user_id == "u1"
+    assert plan.workspace_ids == ("project-a",)
+
+
+def test_public_retrieval_schema_uses_count_limits_only() -> None:
+    properties = retrieval_options_json_schema()["properties"]
+
+    assert "candidate_limit" in properties
+    assert "final_limit" in properties
+    assert "token_budget" not in properties

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from memoryos.contextdb.model.context_relation import ContextRelation
-from memoryos.contextdb.store.sqlite_relation_store import SQLiteRelationStore
+from infrastructure.store.model.context.context_relation import ContextRelation
+from infrastructure.store.sqlite.relation_store import SQLiteRelationStore
 
 
 def test_global_resource_reverse_lookup_filters_owner_user_id(tmp_path) -> None:

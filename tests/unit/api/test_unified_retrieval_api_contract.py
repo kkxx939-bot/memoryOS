@@ -1,21 +1,22 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
-from memoryos.api.http.app import _bound_payload, handle
-from memoryos.api.mcp.config import MCPServerConfig
-from memoryos.api.mcp.schemas import TOOL_INPUT_SCHEMAS
-from memoryos.api.mcp.server import MemoryOSMCPServer
-from memoryos.api.retrieval_contract import retrieval_options_json_schema
-from memoryos.api.sdk.client import MemoryOSClient
-from memoryos.api.sdk.http_client import HTTPMemoryOSClient
-from memoryos.api.trusted_context import READ_CONTEXT, TrustedRequestContext
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.retrieval.orchestrator import RetrievalMetrics, UnifiedRetrievalResult
-from memoryos.contextdb.retrieval.query_plan import RetrievalOptions, RetrievalQueryIntent
+from foundation.identity import LocalUserContext
+from infrastructure.context.orchestrator import RetrievalMetrics, UnifiedRetrievalResult
+from infrastructure.context.retrieval.query_plan import RetrievalOptions, RetrievalQueryIntent
+from infrastructure.store.model.context.context_type import ContextType
+from openApi.http.app import _bound_payload, handle
+from openApi.mcp.config import MCPServerConfig
+from openApi.mcp.schemas import TOOL_INPUT_SCHEMAS
+from openApi.mcp.server import MemoryOSMCPServer
+from openApi.retrieval_contract import retrieval_options_json_schema
+from openApi.sdk.client import MemoryOSClient
+from openApi.sdk.http_client import HTTPMemoryOSClient
 
 
 class _RecordingTransportClient:
@@ -32,27 +33,35 @@ class _RecordingTransportClient:
 
     def assemble_context(self, query: str, **kwargs: Any) -> dict[str, Any]:
         self.assemble_calls.append({"query": query, **kwargs})
-        options = kwargs.get("options")
         return {
             "packed_context": "bounded context",
             "contexts": [{"uri": "memoryos://context/1"}],
             "source_uris": ["memoryos://source/1"],
             "dropped_contexts": [],
-            "total_budget": options.token_budget if isinstance(options, RetrievalOptions) else 2000,
             "query_plan": {"semantic_query": query},
             "metrics": {"structured_candidates": 1},
         }
 
 
-def _caller() -> TrustedRequestContext:
-    return TrustedRequestContext(
-        tenant_id="default",
+def _caller() -> LocalUserContext:
+    return LocalUserContext(
         user_id="u1",
-        actor_kind="agent",
-        actor_id="codex",
-        capabilities=frozenset({READ_CONTEXT}),
-        allowed_workspace_ids=frozenset({"project-a"}),
     )
+
+
+def test_last_recall_trace_id_is_isolated_per_async_request() -> None:
+    client = object.__new__(MemoryOSClient)
+
+    async def request(trace_id: str) -> str:
+        client._set_last_recall_trace_id(trace_id)
+        await asyncio.sleep(0)
+        return client.last_recall_trace_id
+
+    async def run() -> tuple[str, str]:
+        first, second = await asyncio.gather(request("trace-a"), request("trace-b"))
+        return first, second
+
+    assert asyncio.run(run()) == ("trace-a", "trace-b")
 
 
 def test_http_and_mcp_publish_the_same_structured_options_schema() -> None:
@@ -74,7 +83,6 @@ def test_http_handle_parses_options_for_search_and_assemble() -> None:
             "query_intent": "OPEN_RECALL",
             "candidate_limit": 40,
             "final_limit": 7,
-            "token_budget": 512,
         },
     }
 
@@ -96,35 +104,28 @@ def test_http_handle_parses_options_for_search_and_assemble() -> None:
     [
         {"tenant_id": "other"},
         {"owner_user_id": "u2"},
-        {"workspace_ids": ["project-b"]},
-        {"adapter_id": "other-agent"},
     ],
 )
-def test_http_rejects_nested_options_that_expand_trusted_scope(options: dict[str, Any]) -> None:
-    with pytest.raises(PermissionError):
+def test_http_rejects_nested_options_that_select_another_identity(options: dict[str, Any]) -> None:
+    with pytest.raises(ValueError):
         _bound_payload({"query": "private", "options": options}, _caller())
 
 
-@pytest.mark.parametrize(
-    "scope_key",
-    [
-        "memoryos:principal:victim",
-        "memoryos:team:administrators",
-        "memoryos:workspace:project-b",
-    ],
-)
-def test_http_rejects_metadata_scope_keys_outside_trusted_grants(scope_key: str) -> None:
-    with pytest.raises(PermissionError, match="exceed trusted caller grants"):
-        _bound_payload(
-            {
-                "query": "private",
-                "options": {
-                    "workspace_ids": ["project-a"],
-                    "metadata_filters": {"applicability_scope_keys": [scope_key]},
-                },
+def test_http_treats_scope_keys_as_retrieval_filters_not_access_grants() -> None:
+    bound = _bound_payload(
+        {
+            "query": "private",
+            "options": {
+                "workspace_ids": ["project-a"],
+                "metadata_filters": {"applicability_scope_keys": ["memoryos:team:administrators"]},
             },
-            _caller(),
-        )
+        },
+        _caller(),
+    )
+
+    assert bound["options"].metadata_filters == {
+        "applicability_scope_keys": ["memoryos:team:administrators"]
+    }
 
 
 def test_mcp_uses_one_call_and_passes_structured_options() -> None:
@@ -134,10 +135,7 @@ def test_mcp_uses_one_call_and_passes_structured_options() -> None:
         config=MCPServerConfig(
             root="/tmp/memoryos-api-contract",
             user_id="u1",
-            tenant_id="default",
             adapter_id="codex",
-            actor_id="codex",
-            allowed_workspace_ids=frozenset({"project-a"}),
         ),
     )
 
@@ -146,7 +144,6 @@ def test_mcp_uses_one_call_and_passes_structured_options() -> None:
         {
             "query": "desktop file",
             "options": {
-                "tenant_id": "default",
                 "owner_user_id": "u1",
                 "workspace_ids": ["project-a"],
                 "context_types": ["session", "resource"],
@@ -173,15 +170,12 @@ def test_mcp_short_names_are_same_handler_compatibility_aliases() -> None:
         config=MCPServerConfig(
             root="/tmp/memoryos-api-contract-aliases",
             user_id="u1",
-            tenant_id="default",
             adapter_id="codex",
-            actor_id="codex",
-            allowed_workspace_ids=frozenset({"project-a"}),
         ),
     )
 
     searched = server.call_tool("memoryos_search", {"query": "desktop file"})
-    assembled = server.call_tool("memoryos_assemble", {"query": "desktop file", "token_budget": 64})
+    assembled = server.call_tool("memoryos_assemble", {"query": "desktop file"})
 
     assert searched["error"] is None
     assert assembled["error"] is None
@@ -189,17 +183,14 @@ def test_mcp_short_names_are_same_handler_compatibility_aliases() -> None:
     assert len(client.assemble_calls) == 1
 
 
-def test_mcp_rejects_metadata_scope_key_escalation_before_client_call() -> None:
+def test_mcp_passes_metadata_scope_keys_as_plain_retrieval_filters() -> None:
     client = _RecordingTransportClient()
     server = MemoryOSMCPServer(
         cast(MemoryOSClient, client),
         config=MCPServerConfig(
             root="/tmp/memoryos-api-contract",
             user_id="u1",
-            tenant_id="default",
             adapter_id="codex",
-            actor_id="codex",
-            allowed_workspace_ids=frozenset({"project-a"}),
         ),
     )
 
@@ -214,8 +205,10 @@ def test_mcp_rejects_metadata_scope_key_escalation_before_client_call() -> None:
         },
     )
 
-    assert result["error"]["code"] == "PERMISSION_DENIED"
-    assert client.search_calls == []
+    assert result["error"] is None
+    assert client.search_calls[0]["options"].metadata_filters == {
+        "applicability_scope_keys": ["memoryos:team:administrators"]
+    }
 
 
 def test_remote_sdk_serializes_retrieval_options() -> None:
@@ -240,7 +233,8 @@ def test_remote_sdk_serializes_retrieval_options() -> None:
     client.assemble_context("history", options=options)
 
     assert [entry["path"] for entry in client.payloads] == ["/v1/context/search", "/v1/context/assemble"]
-    assert all(entry["payload"]["options"] == options.to_dict() for entry in client.payloads)
+    assert all("tenant_id" not in entry["payload"]["options"] for entry in client.payloads)
+    assert all(entry["payload"]["options"]["final_limit"] == 5 for entry in client.payloads)
 
 
 def test_local_sdk_builds_a_plan_and_calls_the_unified_orchestrator(tmp_path: Path, monkeypatch: Any) -> None:
@@ -263,9 +257,6 @@ def test_local_sdk_builds_a_plan_and_calls_the_unified_orchestrator(tmp_path: Pa
                 dropped_contexts=(),
                 load_plan=(),
                 metrics=RetrievalMetrics(selected_count=1),
-                total_budget=plan.token_budget,
-                used_tokens=4,
-                remaining_tokens=plan.token_budget - 4,
             )
 
     monkeypatch.setattr(client, "_retrieval_orchestrator", lambda: Orchestrator())
@@ -316,7 +307,6 @@ def test_archive_search_is_a_unified_retrieval_wrapper(tmp_path: Path, monkeypat
     results = client.archive_search(
         "report",
         user_id="u1",
-        tenant_id="default",
         timezone_name="Asia/Singapore",
     )
 
@@ -366,7 +356,7 @@ def test_archive_search_sanitizes_secret_and_absolute_path_in_preview(tmp_path: 
         },
     )
 
-    preview = client.archive_search("budget.xlsx", user_id="u1", tenant_id="default")[0]["preview"]
+    preview = client.archive_search("budget.xlsx", user_id="u1")[0]["preview"]
 
     assert "budget.xlsx" in preview
     assert "top-secret" not in preview
@@ -401,7 +391,7 @@ def test_archive_search_does_not_repeat_lexical_matching_over_full_archive(
         },
     )
 
-    results = client.archive_search("different semantic query", user_id="u1", tenant_id="default")
+    results = client.archive_search("different semantic query", user_id="u1")
 
     assert len(results) == 1
     assert results[0]["preview"] == "sanitized semantic catalog match"

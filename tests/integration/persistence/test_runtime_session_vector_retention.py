@@ -6,13 +6,15 @@ from datetime import datetime, timezone
 
 import pytest
 
-from memoryos.contextdb.catalog import CatalogRecord, CatalogRecordKind, ServingTier
-from memoryos.contextdb.retention import CatalogRetentionManager, RetentionPolicy
-from memoryos.contextdb.session.session_model import SessionArchive
-from memoryos.contextdb.store.sqlite_index_store import SQLiteIndexStore
-from memoryos.contextdb.store.vector_store import InMemoryVectorStore, vector_row_id
-from memoryos.providers.embedding import HashingEmbeddingProvider
-from memoryos.runtime import RuntimeConfig, build_runtime_container
+from infrastructure.context.maintenance.retention import CatalogRetentionManager, RetentionPolicy
+from infrastructure.store.contracts.vector import vector_row_id
+from infrastructure.store.model.catalog import CatalogRecord, CatalogRecordKind, ServingTier
+from infrastructure.store.sqlite.index_store import SQLiteIndexStore
+from pre.session import SessionArchive
+from runtime.config import RetentionConfig, RetrievalConfig, RuntimeConfig
+from tests.support.embedding import DeterministicEmbeddingProvider
+from tests.support.persistence import InMemoryVectorStore
+from tests.support.runtime import build_test_runtime
 
 
 def _runtime_archive() -> SessionArchive:
@@ -54,29 +56,24 @@ def _runtime_archive() -> SessionArchive:
 
 def test_runtime_projects_safe_session_vectors_and_retention_replays_tombstones(tmp_path) -> None:
     vectors = InMemoryVectorStore()
-    runtime = build_runtime_container(
+    runtime = build_test_runtime(
         RuntimeConfig(
             root=str(tmp_path),
             tenant_id="tenant-a",
-            retrieval={"vectorize_important_session_events": True},
-            retention={
-                "hot_days": 1,
-                "warm_days": 2,
-                "cold_days": 3,
-                "batch_size": 32,
-            },
+            retrieval=RetrievalConfig(vectorize_important_session_events=True),
+            retention=RetentionConfig(hot_days=1, warm_days=2, cold_days=3, batch_size=32),
         ),
         vector_store=vectors,
-        embedding_provider=HashingEmbeddingProvider(),
+        embedding_provider=DeterministicEmbeddingProvider(),
     )
     archive = _runtime_archive()
 
-    committed = runtime.session_commit_service.sync_archive(archive, enqueue_commit_job=False)
+    committed = runtime.session.commit_service.sync_archive(archive, enqueue_commit_job=False)
 
     assert committed.session_projection_status == "projected"
-    assert runtime.retention_manager is not None
-    assert runtime.context_db.retention_manager is runtime.retention_manager
-    records = runtime.index_store.scan_catalog_batch(  # type: ignore[attr-defined]
+    assert runtime.context.retention_manager is not None
+    assert runtime.context.lifecycle_service.retention_manager is runtime.context.retention_manager
+    records = runtime.stores.index.scan_catalog_batch(  # type: ignore[attr-defined]
         tenant_id="tenant-a",
         filters={
             "tenant_id": "tenant-a",
@@ -94,12 +91,14 @@ def test_runtime_projects_safe_session_vectors_and_retention_replays_tombstones(
     assert CatalogRecordKind.TOOL_RESULT.value not in vector_kinds
     initial_vector_count = len(vectors.rows)
 
-    cycle = runtime.context_db.run_retention_cycle(now=datetime(2026, 7, 14, 12, tzinfo=timezone.utc))
+    cycle = runtime.context.lifecycle_service.run_retention_cycle(
+        now=datetime(2026, 7, 14, 12, tzinfo=timezone.utc)
+    )
 
     assert cycle["tiers"]["tier_changes"] == len(records)
     assert cycle["vectors"]["vectors_deleted"] == initial_vector_count
     assert not vectors.rows
-    retained = runtime.index_store.scan_catalog_batch(  # type: ignore[attr-defined]
+    retained = runtime.stores.index.scan_catalog_batch(  # type: ignore[attr-defined]
         tenant_id="tenant-a",
         filters={
             "tenant_id": "tenant-a",
@@ -109,12 +108,12 @@ def test_runtime_projects_safe_session_vectors_and_retention_replays_tombstones(
         limit=100,
     )
     assert retained and all(record.serving_tier == ServingTier.ARCHIVED.value for record in retained)
-    evidence = runtime.session_archive_store.read_archive(
+    evidence = runtime.session.archive_store.read_archive(
         archive.archive_uri,
         tenant_id="tenant-a",
     )
     assert evidence.archive_digest == archive.archive_digest
-    with sqlite3.connect(runtime.index_store.path) as connection:  # type: ignore[attr-defined]
+    with sqlite3.connect(runtime.stores.index.path) as connection:  # type: ignore[attr-defined]
         rows = connection.execute(
             "SELECT status, payload_json FROM context_tombstones "
             "WHERE json_extract(payload_json, '$.projection_action') = 'vector_delete'"
@@ -124,12 +123,12 @@ def test_runtime_projects_safe_session_vectors_and_retention_replays_tombstones(
     assert all("runtime-secret" not in str(payload) for _status, payload in rows)
 
     root_record = next(record for record in retained if record.record_kind == CatalogRecordKind.SESSION_ROOT.value)
-    restored = runtime.context_db.restore_cold_context(
+    restored = runtime.context.lifecycle_service.restore_cold_context(
         root_record.record_key,
         now=datetime(2026, 7, 14, 12, tzinfo=timezone.utc),
     )
     assert restored["serving_tier"] == ServingTier.WARM.value
-    timeline = runtime.context_db.compact_timeline_context(
+    timeline = runtime.context.lifecycle_service.compact_timeline_context(
         "timeline/2026/06/01",
         owner_user_id="u1",
         now=datetime(2026, 7, 14, 12, tzinfo=timezone.utc),
@@ -151,23 +150,23 @@ def test_session_vector_failure_keeps_durable_job_and_replays_idempotently(tmp_p
             super().upsert_vector(uri, embedding, metadata)
 
     vectors = FailSecondVectorWrite()
-    runtime = build_runtime_container(
+    runtime = build_test_runtime(
         RuntimeConfig(
             root=str(tmp_path),
             tenant_id="tenant-a",
-            retrieval={"vectorize_important_session_events": True},
+            retrieval=RetrievalConfig(vectorize_important_session_events=True),
         ),
         vector_store=vectors,
-        embedding_provider=HashingEmbeddingProvider(),
+        embedding_provider=DeterministicEmbeddingProvider(),
     )
     archive = _runtime_archive()
 
     with pytest.raises(RuntimeError, match="temporary vector outage"):
-        runtime.session_commit_service.sync_archive(archive)
+        runtime.session.commit_service.sync_archive(archive)
 
-    queued = runtime.queue_store.get(archive.task_id)
+    queued = runtime.stores.queue.get(archive.task_id)
     assert queued is not None and queued.status == "pending"
-    degraded = runtime.index_store.scan_catalog_batch(  # type: ignore[attr-defined]
+    degraded = runtime.stores.index.scan_catalog_batch(  # type: ignore[attr-defined]
         tenant_id="tenant-a",
         filters={
             "tenant_id": "tenant-a",
@@ -180,11 +179,11 @@ def test_session_vector_failure_keeps_durable_job_and_replays_idempotently(tmp_p
     assert not vectors.rows, "partial vector writes must be removed before replay"
     assert "do-not-trace" not in repr([record.metadata for record in degraded])
 
-    leased = runtime.queue_store.lease("session_commit", lease_owner="test-replay", limit=1)[0]
-    runtime.session_commit_service.async_commit(archive)
-    runtime.queue_store.ack(leased)
+    leased = runtime.stores.queue.lease("commit", lease_owner="test-replay", limit=1)[0]
+    runtime.session.commit_service.async_commit(archive)
+    runtime.stores.queue.ack(leased)
 
-    projected = runtime.index_store.scan_catalog_batch(  # type: ignore[attr-defined]
+    projected = runtime.stores.index.scan_catalog_batch(  # type: ignore[attr-defined]
         tenant_id="tenant-a",
         filters={
             "tenant_id": "tenant-a",
@@ -195,7 +194,7 @@ def test_session_vector_failure_keeps_durable_job_and_replays_idempotently(tmp_p
     )
     assert projected and {record.projection_status for record in projected} == {"PROJECTED"}
     assert vectors.rows
-    assert runtime.queue_store.get(archive.task_id).status == "done"  # type: ignore[union-attr]
+    assert runtime.stores.queue.get(archive.task_id).status == "done"  # type: ignore[union-attr]
 
 
 def test_retention_vector_failure_stays_durable_and_retryable(tmp_path) -> None:
@@ -282,8 +281,8 @@ def test_retention_vector_failure_stays_durable_and_retryable(tmp_path) -> None:
 
 def test_server_runtime_rejects_local_vector_alias_as_production_backend(tmp_path) -> None:
     with pytest.raises(ValueError, match="production VectorStore"):
-        build_runtime_container(
+        build_test_runtime(
             RuntimeConfig(root=str(tmp_path), mode="server"),
             vector_store=InMemoryVectorStore(),
-            embedding_provider=HashingEmbeddingProvider(),
+            embedding_provider=DeterministicEmbeddingProvider(),
         )

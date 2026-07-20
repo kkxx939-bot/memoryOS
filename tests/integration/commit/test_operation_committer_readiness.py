@@ -4,13 +4,14 @@ from pathlib import Path
 
 import pytest
 
-from memoryos.contextdb.model.context_object import ContextObject
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.session.session_model import SessionArchive
-from memoryos.operations.model.context_operation import ContextOperation
-from memoryos.operations.model.operation_action import OperationAction
-from memoryos.runtime import RuntimeConfig, build_runtime_container
-from memoryos.runtime.readiness import RuntimeNotReadyError, RuntimeReadinessState
+from foundation.readiness import RuntimeNotReadyError, RuntimeReadinessState
+from infrastructure.store.model.context.context_object import ContextObject
+from infrastructure.store.model.context.context_type import ContextType
+from pre.session import SessionArchive
+from runtime.config import RuntimeConfig
+from tests.support.runtime import build_test_runtime
+from transaction.model.context_operation import ContextOperation
+from transaction.model.operation_action import OperationAction
 
 
 class _CountingExtractor:
@@ -58,17 +59,18 @@ def test_ordinary_committer_and_contextdb_reject_before_artifacts(
     tmp_path: Path,
     state: RuntimeReadinessState,
 ) -> None:
-    runtime = build_runtime_container(RuntimeConfig(root=str(tmp_path), tenant_id="t1"))
+    runtime = build_test_runtime(RuntimeConfig(root=str(tmp_path), tenant_id="t1"))
     runtime.readiness.transition(state, reasons=("startup proof incomplete",))
 
     with pytest.raises(RuntimeNotReadyError, match=f"runtime is {state.value}"):
-        runtime.committer.commit("u1", [_resource_operation()])
+        runtime.transaction.committer.commit("u1", [_resource_operation()])
     with pytest.raises(RuntimeNotReadyError, match=f"runtime is {state.value}"):
-        runtime.context_db.commit_operations([_resource_operation()])
+        operation = _resource_operation()
+        runtime.transaction.committer.commit(operation.user_id, [operation])
 
     _assert_no_operation_artifacts(tmp_path)
     with pytest.raises(FileNotFoundError):
-        runtime.source_store.read_object("memoryos://user/u1/resources/readiness-proof")
+        runtime.stores.source.read_object("memoryos://user/u1/resources/readiness-proof")
 
 
 @pytest.mark.parametrize(
@@ -80,8 +82,9 @@ def test_session_service_rejects_before_archive_extraction_or_group_mutation(
     state: RuntimeReadinessState,
 ) -> None:
     extractor = _CountingExtractor()
-    runtime = build_runtime_container(
-        RuntimeConfig(root=str(tmp_path), tenant_id="t1", memory_extractor=extractor)
+    runtime = build_test_runtime(
+        RuntimeConfig(root=str(tmp_path), tenant_id="t1"),
+        memory_extractor=extractor,
     )
     archive = SessionArchive(
         user_id="u1",
@@ -94,20 +97,20 @@ def test_session_service_rejects_before_archive_extraction_or_group_mutation(
     runtime.readiness.transition(state, reasons=("startup proof incomplete",))
 
     with pytest.raises(RuntimeNotReadyError, match=f"runtime is {state.value}"):
-        runtime.session_commit_service.sync_archive(archive)
+        runtime.session.commit_service.sync_archive(archive)
     with pytest.raises(RuntimeNotReadyError, match=f"runtime is {state.value}"):
-        runtime.session_commit_service.async_commit(archive)
+        runtime.session.commit_service.async_commit(archive)
 
     assert extractor.calls == 0
-    assert not runtime.session_archive_store.archive_exists(archive.archive_uri, tenant_id="t1")
+    assert not runtime.session.archive_store.archive_exists(archive.archive_uri, tenant_id="t1")
     system = tmp_path / "tenants" / "t1" / "system"
     assert not list((system / "commit_groups").glob("*.json"))
-    assert runtime.queue_store.stats().get("pending", 0) == 0
+    assert runtime.stores.queue.stats().get("pending", 0) == 0
     _assert_no_operation_artifacts(tmp_path)
 
 
 def test_ordinary_committer_rejects_document_uri_before_redo_publication(tmp_path: Path) -> None:
-    runtime = build_runtime_container(RuntimeConfig(root=str(tmp_path), tenant_id="t1"))
+    runtime = build_test_runtime(RuntimeConfig(root=str(tmp_path), tenant_id="t1"))
     document_uri = "memoryos://user/u1/memory/documents/memdoc_01J00000000000000000000000"
     operation = ContextOperation(
         context_type=ContextType.RESOURCE,
@@ -118,6 +121,6 @@ def test_ordinary_committer_rejects_document_uri_before_redo_publication(tmp_pat
     )
 
     with pytest.raises(PermissionError, match="Markdown memory documents cannot pass"):
-        runtime.committer.commit("u1", [operation])
+        runtime.transaction.committer.commit("u1", [operation])
 
     _assert_no_operation_artifacts(tmp_path)

@@ -5,28 +5,29 @@ import logging
 
 import pytest
 
-from memoryos.action_policy.model.action_policy import ActionPolicy
-from memoryos.action_policy.retrieval import ActionPolicyRetriever
-from memoryos.api.sdk.client import MemoryOSClient
-from memoryos.api.trusted_context import AUTHORITATIVE_REMEMBER, TrustedRequestContext
-from memoryos.behavior.model.behavior_pattern import BehaviorPattern
-from memoryos.behavior.model.observation import Observation
-from memoryos.behavior.retrieval.similar_behavior_retriever import SimilarBehaviorRetriever
-from memoryos.contextdb.model.context_object import ContextObject
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.model.lifecycle import LifecycleState
-from memoryos.contextdb.retrieval.hybrid_search import HybridSearch
-from memoryos.contextdb.store.local_stores import FileSystemSourceStore, InMemoryIndexStore
-from memoryos.contextdb.store.source_store import IndexHit
-from memoryos.contextdb.store.vector_store import InMemoryVectorStore, VectorHit, vector_row_id
-from memoryos.memory.evidence import ScopeRef
-from memoryos.prediction.model.prediction_ledger import PredictionLedger
-from memoryos.prediction.model.prediction_request import PredictionRequest
-from memoryos.prediction.pipeline.prediction_engine import PredictionEngine
-from memoryos.providers.embedding import HashingEmbeddingProvider
+from behavior.core.model.behavior_pattern import BehaviorPattern
+from behavior.core.model.observation import Observation
+from behavior.projection import behavior_pattern_to_context_object
+from behavior.retrieval.similar_behavior_retriever import SimilarBehaviorRetriever
+from foundation.identity import LocalUserContext
+from infrastructure.context.retrieval.hybrid_search import HybridSearch
+from infrastructure.store.action_policy import ActionPolicyDecisionLedger
+from infrastructure.store.contracts.index import IndexHit
+from infrastructure.store.contracts.vector import VectorHit, vector_row_id
+from infrastructure.store.model.context.context_object import ContextObject
+from infrastructure.store.model.context.context_type import ContextType
+from infrastructure.store.model.context.lifecycle import LifecycleState
+from openApi.sdk.client import MemoryOSClient
+from policy.action_policy.decision.engine import PredictionEngine
+from policy.action_policy.decision.request import PredictionRequest
+from policy.action_policy.model.action_policy import ActionPolicy
+from policy.action_policy.retrieval import ActionPolicyRetriever
+from pre.evidence import ScopeRef
+from tests.support.embedding import DeterministicEmbeddingProvider
+from tests.support.persistence import FileSystemSourceStore, InMemoryIndexStore, InMemoryVectorStore
 
 
-class BrokenProvider(HashingEmbeddingProvider):
+class BrokenProvider(DeterministicEmbeddingProvider):
     def embed(self, text: str) -> list[float]:
         raise RuntimeError("provider down")
 
@@ -152,7 +153,7 @@ def test_hybrid_scope_filter_keeps_same_asset_id_isolated_by_parent_path(tmp_pat
     ("vector_store", "provider", "message"),
     [
         (InMemoryVectorStore(), BrokenProvider(), "provider down"),
-        (BrokenVectorStore(), HashingEmbeddingProvider(), "vector db down"),
+        (BrokenVectorStore(), DeterministicEmbeddingProvider(), "vector db down"),
     ],
 )
 def test_vector_failure_logs_and_returns_lexical_hits(tmp_path, caplog, vector_store, provider, message) -> None:  # noqa: ANN001
@@ -162,7 +163,7 @@ def test_vector_failure_logs_and_returns_lexical_hits(tmp_path, caplog, vector_s
     source.write_object(obj, content="hot room")
     _upsert(index, obj, "hot room")
 
-    caplog.set_level(logging.WARNING, logger="memoryos.contextdb.retrieval.hybrid_search")
+    caplog.set_level(logging.WARNING, logger="infrastructure.context.retrieval.hybrid_search")
     hits = HybridSearch(index, vector_store, provider, source).search(
         "hot",
         filters={"tenant_id": "default", "owner_user_id": "u1"},
@@ -200,19 +201,15 @@ def test_document_projection_vector_rebinds_to_public_block_uri(tmp_path) -> Non
     vector = InMemoryVectorStore()
     provider = FixedEmbeddingProvider()
     client = MemoryOSClient(str(tmp_path), vector_store=vector, embedding_provider=provider)
-    caller = TrustedRequestContext(
-        tenant_id="default",
+    caller = LocalUserContext(
         user_id="u1",
-        actor_kind="user",
-        actor_id="u1",
-        capabilities=frozenset({AUTHORITATIVE_REMEMBER}),
     )
     remembered = client.remember(
         "I like pistachio gelato",
         target_hint="preference",
         caller=caller,
     )
-    run = client.memory_projection_worker.process_pending(limit=20)
+    run = client.runtime.memory.projection_worker.process_pending(limit=20)
     assert run.processed
     block_uri = next(
         str(metadata["public_uri"])
@@ -220,7 +217,7 @@ def test_document_projection_vector_rebinds_to_public_block_uri(tmp_path) -> Non
         if str(metadata.get("public_uri") or "").startswith(f"{remembered['document_uri']}/blocks/")
     )
 
-    hits = HybridSearch(client.index_store, vector, provider).search(
+    hits = HybridSearch(client.runtime.stores.index, vector, provider).search(
         "vector-only-query",
         filters={
             "tenant_id": "default",
@@ -306,7 +303,7 @@ def test_behavior_and_action_policy_retrievers_accept_vector_candidates(tmp_path
     source = FileSystemSourceStore(tmp_path)
     index = InMemoryIndexStore()
     vector = InMemoryVectorStore()
-    provider = HashingEmbeddingProvider()
+    provider = DeterministicEmbeddingProvider()
     hybrid = HybridSearch(index, vector, provider, source)
     pattern = BehaviorPattern(
         user_id="u1",
@@ -322,7 +319,7 @@ def test_behavior_and_action_policy_retrievers_accept_vector_candidates(tmp_path
         action="turn_on_ac",
         support_anchor_uri=pattern.support_anchor_uri,
     )
-    pattern_obj = pattern.to_context_object()
+    pattern_obj = behavior_pattern_to_context_object(pattern)
     policy_obj = policy.to_context_object()
     source.write_object(pattern_obj, content="hot room behavior")
     source.write_object(policy_obj, content=json.dumps(policy.to_dict()))
@@ -358,7 +355,7 @@ def test_prediction_engine_ignores_vector_provider_failure(tmp_path) -> None:
 
     result = PredictionEngine(
         index,
-        PredictionLedger(tmp_path),
+        ActionPolicyDecisionLedger(tmp_path),
         source_store=source,
         vector_store=InMemoryVectorStore(),
         embedding_provider=BrokenProvider(),

@@ -4,10 +4,10 @@ import sqlite3
 
 import pytest
 
-from memoryos.adapters.persistence.in_memory.relation_store import InMemoryRelationStore
-from memoryos.contextdb.model.context_object import ContextObject
-from memoryos.contextdb.model.context_relation import ContextRelation
-from memoryos.contextdb.store.sqlite_relation_store import SQLiteRelationStore
+from infrastructure.store.model.context.context_object import ContextObject
+from infrastructure.store.model.context.context_relation import ContextRelation
+from infrastructure.store.sqlite.relation_store import SQLiteRelationStore
+from tests.support.persistence.in_memory import InMemoryRelationStore
 
 
 class _ProtectedDomain:

@@ -8,6 +8,19 @@ from pathlib import Path
 from typing import Literal
 
 ImportKind = Literal["eager", "type_checking", "delayed"]
+PRODUCTION_PACKAGES = (
+    "pre",
+    "memory",
+    "behavior",
+    "openApi",
+    "policy",
+    "agent_hook",
+    "foundation",
+    "infrastructure",
+    "runtime",
+    "sanitization",
+    "transaction",
+)
 
 
 @dataclass(frozen=True)
@@ -25,12 +38,21 @@ def module_imports(path: Path) -> tuple[ImportEdge, ...]:
     return tuple(collector.edges)
 
 
+def production_paths(root: Path) -> tuple[Path, ...]:
+    return tuple(
+        path
+        for package in PRODUCTION_PACKAGES
+        for path in sorted((root / package).rglob("*.py"))
+    )
+
+
 def production_imports(root: Path) -> tuple[ImportEdge, ...]:
     return tuple(
         edge
-        for path in sorted((root / "memoryos").rglob("*.py"))
+        for path in production_paths(root)
         for edge in module_imports(path)
-        if edge.target == "memoryos" or edge.target.startswith("memoryos.")
+        if edge.target in PRODUCTION_PACKAGES
+        or any(edge.target.startswith(f"{package}.") for package in PRODUCTION_PACKAGES)
     )
 
 
@@ -66,9 +88,11 @@ class _ImportCollector(ast.NodeVisitor):
         if not node.level:
             return (node.module,) if node.module else ()
         parts = list(self.path.with_suffix("").parts)
-        try:
-            package_start = parts.index("memoryos")
-        except ValueError:
+        package_start = next(
+            (parts.index(package) for package in PRODUCTION_PACKAGES if package in parts),
+            None,
+        )
+        if package_start is None:
             return (node.module,) if node.module else ()
         module_parts = parts[package_start:]
         package = module_parts if module_parts[-1] == "__init__" else module_parts[:-1]
@@ -116,4 +140,11 @@ def _is_type_checking_guard(node: ast.expr) -> bool:
     )
 
 
-__all__ = ["ImportEdge", "ImportKind", "module_imports", "production_imports"]
+__all__ = [
+    "ImportEdge",
+    "ImportKind",
+    "PRODUCTION_PACKAGES",
+    "module_imports",
+    "production_imports",
+    "production_paths",
+]

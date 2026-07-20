@@ -7,11 +7,9 @@
     "type": "object",
     "properties": {
       "baseUrl": {"type": "string", "default": "http://127.0.0.1:8765"},
-      "apiTokenEnv": {"type": "string", "default": "MEMORYOS_API_TOKEN"},
-      "userId": {"type": "string", "default": "default"},
+      "userId": {"type": "string", "default": "local-user"},
       "projectId": {"type": "string"},
-      "timeoutMs": {"type": "integer", "default": 2500},
-      "tokenBudget": {"type": "integer", "default": 1200}
+      "timeoutMs": {"type": "integer", "default": 2500}
     },
     "required": ["baseUrl"]
   }

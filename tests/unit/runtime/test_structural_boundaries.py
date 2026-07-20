@@ -5,66 +5,93 @@ import sys
 from pathlib import Path
 
 
+def test_runtime_build_and_start_are_separate(tmp_path) -> None:
+    from foundation.readiness import RuntimeReadinessState
+    from runtime import RuntimeBuilder, RuntimeConfig
+
+    runtime = RuntimeBuilder(RuntimeConfig(root=str(tmp_path))).build()
+
+    assert runtime.readiness.state is RuntimeReadinessState.RECOVERING
+    assert runtime.stores.source is not None
+    assert runtime.memory.command_service is not None
+    assert not hasattr(runtime, "source_store")
+    assert not hasattr(runtime, "memory_command_service")
+
+    report = runtime.start()
+
+    assert report.ready is True
+    assert runtime.readiness.state is RuntimeReadinessState.READY
+
+
+def test_runtime_config_does_not_hold_live_dependencies(tmp_path) -> None:
+    from runtime import RuntimeConfig
+
+    config = RuntimeConfig(root=str(tmp_path))
+
+    for name in ("source_store", "vector_store", "embedding", "reranker", "memory_extractor"):
+        assert not hasattr(config, name)
+
+
 def test_client_initializes_with_runtime_container(tmp_path) -> None:
-    from memoryos.api.http.app import MemoryOSASGI
-    from memoryos.api.sdk.client import MemoryOSClient
-    from memoryos.runtime import RuntimeConfig, build_runtime_container
+    from openApi.http.app import MemoryOSASGI
+    from openApi.sdk.client import MemoryOSClient
+    from runtime.config import RuntimeConfig
+    from tests.support.runtime import build_test_runtime
 
     client = MemoryOSClient(str(tmp_path / "client"))
-    container = build_runtime_container(RuntimeConfig(root=str(tmp_path / "runtime")))
+    container = build_test_runtime(RuntimeConfig(root=str(tmp_path / "runtime")))
     app = MemoryOSASGI(client)
 
-    assert client.context_db is not None
-    assert client.engine is not None
-    assert client.agent_session_service is not None
-    assert app.sessions is client.agent_session_service
-    assert container.context_db is not None
-    assert container.agent_session_service is not None
-    assert container.memory_document_consolidator.saga_store is container.memory_document_consolidation_store
-    assert container.memory_command_service.consolidator is container.memory_document_consolidator
-    assert client.memory_document_consolidator is client.memory_command_service.consolidator
+    assert client.runtime.context.facade is not None
+    assert not hasattr(client, "context_db")
+    assert client.runtime.context.administration_service is not None
+    assert client.runtime.context.lifecycle_service is not None
+    assert client.runtime.policy.engine is not None
+    assert client.runtime.agent.session_service is not None
+    assert app.sessions is client.runtime.agent.session_service
+    assert container.context.facade is not None
+    assert not hasattr(container, "context_db")
+    assert container.context.administration_service is not None
+    assert container.context.lifecycle_service is not None
+    assert container.agent.session_service is not None
+    assert container.memory.consolidator.saga_store is container.memory.consolidation_store
+    assert container.memory.command_service.consolidator is container.memory.consolidator
+    assert client.runtime.memory.consolidator is client.runtime.memory.command_service.consolidator
 
 
 def test_memory_public_api_is_document_owned() -> None:
-    from memoryos.memory import (
-        DocumentCommitResult,
-        MemoryDocument,
-        MemoryDocumentCommitter,
-        MemoryEditProposal,
-    )
+    from memory.commit import DocumentCommitResult, MemoryDocumentCommitter
+    from memory.core import MemoryDocument, MemoryEditProposal
 
     root = Path(__file__).resolve().parents[3]
     assert MemoryDocument.__name__ == "MemoryDocument"
     assert MemoryDocumentCommitter.__name__ == "MemoryDocumentCommitter"
     assert MemoryEditProposal.__name__ == "MemoryEditProposal"
     assert DocumentCommitResult.__name__ == "DocumentCommitResult"
-    assert not tuple((root / "memoryos" / "memory" / "model").glob("*.py"))
-    assert not tuple((root / "memoryos" / "memory" / "service").glob("*.py"))
+    assert not (root / "memoryos" / "memory").exists()
+    assert not (root / "memoryos" / "runtime").exists()
 
 
 def test_contextdb_boundary_imports() -> None:
-    from memoryos.contextdb.context_db import ContextDB
-    from memoryos.contextdb.resource import ResourceImporter
-    from memoryos.contextdb.retrieval import ContextSelector
-    from memoryos.contextdb.session import SessionArchive, SessionCommitService
-    from memoryos.contextdb.skill import SkillRegistry
-    from memoryos.contextdb.store import IndexStore, SourceStore
-    from memoryos.contextdb.transaction import RecoveryService
+    from infrastructure.context.facade import ContextDB
+    from infrastructure.context.selection import ContextSelector
+    from infrastructure.store.contracts import IndexStore, SourceStore
+    from memory.commit import SessionCommitService
+    from pre.session import SessionArchive
+    from transaction.commit.recovery import RecoveryService
 
     assert ContextDB.__name__ == "ContextDB"
     assert ContextSelector.__name__ == "ContextSelector"
     assert IndexStore.__name__ == "IndexStore"
     assert RecoveryService.__name__ == "RecoveryService"
-    assert ResourceImporter.__name__ == "ResourceImporter"
     assert SessionArchive.__name__ == "SessionArchive"
     assert SessionCommitService.__name__ == "SessionCommitService"
-    assert SkillRegistry.__name__ == "SkillRegistry"
     assert SourceStore.__name__ == "SourceStore"
 
 
 def test_online_retrieval_exports_only_the_unified_product_boundary() -> None:
-    import memoryos.contextdb.retrieval as retrieval
-    import memoryos.contextdb.retrieval.hybrid_search as internal_hybrid
+    import infrastructure.context.retrieval as retrieval
+    import infrastructure.context.retrieval.hybrid_search as internal_hybrid
 
     assert not hasattr(retrieval, "HybridSearch")
     assert not hasattr(retrieval, "HierarchicalRetriever")
@@ -76,13 +103,14 @@ def test_online_retrieval_exports_only_the_unified_product_boundary() -> None:
 def test_product_retrieval_modules_contain_no_global_scan_or_snapshot_call() -> None:
     root = Path(__file__).resolve().parents[3]
     product_modules = (
-        "memoryos/api/sdk/client.py",
-        "memoryos/api/http/app.py",
-        "memoryos/api/mcp/tools.py",
-        "memoryos/application/context/assembler.py",
-        "memoryos/application/context/query_service.py",
-        "memoryos/application/context/orchestrator.py",
-        "memoryos/application/context/candidate_generator.py",
+        "openApi/sdk/client.py",
+        "openApi/http/app.py",
+        "openApi/mcp/tools.py",
+        "infrastructure/context/query_service.py",
+        "infrastructure/context/orchestrator.py",
+        "infrastructure/context/candidate/generator.py",
+        "infrastructure/context/candidate/vector.py",
+        "infrastructure/context/candidate/relation.py",
     )
     forbidden_calls = (
         ".list_objects(",
@@ -97,26 +125,19 @@ def test_product_retrieval_modules_contain_no_global_scan_or_snapshot_call() -> 
             assert forbidden_call not in source, f"{relative_path} contains {forbidden_call}"
 
 def test_provider_boundary_imports() -> None:
-    from memoryos.contextdb.store.vector_store import VectorStore
-    from memoryos.providers import ChatProvider, EmbeddingProvider, HashingEmbeddingProvider
-    from memoryos.providers.llm import ChatRequest
+    from infrastructure.context.retrieval.embedding import EmbeddingProvider
+    from infrastructure.model import ChatRequest, ModelProvider
+    from infrastructure.store.contracts.vector import VectorStore
 
-    assert ChatProvider.__name__ == "ChatProvider"
+    assert ModelProvider.__name__ == "ModelProvider"
     assert ChatRequest.__name__ == "ChatRequest"
     assert EmbeddingProvider.__name__ == "EmbeddingProvider"
-    assert HashingEmbeddingProvider.__name__ == "HashingEmbeddingProvider"
     assert VectorStore.__name__ == "VectorStore"
-
-
-def test_example_main_runs_without_import_errors() -> None:
-    root = Path(__file__).resolve().parents[3]
-
-    subprocess.run([sys.executable, str(root / "examples" / "main.py")], check=True, cwd=root)
 
 
 def test_context_assembly_smoke_benchmark_runs() -> None:
     root = Path(__file__).resolve().parents[3]
-    script = root / "benchmark" / "smoke" / "context_assembly_smoke.py"
+    script = root / "tests" / "benchmark" / "smoke" / "context_assembly_smoke.py"
 
     result = subprocess.run(
         [sys.executable, str(script)],

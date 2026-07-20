@@ -2,16 +2,16 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from memoryos.contextdb.catalog import CatalogRecord, CatalogRecordKind, ServingTier
-from memoryos.contextdb.model.context_object import ContextObject
-from memoryos.contextdb.model.context_relation import ContextRelation
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.retention import CatalogRetentionManager, RetentionPolicy
-from memoryos.contextdb.store.local_stores import FileSystemSourceStore
-from memoryos.contextdb.store.sqlite_index_store import SQLiteIndexStore
-from memoryos.contextdb.store.sqlite_relation_store import SQLiteRelationStore
-from memoryos.contextdb.store.vector_store import InMemoryVectorStore, vector_row_id
-from memoryos.contextdb.tombstone import ProjectionTombstoneService
+from infrastructure.context.maintenance.retention import CatalogRetentionManager, RetentionPolicy
+from infrastructure.context.maintenance.tombstone import ProjectionTombstoneService
+from infrastructure.store.contracts.vector import vector_row_id
+from infrastructure.store.model.catalog import CatalogRecord, CatalogRecordKind, ServingTier
+from infrastructure.store.model.context.context_object import ContextObject
+from infrastructure.store.model.context.context_relation import ContextRelation
+from infrastructure.store.model.context.context_type import ContextType
+from infrastructure.store.sqlite.index_store import SQLiteIndexStore
+from infrastructure.store.sqlite.relation_store import SQLiteRelationStore
+from tests.support.persistence import FileSystemSourceStore, InMemoryVectorStore
 
 
 def test_tombstone_replay_is_tenant_scoped_and_waits_for_source_retirement(tmp_path) -> None:

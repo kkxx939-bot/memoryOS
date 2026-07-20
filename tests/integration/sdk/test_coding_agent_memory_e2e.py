@@ -2,33 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from memoryos.api.sdk.client import MemoryOSClient
-from memoryos.api.trusted_context import (
-    AUTHORITATIVE_FORGET,
-    AUTHORITATIVE_REMEMBER,
-    HARD_ERASE_MEMORY,
-    READ_CONTEXT,
-    TrustedRequestContext,
-)
-from memoryos.contextdb.session.session_model import SessionArchive
-from memoryos.memory.documents.model import ABSENT
+from memory.core.model import ABSENT
+from openApi.sdk.client import MemoryOSClient
+from foundation.identity import LocalUserContext
+from pre.session import SessionArchive
 
 
-def _caller(*, tenant_id: str = "default") -> TrustedRequestContext:
-    return TrustedRequestContext(
-        tenant_id=tenant_id,
-        user_id="u1",
-        actor_kind="user",
-        actor_id="u1",
-        capabilities=frozenset(
-            {
-                READ_CONTEXT,
-                AUTHORITATIVE_REMEMBER,
-                AUTHORITATIVE_FORGET,
-                HARD_ERASE_MEMORY,
-            }
-        ),
-    )
+def _caller() -> LocalUserContext:
+    return LocalUserContext(user_id="u1")
 
 
 def test_explicit_document_commands_round_trip_through_sdk(tmp_path: Path) -> None:
@@ -112,12 +93,12 @@ def test_rename_and_roll_forward_merge_are_public_sdk_operations(tmp_path: Path)
 
     assert completed["status"] == "COMPLETED"
     assert completed["soft_forgotten_document_ids"] == [source["document_id"]]
-    assert b"Merge source body" in client.memory_document_store.read_raw(
+    assert b"Merge source body" in client.runtime.memory.document_store.read_raw(
         "default",
         "u1",
         document_id=target["document_id"],
     )
-    assert client.memory_document_store.read_state(
+    assert client.runtime.memory.document_store.read_state(
         "default",
         "u1",
         source["relative_path"],
@@ -164,17 +145,17 @@ def test_real_session_uncertain_memory_waits_for_review_then_uses_document_commi
         metadata={"tenant_id": "default"},
     )
 
-    committed = client.context_db.commit_session(archive, async_commit=True)
+    committed = client.runtime.session.commit_service.commit_session(archive, async_commit=True)
 
     assert committed.done is True
     assert committed.memory_document_change_count == 0
     assert committed.edit_proposal_count == 1
     assert len(committed.edit_proposal_ids) == 1
     proposal_id = committed.edit_proposal_ids[0]
-    record = client.memory_review_service.review_store.load("default", "u1", proposal_id)
+    record = client.runtime.memory.review_service.review_store.load("default", "u1", proposal_id)
     assert record is not None
     assert record.independent_evidence_references == (archive.archive_uri,)
-    assert client.memory_document_store.read_state("default", "u1", record.relative_path) == ABSENT
+    assert client.runtime.memory.document_store.read_state("default", "u1", record.relative_path) == ABSENT
     preview = client.preview_memory_edit(proposal_id, caller=caller)
     assert preview["proposal_id"] == proposal_id
     assert "auto-review-proof-token" in preview["proposed_diff"]
@@ -184,7 +165,7 @@ def test_real_session_uncertain_memory_waits_for_review_then_uses_document_commi
 
     assert approved["changed"] is True
     assert approved["projection_status"] == "ENQUEUED"
-    assert b"auto-review-proof-token" in client.memory_document_store.read_raw(
+    assert b"auto-review-proof-token" in client.runtime.memory.document_store.read_raw(
         "default",
         "u1",
         document_id=approved["document_id"],

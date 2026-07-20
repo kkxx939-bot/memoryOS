@@ -1,45 +1,35 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import cast
 
-from memoryos.adapters.persistence.sqlite import SQLiteIndexStore
-from memoryos.api.sdk.client import MemoryOSClient
-from memoryos.contextdb.catalog import CatalogRecordKind
-from memoryos.contextdb.store.vector_store import InMemoryVectorStore
-from memoryos.providers.embedding import HashingEmbeddingProvider
-from memoryos.security.trusted_context import (
-    AUTHORITATIVE_FORGET,
-    AUTHORITATIVE_REMEMBER,
-    READ_CONTEXT,
-    TrustedRequestContext,
-)
+import pytest
+
+from foundation.identity import InternalJobNamespaceError, LocalUserContext
+from infrastructure.store.model.catalog import CatalogRecordKind
+from infrastructure.store.sqlite import SQLiteIndexStore
+from openApi.sdk.client import MemoryOSClient
+from tests.support.embedding import DeterministicEmbeddingProvider
+from tests.support.persistence import InMemoryVectorStore
 
 
-def _caller() -> TrustedRequestContext:
-    return TrustedRequestContext(
-        tenant_id="default",
-        user_id="u1",
-        actor_kind="user",
-        actor_id="u1",
-        capabilities=frozenset(
-            {READ_CONTEXT, AUTHORITATIVE_REMEMBER, AUTHORITATIVE_FORGET}
-        ),
-    )
+def _caller() -> LocalUserContext:
+    return LocalUserContext(user_id="u1")
 
 
 def _project_one(client: MemoryOSClient):  # noqa: ANN202
-    leased = client.queue_store.lease(
+    leased = client.runtime.stores.queue.lease(
         "memory_projection",
         lease_owner="projection-test",
         limit=1,
     )[0]
-    outcome = client.memory_projection_worker.process_job(leased)
-    client.queue_store.ack(leased)
+    outcome = client.runtime.memory.projection_worker.process_job(leased)
+    client.runtime.stores.queue.ack(leased)
     return leased, outcome
 
 
 def _catalog(client: MemoryOSClient) -> SQLiteIndexStore:
-    return cast(SQLiteIndexStore, client.index_store)
+    return cast(SQLiteIndexStore, client.runtime.stores.index)
 
 
 def test_document_commit_projects_exact_generation_and_stale_job_cannot_republish(tmp_path) -> None:  # noqa: ANN001
@@ -47,7 +37,7 @@ def test_document_commit_projects_exact_generation_and_stale_job_cannot_republis
     client = MemoryOSClient(
         str(tmp_path),
         vector_store=vectors,
-        embedding_provider=HashingEmbeddingProvider(),
+        embedding_provider=DeterministicEmbeddingProvider(),
     )
     caller = _caller()
     marker = "projection-secret-marker"
@@ -98,7 +88,7 @@ def test_document_commit_projects_exact_generation_and_stale_job_cannot_republis
     assert current and {record.projection_generation for record in current} == {2}
     assert {record.source_digest for record in current} == {edited["source_digest"]}
 
-    assert client.memory_projection_worker.process_job(first_job) == "stale"
+    assert client.runtime.memory.projection_worker.process_job(first_job) == "stale"
     after_stale = _catalog(client).list_catalog(
         tenant_id="default",
         filters={
@@ -129,7 +119,7 @@ def test_document_commit_projects_exact_generation_and_stale_job_cannot_republis
         limit=100,
     ) == []
     assert not vectors.rows
-    barrier = client.memory_document_control_store.load_publication_barrier(
+    barrier = client.runtime.memory.control_store.load_publication_barrier(
         "default",
         "u1",
         remembered["document_id"],
@@ -137,7 +127,7 @@ def test_document_commit_projects_exact_generation_and_stale_job_cannot_republis
     assert barrier is not None
 
     _catalog(client).clear(tenant_id="default")
-    assert client.memory_projection_worker.process_job(first_job) == "stale"
+    assert client.runtime.memory.projection_worker.process_job(first_job) == "stale"
     assert _catalog(client).list_catalog(
         tenant_id="default",
         filters={
@@ -156,7 +146,7 @@ def test_document_commit_projects_exact_generation_and_stale_job_cannot_republis
     )
     _restore_job, restore_outcome = _project_one(client)
     assert restore_outcome == "processed"
-    restored_control = client.memory_document_control_store.load_control(
+    restored_control = client.runtime.memory.control_store.load_control(
         "default",
         "u1",
         remembered["document_id"],
@@ -167,7 +157,7 @@ def test_document_commit_projects_exact_generation_and_stale_job_cannot_republis
     assert restored["source_digest"] == restored_control.raw_sha256
 
     _catalog(client).clear(tenant_id="default")
-    rebuilt = client.memory_projection_worker.rebuild_owner("default", "u1")
+    rebuilt = client.runtime.memory.projection_worker.rebuild_owner("default", "u1")
     assert rebuilt["projected"] >= 1
     after_rebuild = _catalog(client).list_catalog(
         tenant_id="default",
@@ -180,3 +170,24 @@ def test_document_commit_projects_exact_generation_and_stale_job_cannot_republis
     )
     assert after_rebuild
     assert {record.source_digest for record in after_rebuild} == {restored["source_digest"]}
+
+
+def test_projection_worker_rejects_job_outside_internal_namespace(tmp_path) -> None:  # noqa: ANN001
+    client = MemoryOSClient(str(tmp_path))
+    client.remember(
+        "Prefer deterministic projection jobs.",
+        target_hint="preference:projection",
+        caller=_caller(),
+    )
+    leased = client.runtime.stores.queue.lease(
+        "memory_projection",
+        lease_owner="namespace-test",
+        limit=1,
+    )[0]
+    forged = replace(
+        leased,
+        payload={**leased.payload, "tenant_id": "foreign"},
+    )
+
+    with pytest.raises(InternalJobNamespaceError):
+        client.runtime.memory.projection_worker.process_job(forged)

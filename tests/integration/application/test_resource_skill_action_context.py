@@ -2,40 +2,71 @@ from __future__ import annotations
 
 import json
 
-from memoryos.action_policy.model.action_policy import ActionCandidate, ActionPolicy
-from memoryos.api.sdk.client import MemoryOSClient
-from memoryos.behavior.model.behavior_pattern import BehaviorPattern
-from memoryos.connect import ConnectMetadata
-from memoryos.contextdb.resource.resource_importer import ResourceImporter
-from memoryos.contextdb.skill.skill_model import Skill
-from memoryos.contextdb.skill.skill_registry import SkillRegistry
-from memoryos.contextdb.store.local_stores import FileSystemSourceStore, InMemoryIndexStore, InMemoryRelationStore
-from memoryos.operations.commit.operation_committer import OperationCommitter
-from memoryos.operations.model.context_operation import ContextOperation
-from memoryos.operations.model.operation_action import OperationAction
-from memoryos.prediction.model.prediction_request import PredictionRequest
-from memoryos.prediction.pipeline.action_context_builder import ActionContextBuilder
-from memoryos.prediction.pipeline.policy_gate import PolicyGate
-from memoryos.skill.tool_registry import ToolRegistry
-from memoryos.support import SupportAnchor
+from behavior.core.model.behavior_pattern import BehaviorPattern
+from behavior.core.support import BehaviorSupportAnchor
+from behavior.projection import behavior_pattern_to_context_object, behavior_support_to_context_object
+from infrastructure.context.operation_effects import InfrastructureContextOperationEffects
+from infrastructure.store.model.context import ContextObject, ContextType
+from openApi.sdk.client import MemoryOSClient
+from policy.action_policy.decision.context_builder import ActionContextBuilder
+from policy.action_policy.decision.gate import PolicyGate
+from policy.action_policy.decision.request import PredictionRequest
+from policy.action_policy.execution.tool_registry import ToolRegistry
+from policy.action_policy.integration.commit_registration import build_action_policy_transaction_extensions
+from policy.action_policy.model.action_policy import ActionCandidate, ActionPolicy
+from pre.connect import ConnectMetadata
+from tests.support.persistence import (
+    FileSystemSourceStore,
+    InMemoryIndexStore,
+    InMemoryRelationStore,
+    seed_context_object,
+)
+from tests.support.transaction import build_test_operation_committer as OperationCommitter
+from transaction.model.context_operation import ContextOperation
+from transaction.model.operation_action import OperationAction
 
 
 def test_resource_and_skill_required_by_action_policy_gate_execution(tmp_path) -> None:
     source = FileSystemSourceStore(tmp_path)
     index = InMemoryIndexStore()
     relations = InMemoryRelationStore()
-    committer = OperationCommitter(source, index, tmp_path, relation_store=relations)
+    committer = OperationCommitter(
+        source,
+        index,
+        tmp_path,
+        relation_store=relations,
+        context_effects=InfrastructureContextOperationEffects(),
+        domain_extensions=build_action_policy_transaction_extensions(),
+    )
     resource_uri = "memoryos://resources/devices/ac-living-room"
     skill_uri = "memoryos://skills/smart_home/ac-control"
 
-    ResourceImporter(source, index).import_text(resource_uri, "AC", "device", "available")
-    SkillRegistry(source, index).register(
-        Skill(uri=skill_uri, title="AC control", tool_name="ac.set", risk_level="low"), content="executable"
+    seed_context_object(
+        source,
+        index,
+        ContextObject(
+            uri=resource_uri,
+            context_type=ContextType.RESOURCE,
+            title="AC",
+            metadata={"resource_type": "device"},
+        ),
+        content="available",
+    )
+    seed_context_object(
+        source,
+        index,
+        ContextObject(
+            uri=skill_uri,
+            context_type=ContextType.SKILL,
+            title="AC control",
+            metadata={"tool_name": "ac.set", "risk_level": "low", "executable": True},
+        ),
+        content="executable",
     )
     policy = ActionPolicy(
         user_id="u1",
         scene_key="hot",
-        action="turn_on_ac",
+        action="turn_on_fan",
         support_anchor_uri="memoryos://user/u1/support/behavior/hot",
         auto_execute_allowed=True,
         q_value=0.9,
@@ -44,13 +75,15 @@ def test_resource_and_skill_required_by_action_policy_gate_execution(tmp_path) -
         required_skill_uris=[skill_uri],
     )
     source.write_object(
-        SupportAnchor(
-            uri=policy.support_anchor_uri,
-            user_id="u1",
-            title="hot anchor",
-            content="verified hot-room behavior anchor",
-            anchor_key="hot",
-        ).to_context_object(),
+        behavior_support_to_context_object(
+            BehaviorSupportAnchor(
+                uri=policy.support_anchor_uri,
+                user_id="u1",
+                title="hot anchor",
+                content="verified hot-room behavior anchor",
+                anchor_key="hot",
+            )
+        ),
         content="verified hot-room behavior anchor",
     )
     committer.commit(
@@ -68,7 +101,7 @@ def test_resource_and_skill_required_by_action_policy_gate_execution(tmp_path) -
 
     candidate = ActionCandidate(action=policy.action, score=0.92, policy_uri=policy.uri, reason="test")
     context = ActionContextBuilder(index, source_store=source, relation_store=relations).build(
-        "u1", [candidate], [policy], token_budget=1000
+        "u1", [candidate], [policy]
     )
     assert context.packed_context["slices"]["resource"]["items"]
     assert context.packed_context["slices"]["skill"]["items"]
@@ -76,7 +109,7 @@ def test_resource_and_skill_required_by_action_policy_gate_execution(tmp_path) -
 
     source.soft_delete(skill_uri, "removed")
     context_without_skill = ActionContextBuilder(index, source_store=source, relation_store=relations).build(
-        "u1", [candidate], [policy], token_budget=1000
+        "u1", [candidate], [policy]
     )
     assert PolicyGate().evaluate(candidate, context_without_skill, policy, 0.92).reason == "required skill unavailable"
 
@@ -101,35 +134,49 @@ def test_direct_request_resource_and_skill_are_archived_and_learned_by_action_po
         trigger_conditions={"scene_key": scene_key},
         support_anchor_uri=anchor_uri,
         case_refs=["case-1"],
-        action_distribution=[{"action": "turn_on_ac", "count": 1}],
+        action_distribution=[{"action": "turn_on_fan", "count": 1}],
     )
-    client.context_db.seed_object(pattern.to_context_object(), content="hot_room turn_on_ac behavior")
-    client.context_db.seed_object(
-        SupportAnchor(
-            uri=anchor_uri,
-            user_id="u1",
-            title="hot room anchor",
-            content="verified hot-room behavior anchor",
-            anchor_key=scene_key,
-        ).to_context_object(),
+    seed_context_object(
+        client.runtime.stores.source,
+        client.runtime.stores.index,
+        behavior_pattern_to_context_object(pattern),
+        content="hot_room turn_on_fan behavior",
+    )
+    seed_context_object(
+        client.runtime.stores.source,
+        client.runtime.stores.index,
+        behavior_support_to_context_object(
+            BehaviorSupportAnchor(
+                uri=anchor_uri,
+                user_id="u1",
+                title="hot room anchor",
+                content="verified hot-room behavior anchor",
+                anchor_key=scene_key,
+            )
+        ),
         content="verified hot-room behavior anchor",
     )
     policy = ActionPolicy(
         user_id="u1",
         scene_key=scene_key,
-        action="turn_on_ac",
+        action="turn_on_fan",
         support_anchor_uri=anchor_uri,
         auto_execute_allowed=True,
         q_value=0.95,
         confidence=0.95,
         reward_score=10.0,
     )
-    client.context_db.seed_object(policy.to_context_object(), content=json.dumps(policy.to_dict()))
+    seed_context_object(
+        client.runtime.stores.source,
+        client.runtime.stores.index,
+        policy.to_context_object(),
+        content=json.dumps(policy.to_dict()),
+    )
     request = PredictionRequest(
         user_id="u1",
         episode_id="direct-resource-skill",
         observation={"raw_text": "room is hot", "location": "home", "scene_key": scene_key},
-        available_actions=["turn_on_ac", "ask_user", "do_nothing"],
+        available_actions=["turn_on_fan", "ask_user", "do_nothing"],
         request_id="req-direct",
         connect_metadata=ConnectMetadata.action_capable_embodied("reachy_mini").to_dict(),
         resources=[
@@ -138,7 +185,7 @@ def test_direct_request_resource_and_skill_are_archived_and_learned_by_action_po
                 "title": "AC",
                 "metadata": {
                     "tool_name": "ac_tool",
-                    "supported_actions": ["turn_on_ac"],
+                    "supported_actions": ["turn_on_fan"],
                     "device_id": "ac",
                 },
             }
@@ -150,7 +197,7 @@ def test_direct_request_resource_and_skill_are_archived_and_learned_by_action_po
                 "metadata": {
                     "tool_name": "ac_tool",
                     "executable": True,
-                    "supported_actions": ["turn_on_ac"],
+                    "supported_actions": ["turn_on_fan"],
                 },
             }
         ],
@@ -168,16 +215,16 @@ def test_direct_request_resource_and_skill_are_archived_and_learned_by_action_po
     assert [item["uri"] for item in action_context["skill"]["items"]] == [skill_uri]
 
     assert result.archive_uri is not None
-    archived = client.session_archive_store.read_archive(result.archive_uri)
+    archived = client.runtime.session.archive_store.read_archive(result.archive_uri)
     assert resource_uri in {item["uri"] for item in archived.used_contexts}
     assert skill_uri in {item["uri"] for item in archived.used_skills}
 
-    learned_policy = client.context_db.read_object(f"memoryos://user/u1/action_policies/{scene_key}/turn_on_ac")
+    learned_policy = client.runtime.stores.source.read_object(f"memoryos://user/u1/action_policies/{scene_key}/turn_on_fan")
     assert learned_policy.metadata["required_resource_uris"] == [resource_uri]
     assert learned_policy.metadata["required_skill_uris"] == [skill_uri]
 
 
-def test_registered_persistent_skill_is_executable_by_default(tmp_path) -> None:
+def test_persistent_context_skill_is_executable_when_explicitly_enabled(tmp_path) -> None:
     calls: list[dict] = []
     registry = ToolRegistry()
 
@@ -189,20 +236,37 @@ def test_registered_persistent_skill_is_executable_by_default(tmp_path) -> None:
     client = MemoryOSClient(str(tmp_path), tool_registry=registry)
     resource_uri = "memoryos://resources/devices/ac-living-room"
     skill_uri = "memoryos://skills/smart_home/ac-control"
-    ResourceImporter(client.source_store, client.index_store).import_text(
-        resource_uri,
-        "AC",
-        "device",
-        json.dumps({"tool_name": "ac_tool", "supported_actions": ["turn_on_ac"], "device_id": "ac"}),
+    seed_context_object(
+        client.runtime.stores.source,
+        client.runtime.stores.index,
+        ContextObject(
+            uri=resource_uri,
+            context_type=ContextType.RESOURCE,
+            title="AC",
+            metadata={
+                "resource_type": "device",
+                "tool_name": "ac_tool",
+                "supported_actions": ["turn_on_fan"],
+                "device_id": "ac",
+            },
+        ),
+        content="AC resource available",
     )
-    SkillRegistry(client.source_store, client.index_store).register(
-        Skill(uri=skill_uri, title="AC control", tool_name="ac_tool"),
-        content="turn_on_ac skill available",
+    seed_context_object(
+        client.runtime.stores.source,
+        client.runtime.stores.index,
+        ContextObject(
+            uri=skill_uri,
+            context_type=ContextType.SKILL,
+            title="AC control",
+            metadata={"tool_name": "ac_tool", "risk_level": "low", "executable": True},
+        ),
+        content="turn_on_fan skill available",
     )
     policy = ActionPolicy(
         user_id="u1",
         scene_key="hot",
-        action="turn_on_ac",
+        action="turn_on_fan",
         support_anchor_uri="memoryos://user/u1/support/behavior/hot",
         auto_execute_allowed=True,
         q_value=0.95,
@@ -211,17 +275,21 @@ def test_registered_persistent_skill_is_executable_by_default(tmp_path) -> None:
         required_resource_uris=[resource_uri],
         required_skill_uris=[skill_uri],
     )
-    client.context_db.seed_object(
-        SupportAnchor(
-            uri=policy.support_anchor_uri,
-            user_id="u1",
-            title="hot anchor",
-            content="verified hot-room behavior anchor",
-            anchor_key="hot",
-        ).to_context_object(),
+    seed_context_object(
+        client.runtime.stores.source,
+        client.runtime.stores.index,
+        behavior_support_to_context_object(
+            BehaviorSupportAnchor(
+                uri=policy.support_anchor_uri,
+                user_id="u1",
+                title="hot anchor",
+                content="verified hot-room behavior anchor",
+                anchor_key="hot",
+            )
+        ),
         content="verified hot-room behavior anchor",
     )
-    client.committer.commit(
+    client.runtime.transaction.committer.commit(
         "u1",
         [
             ContextOperation(
@@ -242,7 +310,7 @@ def test_registered_persistent_skill_is_executable_by_default(tmp_path) -> None:
             user_id="u1",
             episode_id="registered-skill",
             observation={"scene_key": "hot", "raw_text": "room is hot", "location": "home"},
-            available_actions=["turn_on_ac", "ask_user", "do_nothing"],
+            available_actions=["turn_on_fan", "ask_user", "do_nothing"],
             connect_metadata=ConnectMetadata.action_capable_embodied("reachy_mini").to_dict(),
         ),
         async_commit=False,
@@ -252,14 +320,3 @@ def test_registered_persistent_skill_is_executable_by_default(tmp_path) -> None:
     assert result.action_result.status == "success"
     assert result.action_result.skill_uris == [skill_uri]
     assert calls
-
-
-def test_registered_skill_preserves_explicit_non_executable_metadata() -> None:
-    skill = Skill(
-        uri="memoryos://skills/smart_home/ac-control-disabled",
-        title="AC control disabled",
-        tool_name="ac_tool",
-        metadata={"executable": False},
-    )
-
-    assert skill.to_context_object().metadata["executable"] is False

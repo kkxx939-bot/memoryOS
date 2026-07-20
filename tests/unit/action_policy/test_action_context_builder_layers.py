@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from memoryos.action_policy.model.action_policy import ActionCandidate, ActionPolicy
-from memoryos.contextdb.model.context_layer import ContextLayers
-from memoryos.contextdb.model.context_object import ContextObject
-from memoryos.contextdb.model.context_relation import ContextRelation
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.store.local_stores import FileSystemSourceStore, InMemoryIndexStore, InMemoryRelationStore
-from memoryos.prediction.pipeline.action_context_builder import ActionContextBuilder
+from infrastructure.store.model.context.context_layer import ContextLayers
+from infrastructure.store.model.context.context_object import ContextObject
+from infrastructure.store.model.context.context_relation import ContextRelation
+from infrastructure.store.model.context.context_type import ContextType
+from policy.action_policy.decision.context_builder import ActionContextBuilder
+from policy.action_policy.model.action_policy import ActionCandidate, ActionPolicy
+from tests.support.persistence import FileSystemSourceStore, InMemoryIndexStore, InMemoryRelationStore
 
 
 def test_action_context_builder_prefers_l1_falls_back_to_l0_and_records_layers(tmp_path) -> None:
@@ -41,7 +41,6 @@ def test_action_context_builder_prefers_l1_falls_back_to_l0_and_records_layers(t
         "u1",
         [ActionCandidate(action=policy.action, score=0.8, policy_uri=policy.uri, reason="test")],
         [policy],
-        token_budget=1000,
     )
     item = context.packed_context["slices"]["support_anchor"]["items"][0]
     assert item["content"] == "L1"
@@ -54,14 +53,13 @@ def test_action_context_builder_prefers_l1_falls_back_to_l0_and_records_layers(t
         "u1",
         [ActionCandidate(action=policy.action, score=0.8, policy_uri=policy.uri, reason="test")],
         [policy],
-        token_budget=1000,
     )
     item = context.packed_context["slices"]["support_anchor"]["items"][0]
     assert item["content"] == "L0"
     assert item["layer"] == "l0"
 
 
-def test_action_context_builder_loads_l2_only_for_strong_relevance_and_budget(tmp_path) -> None:
+def test_action_context_builder_loads_l2_only_for_strong_relevance(tmp_path) -> None:
     source = FileSystemSourceStore(tmp_path)
     index = InMemoryIndexStore()
     relations = InMemoryRelationStore()
@@ -93,7 +91,6 @@ def test_action_context_builder_loads_l2_only_for_strong_relevance_and_budget(tm
         "u1",
         [ActionCandidate(action=policy.action, score=0.84, policy_uri=policy.uri, reason="test")],
         [policy],
-        token_budget=2000,
     )
     assert default_context.packed_context["slices"]["support_anchor"]["items"][0]["layer"] == "l1"
 
@@ -101,12 +98,11 @@ def test_action_context_builder_loads_l2_only_for_strong_relevance_and_budget(tm
         "u1",
         [ActionCandidate(action=policy.action, score=0.95, policy_uri=policy.uri, reason="test")],
         [policy],
-        token_budget=2000,
     )
     assert strong_context.packed_context["slices"]["support_anchor"]["items"][0]["layer"] == "l2"
 
 
-def test_action_context_builder_reports_dropped_contexts_when_budget_is_tight(tmp_path) -> None:
+def test_action_context_builder_reports_items_over_section_limit(tmp_path) -> None:
     source = FileSystemSourceStore(tmp_path)
     index = InMemoryIndexStore()
     relations = InMemoryRelationStore()
@@ -134,6 +130,7 @@ def test_action_context_builder_reports_dropped_contexts_when_budget_is_tight(tm
         "u1",
         [ActionCandidate(action=policy.action, score=0.9, policy_uri=policy.uri, reason="test")],
         [policy],
-        token_budget=50,
+        resources=[{"uri": f"memoryos://resources/{index}", "content": str(index)} for index in range(5)],
     )
     assert context.packed_context["dropped_contexts"]
+    assert context.packed_context["dropped_contexts"][0]["reason"] == "section_limit"

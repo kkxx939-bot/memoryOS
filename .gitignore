@@ -20,7 +20,6 @@ venv/
 # Local database / runtime files
 *.sqlite3
 *.db
-memory-root/
 
 # Logs
 *.log

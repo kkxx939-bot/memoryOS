@@ -3,19 +3,13 @@ from __future__ import annotations
 import json
 from typing import Any, cast
 
-from memoryos.api.mcp import stdio
-from memoryos.api.mcp.config import MCPServerConfig
-from memoryos.api.mcp.server import MemoryOSMCPServer
-from memoryos.api.sdk.client import MemoryOSClient
-from memoryos.api.trusted_context import (
-    AUTHORITATIVE_FORGET,
-    AUTHORITATIVE_REMEMBER,
-    DEFAULT_AGENT_CAPABILITIES,
-    HARD_ERASE_MEMORY,
-)
-from memoryos.connect import ConnectMetadata
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.runtime.readiness import RuntimeNotReadyError, RuntimeReadinessState
+from foundation.readiness import RuntimeNotReadyError, RuntimeReadinessState
+from infrastructure.store.model.context.context_type import ContextType
+from openApi.mcp import stdio
+from openApi.mcp.config import MCPServerConfig
+from openApi.mcp.server import MemoryOSMCPServer
+from openApi.sdk.client import MemoryOSClient
+from pre.connect import ConnectMetadata
 
 
 def _document_result(*, edit_summary: str = "explicit remember") -> dict[str, Any]:
@@ -77,7 +71,7 @@ class FakeMCPClient:
             "packed_context": "short context",
             "contexts": [{"uri": "memoryos://ctx/1"}],
             "source_uris": ["memoryos://ctx/1"],
-            "dropped_contexts": [{"uri": "memoryos://ctx/2", "reason": "token_budget"}],
+            "dropped_contexts": [{"uri": "memoryos://ctx/2", "reason": "section_limit"}],
         }
 
     def commit_agent_session(self, **kwargs: Any) -> dict[str, Any]:
@@ -193,7 +187,6 @@ class FakeMCPClient:
 def _server(
     *,
     enable_action_tools: bool = False,
-    authoritative: bool = False,
 ) -> tuple[MemoryOSMCPServer, FakeMCPClient]:
     client = FakeMCPClient()
     config = MCPServerConfig(
@@ -201,29 +194,13 @@ def _server(
         user_id="u1",
         adapter_id="codex",
         agent_name="codex",
-        actor_kind="user" if authoritative else "agent",
-        actor_id="u1" if authoritative else "codex",
-        capabilities=(
-            frozenset(
-                {
-                    *DEFAULT_AGENT_CAPABILITIES,
-                    AUTHORITATIVE_REMEMBER,
-                    AUTHORITATIVE_FORGET,
-                    HARD_ERASE_MEMORY,
-                }
-            )
-            if authoritative
-            else DEFAULT_AGENT_CAPABILITIES
-        ),
-        token_budget=64,
         enable_action_tools=enable_action_tools,
-        allowed_workspace_ids=frozenset({"memoryOS"}),
     )
     return MemoryOSMCPServer(cast(MemoryOSClient, client), config=config), client
 
 
 def test_mcp_markdown_memory_commands_share_the_document_contract() -> None:
-    server, client = _server(authoritative=True)
+    server, client = _server()
     invalid = server.call_tool(
         "memoryos_remember",
         {
@@ -303,19 +280,8 @@ def test_mcp_markdown_memory_commands_share_the_document_contract() -> None:
     assert client.consolidation_proposal_calls == [proposal_request]
 
 
-def test_mcp_hard_erase_requires_its_independent_capability() -> None:
-    server, client = _server(authoritative=False)
-    server.config = MCPServerConfig(
-        root="/tmp/memory",
-        user_id="u1",
-        adapter_id="codex",
-        actor_kind="user",
-        actor_id="u1",
-        capabilities=frozenset({*DEFAULT_AGENT_CAPABILITIES, AUTHORITATIVE_FORGET}),
-    )
-    server.router.config = server.config
-    server.router.caller = server.config.trusted_context()
-
+def test_mcp_hard_erase_is_available_to_the_local_user() -> None:
+    server, client = _server()
     result = server.call_tool(
         "memoryos_forget",
         {
@@ -325,8 +291,8 @@ def test_mcp_hard_erase_requires_its_independent_capability() -> None:
         },
     )
 
-    assert result["error"]["code"] == "PERMISSION_DENIED"
-    assert client.forget_calls == []
+    assert result["error"] is None
+    assert client.forget_calls[0]["mode"] == "HARD_ERASE"
 
 
 def _request(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -448,33 +414,26 @@ def test_mcp_agent_metadata_response_remains_context_reduction() -> None:
     assert client.search_calls[0]["connect_metadata"] == {"adapter_id": "codex"}
 
 
-def test_mcp_assemble_context_respects_token_budget_and_dropped_contexts() -> None:
+def test_mcp_assemble_context_returns_selected_and_dropped_contexts() -> None:
     server, client = _server()
 
-    result = server.call_tool("memoryos_assemble_context", {"query": "MCP", "token_budget": 32})
+    result = server.call_tool("memoryos_assemble_context", {"query": "MCP"})
 
     assert result["error"] is None
     assert result["packed_context"] == "short context"
-    assert result["token_budget"] == 32
-    assert result["estimated_tokens"] <= 32
-    assert result["dropped_contexts"] == [{"uri": "memoryos://ctx/2", "reason": "token_budget"}]
-    assert client.assemble_calls[0]["token_budget"] == 32
+    assert result["dropped_contexts"] == [{"uri": "memoryos://ctx/2", "reason": "section_limit"}]
+    assert "token_budget" not in client.assemble_calls[0]
 
 
 def test_mcp_optional_int_rejects_bool_and_accepts_numbers() -> None:
     server, client = _server()
 
     bad_limit = server.call_tool("memoryos_search_context", {"query": "MCP", "limit": True})
-    bad_budget = server.call_tool("memoryos_assemble_context", {"query": "MCP", "token_budget": True})
     good_limit = server.call_tool("memoryos_search_context", {"query": "MCP", "limit": "2"})
-    good_budget = server.call_tool("memoryos_assemble_context", {"query": "MCP", "token_budget": 32})
 
     assert bad_limit["error"]["code"] == "VALIDATION_ERROR"
-    assert bad_budget["error"]["code"] == "VALIDATION_ERROR"
     assert good_limit["error"] is None
-    assert good_budget["error"] is None
     assert client.search_calls[-1]["limit"] == 2
-    assert client.assemble_calls[-1]["token_budget"] == 32
 
 
 def test_mcp_commit_session_returns_structured_result() -> None:

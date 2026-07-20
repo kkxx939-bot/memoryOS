@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from memoryos.contextdb.model.context_object import ContextObject
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.store.local_stores import FileSystemSourceStore, InMemoryIndexStore
-from memoryos.contextdb.transaction.recovery import RecoveryService
-from memoryos.operations.commit.operation_committer import OperationCommitter
-from memoryos.operations.model.context_operation import ContextOperation
-from memoryos.operations.model.operation_action import OperationAction
+from infrastructure.store.model.context.context_object import ContextObject
+from infrastructure.store.model.context.context_type import ContextType
+from tests.support.persistence import FileSystemSourceStore, InMemoryIndexStore
+from tests.support.transaction import build_test_operation_committer as OperationCommitter
+from transaction.commit.recovery import RecoveryService
+from transaction.model.context_operation import ContextOperation
+from transaction.model.operation_action import OperationAction
 
 
 def test_source_written_recovery_rebuilds_index(tmp_path) -> None:  # noqa: ANN001

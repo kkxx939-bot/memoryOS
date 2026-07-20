@@ -5,19 +5,18 @@ from pathlib import Path
 
 import pytest
 
-from memoryos.core.readiness import RuntimeReadinessState
-from memoryos.memory.documents import (
+from foundation.readiness import RuntimeReadinessState
+from memory.commit import ConsolidationSource, ConsolidationStatus, MemoryDocumentConsolidator
+from memory.core import (
     ABSENT,
-    ConsolidationSource,
-    ConsolidationStatus,
     DocumentEditKind,
     DocumentEditPlan,
-    MemoryDocumentConsolidator,
     PresentPath,
     new_document_id,
     render_new_document,
 )
-from memoryos.runtime import RuntimeConfig, build_runtime_container
+from runtime.config import RuntimeConfig
+from tests.support.runtime import build_test_runtime
 
 
 def _create_plan(document_id: str, relative_path: str, body: str, *, key: str) -> DocumentEditPlan:
@@ -37,7 +36,7 @@ def _create_plan(document_id: str, relative_path: str, body: str, *, key: str) -
 
 def test_startup_resumes_consolidation_around_projection_drain(tmp_path: Path) -> None:
     root = tmp_path / "runtime"
-    first = build_runtime_container(RuntimeConfig(root=str(root)))
+    first = build_test_runtime(RuntimeConfig(root=str(root)))
     source_id = new_document_id()
     source_plan = _create_plan(
         source_id,
@@ -45,7 +44,7 @@ def test_startup_resumes_consolidation_around_projection_drain(tmp_path: Path) -
         "redundant source survives until target projection",
         key="runtime-source-create",
     )
-    source_commit = first.memory_document_committer.commit(
+    source_commit = first.memory.committer.commit(
         source_plan,
         actor_binding="trusted:user:user-a:user-a",
         evidence_reference="runtime-test:source",
@@ -69,9 +68,9 @@ def test_startup_resumes_consolidation_around_projection_drain(tmp_path: Path) -
             raise RuntimeError("restart after durable target commit")
 
     crashing = MemoryDocumentConsolidator(
-        first.memory_document_committer,
-        first.index_store,  # type: ignore[arg-type]
-        saga_store=first.memory_document_consolidation_store,
+        first.memory.committer,
+        first.stores.index,  # type: ignore[arg-type]
+        saga_store=first.memory.consolidation_store,
         test_hook=crash_before_target_checkpoint,
     )
     with pytest.raises(RuntimeError, match="restart after durable target commit"):
@@ -89,23 +88,29 @@ def test_startup_resumes_consolidation_around_projection_drain(tmp_path: Path) -
             actor_binding="trusted:user:user-a:user-a",
         )
 
-    pending = first.memory_document_consolidation_store.list_pending("default", "user-a")
+    pending = first.memory.consolidation_store.list_pending("default", "user-a")
     assert len(pending) == 1 and pending[0].status == ConsolidationStatus.PREPARED
 
-    restarted = build_runtime_container(RuntimeConfig(root=str(root)))
+    restarted = build_test_runtime(RuntimeConfig(root=str(root)))
 
     assert restarted.readiness.state == RuntimeReadinessState.READY
-    assert restarted.memory_document_store.read_state(
-        "default",
-        "user-a",
-        source_plan.relative_path,
-    ) == ABSENT
-    assert restarted.memory_document_store.read_raw(
-        "default",
-        "user-a",
-        document_id=target_id,
-    ) == target_plan.after_bytes
-    records = restarted.memory_document_consolidation_store.list_records("default", "user-a")
+    assert (
+        restarted.memory.document_store.read_state(
+            "default",
+            "user-a",
+            source_plan.relative_path,
+        )
+        == ABSENT
+    )
+    assert (
+        restarted.memory.document_store.read_raw(
+            "default",
+            "user-a",
+            document_id=target_id,
+        )
+        == target_plan.after_bytes
+    )
+    records = restarted.memory.consolidation_store.list_records("default", "user-a")
     assert len(records) == 1 and records[0].status == ConsolidationStatus.COMPLETED
     details = restarted.readiness.details
     assert details["memory_consolidations_pre_projection"]["awaiting_projection"] == 1

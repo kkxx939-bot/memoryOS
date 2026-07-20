@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import json
 
-from memoryos.action_policy.model.action_policy import ActionPolicy
-from memoryos.api.sdk.client import MemoryOSClient
-from memoryos.behavior.model.behavior_pattern import BehaviorPattern
-from memoryos.behavior.model.observation import Observation
-from memoryos.connect import ConnectMetadata
-from memoryos.contextdb.model.context_object import ContextObject
-from memoryos.contextdb.model.context_relation import ContextRelation
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.prediction.model.prediction_request import PredictionRequest
-from memoryos.skill.tool_registry import ToolRegistry
+from behavior.core.model.behavior_pattern import BehaviorPattern
+from behavior.core.model.observation import Observation
+from behavior.projection import behavior_pattern_to_context_object
+from policy.action_policy.execution.tool_registry import ToolRegistry
+from infrastructure.store.model.context.context_object import ContextObject
+from infrastructure.store.model.context.context_relation import ContextRelation
+from infrastructure.store.model.context.context_type import ContextType
+from openApi.sdk.client import MemoryOSClient
+from policy.action_policy.decision.request import PredictionRequest
+from policy.action_policy.model.action_policy import ActionPolicy
+from pre.connect import ConnectMetadata
+from tests.support.persistence import seed_context_object
 
 
 def test_predictive_context_hot_room_flow_uses_production_entrypoint(tmp_path) -> None:
@@ -48,7 +50,12 @@ def test_predictive_context_hot_room_flow_uses_production_entrypoint(tmp_path) -
             "summary": "User comfort support anchor for hot room behavior.",
         },
     )
-    client.context_db.seed_object(anchor, content="User comfort memory anchor for hot room behavior.")
+    seed_context_object(
+        client.runtime.stores.source,
+        client.runtime.stores.index,
+        anchor,
+        content="User comfort memory anchor for hot room behavior.",
+    )
 
     pattern = BehaviorPattern(
         user_id="u1",
@@ -56,12 +63,17 @@ def test_predictive_context_hot_room_flow_uses_production_entrypoint(tmp_path) -
         trigger_conditions={"scene_key": observation.scene_key, "context_tags": ["home", "hot_environment"]},
         support_anchor_uri=anchor_uri,
         case_refs=["case-1", "case-2", "case-3"],
-        action_distribution=[{"action": "turn_on_ac", "count": 3}],
+        action_distribution=[{"action": "turn_on_fan", "count": 3}],
         hotness=0.95,
         confidence=0.95,
     )
-    pattern_obj = pattern.to_context_object()
-    client.context_db.seed_object(pattern_obj, content="hot room home user_present turn_on_ac behavior pattern")
+    pattern_obj = behavior_pattern_to_context_object(pattern)
+    seed_context_object(
+        client.runtime.stores.source,
+        client.runtime.stores.index,
+        pattern_obj,
+        content="hot room home user_present turn_on_fan behavior pattern",
+    )
 
     resource = ContextObject(
         uri=resource_uri,
@@ -85,13 +97,13 @@ def test_predictive_context_hot_room_flow_uses_production_entrypoint(tmp_path) -
             "dry_run_supported": True,
         },
     )
-    client.context_db.seed_object(resource, content="living room AC is available")
-    client.context_db.seed_object(skill, content="skill can execute turn_on_ac")
+    seed_context_object(client.runtime.stores.source, client.runtime.stores.index, resource, content="living room AC is available")
+    seed_context_object(client.runtime.stores.source, client.runtime.stores.index, skill, content="skill can execute turn_on_fan")
 
     policy = ActionPolicy(
         user_id="u1",
         scene_key=observation.scene_key,
-        action="turn_on_ac",
+        action="turn_on_fan",
         support_anchor_uri=anchor_uri,
         q_value=0.95,
         confidence=0.95,
@@ -101,46 +113,51 @@ def test_predictive_context_hot_room_flow_uses_production_entrypoint(tmp_path) -
         required_skill_uris=[skill_uri],
         supported_behavior_pattern_uris=[pattern_obj.uri],
     )
-    client.context_db.seed_object(policy.to_context_object(), content=json.dumps(policy.to_dict()))
+    seed_context_object(
+        client.runtime.stores.source,
+        client.runtime.stores.index,
+        policy.to_context_object(),
+        content=json.dumps(policy.to_dict()),
+    )
     for relation_type, target_uri in (
         ("anchored_by", anchor_uri),
         ("supported_by", pattern_obj.uri),
         ("requires_resource", resource_uri),
         ("requires_skill", skill_uri),
     ):
-        client.context_db.add_relation(
+        client.runtime.stores.relation.add_relation(
             ContextRelation(
                 source_uri=policy.uri,
                 relation_type=relation_type,
                 target_uri=target_uri,
                 metadata={"owner_user_id": "u1", "tenant_id": "default"},
-            )
+            ),
+            tenant_id="default",
         )
 
     request = PredictionRequest(
         user_id="u1",
         episode_id="ep-hot-room-production",
         observation=observation,
-        available_actions=["turn_on_ac", "turn_on_fan", "ask_user", "do_nothing"],
-        token_budget=2000,
+        available_actions=["turn_on_fan", "ask_user", "do_nothing"],
         connect_metadata=ConnectMetadata.action_capable_embodied("reachy_mini").to_dict(),
     )
     result = client.process_observation(request, archive_session=True, async_commit=True)
     prediction = result.prediction_result
 
     assert result.archive_error is None, result.archive_error
-    assert prediction.candidates[0].action == "turn_on_ac"
+    assert prediction.candidates[0].action == "turn_on_fan"
     assert prediction.decision.mode == "execute"
-    assert prediction.memory_operations == []
+    assert "memory_operations" not in prediction.to_dict()
     assert prediction.action_context.packed_context["load_plan"]
     assert "dropped_contexts" in prediction.action_context.packed_context
 
-    archived = client.session_archive_store.read_archive("memoryos://user/u1/sessions/history/ep-hot-room-production")
+    archived = client.runtime.session.archive_store.read_archive("memoryos://user/u1/sessions/history/ep-hot-room-production")
     assert archived.observations
     action_result = archived.action_results[0]["action_result"]
     assert action_result["status"] == "success"
     assert action_result["tool_name"] == "ac.turn_on"
-    outputs = client.session_archive_store.read_async_outputs(archived)
+    outputs = client.runtime.session.archive_store.read_async_outputs(archived)
     for output_name in ("memory_diff", "behavior_diff", "action_policy_diff", "context_diff"):
         payload = outputs[output_name]
         assert payload["status"] == "committed"

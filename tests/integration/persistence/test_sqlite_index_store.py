@@ -5,14 +5,29 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from memoryos.contextdb.model.context_object import ContextObject
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.store.local_stores import InMemoryIndexStore
-from memoryos.contextdb.store.sqlite_index_store import SQLiteIndexStore
-from memoryos.core.types import ScopeRef
+from foundation.scope import ScopeRef
+from infrastructure.store.model.context.context_object import ContextObject
+from infrastructure.store.model.context.context_type import ContextType
+from infrastructure.store.sqlite.index_store import SQLiteIndexStore
+from tests.support.persistence import InMemoryIndexStore
 
 
 class SQLiteIndexStoreTest(unittest.TestCase):
+    def test_serving_generation_token_changes_after_catalog_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteIndexStore(Path(tmp) / "index.sqlite3")
+            before = store.serving_generation_token()
+            obj = ContextObject(
+                uri="memoryos://user/u1/resources/generation-check",
+                context_type=ContextType.RESOURCE,
+                title="generation check",
+                owner_user_id="u1",
+            )
+
+            store.upsert_index(obj, content="new catalog state", tenant_id="default")
+
+            self.assertNotEqual(store.serving_generation_token(), before)
+
     def test_upsert_search_delete_and_filters(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteIndexStore(Path(tmp) / "index.sqlite3")
@@ -196,13 +211,11 @@ class SQLiteIndexStoreTest(unittest.TestCase):
         store.upsert_index(unrelated, content="redistribution strategy", tenant_id="default")
         store.upsert_index(chinese, content="生产数据库继续使用PostgreSQL", tenant_id="default")
 
-        assert [
-            hit.uri
-            for hit in store.search("Redis", tenant_id="default", filters={"owner_user_id": "u1"})
-        ] == [related.uri]
+        assert [hit.uri for hit in store.search("Redis", tenant_id="default", filters={"owner_user_id": "u1"})] == [
+            related.uri
+        ]
         assert chinese.uri in {
-            hit.uri
-            for hit in store.search("数据库继续使用", tenant_id="default", filters={"owner_user_id": "u1"})
+            hit.uri for hit in store.search("数据库继续使用", tenant_id="default", filters={"owner_user_id": "u1"})
         }
 
 

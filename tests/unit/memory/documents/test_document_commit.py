@@ -6,20 +6,22 @@ from typing import cast
 
 import pytest
 
-from memoryos.adapters.persistence.filesystem.memory_document_store import FileSystemMemoryDocumentStore
-from memoryos.contextdb.store.queue_store import QueueIdempotencyConflictError, QueueJob, QueueStore
-from memoryos.memory.documents import (
-    ABSENT,
-    DocumentCommitConflict,
+from infrastructure.store.contracts.queue import QueueIdempotencyConflictError, QueueJob, QueueStore
+from infrastructure.store.filesystem.memory_document_store import FileSystemMemoryDocumentStore
+from infrastructure.store.memory import (
     DocumentCommitIntent,
     DocumentControlIntegrityError,
     DocumentDeletionStatus,
-    DocumentEditKind,
-    DocumentEditPlan,
     DocumentIntentStatus,
-    MemoryDocumentCommitter,
     MemoryDocumentControlStore,
     MemoryDocumentRevisionStore,
+)
+from infrastructure.store.memory.erasure_store import MemoryDocumentEraseStore
+from memory.commit import DocumentCommitConflict, MemoryDocumentCommitter
+from memory.core import (
+    ABSENT,
+    DocumentEditKind,
+    DocumentEditPlan,
     PresentPath,
     new_document_id,
     render_new_document,
@@ -48,6 +50,7 @@ def _components(root: Path):  # noqa: ANN202 - compact test fixture factory.
         controls,
         revisions,
         cast(QueueStore, queue),
+        erasure_store=MemoryDocumentEraseStore(controls.root),
     )
     return source, controls, revisions, queue, committer
 
@@ -286,6 +289,7 @@ def test_soft_forget_barrier_is_durable_before_live_unlink(tmp_path: Path) -> No
         revisions,
         cast(QueueStore, queue),
         test_hook=hook,
+        erasure_store=MemoryDocumentEraseStore(controls.root),
     )
     _commit(
         committer,

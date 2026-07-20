@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from memoryos.behavior.model.behavior_case import BehaviorCase
-from memoryos.behavior.update.behavior_case_writer import BehaviorCaseWriter
-from memoryos.behavior.update.behavior_window import BehaviorWindowEvaluator
+from behavior.core.evaluation.behavior_window import BehaviorWindowEvaluator
+from behavior.core.model.behavior_case import BehaviorCase
+from behavior.projection.behavior_case import BehaviorCaseWriter
 
 NOW = datetime(2026, 7, 4, tzinfo=timezone.utc)
 

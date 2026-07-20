@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from memoryos.behavior.model.behavior_case import BehaviorCase
-from memoryos.behavior.update.behavior_case_writer import BehaviorCaseWriter
-from memoryos.contextdb.session.planners.behavior_commit_planner import BehaviorCommitPlanner
-from memoryos.contextdb.session.session_model import SessionArchive
-from memoryos.contextdb.store.local_stores import FileSystemSourceStore, InMemoryIndexStore
-from memoryos.operations.commit.operation_committer import OperationCommitter
-from memoryos.operations.model.operation_action import OperationAction
+from behavior.core.model.behavior_case import BehaviorCase
+from behavior.execute.session_commit_planner import BehaviorCommitPlanner
+from behavior.projection.behavior_case import BehaviorCaseWriter
+from infrastructure.context.session_commit_planner import ContextCommitPlanner
+from pre.session import SessionArchive
+from tests.support.persistence import FileSystemSourceStore, InMemoryIndexStore
+from tests.support.transaction import build_test_operation_committer as OperationCommitter
+from transaction.model.operation_action import OperationAction
 
 NOW = datetime.now(timezone.utc)
 
@@ -64,6 +65,20 @@ def test_one_case_only_writes_case_without_cluster_or_pattern(tmp_path) -> None:
     operations = BehaviorCommitPlanner(index, source).plan(_archive())
     assert _actions(operations).count(OperationAction.ADD) == 1
     assert all(operation.context_type.value != "behavior_pattern" for operation in operations)
+
+
+def test_behavior_case_archive_is_not_planned_by_context() -> None:
+    archive = _archive()
+    case_uri = "memoryos://user/u1/behavior/cases/hot_room/old-case"
+    archive.observations[0]["case_uri"] = case_uri
+
+    behavior_operations = BehaviorCommitPlanner().plan(archive)
+
+    assert any(
+        operation.action == OperationAction.ARCHIVE and operation.target_uri == case_uri
+        for operation in behavior_operations
+    )
+    assert ContextCommitPlanner().plan(archive) == []
 
 
 def test_two_similar_cases_within_three_days_generate_cluster_and_anchor(tmp_path) -> None:

@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import json
 
-from memoryos.action_policy.model.action_policy import ActionPolicy
-from memoryos.action_policy.retrieval import ActionPolicyRetriever
-from memoryos.contextdb.context_db import ContextDB
-from memoryos.contextdb.store.local_stores import FileSystemSourceStore, InMemoryIndexStore, InMemoryRelationStore
+from infrastructure.context.facade import ContextDB
+from policy.action_policy.model.action_policy import ActionPolicy
+from policy.action_policy.retrieval import ActionPolicyRetriever
+from tests.support.persistence import (
+    FileSystemSourceStore,
+    InMemoryIndexStore,
+    InMemoryRelationStore,
+    seed_context_object,
+)
 
 
 def _db(tmp_path) -> ContextDB:
@@ -13,7 +18,12 @@ def _db(tmp_path) -> ContextDB:
 
 
 def _seed(db: ContextDB, policy: ActionPolicy) -> None:
-    db.seed_object(policy.to_context_object(), content=json.dumps(policy.to_dict()))
+    seed_context_object(
+        db.source_store,
+        db.index_store,
+        policy.to_context_object(),
+        content=json.dumps(policy.to_dict()),
+    )
 
 
 def test_exact_scene_policies_do_not_mix_cross_scene_when_actions_are_covered(tmp_path) -> None:
@@ -23,7 +33,11 @@ def test_exact_scene_policies_do_not_mix_cross_scene_when_actions_are_covered(tm
     _seed(db, exact)
     _seed(db, cross)
 
-    policies = ActionPolicyRetriever(db.index_store, db.source_store).retrieve("u1", ["turn_on_ac"], scene_key="hot_home")
+    policies = ActionPolicyRetriever(db.index_store, db.source_store).retrieve(
+        "u1",
+        ["turn_on_ac", "ask_user", "do_nothing"],
+        scene_key="hot_home",
+    )
 
     assert [policy.uri for policy in policies] == [exact.uri]
     assert policies[0].cross_scene_fallback is False

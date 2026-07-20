@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "memoryos"
-version = "0.1.0"
+dynamic = ["version"]
 requires-python = ">=3.10"
 dependencies = ["PyYAML>=6.0.2,<7"]
 
@@ -14,13 +14,19 @@ server = ["uvicorn>=0.30,<1"]
 test = ["pytest>=8.2,<9"]
 
 [project.scripts]
-memoryos = "memoryos.api.cli.main:main"
-memoryos-mcp-server = "memoryos.api.mcp.stdio:main"
-memoryos-agent-hook = "memoryos.adapters.agent_hooks.cli:main"
-memoryos-http-server = "memoryos.api.http.app:main"
+memoryos = "runtime.entry:run"
+memoryos-mcp-server = "openApi.mcp.stdio:run"
+memoryos-agent-hook = "openApi.cli.agent_hooks:run"
+memoryos-http-server = "openApi.http.app:run"
+
+[tool.setuptools]
+py-modules = ["config"]
+
+[tool.setuptools.dynamic]
+version = {attr = "openApi.version.__version__"}
 
 [tool.setuptools.packages.find]
-include = ["memoryos*"]
+include = ["pre*", "memory*", "behavior*", "openApi*", "policy*", "agent_hook*", "infrastructure*", "foundation*", "runtime*", "sanitization*", "transaction*"]
 
 [tool.ruff]
 line-length = 120
@@ -40,7 +46,7 @@ warn_redundant_casts = true
 [tool.pyright]
 pythonVersion = "3.10"
 typeCheckingMode = "basic"
-include = ["memoryos", "tests"]
+include = ["config.py", "pre", "memory", "behavior", "openApi", "policy", "agent_hook", "infrastructure", "foundation", "runtime", "sanitization", "transaction", "tests"]
 reportUnsupportedDunderAll = false
 
 [tool.pytest.ini_options]

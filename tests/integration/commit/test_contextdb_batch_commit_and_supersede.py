@@ -2,36 +2,49 @@ from __future__ import annotations
 
 import json
 
-from memoryos.action_policy.model.action_policy import ActionCandidate, ActionPolicy
-from memoryos.contextdb.context_db import ContextDB
-from memoryos.contextdb.model.context_object import ContextObject
-from memoryos.contextdb.model.context_relation import ContextRelation
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.model.lifecycle import LifecycleState
-from memoryos.contextdb.store.local_stores import FileSystemSourceStore, InMemoryIndexStore, InMemoryRelationStore
-from memoryos.operations.commit.operation_committer import OperationCommitter
-from memoryos.operations.model.context_operation import ContextOperation
-from memoryos.operations.model.operation_action import OperationAction
-from memoryos.prediction.pipeline.action_context_builder import ActionContextBuilder
+from infrastructure.context.operation_effects import InfrastructureContextOperationEffects
+from infrastructure.store.model.context.context_object import ContextObject
+from infrastructure.store.model.context.context_relation import ContextRelation
+from infrastructure.store.model.context.context_type import ContextType
+from infrastructure.store.model.context.lifecycle import LifecycleState
+from policy.action_policy.decision.context_builder import ActionContextBuilder
+from policy.action_policy.integration.commit_registration import build_action_policy_transaction_extensions
+from policy.action_policy.model.action_policy import ActionCandidate, ActionPolicy
+from tests.support.persistence import (
+    FileSystemSourceStore,
+    InMemoryIndexStore,
+    InMemoryRelationStore,
+    seed_context_object,
+)
+from tests.support.transaction import build_test_operation_committer as OperationCommitter
+from transaction.model.context_operation import ContextOperation
+from transaction.model.operation_action import OperationAction
 
 
-def _context_db(tmp_path):
+def _commit_setup(tmp_path):
     source = FileSystemSourceStore(tmp_path)
     index = InMemoryIndexStore()
     relations = InMemoryRelationStore()
-    committer = OperationCommitter(source, index, str(tmp_path), relation_store=relations)
-    return ContextDB(source, index, relations, committer=committer), source, index, relations
+    committer = OperationCommitter(
+        source,
+        index,
+        str(tmp_path),
+        relation_store=relations,
+        context_effects=InfrastructureContextOperationEffects(),
+        domain_extensions=build_action_policy_transaction_extensions(),
+    )
+    return committer, source, index, relations
 
 
 def test_commit_operations_batches_same_user_update_delete_for_coalescer(tmp_path) -> None:
-    db, source, _, _ = _context_db(tmp_path)
+    committer, source, index, _ = _commit_setup(tmp_path)
     obj = ContextObject(
         uri="memoryos://user/u1/resources/profile/temp",
         context_type=ContextType.RESOURCE,
         title="temperature",
         owner_user_id="u1",
     )
-    db.seed_object(obj, content="old")
+    seed_context_object(source, index, obj, content="old")
     updated = ContextObject(
         uri=obj.uri,
         context_type=ContextType.RESOURCE,
@@ -39,7 +52,8 @@ def test_commit_operations_batches_same_user_update_delete_for_coalescer(tmp_pat
         owner_user_id="u1",
     )
 
-    results = db.commit_operations(
+    result = committer.commit(
+        "u1",
         [
             ContextOperation(
                 user_id="u1",
@@ -58,22 +72,22 @@ def test_commit_operations_batches_same_user_update_delete_for_coalescer(tmp_pat
         ]
     )
 
-    assert len(results) == 1
-    assert [operation.action for operation in results[0].operations] == [OperationAction.DELETE]
+    assert [operation.action for operation in result.operations] == [OperationAction.DELETE]
     assert source.read_object(obj.uri).lifecycle_state == LifecycleState.DELETED
 
 
 def test_commit_operations_batches_same_user_reward_penalty_for_conflict_resolver(tmp_path) -> None:
-    db, source, _, _ = _context_db(tmp_path)
+    committer, source, index, _ = _commit_setup(tmp_path)
     policy = ActionPolicy(
         user_id="u1",
         scene_key="hot_room",
         action="turn_on_ac",
         support_anchor_uri="memoryos://user/u1/support/behavior/hot",
     )
-    db.seed_object(policy.to_context_object(), content=json.dumps(policy.to_dict()))
+    seed_context_object(source, index, policy.to_context_object(), content=json.dumps(policy.to_dict()))
 
-    results = db.commit_operations(
+    result = committer.commit(
+        "u1",
         [
             ContextOperation(
                 user_id="u1",
@@ -92,21 +106,20 @@ def test_commit_operations_batches_same_user_reward_penalty_for_conflict_resolve
         ]
     )
 
-    assert len(results) == 1
-    assert [operation.action for operation in results[0].operations] == [OperationAction.PENALIZE]
-    assert len(results[0].rejected_operations) == 1
+    assert [operation.action for operation in result.operations] == [OperationAction.PENALIZE]
+    assert len(result.rejected_operations) == 1
     assert source.read_object(policy.uri).metadata["failure_count"] == 1
 
 
 def test_supersede_marks_old_obsolete_and_action_context_uses_active_replacement(tmp_path) -> None:
-    db, source, index, relations = _context_db(tmp_path)
+    committer, source, index, relations = _commit_setup(tmp_path)
     policy = ActionPolicy(
         user_id="u1",
         scene_key="hot_room",
         action="turn_on_ac",
         support_anchor_uri="memoryos://user/u1/support/behavior/hot",
     )
-    db.seed_object(policy.to_context_object(), content=json.dumps(policy.to_dict()))
+    seed_context_object(source, index, policy.to_context_object(), content=json.dumps(policy.to_dict()))
     old = ContextObject(
         uri="memoryos://user/u1/support/action-policy/old-ac",
         context_type=ContextType.ACTION_POLICY_SUPPORT,
@@ -114,7 +127,7 @@ def test_supersede_marks_old_obsolete_and_action_context_uses_active_replacement
         owner_user_id="u1",
         metadata={"support_anchor_kind": "action_policy", "constrains_policy_uris": [policy.uri]},
     )
-    db.seed_object(old, content="old turn_on_ac rule")
+    seed_context_object(source, index, old, content="old turn_on_ac rule")
     relations.add_relation(
         ContextRelation(
             source_uri=policy.uri,
@@ -132,15 +145,14 @@ def test_supersede_marks_old_obsolete_and_action_context_uses_active_replacement
         metadata={"support_anchor_kind": "action_policy", "constrains_policy_uris": [policy.uri]},
     )
 
-    db.commit_operation(
-        ContextOperation(
+    operation = ContextOperation(
             user_id="u1",
             context_type=ContextType.ACTION_POLICY_SUPPORT,
             action=OperationAction.SUPERSEDE,
             target_uri=old.uri,
             payload={"context_object": new.to_dict(), "content": "new turn_on_ac rule", "reason": "newer user preference"},
-        )
     )
+    committer.commit(operation.user_id, [operation])
 
     old_obj = source.read_object(old.uri)
     new_obj = source.read_object(new.uri)
@@ -166,7 +178,6 @@ def test_supersede_marks_old_obsolete_and_action_context_uses_active_replacement
         "u1",
         [ActionCandidate(action=policy.action, score=1.0, policy_uri=policy.uri, reason="test")],
         [policy],
-        token_budget=1000,
     )
     assert old.uri not in context.source_uris
     assert new.uri in context.source_uris

@@ -1,25 +1,30 @@
 from __future__ import annotations
 
-from memoryos.action_policy.model.action_policy import ActionPolicy
-from memoryos.behavior.model.behavior_pattern import BehaviorPattern
-from memoryos.contextdb.layers.layer_generator import (
+from behavior.core.model.behavior_pattern import BehaviorPattern
+from behavior.core.support import BehaviorSupportAnchor
+from behavior.projection import behavior_pattern_to_context_object, behavior_support_to_context_object
+from infrastructure.context.layers.generator import (
     generate_l0_for_object,
     generate_l1_for_object,
     l0_abstract,
     l1_overview,
 )
-from memoryos.support import SupportAnchor, SupportAnchorKind
+from policy.action_policy.model.action_policy import ActionPolicy
+from policy.action_policy.model.policy_support_rule import PolicySupportRule
+from policy.action_policy.update.policy_support_writer import policy_support_rule_to_context_object
 
 
 def test_behavior_pattern_structured_l0_l1() -> None:
-    pattern = BehaviorPattern(
-        user_id="u1",
-        scene_key="hot_room",
-        trigger_conditions={"context_tags": ["home"]},
-        support_anchor_uri="memoryos://user/u1/support/behavior/hot",
-        case_refs=["c1", "c2", "c3"],
-        action_distribution=[{"action": "turn_on_ac", "count": 3}],
-    ).to_context_object()
+    pattern = behavior_pattern_to_context_object(
+        BehaviorPattern(
+            user_id="u1",
+            scene_key="hot_room",
+            trigger_conditions={"context_tags": ["home"]},
+            support_anchor_uri="memoryos://user/u1/support/behavior/hot",
+            case_refs=["c1", "c2", "c3"],
+            action_distribution=[{"action": "turn_on_ac", "count": 3}],
+        )
+    )
 
     assert "hot_room" in generate_l0_for_object(pattern, "")
     l1 = generate_l1_for_object(pattern, "")
@@ -44,23 +49,26 @@ def test_action_policy_structured_l0_l1() -> None:
 
 
 def test_behavior_and_policy_support_structured_l0_l1() -> None:
-    behavior_support = SupportAnchor(
-        uri="memoryos://user/u1/support/behavior/hot",
-        user_id="u1",
-        title="hot behavior support",
-        content="recurring hot-room evidence",
-        anchor_key="hot",
-    ).to_context_object()
-    policy_support = SupportAnchor(
-        uri="memoryos://user/u1/support/action-policy/no-auto",
-        user_id="u1",
-        title="no automatic AC",
-        content="do not automatically turn on AC",
-        anchor_key="no-auto",
-        kind=SupportAnchorKind.ACTION_POLICY,
-        policy_rule_type="action_auto_execute",
-        policy_rule_value="forbidden",
-    ).to_context_object()
+    behavior_support = behavior_support_to_context_object(
+        BehaviorSupportAnchor(
+            uri="memoryos://user/u1/support/behavior/hot",
+            user_id="u1",
+            title="hot behavior support",
+            content="recurring hot-room evidence",
+            anchor_key="hot",
+        )
+    )
+    policy_support = policy_support_rule_to_context_object(
+        PolicySupportRule(
+            uri="memoryos://user/u1/support/action-policy/no-auto",
+            user_id="u1",
+            title="no automatic AC",
+            content="do not automatically turn on AC",
+            rule_key="no-auto",
+            policy_rule_type="action_auto_execute",
+            policy_rule_value="forbidden",
+        )
+    )
 
     assert "行为支持锚点" in generate_l0_for_object(behavior_support, "")
     assert "规则值=forbidden" in generate_l0_for_object(policy_support, "")

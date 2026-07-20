@@ -11,25 +11,24 @@ from typing import Any
 
 import pytest
 
-from memoryos.adapters.agent_hooks.base import HookResult
-from memoryos.adapters.agent_hooks.contracts import (
+from agent_hook.base import HookResult
+from agent_hook.contracts import (
     ClaudeCodeOutputRenderer,
     ClaudeCodePayloadParser,
     CodexPayloadParser,
 )
-from memoryos.adapters.agent_hooks.events import AgentEventType, AgentHookEvent, make_session_key, project_identity
-from memoryos.adapters.agent_hooks.session_service import AgentSessionService
-from memoryos.adapters.agent_hooks.transcript import (
+from agent_hook.events import AgentEventType, AgentHookEvent, make_session_key, project_identity
+from agent_hook.session_service import AgentSessionService
+from agent_hook.transcript import (
     ClaudeCodeTranscriptReader,
     CodexTranscriptReader,
     GenericJsonlTranscriptReader,
 )
-from memoryos.api.http.app import MemoryOSASGI
-from memoryos.api.mcp.config import MCPServerConfig
-from memoryos.api.mcp.stdio import _build_transport_client
-from memoryos.api.sdk.client import MemoryOSClient
-from memoryos.api.sdk.http_client import HTTPMemoryOSClient
-from memoryos.api.trusted_context import AUTHORITATIVE_REMEMBER, TrustedRequestContext
+from openApi.http.app import MemoryOSASGI
+from openApi.mcp.config import MCPServerConfig
+from openApi.mcp.stdio import _build_transport_client
+from openApi.sdk.client import MemoryOSClient
+from openApi.sdk.http_client import HTTPMemoryOSClient
 
 
 def test_project_identity_and_session_key_are_stable_and_isolated() -> None:
@@ -165,7 +164,7 @@ def test_missing_transcript_soft_fails_without_losing_event(tmp_path: Path) -> N
 
 
 def test_asgi_health_and_body_limit(tmp_path: Path) -> None:
-    app = MemoryOSASGI(MemoryOSClient(str(tmp_path)), api_token="secret", max_body_bytes=10)
+    app = MemoryOSASGI(MemoryOSClient(str(tmp_path)), max_body_bytes=10)
 
     async def invoke() -> tuple[int, dict]:
         sent = []
@@ -174,7 +173,7 @@ def test_asgi_health_and_body_limit(tmp_path: Path) -> None:
             return next(messages)
         async def send(message):  # noqa: ANN001, ANN202
             sent.append(message)
-        await app({"type": "http", "method": "GET", "path": "/health", "headers": [(b"authorization", b"Bearer secret")]}, receive, send)
+        await app({"type": "http", "method": "GET", "path": "/health", "headers": []}, receive, send)
         return sent[0]["status"], json.loads(sent[1]["body"])
 
     status, body = asyncio.run(invoke())
@@ -283,13 +282,11 @@ def test_http_client_exposes_remote_memory_health_and_trace_routes() -> None:
 def test_mcp_stdio_selects_http_transport_for_remote_mode(tmp_path: Path, monkeypatch: Any) -> None:
     config = MCPServerConfig(root=str(tmp_path), user_id="u1", adapter_id="cursor")
     monkeypatch.setenv("MEMORYOS_BASE_URL", "https://memory.example")
-    monkeypatch.setenv("MEMORYOS_API_TOKEN", "test-token")
-
     client = _build_transport_client(config)
 
     assert isinstance(client, HTTPMemoryOSClient)
     assert client.base_url == "https://memory.example"
-    assert client.user_id == "u1"
+    assert not hasattr(client, "user_id")
 
 
 def test_http_client_unavailable_returns_structured_retryable_error(monkeypatch: Any) -> None:
@@ -303,31 +300,6 @@ def test_http_client_unavailable_returns_structured_retryable_error(monkeypatch:
     assert error["retryable"] is True
     assert error["request_id"]
     assert error["operation"] == "/health"
-
-
-def test_token_budget_degrades_l2_to_smaller_layer(tmp_path: Path) -> None:
-    client = MemoryOSClient(str(tmp_path))
-    client.remember(
-        "needle " + ("implementation detail " * 200),
-        target_hint="topic:Needle decision",
-        caller=TrustedRequestContext(
-            tenant_id="default",
-            user_id="u1",
-            actor_kind="user",
-            actor_id="u1",
-            capabilities=frozenset({AUTHORITATIVE_REMEMBER}),
-        ),
-    )
-    client.memory_projection_worker.process_pending()
-    result = client.assemble_context(
-        "needle",
-        user_id="u1",
-        project_id="p1",
-        search_scope="workspace_context",
-        token_budget=40,
-    )
-    assert result["contexts"]
-    assert result["contexts"][0]["selected_layer"] == "L0"
 
 
 def test_claude_installer_is_idempotent_and_uninstalls(tmp_path: Path) -> None:

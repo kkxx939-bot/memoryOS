@@ -2,19 +2,28 @@ from __future__ import annotations
 
 import json
 
-from memoryos.action_policy.model.action_policy import ActionPolicy, ActionPolicyStatus
-from memoryos.behavior.model.behavior_pattern import BehaviorPattern
-from memoryos.behavior.model.observation import Observation
-from memoryos.behavior.model.opportunity import OpportunityStats
-from memoryos.contextdb.store.local_stores import FileSystemSourceStore, InMemoryIndexStore
-from memoryos.operations.commit.operation_committer import OperationCommitter
-from memoryos.workers.cooling_worker import CoolingWorker
+from behavior.core.model.behavior_pattern import BehaviorPattern
+from behavior.core.model.observation import Observation
+from behavior.core.model.opportunity import OpportunityStats
+from behavior.execute.cooling_worker import CoolingWorker
+from behavior.projection import behavior_pattern_to_context_object
+from infrastructure.context.operation_effects import InfrastructureContextOperationEffects
+from policy.action_policy.integration.commit_registration import build_action_policy_transaction_extensions
+from policy.action_policy.model.action_policy import ActionPolicy, ActionPolicyStatus
+from tests.support.persistence import FileSystemSourceStore, InMemoryIndexStore
+from tests.support.transaction import build_test_operation_committer as OperationCommitter
 
 
 def _stores(tmp_path):
     source = FileSystemSourceStore(tmp_path)
     index = InMemoryIndexStore()
-    committer = OperationCommitter(source, index, str(tmp_path))
+    committer = OperationCommitter(
+        source,
+        index,
+        str(tmp_path),
+        context_effects=InfrastructureContextOperationEffects(),
+        domain_extensions=build_action_policy_transaction_extensions(),
+    )
     return source, index, committer
 
 
@@ -39,9 +48,9 @@ def _seed_policy_and_pattern(source, index, policy: ActionPolicy, stats: Opportu
         hotness=0.8,
         confidence=0.8,
     )
-    source.write_object(pattern.to_context_object(), content="hot room behavior pattern")
+    source.write_object(behavior_pattern_to_context_object(pattern), content="hot room behavior pattern")
     index.upsert_index(
-        pattern.to_context_object(),
+        behavior_pattern_to_context_object(pattern),
         content="hot room behavior pattern home",
         tenant_id="default",
     )
@@ -69,8 +78,8 @@ def _seed_custom_pattern(source, index, policy: ActionPolicy, stats: Opportunity
         hotness=0.8,
         confidence=0.8,
     )
-    source.write_object(pattern.to_context_object(), content=content)
-    index.upsert_index(pattern.to_context_object(), content=content, tenant_id="default")
+    source.write_object(behavior_pattern_to_context_object(pattern), content=content)
+    index.upsert_index(behavior_pattern_to_context_object(pattern), content=content, tenant_id="default")
     return pattern
 
 

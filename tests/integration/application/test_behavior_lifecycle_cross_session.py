@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.session.planners.behavior_commit_planner import BehaviorCommitPlanner
-from memoryos.contextdb.session.session_model import SessionArchive
-from memoryos.contextdb.store.local_stores import FileSystemSourceStore, InMemoryIndexStore, InMemoryRelationStore
-from memoryos.operations.commit.operation_committer import OperationCommitter
-from memoryos.operations.model.operation_action import OperationAction
+from behavior.execute.session_commit_planner import BehaviorCommitPlanner
+from infrastructure.context.operation_effects import InfrastructureContextOperationEffects
+from infrastructure.store.model.context.context_type import ContextType
+from pre.session import SessionArchive
+from tests.support.persistence import FileSystemSourceStore, InMemoryIndexStore, InMemoryRelationStore
+from tests.support.transaction import build_test_operation_committer as OperationCommitter
+from transaction.model.operation_action import OperationAction
 
 
 def _archive(user_id: str, session_id: str, scene_key: str, older_than_days: int = 0) -> SessionArchive:
@@ -22,7 +23,13 @@ def test_behavior_lifecycle_aggregates_across_history(tmp_path) -> None:
     source = FileSystemSourceStore(tmp_path)
     index = InMemoryIndexStore()
     relations = InMemoryRelationStore()
-    committer = OperationCommitter(source, index, tmp_path, relation_store=relations)
+    committer = OperationCommitter(
+        source,
+        index,
+        tmp_path,
+        relation_store=relations,
+        context_effects=InfrastructureContextOperationEffects(),
+    )
     planner = BehaviorCommitPlanner(index, source)
 
     first_ops = planner.plan(_archive("u1", "s1", "hot_room"))

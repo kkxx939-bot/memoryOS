@@ -1,15 +1,21 @@
 from __future__ import annotations
 
-from memoryos.behavior.model.observation import Observation
-from memoryos.behavior.retrieval import SimilarBehaviorRetriever
-from memoryos.contextdb.context_db import ContextDB
-from memoryos.contextdb.model.context_object import ContextObject
-from memoryos.contextdb.model.context_relation import ContextRelation
-from memoryos.contextdb.model.context_type import ContextType
-from memoryos.contextdb.model.lifecycle import LifecycleState
-from memoryos.contextdb.store.local_stores import FileSystemSourceStore, InMemoryIndexStore, InMemoryRelationStore
-from memoryos.contextdb.store.source_store import IndexHit
-from memoryos.operations.commit.operation_committer import OperationCommitter
+from behavior.core.model.observation import Observation
+from behavior.retrieval import SimilarBehaviorRetriever
+from infrastructure.context.facade import ContextDB
+from infrastructure.context.operation_effects import InfrastructureContextOperationEffects
+from infrastructure.store.contracts.index import IndexHit
+from infrastructure.store.model.context.context_object import ContextObject
+from infrastructure.store.model.context.context_relation import ContextRelation
+from infrastructure.store.model.context.context_type import ContextType
+from infrastructure.store.model.context.lifecycle import LifecycleState
+from tests.support.persistence import (
+    FileSystemSourceStore,
+    InMemoryIndexStore,
+    InMemoryRelationStore,
+    seed_context_object,
+)
+from tests.support.transaction import build_test_operation_committer as OperationCommitter
 
 
 def _object(uri: str, context_type: ContextType, title: str, metadata: dict | None = None) -> ContextObject:
@@ -24,10 +30,11 @@ def test_similar_behavior_retriever_final_semantics(tmp_path) -> None:
         source,
         index,
         relations,
-        committer=OperationCommitter(
+        relation_committer=OperationCommitter(
             source,
             index,
             str(source.root),
+            context_effects=InfrastructureContextOperationEffects(),
             relation_store=relations,
         ),
     )
@@ -45,7 +52,7 @@ def test_similar_behavior_retriever_final_semantics(tmp_path) -> None:
         for idx, reward in enumerate([1.0, -1.0, 0.2, 0.0, 0.0], start=1)
     ]
     for obj in [anchor, pattern, cluster, policy, *cases]:
-        db.seed_object(obj, content=f"hot room {obj.title}")
+        seed_context_object(db.source_store, db.index_store, obj, content=f"hot room {obj.title}")
     for relation in [
         ContextRelation(source_uri=pattern.uri, relation_type="anchored_by", target_uri=anchor.uri, metadata={"owner_user_id": "u1"}),
         ContextRelation(source_uri=pattern.uri, relation_type="aggregated_from", target_uri=cases[0].uri, metadata={"owner_user_id": "u1"}),
@@ -78,7 +85,7 @@ def test_similar_behavior_retriever_excludes_inactive_support_relations(tmp_path
         "hot pending filter pattern",
         {"scene_key": "hot"},
     )
-    db.seed_object(pattern, content="hot room")
+    seed_context_object(db.source_store, db.index_store, pattern, content="hot room")
     rejected_uris = []
     for lifecycle_state in (
         LifecycleState.PENDING,

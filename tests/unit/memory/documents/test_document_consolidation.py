@@ -6,39 +6,39 @@ from pathlib import Path
 
 import pytest
 
-from memoryos.adapters.persistence.filesystem.memory_document_store import FileSystemMemoryDocumentStore
-from memoryos.adapters.persistence.in_memory.queue_store import InMemoryQueueStore
-from memoryos.application.memory.command_service import MemoryCommandService
-from memoryos.application.memory.pending_review_service import MemoryEditReviewService
-from memoryos.contextdb.catalog import CatalogRecord
-from memoryos.memory.documents import (
-    ABSENT,
-    ConsolidationSource,
-    ConsolidationStatus,
-    DocumentConflictError,
-    DocumentEditKind,
-    DocumentEditPlan,
-    MemoryDocumentCommitter,
-    MemoryDocumentConsolidationStore,
-    MemoryDocumentConsolidator,
+from infrastructure.store.filesystem.memory_document_store import FileSystemMemoryDocumentStore
+from infrastructure.store.memory import (
     MemoryDocumentControlStore,
-    MemoryDocumentEraser,
-    MemoryDocumentPlanner,
     MemoryDocumentRevisionStore,
     MemoryEditReviewIntegrityError,
     MemoryEditReviewStore,
     MemoryEditReviewWorkflow,
-    PresentPath,
     ReviewConsolidationSource,
+)
+from infrastructure.store.memory.consolidation_store import MemoryDocumentConsolidationStore
+from infrastructure.store.memory.erasure_store import MemoryDocumentEraseStore
+from infrastructure.store.model.catalog import CatalogRecord
+from memory.commit import (
+    ConsolidationSource,
+    ConsolidationStatus,
+    MemoryDocumentCommitter,
+    MemoryDocumentConsolidator,
+    MemoryDocumentEraser,
+)
+from memory.core import (
+    ABSENT,
+    DocumentEditKind,
+    DocumentEditPlan,
+    PresentPath,
     new_document_id,
     render_new_document,
 )
-from memoryos.security.trusted_context import (
-    AUTHORITATIVE_FORGET,
-    AUTHORITATIVE_REMEMBER,
-    READ_CONTEXT,
-    TrustedRequestContext,
-)
+from memory.execute import MemoryDocumentPlanner
+from memory.execute.command_service import MemoryCommandService
+from memory.execute.pending_review_service import MemoryEditReviewService
+from memory.ports import DocumentConflictError
+from foundation.identity import LocalUserContext
+from tests.support.persistence.in_memory import InMemoryQueueStore
 
 
 class _ProjectionStore:
@@ -96,7 +96,13 @@ def _components(root: Path):  # noqa: ANN202 - compact test fixture factory.
     controls = MemoryDocumentControlStore(root)
     revisions = MemoryDocumentRevisionStore(root)
     queue = InMemoryQueueStore()
-    committer = MemoryDocumentCommitter(documents, controls, revisions, queue)
+    committer = MemoryDocumentCommitter(
+        documents,
+        controls,
+        revisions,
+        queue,
+        erasure_store=MemoryDocumentEraseStore(controls.root),
+    )
     projections = _ProjectionStore()
     return documents, controls, revisions, committer, projections
 
@@ -167,7 +173,11 @@ def test_consolidation_waits_for_exact_target_projection_before_deleting_sources
         ConsolidationSource(source_a, state_a.relative_path, state_a.raw_sha256, state_a.size),
         ConsolidationSource(source_b, state_b.relative_path, state_b.raw_sha256, state_b.size),
     )
-    consolidator = MemoryDocumentConsolidator(committer, projections)
+    consolidator = MemoryDocumentConsolidator(
+        committer,
+        projections,
+        saga_store=MemoryDocumentConsolidationStore(committer.control_store.root),
+    )
 
     waiting = consolidator.consolidate(
         target,
@@ -387,19 +397,24 @@ def test_trusted_command_service_starts_configured_consolidation(tmp_path: Path)
     )
     target_id = new_document_id()
     target = _target_plan(target_id, "command target contains source")
-    consolidator = MemoryDocumentConsolidator(committer, projections)
+    consolidator = MemoryDocumentConsolidator(
+        committer,
+        projections,
+        saga_store=MemoryDocumentConsolidationStore(committer.control_store.root),
+    )
     commands = MemoryCommandService(
         MemoryDocumentPlanner(documents),
         committer,
-        MemoryDocumentEraser(documents, controls, revisions),
+        MemoryDocumentEraser(
+            documents,
+            controls,
+            revisions,
+            erase_store=MemoryDocumentEraseStore(controls.root),
+        ),
         consolidator=consolidator,
     )
-    caller = TrustedRequestContext(
-        tenant_id="default",
+    caller = LocalUserContext(
         user_id="user-a",
-        actor_kind="user",
-        actor_id="user-a",
-        capabilities=frozenset({AUTHORITATIVE_REMEMBER, AUTHORITATIVE_FORGET}),
     )
 
     result = commands.consolidate_memory_documents(
@@ -439,15 +454,20 @@ def test_public_merge_inputs_are_resolved_to_exact_live_documents_and_resume_by_
     commands = MemoryCommandService(
         MemoryDocumentPlanner(documents),
         committer,
-        MemoryDocumentEraser(documents, controls, revisions),
-        consolidator=MemoryDocumentConsolidator(committer, projections),
+        MemoryDocumentEraser(
+            documents,
+            controls,
+            revisions,
+            erase_store=MemoryDocumentEraseStore(controls.root),
+        ),
+        consolidator=MemoryDocumentConsolidator(
+            committer,
+            projections,
+            saga_store=MemoryDocumentConsolidationStore(committer.control_store.root),
+        ),
     )
-    caller = TrustedRequestContext(
-        tenant_id="default",
+    caller = LocalUserContext(
         user_id="user-a",
-        actor_kind="user",
-        actor_id="user-a",
-        capabilities=frozenset({AUTHORITATIVE_REMEMBER, AUTHORITATIVE_FORGET}),
     )
     target_uri = f"memoryos://user/user-a/memory/documents/{target_id}"
     source_uri = f"memoryos://user/user-a/memory/documents/{source_id}"
@@ -501,23 +521,32 @@ def test_copy_on_write_consolidation_is_sealed_previewed_approved_and_restorable
         body="source fact retained until reviewed projection",
     )
     review_store = MemoryEditReviewStore(tmp_path)
-    consolidator = MemoryDocumentConsolidator(committer, projections)
+    consolidator = MemoryDocumentConsolidator(
+        committer,
+        projections,
+        saga_store=MemoryDocumentConsolidationStore(committer.control_store.root),
+    )
     commands = MemoryCommandService(
         MemoryDocumentPlanner(documents),
         committer,
-        MemoryDocumentEraser(documents, controls, revisions, review_store=review_store),
+        MemoryDocumentEraser(
+            documents,
+            controls,
+            revisions,
+            review_store=review_store,
+            erase_store=MemoryDocumentEraseStore(controls.root),
+        ),
         consolidator=consolidator,
         review_store=review_store,
     )
-    reviews = MemoryEditReviewService(review_store, committer, consolidator=consolidator)
-    caller = TrustedRequestContext(
-        tenant_id="default",
+    reviews = MemoryEditReviewService(
+        review_store,
+        committer,
+        consolidator=consolidator,
+        erasure_store=MemoryDocumentEraseStore(committer.control_store.root),
+    )
+    caller = LocalUserContext(
         user_id="user-a",
-        actor_kind="user",
-        actor_id="user-a",
-        capabilities=frozenset(
-            {AUTHORITATIVE_REMEMBER, AUTHORITATIVE_FORGET, READ_CONTEXT}
-        ),
     )
     target_uri = f"memoryos://user/user-a/memory/documents/{target_id}"
     source_uri = f"memoryos://user/user-a/memory/documents/{source_id}"
@@ -564,9 +593,7 @@ def test_copy_on_write_consolidation_is_sealed_previewed_approved_and_restorable
     assert documents.read_state("default", "user-a", source_state.relative_path) == ABSENT
     restored = commands.restore_memory_revision(source_uri, 1, "", caller=caller)
     assert restored.changed is True
-    assert b"source fact retained" in documents.read_raw(
-        "default", "user-a", document_id=source_id
-    )
+    assert b"source fact retained" in documents.read_raw("default", "user-a", document_id=source_id)
 
 
 def test_consolidation_proposal_rejects_or_conflicts_without_mutating_target(tmp_path: Path) -> None:
@@ -586,23 +613,32 @@ def test_consolidation_proposal_rejects_or_conflicts_without_mutating_target(tmp
         body="source v1",
     )
     review_store = MemoryEditReviewStore(tmp_path)
-    consolidator = MemoryDocumentConsolidator(committer, projections)
+    consolidator = MemoryDocumentConsolidator(
+        committer,
+        projections,
+        saga_store=MemoryDocumentConsolidationStore(committer.control_store.root),
+    )
     commands = MemoryCommandService(
         MemoryDocumentPlanner(documents),
         committer,
-        MemoryDocumentEraser(documents, controls, revisions, review_store=review_store),
+        MemoryDocumentEraser(
+            documents,
+            controls,
+            revisions,
+            review_store=review_store,
+            erase_store=MemoryDocumentEraseStore(controls.root),
+        ),
         consolidator=consolidator,
         review_store=review_store,
     )
-    reviews = MemoryEditReviewService(review_store, committer, consolidator=consolidator)
-    caller = TrustedRequestContext(
-        tenant_id="default",
+    reviews = MemoryEditReviewService(
+        review_store,
+        committer,
+        consolidator=consolidator,
+        erasure_store=MemoryDocumentEraseStore(committer.control_store.root),
+    )
+    caller = LocalUserContext(
         user_id="user-a",
-        actor_kind="user",
-        actor_id="user-a",
-        capabilities=frozenset(
-            {AUTHORITATIVE_REMEMBER, AUTHORITATIVE_FORGET, READ_CONTEXT}
-        ),
     )
     target_uri = f"memoryos://user/user-a/memory/documents/{target_id}"
     source_uri = f"memoryos://user/user-a/memory/documents/{source_id}"
@@ -668,21 +704,29 @@ def test_pending_consolidation_review_recovers_existing_saga_after_target_commit
         committer,
         projections,
         test_hook=stop_after_target_commit,
+        saga_store=MemoryDocumentConsolidationStore(committer.control_store.root),
     )
     commands = MemoryCommandService(
         MemoryDocumentPlanner(documents),
         committer,
-        MemoryDocumentEraser(documents, controls, revisions, review_store=review_store),
+        MemoryDocumentEraser(
+            documents,
+            controls,
+            revisions,
+            review_store=review_store,
+            erase_store=MemoryDocumentEraseStore(controls.root),
+        ),
         consolidator=consolidator,
         review_store=review_store,
     )
-    reviews = MemoryEditReviewService(review_store, committer, consolidator=consolidator)
-    caller = TrustedRequestContext(
-        tenant_id="default",
+    reviews = MemoryEditReviewService(
+        review_store,
+        committer,
+        consolidator=consolidator,
+        erasure_store=MemoryDocumentEraseStore(committer.control_store.root),
+    )
+    caller = LocalUserContext(
         user_id="user-a",
-        actor_kind="user",
-        actor_id="user-a",
-        capabilities=frozenset({AUTHORITATIVE_REMEMBER, AUTHORITATIVE_FORGET}),
     )
     target_uri = f"memoryos://user/user-a/memory/documents/{target_id}"
     source_uri = f"memoryos://user/user-a/memory/documents/{source_id}"
@@ -736,16 +780,22 @@ def test_consolidation_proposal_canonicalizes_source_order_for_idempotent_reseal
     commands = MemoryCommandService(
         MemoryDocumentPlanner(documents),
         committer,
-        MemoryDocumentEraser(documents, controls, revisions, review_store=review_store),
-        consolidator=MemoryDocumentConsolidator(committer, projections),
+        MemoryDocumentEraser(
+            documents,
+            controls,
+            revisions,
+            review_store=review_store,
+            erase_store=MemoryDocumentEraseStore(controls.root),
+        ),
+        consolidator=MemoryDocumentConsolidator(
+            committer,
+            projections,
+            saga_store=MemoryDocumentConsolidationStore(committer.control_store.root),
+        ),
         review_store=review_store,
     )
-    caller = TrustedRequestContext(
-        tenant_id="default",
+    caller = LocalUserContext(
         user_id="user-a",
-        actor_kind="user",
-        actor_id="user-a",
-        capabilities=frozenset({AUTHORITATIVE_REMEMBER, AUTHORITATIVE_FORGET}),
     )
     target_uri = f"memoryos://user/user-a/memory/documents/{target_id}"
     sources = tuple(
@@ -833,14 +883,7 @@ def test_hard_erase_closes_shared_review_blob_references_without_dangling_record
         assert store.load("default", "user-a", record.proposal_id) is None
     assert store.load("default", "user-a", retained.proposal_id) == retained
     target_blobs = tuple(
-        (
-            tmp_path
-            / "system"
-            / "memory-documents"
-            / "user-a"
-            / "review-blobs"
-            / target_id
-        ).glob("*.blob")
+        (tmp_path / "system" / "memory-documents" / "user-a" / "review-blobs" / target_id).glob("*.blob")
     )
     assert target_blobs == ()
     for artifact in tmp_path.rglob("*"):

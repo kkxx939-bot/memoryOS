@@ -3,8 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from memoryos.contextdb.retrieval.fusion import FusionRanker, RetrievalCandidate
-from memoryos.contextdb.retrieval.query_plan import RetrievalOptions, RetrievalQueryPlan
+from infrastructure.context.retrieval.fusion import FusionRanker, RetrievalCandidate
+from infrastructure.context.retrieval.query_plan import RetrievalOptions, RetrievalQueryPlan
 
 
 def _plan(**kwargs: Any) -> RetrievalQueryPlan:
