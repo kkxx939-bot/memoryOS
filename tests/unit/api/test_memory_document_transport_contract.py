@@ -35,7 +35,7 @@ class _CaptureHTTPClient(HTTPMemoryOSClient):
         payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         self.calls.append((method, path, payload))
-        document = {
+        document: dict[str, Any] = {
             "document_uri": "memoryos://user/u1/memory/documents/01ARZ3NDEKTSV4RRFFQ69G5FAV",
             "document_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
             "document_kind": "topic",

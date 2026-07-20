@@ -270,9 +270,10 @@ def test_process_observation_result_to_dict_handles_optional_and_commit_shapes()
 
 def test_prediction_result_has_no_memory_operation_channel() -> None:
     base = _prediction_result()
+    prediction_result_type: Any = PredictionResult
 
     with pytest.raises(TypeError):
-        PredictionResult(
+        prediction_result_type(
             request_id=base.request_id,
             episode_id=base.episode_id,
             observation=base.observation,

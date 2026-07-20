@@ -25,6 +25,7 @@ from infrastructure.store.memory import (
 from infrastructure.store.memory.erasure_store import MemoryDocumentEraseStore
 from infrastructure.store.memory.layout import user_memory_root
 from memory.commit import (
+    DerivedEraseRequest,
     DocumentErasedError,
     DocumentEraseStatus,
     MemoryDocumentCommitter,
@@ -63,9 +64,9 @@ class _CleanupBackend:
 
     def __init__(self, acknowledgements: list[bool]) -> None:
         self.acknowledgements = acknowledgements
-        self.requests = []
+        self.requests: list[DerivedEraseRequest] = []
 
-    def erase_document(self, request):  # noqa: ANN001, ANN201 - compact protocol test double.
+    def erase_document(self, request: DerivedEraseRequest) -> bool:
         self.requests.append(request)
         return self.acknowledgements.pop(0)
 

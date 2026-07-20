@@ -5,11 +5,11 @@ import json
 from typing import Any
 from urllib.parse import urlencode
 
+from foundation.identity import LocalUserContext
 from openApi.http.app import MemoryOSASGI
 from openApi.mcp.config import MCPServerConfig
 from openApi.mcp.tools import MCPToolRouter
 from openApi.sdk.client import MemoryOSClient
-from foundation.identity import LocalUserContext
 
 
 async def _request(

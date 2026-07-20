@@ -31,6 +31,9 @@ from memory.core.structure.path_policy import MemoryDocumentPathPolicy
 
 
 class ControlFileMixin:
+    # 由 MemoryDocumentControlStore 在初始化时绑定。
+    root: Path
+
     def _artifact_root(self, tenant_id: str) -> Path:
         return tenant_control_root(self.root, tenant_id)
 
@@ -182,5 +185,4 @@ class ControlFileMixin:
         finally:
             os.close(parent_descriptor)
         return removed
-
 

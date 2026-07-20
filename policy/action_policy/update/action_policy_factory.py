@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from policy.action_policy.risk import action_spec, canonical_action
 from policy.action_policy.model.action_policy import ActionPolicy, ActionPolicyStatus
+from policy.action_policy.risk import action_spec, canonical_action
 
 
 @dataclass

@@ -13,12 +13,18 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from infrastructure.context.layers.generator import l0_abstract
 from infrastructure.store.model.catalog import CatalogRecord, CatalogRecordKind
 from pre.session import SessionArchive
+from sanitization.context_projection import ContextProjectionSanitizer
 
 _SAFE_SEGMENT = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")
 
 
 class SessionRecordBuilderMixin:
     """为 Session 投影器提供纯记录构造辅助方法。"""
+
+    # 由 SessionContextProjector 绑定；在 Mixin 中显式声明以保持类型边界完整。
+    sanitizer: ContextProjectionSanitizer
+    semantic_segment_size: int
+    vectorize_important_events: bool
 
     def _record(self, **kwargs: Any) -> CatalogRecord:
         return CatalogRecord(**kwargs).with_sanitized_projection(self.sanitizer)

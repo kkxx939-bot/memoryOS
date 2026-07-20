@@ -13,6 +13,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from foundation.clock import utc_now
+from foundation.ids import require_safe_path_segment
+from foundation.integrity import canonical_digest
+from infrastructure.store.filesystem.durable_io import atomic_write_json
+from infrastructure.store.filesystem.durable_io.atomic_file import _open_control_parent
+from infrastructure.store.filesystem.durable_io.quarantine import quarantine_control_file
+from infrastructure.store.filesystem.file_lock import open_private_lock
+from infrastructure.store.filesystem.path_safety import DurablePathIntegrityError
 from infrastructure.store.session.commit_group_model import (
     _TERMINAL,
     CONSUMERS,
@@ -23,14 +31,6 @@ from infrastructure.store.session.commit_group_model import (
     _mapping,
     _validate_summary,
 )
-from foundation.clock import utc_now
-from infrastructure.store.filesystem.durable_io import atomic_write_json
-from infrastructure.store.filesystem.durable_io.atomic_file import _open_control_parent
-from infrastructure.store.filesystem.durable_io.quarantine import quarantine_control_file
-from infrastructure.store.filesystem.file_lock import open_private_lock
-from foundation.ids import require_safe_path_segment
-from foundation.integrity import canonical_digest
-from infrastructure.store.filesystem.path_safety import DurablePathIntegrityError
 
 try:  # pragma: no cover - 生产平台提供 fcntl
     import fcntl

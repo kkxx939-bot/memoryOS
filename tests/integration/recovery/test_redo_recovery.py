@@ -41,4 +41,4 @@ def test_source_written_recovery_rebuilds_index(tmp_path) -> None:  # noqa: ANN0
         tenant_id="default",
         filters={"owner_user_id": "u1", "context_type": "behavior_case"},
     )
-    assert not committer.redo.pending()
+    assert not committer.redo.pending_entries()

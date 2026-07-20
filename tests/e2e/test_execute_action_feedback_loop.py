@@ -3,12 +3,12 @@ from __future__ import annotations
 import json
 
 from behavior.core.model.observation import Observation
-from policy.action_policy.execution.tool_registry import ToolRegistry
 from infrastructure.store.model.context.context_object import ContextObject
 from infrastructure.store.model.context.context_relation import ContextRelation
 from infrastructure.store.model.context.context_type import ContextType
 from openApi.sdk.client import MemoryOSClient
 from policy.action_policy.decision.request import PredictionRequest
+from policy.action_policy.execution.tool_registry import ToolRegistry
 from policy.action_policy.model.action_policy import ActionPolicy
 from pre.connect import ConnectMetadata
 from tests.support.persistence import seed_context_object

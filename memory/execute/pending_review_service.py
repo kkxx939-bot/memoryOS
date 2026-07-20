@@ -509,6 +509,8 @@ class MemoryEditReviewService:
                 source_digest = record.expected_state.raw_sha256
             else:
                 source_digest = ""
+        assert document_revision is not None
+        assert source_digest is not None
         return MemoryEditReviewResult(
             proposal_id=record.proposal_id,
             status=record.status.value,

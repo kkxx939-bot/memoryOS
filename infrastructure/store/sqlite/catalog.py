@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from infrastructure.store.sqlite._common import (
     _CATALOG_SCHEMA_VERSION,
     Any,
@@ -13,7 +15,9 @@ from infrastructure.store.sqlite._common import (
     replace,
 )
 from infrastructure.store.sqlite.catalog_documents import CatalogDocumentOperationsMixin
-from infrastructure.store.sqlite.catalog_writes import CatalogWriteOperationsMixin
+
+if TYPE_CHECKING:
+    from infrastructure.store.sqlite.index_store import SQLiteIndexStore
 
 _DOCUMENT_RECORD_KINDS = frozenset(
     {
@@ -23,18 +27,11 @@ _DOCUMENT_RECORD_KINDS = frozenset(
 )
 
 
-class CatalogStoreOperations(CatalogDocumentOperationsMixin, CatalogWriteOperationsMixin):
+class CatalogStoreOperations(CatalogDocumentOperationsMixin):
     """管理事务写入和租户范围内的有界 Catalog 读取。"""
 
-    def __init__(self, store: Any) -> None:
+    def __init__(self, store: SQLiteIndexStore) -> None:
         self._store = store
-
-    @staticmethod
-    def _require_tenant(tenant_id: str) -> str:
-        resolved = str(tenant_id or "").strip()
-        if not resolved:
-            raise ValueError("tenant_id is required")
-        return resolved
 
     def upsert_index(self, obj: ContextObject, content: str = "", *, tenant_id: str) -> None:
         """把一个普通 ContextObject 投影到所属租户的 Catalog。"""

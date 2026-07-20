@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Collection
 
-from policy.action_policy.risk import action_spec
 from policy.action_policy.model.action_policy import ActionCandidate, ActionPolicy, ActionPolicyStatus
+from policy.action_policy.risk import action_spec
 
 
 class ActionPolicyRanker:

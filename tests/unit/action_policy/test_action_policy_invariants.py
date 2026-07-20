@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import pytest
 
@@ -19,8 +20,8 @@ from tests.support.persistence import FileSystemSourceStore, InMemoryIndexStore,
 from transaction.model.operation_action import OperationAction
 
 
-def _policy(**overrides) -> ActionPolicy:
-    values = {
+def _policy(**overrides: Any) -> ActionPolicy:
+    values: dict[str, Any] = {
         "user_id": "u1",
         "scene_key": "hot",
         "action": "turn_on_fan",

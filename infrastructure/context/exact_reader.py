@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 from foundation.identity import LocalUserContext
 from infrastructure.context.contracts import ContextObjectReader
 from infrastructure.context.layers.memory_document_overlay import MemoryDocumentContextOverlay
-from infrastructure.store.contracts.index import IndexStore
+from infrastructure.store.contracts.index import CatalogStore, IndexStore
 from infrastructure.store.contracts.source import SourceStore
 from infrastructure.store.model.context.context_uri import ContextURI
 from memory.core.structure.path_policy import MemoryDocumentPathPolicy
@@ -28,7 +28,7 @@ class ContextExactReader:
         require_exact_read_scope: Callable[[str, Any, LocalUserContext], None],
     ) -> None:
         self.source_store = source_store
-        self.index_store = index_store
+        self.catalog_store = cast(CatalogStore | None, index_store)
         self.context_reader = context_reader
         self.document_overlay = document_overlay
         self.require_exact_read_scope = require_exact_read_scope
@@ -80,12 +80,12 @@ class ContextExactReader:
         tenant_id: str,
         caller: LocalUserContext | None,
     ) -> dict[str, Any]:
-        if self.index_store is None:
+        if self.catalog_store is None:
             raise FileNotFoundError(uri)
         owner_user_id, document_id = MemoryDocumentPathPolicy.parse_document_uri(uri)
         if caller is not None and owner_user_id != caller.user_id:
             raise FileNotFoundError(uri)
-        records = self.index_store.get_catalog_by_uri(
+        records = self.catalog_store.get_catalog_by_uri(
             tenant_id=tenant_id,
             uri=uri,
             limit=2,

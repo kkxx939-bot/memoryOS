@@ -12,9 +12,9 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 
+from foundation.integrity import canonical_digest
 from infrastructure.store.model.context.context_object import ContextObject
 from infrastructure.store.model.context.context_uri import ContextURI
-from foundation.integrity import canonical_digest
 
 
 class BundleIntegrityError(RuntimeError):

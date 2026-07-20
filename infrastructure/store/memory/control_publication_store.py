@@ -9,6 +9,7 @@ from infrastructure.store.filesystem.durable_io import (
     atomic_write_json,
 )
 from infrastructure.store.filesystem.durable_io.atomic_file import _open_control_parent
+from infrastructure.store.memory.control_commit_store import ControlCommitStoreMixin
 from infrastructure.store.memory.control_common import (
     _EVENT_SCHEMA,
     _MAX_LINEAGE_EVENTS,
@@ -36,7 +37,9 @@ from memory.core.structure.frontmatter import validate_document_id
 from memory.core.structure.path_policy import MemoryDocumentPathPolicy
 
 
-class ControlPublicationStoreMixin:
+class ControlPublicationStoreMixin(ControlCommitStoreMixin):
+    """发布屏障操作；文件和意图读取能力由组合存储的兄弟 Mixin 提供。"""
+
     def write_publication_barrier(
         self,
         barrier: DocumentPublicationBarrier,

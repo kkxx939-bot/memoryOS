@@ -4,11 +4,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from infrastructure.store.contracts.index import IndexHit
 from infrastructure.store.model.context.context_object import ContextObject
 from infrastructure.store.model.context.context_relation import ContextRelation
 from infrastructure.store.model.context.context_type import ContextType
 from infrastructure.store.model.context.lifecycle import LifecycleState
-from infrastructure.store.contracts.index import IndexHit
 from policy.action_policy.decision.context_builder import ActionContextBuilder
 from policy.action_policy.model.action_policy import ActionCandidate, ActionPolicy
 from tests.support.persistence import (

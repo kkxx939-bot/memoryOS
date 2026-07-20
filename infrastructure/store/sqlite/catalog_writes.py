@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from infrastructure.store.sqlite._common import (
     _CONTEXT_COLUMNS,
     _MAX_SCOPE_KEYS_PER_RECORD,
@@ -19,9 +21,21 @@ from infrastructure.store.sqlite._common import (
     sqlite3,
 )
 
+if TYPE_CHECKING:
+    from infrastructure.store.sqlite.index_store import SQLiteIndexStore
+
 
 class CatalogWriteOperationsMixin:
     """负责记录清洗、路径、ACL、FTS 与删除事务。"""
+
+    _store: SQLiteIndexStore
+
+    @staticmethod
+    def _require_tenant(tenant_id: str) -> str:
+        resolved = str(tenant_id or "").strip()
+        if not resolved:
+            raise ValueError("tenant_id is required")
+        return resolved
 
     def _prepare_record(
         self,

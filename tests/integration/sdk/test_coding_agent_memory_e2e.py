@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from foundation.identity import LocalUserContext
 from memory.core.model import ABSENT
 from openApi.sdk.client import MemoryOSClient
-from foundation.identity import LocalUserContext
 from pre.session import SessionArchive
 
 

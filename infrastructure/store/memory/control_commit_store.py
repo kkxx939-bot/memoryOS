@@ -21,6 +21,7 @@ from infrastructure.store.memory.control_common import (
 from infrastructure.store.memory.control_common import (
     validate_prefixed_digest as _validate_prefixed_digest,
 )
+from infrastructure.store.memory.control_files import ControlFileMixin
 from infrastructure.store.memory.control_intent import (
     DocumentCommitIntent,
 )
@@ -36,7 +37,9 @@ from memory.core.structure.frontmatter import validate_document_id
 from memory.core.structure.path_policy import MemoryDocumentPathPolicy
 
 
-class ControlCommitStoreMixin:
+class ControlCommitStoreMixin(ControlFileMixin):
+    """提交控制操作；文件能力由 ControlFileMixin 提供。"""
+
     def prepare_intent(self, intent: DocumentCommitIntent) -> DocumentCommitIntent:
         path = self._intent_path(intent.tenant_id, intent.owner_user_id, intent.intent_id)
         try:
@@ -315,4 +318,3 @@ def _event_matches_intent(event: DocumentChangeEvent, intent: DocumentCommitInte
         and event.evidence_digest == intent.evidence_digest
         and event.edit_summary == intent.edit_summary
     )
-

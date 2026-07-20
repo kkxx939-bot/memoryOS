@@ -4,13 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from infrastructure.store.memory.control_commit_store import ControlCommitStoreMixin
 from infrastructure.store.memory.control_common import (
     DocumentControlIntegrityError,
     DocumentDeletionStatus,
     DocumentIntentStatus,
 )
-from infrastructure.store.memory.control_files import ControlFileMixin
 from infrastructure.store.memory.control_identity import (
     DocumentAdoptionReceipt,
     DocumentRootIdentity,
@@ -35,9 +33,7 @@ from infrastructure.store.memory.control_record import (
 
 class MemoryDocumentControlStore(
     ControlIdentityStoreMixin,
-    ControlCommitStoreMixin,
     ControlPublicationStoreMixin,
-    ControlFileMixin,
 ):
     """组合文档身份、提交日志、发布屏障和安全文件操作。"""
 

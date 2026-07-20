@@ -13,8 +13,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from memory.ports.erase import DerivedEraseRequest
 from memory.core.structure.path_policy import MemoryDocumentPathPolicy
+from memory.ports.erase import DerivedEraseRequest
 
 _MAX_TRACE_BYTES = 2 * 1024 * 1024
 _MAX_TRACES_PER_TENANT = 10_000

@@ -12,20 +12,20 @@ import stat
 import uuid
 from datetime import datetime, timezone
 
-from infrastructure.store.filesystem.memory_document_io import MemoryDocumentFileIO
 from foundation.ids import stable_hash
-from memory.core.structure.frontmatter import (
-    FrontMatterError,
-    MissingDocumentId,
-    MissingFrontMatter,
-    parse_front_matter,
-)
+from infrastructure.store.filesystem.memory_document_io import MemoryDocumentFileIO
 from memory.core.model import (
     ManagedDocument,
     QuarantinedDocument,
     ScanGeneration,
     UnmanagedDocument,
     UnsafePath,
+)
+from memory.core.structure.frontmatter import (
+    FrontMatterError,
+    MissingDocumentId,
+    MissingFrontMatter,
+    parse_front_matter,
 )
 from memory.core.structure.path_policy import MemoryDocumentPathPolicy
 from memory.ports.document_store import DocumentUnsafeError

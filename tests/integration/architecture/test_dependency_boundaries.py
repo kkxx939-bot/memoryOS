@@ -220,6 +220,8 @@ def _top_level(module: str) -> str:
 
 def _source_top(path: str) -> str:
     parts = Path(path).parts
+    if not parts:
+        return ""
     if parts[0] == "foundation":
         return "foundation"
     if parts[0] == "pre":
@@ -242,7 +244,9 @@ def _source_top(path: str) -> str:
         return "transaction"
     if parts[:2] == ("policy", "action_policy"):
         return "action_policy"
-    return parts[0] if parts[0] == "policy" else (parts[1] if len(parts) > 1 else parts[0])
+    if parts[0] == "policy":
+        return "policy"
+    return parts[1] if len(parts) > 1 else path
 
 
 def _is_compatibility(path: str) -> bool:

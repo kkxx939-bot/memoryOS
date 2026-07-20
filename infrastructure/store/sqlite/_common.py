@@ -14,12 +14,8 @@ from itertools import combinations
 from pathlib import Path
 from typing import Any
 
-from infrastructure.store.query import (
-    CatalogCandidateBoundExceeded,
-    lexical_match_count,
-    lexical_relevance,
-    lexical_terms,
-)
+from foundation.identity.workspace import normalize_workspace_id
+from infrastructure.store.contracts.index import IndexHit
 from infrastructure.store.model.catalog import (
     CatalogProjectionStatus,
     CatalogRecord,
@@ -28,9 +24,13 @@ from infrastructure.store.model.catalog import (
     normalize_tree_path,
 )
 from infrastructure.store.model.context.context_object import ContextObject
-from infrastructure.store.contracts.index import IndexHit
+from infrastructure.store.query import (
+    CatalogCandidateBoundExceeded,
+    lexical_match_count,
+    lexical_relevance,
+    lexical_terms,
+)
 from sanitization.context_projection import ContextProjectionSanitizer
-from foundation.identity.workspace import normalize_workspace_id
 
 _CATALOG_SCHEMA_VERSION = 1
 _INVALID_SCOPE_KEY = "__memoryos_invalid_scope__"

@@ -13,6 +13,7 @@ from infrastructure.store.filesystem.durable_io import (
 )
 from infrastructure.store.filesystem.durable_io.atomic_file import _open_control_parent
 from infrastructure.store.filesystem.file_lock import open_private_lock
+from infrastructure.store.memory.control_commit_store import ControlCommitStoreMixin
 from infrastructure.store.memory.control_common import (
     _ADOPTION_IDENTITY_SCHEMA,
     _MAX_ADOPTION_RECEIPTS,
@@ -35,7 +36,9 @@ from memory.core.structure.frontmatter import validate_document_id
 from memory.core.structure.path_policy import MemoryDocumentPathPolicy
 
 
-class ControlIdentityStoreMixin:
+class ControlIdentityStoreMixin(ControlCommitStoreMixin):
+    """身份控制操作；文件和提交查询能力由组合存储的兄弟 Mixin 提供。"""
+
     @contextmanager
     def root_identity_lock(
         self,

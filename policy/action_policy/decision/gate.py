@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from policy.action_policy.risk import action_spec, canonical_action
 from policy.action_policy.decision.action_context import ActionContext
 from policy.action_policy.decision.result import PolicyDecision
 from policy.action_policy.model.action_policy import ActionCandidate, ActionPolicy, ActionPolicyStatus
+from policy.action_policy.risk import action_spec, canonical_action
 
 
 class PolicyGate:

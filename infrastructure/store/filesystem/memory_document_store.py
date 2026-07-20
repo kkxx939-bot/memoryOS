@@ -17,14 +17,6 @@ from infrastructure.store.filesystem.memory_document_io import (
     StoreFaultHook,
 )
 from infrastructure.store.filesystem.memory_document_scan import scan_memory_documents
-from memory.core.structure.frontmatter import (
-    FrontMatterError,
-    MissingFrontMatter,
-    adopt_raw_document,
-    new_document_id,
-    parse_front_matter,
-    validate_document_id,
-)
 from memory.core.model import (
     ABSENT,
     AbsentPath,
@@ -34,6 +26,14 @@ from memory.core.model import (
     RawPathState,
     ScanGeneration,
     UnsafePath,
+)
+from memory.core.structure.frontmatter import (
+    FrontMatterError,
+    MissingFrontMatter,
+    adopt_raw_document,
+    new_document_id,
+    parse_front_matter,
+    validate_document_id,
 )
 from memory.core.structure.path_policy import MemoryDocumentPathPolicy
 from memory.ports.document_store import (

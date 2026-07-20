@@ -9,6 +9,7 @@ from typing import Any
 from foundation.integrity import canonical_digest
 from memory.core.formation.schema import MemoryCandidateSchema
 from memory.core.model import MemoryEditProposal
+from memory.formation.egress import EgressDecision, MemoryEgressPolicy
 from memory.formation.errors import (
     MemoryExtractionCandidateValidationError,
     MemoryExtractionConfigurationError,
@@ -20,7 +21,6 @@ from memory.formation.llm.prompt import MemoryExtractionPromptBuilder
 from memory.formation.llm.result import MemoryExtractionBatchResult, RejectedMemoryCandidate
 from memory.formation.llm.validation import MemoryExtractionCandidateValidator
 from memory.ports import MemoryExtractionModelProvider
-from memory.formation.egress import EgressDecision, MemoryEgressPolicy
 from pre.evidence import SessionArchiveEpisodeAdapter
 from pre.session import SessionArchive
 

@@ -9,6 +9,7 @@ from infrastructure.store.sqlite._common import (
     Mapping,
     Sequence,
 )
+from infrastructure.store.sqlite.catalog_writes import CatalogWriteOperationsMixin
 
 _DOCUMENT_RECORD_KINDS = frozenset(
     {
@@ -18,7 +19,7 @@ _DOCUMENT_RECORD_KINDS = frozenset(
 )
 
 
-class CatalogDocumentOperationsMixin:
+class CatalogDocumentOperationsMixin(CatalogWriteOperationsMixin):
     """集中处理记忆文档投影的 generation CAS、发布与墓碑事务。"""
 
     def get_memory_document_projection_state(

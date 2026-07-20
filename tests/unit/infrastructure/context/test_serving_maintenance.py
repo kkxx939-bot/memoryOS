@@ -6,16 +6,16 @@ from dataclasses import dataclass
 
 import pytest
 
+from infrastructure.context.contracts import NoContextIndexPolicy, NoDomainOverlay
 from infrastructure.context.maintenance import (
     CallbackDocumentServingMaintenance,
     CatalogDocumentProjectionVerifier,
     DerivedServingMaintenanceService,
 )
-from infrastructure.store.sqlite.index_store import SQLiteIndexStore
 from infrastructure.store.model.catalog import CatalogRecord, CatalogRecordKind
-from infrastructure.context.contracts import NoContextIndexPolicy, NoDomainOverlay
 from infrastructure.store.model.context.context_object import ContextObject
 from infrastructure.store.model.context.context_type import ContextType
+from infrastructure.store.sqlite.index_store import SQLiteIndexStore
 from memory.core.model import ManagedDocument, ScanGeneration, UnmanagedDocument
 from tests.support.persistence import (
     FileSystemSourceStore,
@@ -31,7 +31,7 @@ def _scan(*, owner: str = "alice", unmanaged: bool = False) -> ScanGeneration:
         raw_sha256="a" * 64,
         size=20,
     )
-    registrations = (managed,)
+    registrations: tuple[ManagedDocument | UnmanagedDocument, ...] = (managed,)
     if unmanaged:
         registrations += (
             UnmanagedDocument(

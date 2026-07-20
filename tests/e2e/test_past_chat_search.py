@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from foundation.identity import LocalUserContext
 from infrastructure.context.retrieval.query_plan import (
     RetrievalOptions,
     RetrievalQueryIntent,
 )
 from infrastructure.store.model.context.context_type import ContextType
-from foundation.identity import LocalUserContext
 from openApi.sdk.client import MemoryOSClient
 
 _MARKER = "PastChatJavaRaftMarker"

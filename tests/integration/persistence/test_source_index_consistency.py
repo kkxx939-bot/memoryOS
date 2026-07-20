@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from infrastructure.context.maintenance.index_consistency import IndexConsistencyService
 from infrastructure.store.contracts.index import IndexHit
-from infrastructure.store.sqlite.index_store import SQLiteIndexStore
-from infrastructure.store.sqlite.relation_store import SQLiteRelationStore
 from infrastructure.store.model.context.context_object import ContextObject
 from infrastructure.store.model.context.context_relation import ContextRelation
 from infrastructure.store.model.context.context_type import ContextType
 from infrastructure.store.model.context.lifecycle import LifecycleState
+from infrastructure.store.sqlite.index_store import SQLiteIndexStore
+from infrastructure.store.sqlite.relation_store import SQLiteRelationStore
 from tests.support.persistence import FileSystemSourceStore, InMemoryIndexStore
 
 

@@ -61,6 +61,14 @@ class CatalogStore(Protocol):
 
     def get_catalog(self, record_key: str, *, tenant_id: str) -> CatalogRecord | None: ...
 
+    def get_catalog_by_uri(
+        self,
+        uri: str,
+        *,
+        tenant_id: str,
+        limit: int = 100,
+    ) -> list[CatalogRecord]: ...
+
     def delete_catalog(self, record_key: str, *, tenant_id: str) -> bool: ...
 
 

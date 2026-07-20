@@ -11,13 +11,13 @@ import shutil
 from collections.abc import Callable
 from pathlib import Path
 
+from infrastructure.store.contracts.domain import ContextDomainClassifier, NoContextDomainClassifier
 from infrastructure.store.filesystem.source_bundle import (
     BundleIntegrityError,
     SourceBundleStore,
     SourceFileIO,
 )
 from infrastructure.store.locks.process_local import ProcessLocalLockStore
-from infrastructure.store.contracts.domain import ContextDomainClassifier, NoContextDomainClassifier
 from infrastructure.store.model.context.context_object import ContextObject
 from infrastructure.store.model.context.context_uri import ContextURI
 from infrastructure.store.model.context.lifecycle import LifecycleState

@@ -10,8 +10,8 @@ from pathlib import Path
 from typing import Any
 
 from foundation.clock import utc_now
-from infrastructure.store.filesystem.durable_io.atomic_json import atomic_write_json
 from foundation.integrity import canonical_digest
+from infrastructure.store.filesystem.durable_io.atomic_json import atomic_write_json
 
 
 @dataclass(frozen=True)

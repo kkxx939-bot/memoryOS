@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from pathlib import Path
 
 from infrastructure.store.contracts.queue import (
     LeaseLostError,
@@ -36,6 +37,9 @@ _QUEUE_STATUSES = ("pending", "leased", "done", "dead_letter", "quarantine")
 
 class QueueStoreSupportMixin:
     """封装队列存储的基础设施细节，业务状态转换留在主存储类。"""
+
+    # 由 SQLiteQueueStore 在初始化时绑定。
+    path: Path
 
     def _row_to_job(self, row: sqlite3.Row) -> QueueJob:
         return QueueJob(

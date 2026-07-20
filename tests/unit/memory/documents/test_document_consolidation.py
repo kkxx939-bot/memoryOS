@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from foundation.identity import LocalUserContext
 from infrastructure.store.filesystem.memory_document_store import FileSystemMemoryDocumentStore
 from infrastructure.store.memory import (
     MemoryDocumentControlStore,
@@ -37,7 +38,6 @@ from memory.execute import MemoryDocumentPlanner
 from memory.execute.command_service import MemoryCommandService
 from memory.execute.pending_review_service import MemoryEditReviewService
 from memory.ports import DocumentConflictError
-from foundation.identity import LocalUserContext
 from tests.support.persistence.in_memory import InMemoryQueueStore
 
 

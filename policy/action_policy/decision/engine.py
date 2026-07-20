@@ -9,7 +9,6 @@ from infrastructure.store.contracts.index import IndexStore
 from infrastructure.store.contracts.relation import RelationStore
 from infrastructure.store.contracts.source import SourceStore
 from infrastructure.store.contracts.vector import VectorStore
-from policy.action_policy.risk import canonical_action
 from policy.action_policy.decision.context_builder import ActionContextBuilder
 from policy.action_policy.decision.gate import PolicyGate
 from policy.action_policy.decision.ledger import DecisionLedger
@@ -19,6 +18,7 @@ from policy.action_policy.decision.result import PredictionResult
 from policy.action_policy.model.action_policy import ActionPolicy
 from policy.action_policy.ranking.action_policy_ranker import ActionPolicyRanker
 from policy.action_policy.retrieval import ActionPolicyRetriever
+from policy.action_policy.risk import canonical_action
 
 
 class PredictionEngine:

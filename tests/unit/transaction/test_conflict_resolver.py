@@ -125,7 +125,7 @@ class ConflictResolverTest(unittest.TestCase):
 
     def test_policy_support_requires_structured_forbidden_rule(self) -> None:
         policy_uri = "memoryos://user/u1/action_policies/hot/turn_on_ac"
-        malformed = (
+        malformed: tuple[dict[str, object], ...] = (
             {"support_anchor_kind": "behavior"},
             {"policy_rule_type": "other"},
             {"policy_rule_value": "allowed"},

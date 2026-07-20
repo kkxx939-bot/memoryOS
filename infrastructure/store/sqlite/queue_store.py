@@ -9,14 +9,14 @@ from collections.abc import Sequence
 from datetime import timedelta
 from pathlib import Path
 
-from infrastructure.store.sqlite.queue_support import QueueStoreSupportMixin
+from foundation.clock import utc_now
 from infrastructure.store.contracts.queue import (
     LeaseLostError,
     QueueIdempotencyConflictError,
     QueueJob,
     QueueLeaseIdentityError,
 )
-from foundation.clock import utc_now
+from infrastructure.store.sqlite.queue_support import QueueStoreSupportMixin
 
 
 class SQLiteQueueStore(QueueStoreSupportMixin):

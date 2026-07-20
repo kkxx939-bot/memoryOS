@@ -75,7 +75,7 @@ class OperationPlaneTest(unittest.TestCase):
             )
             self.assertEqual(RedoLog(tmp).pending(), [])
 
-            audit_path = committer.audit.root / "system" / "audit" / "gulf.jsonl"
+            audit_path = committer.artifact_root / "system" / "audit" / "gulf.jsonl"
             audit = json.loads(audit_path.read_text(encoding="utf-8").splitlines()[0])
             single_diff = committer.diff_writer.read(f"diff_{op.operation_id}")
             marker = committer.marker_store.read(committer._operation_marker(op.operation_id))

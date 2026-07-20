@@ -8,8 +8,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from infrastructure.store.filesystem.durable_io.atomic_file import _open_control_parent, atomic_create_bytes
 from foundation.integrity.canonical_json import canonical_json
+from infrastructure.store.filesystem.durable_io.atomic_file import _open_control_parent, atomic_create_bytes
 from infrastructure.store.filesystem.path_safety import DurablePathIntegrityError
 
 

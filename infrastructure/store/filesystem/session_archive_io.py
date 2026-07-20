@@ -8,11 +8,11 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from foundation.integrity import canonical_json
 from memory.commit.evidence.errors import (
     EvidenceArchiveConflictError,
     EvidenceArchiveIntegrityError,
 )
-from foundation.integrity import canonical_json
 
 
 class SessionArchiveFileIO:

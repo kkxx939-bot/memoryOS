@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from infrastructure.store.filesystem.durable_io import ImmutableArtifactConflictError, atomic_create_json
 from foundation.integrity import canonical_digest, canonical_json
+from infrastructure.store.filesystem.durable_io import ImmutableArtifactConflictError, atomic_create_json
 
 
 def test_integrity_json_bytes_and_digest_are_deterministic() -> None:

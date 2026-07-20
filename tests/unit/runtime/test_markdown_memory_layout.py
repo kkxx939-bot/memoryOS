@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from foundation.identity import LocalUserContext
 from foundation.readiness import RuntimeNotReadyError
 from infrastructure.store.contracts.queue import QueueJob
 from infrastructure.store.filesystem.memory_document_store import FileSystemMemoryDocumentStore
@@ -32,7 +33,6 @@ from memory.core.structure.frontmatter import (
     render_new_document,
 )
 from memory.ports.document_store import DocumentConflictError, DocumentUnsafeError
-from foundation.identity import LocalUserContext
 from runtime.config import RuntimeConfig
 from tests.support.runtime import build_test_runtime
 
