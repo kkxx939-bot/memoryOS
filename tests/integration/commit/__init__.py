@@ -1,1 +1,0 @@
-"""Commit-protocol integration tests."""

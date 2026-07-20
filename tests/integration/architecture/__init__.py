@@ -1,1 +1,0 @@
-"""Executable architecture checks."""

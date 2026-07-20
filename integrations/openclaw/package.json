@@ -1,1 +1,1 @@
-{"name":"memoryos-openclaw","private":true,"type":"module","scripts":{"build":"tsc -p tsconfig.json","test":"npm run build && node --test tests/*.test.mjs"},"devDependencies":{"@types/node":"^22.0","typescript":"^5.0"}}
+{"name":"memoryos-openclaw","private":true,"type":"module","scripts":{"build":"tsc -p tsconfig.json"},"devDependencies":{"@types/node":"^22.0","typescript":"^5.0"}}

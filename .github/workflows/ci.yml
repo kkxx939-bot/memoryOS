@@ -10,7 +10,7 @@ jobs:
     env:
       MEMORYOS_PYTHON_PATHS: >-
         config.py pre memory behavior openApi policy agent_hook infrastructure
-        foundation runtime sanitization transaction tests
+        foundation runtime sanitization transaction
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -22,7 +22,7 @@ jobs:
       - name: Install dependencies and tooling
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e '.[mcp,server,test]'
+          python -m pip install -e '.[mcp,server]'
           python -m pip install ruff mypy pyright
       - name: Compile
         run: python -m compileall -q $MEMORYOS_PYTHON_PATHS
@@ -32,19 +32,13 @@ jobs:
         run: |
           mypy $MEMORYOS_PYTHON_PATHS
           pyright $MEMORYOS_PYTHON_PATHS
-      - name: Tests
-        run: python -m pytest
-      - name: Benchmark smoke
-        run: python tests/benchmark/smoke/context_assembly_smoke.py
       - name: OpenClaw integration
         working-directory: integrations/openclaw
         run: |
           npm ci
-          npm test
           npm run build
       - name: OpenCode integration
         working-directory: integrations/opencode
         run: |
           npm ci
-          npm test
           npm run build

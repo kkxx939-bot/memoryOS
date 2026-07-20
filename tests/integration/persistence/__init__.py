@@ -1,1 +1,0 @@
-"""Persistence-adapter integration tests."""

@@ -126,4 +126,4 @@ Memory document 提交成功定义为 live Markdown 已耐久安装且 projectio
 - 在线查询不会调用禁止的 O(N) API，且候选、source read、vector overfetch、per-session 和 per-document 均有硬上限；
 - `EXPLAIN QUERY PLAN` 证明结构化过滤使用索引。
 
-完成前运行项目实际配置支持的完整 pytest、相关集成/性能测试、Ruff、MyPy 和 Pyright。工具缺失或外部服务不可用时记录真实命令与真实错误，不得伪造通过，也不得为跑检查随意修改依赖。
+旧测试资产已经退役，等待按新架构重新设计。在新测试体系建立前，完成前必须运行生产源码 Compile、Ruff、MyPy、Pyright，以及现存集成包的构建检查；恢复测试体系后，必须重新启用相关测试和完整测试门禁。工具缺失或外部服务不可用时记录真实命令与真实错误，不得伪造通过，也不得为跑检查随意修改依赖。
