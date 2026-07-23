@@ -1,23 +1,21 @@
-"""完整、严格角色化的原始会话事实。"""
+"""Conversation 原始消息与归档片段 Schema。"""
 
 from pre.conversation.messages.model import (
     ConversationBatch,
     ConversationMessage,
-    ConversationMessageError,
     ConversationMessageRole,
+    ConversationMessageSchemaError,
+    ConversationSegment,
+    ConversationToolResultContentMode,
+    ConversationToolResultStatus,
 )
-from pre.conversation.messages.projector import (
-    ConversationProjectionError,
-    SessionArchiveConversationProjector,
-)
-from pre.conversation.messages.store import ConversationMessageStore
 
 __all__ = [
     "ConversationBatch",
     "ConversationMessage",
-    "ConversationMessageError",
     "ConversationMessageRole",
-    "ConversationMessageStore",
-    "ConversationProjectionError",
-    "SessionArchiveConversationProjector",
+    "ConversationMessageSchemaError",
+    "ConversationSegment",
+    "ConversationToolResultContentMode",
+    "ConversationToolResultStatus",
 ]

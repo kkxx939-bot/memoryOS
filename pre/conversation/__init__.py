@@ -1,22 +1,27 @@
-"""原始会话事实与可重建语义摘要。"""
+"""Conversation 原始消息与可重建历史过程摘要的数据契约。"""
 
 from pre.conversation.messages import (
     ConversationBatch,
     ConversationMessage,
     ConversationMessageRole,
-    ConversationMessageStore,
-    ConversationProjectionError,
-    SessionArchiveConversationProjector,
+    ConversationMessageSchemaError,
+    ConversationSegment,
+    ConversationToolResultContentMode,
+    ConversationToolResultStatus,
 )
-from pre.conversation.summaries import ConversationSummary, ConversationSummaryStore
+from pre.conversation.summaries import (
+    ConversationSegmentSummary,
+    ConversationSummarySchemaError,
+)
 
 __all__ = [
     "ConversationBatch",
     "ConversationMessage",
     "ConversationMessageRole",
-    "ConversationMessageStore",
-    "ConversationProjectionError",
-    "ConversationSummary",
-    "ConversationSummaryStore",
-    "SessionArchiveConversationProjector",
+    "ConversationMessageSchemaError",
+    "ConversationSegment",
+    "ConversationSegmentSummary",
+    "ConversationSummarySchemaError",
+    "ConversationToolResultContentMode",
+    "ConversationToolResultStatus",
 ]

@@ -1,4 +1,4 @@
-"""Atomic creation of immutable durable files within a trusted root."""
+"""Atomic durable byte-file operations within a trusted root."""
 
 from __future__ import annotations
 
@@ -7,11 +7,23 @@ import stat
 import uuid
 from pathlib import Path
 
-from infrastructure.store.filesystem.path_safety import DurablePathIntegrityError
+from infrastructure.store.filesystem.path_safety import (
+    DurablePathIntegrityError,
+    require_safe_artifact_path,
+)
 
 
 class ImmutableArtifactConflictError(ValueError):
     """A create-only artifact identity is already bound to different bytes."""
+
+
+def _write_all(descriptor: int, encoded: bytes) -> None:
+    view = memoryview(encoded)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:  # pragma: no cover - defensive OS contract.
+            raise OSError("durable artifact write made no progress")
+        view = view[written:]
 
 
 def _open_control_parent(path: Path, artifact_root: str | Path) -> int:
@@ -99,12 +111,7 @@ def atomic_create_bytes(path: Path, encoded: bytes, *, artifact_root: str | Path
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(temporary_name, flags, 0o600, dir_fd=parent_descriptor)
         try:
-            view = memoryview(encoded)
-            while view:
-                written = os.write(descriptor, view)
-                if written <= 0:  # pragma: no cover - defensive OS contract.
-                    raise OSError("immutable artifact write made no progress")
-                view = view[written:]
+            _write_all(descriptor, encoded)
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
@@ -132,4 +139,85 @@ def atomic_create_bytes(path: Path, encoded: bytes, *, artifact_root: str | Path
         os.close(parent_descriptor)
 
 
-__all__ = ["ImmutableArtifactConflictError", "atomic_create_bytes"]
+def atomic_replace_bytes(path: Path, encoded: bytes, *, artifact_root: str | Path) -> None:
+    """Atomically create or replace one mutable regular file."""
+
+    parent_descriptor = _open_control_parent(path, artifact_root)
+    temporary_name = f".{path.name}.{uuid.uuid4().hex}.tmp"
+    try:
+        try:
+            existing = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            if not stat.S_ISREG(existing.st_mode):
+                raise DurablePathIntegrityError("mutable artifact destination is not a regular file")
+
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(temporary_name, flags, 0o600, dir_fd=parent_descriptor)
+        try:
+            _write_all(descriptor, encoded)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(
+            temporary_name,
+            path.name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+        os.chmod(path.name, 0o600, dir_fd=parent_descriptor, follow_symlinks=False)
+        os.fsync(parent_descriptor)
+    finally:
+        try:
+            os.unlink(temporary_name, dir_fd=parent_descriptor)
+        except FileNotFoundError:
+            pass
+        os.close(parent_descriptor)
+
+
+def read_regular_bytes(
+    path: Path,
+    *,
+    artifact_root: str | Path,
+    max_bytes: int,
+) -> bytes:
+    """Read one bounded regular file without following its final symlink."""
+
+    maximum = int(max_bytes)
+    if maximum <= 0:
+        raise ValueError("max_bytes must be positive")
+    candidate = require_safe_artifact_path(artifact_root, path, label="durable byte file")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(candidate, flags)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise DurablePathIntegrityError("durable byte file cannot be opened safely") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise DurablePathIntegrityError("durable byte path is not a regular file")
+        if metadata.st_size > maximum:
+            raise DurablePathIntegrityError("durable byte file exceeds its read bound")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(1024 * 1024, maximum - total + 1))
+            if not chunk:
+                return b"".join(chunks)
+            total += len(chunk)
+            if total > maximum:
+                raise DurablePathIntegrityError("durable byte file exceeds its read bound")
+            chunks.append(chunk)
+    finally:
+        os.close(descriptor)
+
+
+__all__ = [
+    "ImmutableArtifactConflictError",
+    "atomic_create_bytes",
+    "atomic_replace_bytes",
+    "read_regular_bytes",
+]

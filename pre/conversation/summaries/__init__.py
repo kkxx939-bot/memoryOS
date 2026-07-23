@@ -1,6 +1,8 @@
-"""与原始 ConversationBatch 绑定的语义摘要。"""
+"""绑定不可变 ConversationSegment 的历史过程摘要 Schema。"""
 
-from pre.conversation.summaries.model import ConversationSummary, ConversationSummaryError
-from pre.conversation.summaries.store import ConversationSummaryStore
+from pre.conversation.summaries.model import (
+    ConversationSegmentSummary,
+    ConversationSummarySchemaError,
+)
 
-__all__ = ["ConversationSummary", "ConversationSummaryError", "ConversationSummaryStore"]
+__all__ = ["ConversationSegmentSummary", "ConversationSummarySchemaError"]
