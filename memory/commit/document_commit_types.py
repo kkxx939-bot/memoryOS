@@ -27,6 +27,8 @@ from memory.ports.document_store import (
 class DocumentCommitConflict(DocumentConflictError):
     """当前 Markdown 或耐久身份处于第三状态，原状态已被保留。"""
 
+    retryable = False
+
 
 @dataclass(frozen=True)
 class DocumentCommitResult:

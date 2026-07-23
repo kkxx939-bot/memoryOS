@@ -1,4 +1,4 @@
-"""明确记住内容的单一用例。"""
+"""明确记住内容的单一可信命令。"""
 
 from __future__ import annotations
 
@@ -7,14 +7,13 @@ import re
 
 from foundation.identity import LocalUserContext
 from foundation.integrity import canonical_json
-from memory.core.model import MemoryCandidateKind, MemoryEditProposal
+from memory.commit.remember_plan import RememberTarget, RememberTargetKind
 from memory.execute.base import MemoryCommandBase, _assert_expected_digest
 from memory.execute.contracts import RememberResult
-from memory.execute.write_planner import explicit_evidence_digest
 
 
 class RememberOperation(MemoryCommandBase):
-    """把可信用户明确输入转换为确定性的记忆文档 CAS。"""
+    """把可信用户显式输入转换为确定性的 Markdown CAS。"""
 
     def remember(
         self,
@@ -31,77 +30,55 @@ class RememberOperation(MemoryCommandBase):
         body = str(content or "").strip()
         if not body:
             raise ValueError("remember content is required")
-        evidence_digest = explicit_evidence_digest(body)
-        proposal = _explicit_proposal(
-            body,
-            occurred_at=occurred_at,
-            target_hint=target_hint,
-            evidence_reference=f"explicit-input:sha256:{evidence_digest}",
+        request_material = canonical_json(
+            [caller.tenant_id, caller.user_id, body, occurred_at or "", target_hint or ""]
         )
-        request_key = "remember:" + hashlib.sha256(
-            canonical_json([caller.tenant_id, caller.user_id, body, occurred_at or "", target_hint or ""]).encode()
-        ).hexdigest()
+        command_digest = hashlib.sha256(request_material.encode()).hexdigest()
+        target = _explicit_target(body, target_hint)
+        request_key = f"remember:{command_digest}"
         plan = self.planner.plan(
-            proposal,
+            body,
+            target,
             tenant_id=caller.tenant_id,
             owner_user_id=caller.user_id,
             idempotency_key=request_key,
-            evidence_digest=evidence_digest,
+            command_digest=command_digest,
         )
         _assert_expected_digest(plan.expected_state, expected_document_digest)
         self.erase_store.assert_mutation_allowed(caller.tenant_id, caller.user_id, plan.document_id)
         result = self._commit_or_replay(
             plan,
             caller=caller,
-            evidence_reference=f"explicit-input:sha256:{evidence_digest}",
+            evidence_reference=f"explicit-command:sha256:{command_digest}",
         )
         return RememberResult(**self._result_fields(plan, result))
 
 
-def _explicit_proposal(
-    content: str,
-    *,
-    occurred_at: str | None,
-    target_hint: str | None,
-    evidence_reference: str,
-) -> MemoryEditProposal:
+def _explicit_target(content: str, target_hint: str | None) -> RememberTarget:
     raw_hint = str(target_hint or "").strip()
-    normalized_hint = raw_hint.casefold().replace("-", "_")
-    kind_aliases = {
-        "profile": MemoryCandidateKind.PROFILE_FACT,
-        "profile_fact": MemoryCandidateKind.PROFILE_FACT,
-        "preference": MemoryCandidateKind.PREFERENCE,
-        "preferences": MemoryCandidateKind.PREFERENCE,
-        "entity": MemoryCandidateKind.ENTITY_NOTE,
-        "entity_note": MemoryCandidateKind.ENTITY_NOTE,
-        "topic": MemoryCandidateKind.TOPIC_NOTE,
-        "topic_note": MemoryCandidateKind.TOPIC_NOTE,
-        "episode": MemoryCandidateKind.EPISODE,
-        "open_loop": MemoryCandidateKind.OPEN_LOOP,
-        "experience": MemoryCandidateKind.EXPERIENCE,
+    aliases = {
+        "profile": RememberTargetKind.PROFILE,
+        "profile_fact": RememberTargetKind.PROFILE,
+        "preference": RememberTargetKind.PREFERENCE,
+        "preferences": RememberTargetKind.PREFERENCE,
+        "entity": RememberTargetKind.ENTITY,
+        "entity_note": RememberTargetKind.ENTITY,
+        "topic": RememberTargetKind.TOPIC,
+        "topic_note": RememberTargetKind.TOPIC,
+        "episode": RememberTargetKind.EPISODE,
+        "experience": RememberTargetKind.EPISODE,
+        "open_loop": RememberTargetKind.OPEN_LOOP,
     }
-    subject_hint = ""
     prefix, separator, suffix = raw_hint.partition(":")
-    if separator and prefix.casefold().replace("-", "_") in kind_aliases:
-        kind = kind_aliases[prefix.casefold().replace("-", "_")]
-        subject_hint = suffix.strip()
+    normalized_prefix = prefix.casefold().replace("-", "_")
+    if separator and normalized_prefix in aliases:
+        kind = aliases[normalized_prefix]
+        subject = suffix.strip()
     else:
-        kind = kind_aliases.get(normalized_hint, MemoryCandidateKind.TOPIC_NOTE)
-        if raw_hint and normalized_hint not in kind_aliases:
-            subject_hint = raw_hint
-    title = subject_hint or _content_title(content)
-    entity_hints = (title,) if kind == MemoryCandidateKind.ENTITY_NOTE else ()
-    topic_hints = (title,) if kind == MemoryCandidateKind.TOPIC_NOTE else ()
-    return MemoryEditProposal(
-        candidate_kind=kind,
-        title=title,
-        body=content,
-        evidence_refs=(evidence_reference,),
-        subject=title,
-        entity_hints=entity_hints,
-        topic_hints=topic_hints,
-        occurred_at=str(occurred_at or ""),
-    )
+        normalized = raw_hint.casefold().replace("-", "_")
+        kind = aliases.get(normalized, RememberTargetKind.TOPIC)
+        subject = "" if normalized in aliases else raw_hint
+    return RememberTarget(kind, subject or _content_title(content))
 
 
 def _content_title(content: str) -> str:

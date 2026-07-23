@@ -1,14 +1,5 @@
-"""记忆领域核心：模型、文档结构与确定性写入规则。"""
+"""Markdown Memory 的领域模型与受控文档结构。"""
 
-from memory.core.formation import (
-    MEMORY_SCHEMA_VERSION,
-    EpisodeSalienceGate,
-    MemoryCandidateRegistry,
-    MemoryCandidateSchema,
-    RuleFallbackExtractor,
-    SalienceDecision,
-    SalienceFactor,
-)
 from memory.core.model import (
     ABSENT,
     AbsentPath,
@@ -17,10 +8,8 @@ from memory.core.model import (
     DocumentEditPlan,
     DocumentRegistrationState,
     ManagedDocument,
-    MemoryCandidateKind,
     MemoryDocument,
     MemoryDocumentKind,
-    MemoryEditProposal,
     PresentPath,
     QuarantinedDocument,
     RawPathState,
@@ -42,27 +31,19 @@ from memory.core.structure.frontmatter import (
     validate_document_id,
 )
 from memory.core.structure.path_policy import MemoryDocumentPathPolicy
-from memory.core.write.router import MemoryDocumentRouter
 
 __all__ = [
     "ABSENT",
-    "MEMORY_SCHEMA_VERSION",
     "AbsentPath",
     "DocumentChangeEvent",
     "DocumentEditKind",
     "DocumentEditPlan",
     "DocumentRegistrationState",
-    "EpisodeSalienceGate",
     "FrontMatterError",
     "ManagedDocument",
-    "MemoryCandidateKind",
-    "MemoryCandidateRegistry",
-    "MemoryCandidateSchema",
     "MemoryDocument",
     "MemoryDocumentKind",
     "MemoryDocumentPathPolicy",
-    "MemoryDocumentRouter",
-    "MemoryEditProposal",
     "MissingDocumentId",
     "MissingFrontMatter",
     "ParsedFrontMatter",
@@ -70,9 +51,6 @@ __all__ = [
     "QuarantinedDocument",
     "RawPathState",
     "RegistrationStatus",
-    "RuleFallbackExtractor",
-    "SalienceDecision",
-    "SalienceFactor",
     "ScanGeneration",
     "UnmanagedDocument",
     "UnsafePath",

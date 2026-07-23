@@ -15,9 +15,6 @@ from infrastructure.store.memory.layout import tenant_control_root
 from infrastructure.store.session.commit_group import (
     CommitGroupStore,
 )
-from memory.commit.document_commit import (
-    MemoryDocumentCommitter,
-)
 from memory.commit.entry import commit_session as commit_session_entry
 from memory.commit.model.session import (
     SessionCommitResult,
@@ -29,7 +26,6 @@ from memory.commit.session_commit_types import (
     DerivedConsumerError,
 )
 from memory.commit.session_support import _SessionCommitSupport
-from memory.execute.write_planner import MemoryDocumentPlanner
 from policy.action_policy.planning.session_commit_planner import (
     ActionPolicyCommitPlanner,
 )
@@ -38,27 +34,23 @@ from transaction.commit.operation_committer import OperationCommitter
 
 
 class SessionCommitService(_SessionCommitSupport):
-    """先归档证据，再分别提交 Memory 与其他普通消费者。"""
+    """归档 Session，并提交与长期记忆无关的普通派生消费者。"""
 
     def __init__(
         self,
         archive_store: SessionArchiveStore,
         queue_store: QueueStore,
         committer: OperationCommitter | None = None,
-        memory_planner: Any | None = None,
         behavior_planner: BehaviorCommitPlanner | None = None,
         action_policy_planner: ActionPolicyCommitPlanner | None = None,
         context_planner: ContextCommitPlanner | None = None,
         session_projector: Any | None = None,
         commit_group_store: CommitGroupStore | None = None,
-        memory_committer: MemoryDocumentCommitter | None = None,
-        document_planner: MemoryDocumentPlanner | None = None,
         projection_journal: SessionProjectionJournal | None = None,
     ) -> None:
         self.archive_store = archive_store
         self.queue_store = queue_store
         self.committer = committer
-        self.memory_planner = memory_planner
         self.behavior_planner = behavior_planner or BehaviorCommitPlanner()
         self.action_policy_planner = action_policy_planner or ActionPolicyCommitPlanner()
         self.context_planner = context_planner or ContextCommitPlanner()
@@ -69,13 +61,6 @@ class SessionCommitService(_SessionCommitSupport):
         ):
             raise ValueError("CommitGroupStore root differs from the bound Session tenant")
         self.commit_group_store = commit_group_store or CommitGroupStore(expected_control_root)
-        self.memory_committer = memory_committer
-        planner_document = getattr(memory_planner, "document_planner", None)
-        if document_planner is not None and planner_document is not None and planner_document is not document_planner:
-            raise ValueError("Session and memory planners must share one document planner")
-        self.document_planner = document_planner or (
-            planner_document if isinstance(planner_document, MemoryDocumentPlanner) else None
-        )
         journal_store = getattr(session_projector, "catalog_store", None)
         self.projection_journal = projection_journal or SessionProjectionJournal(journal_store)
         self._startup_recovery_group: ContextVar[str] = ContextVar(
@@ -199,7 +184,6 @@ class SessionCommitService(_SessionCommitSupport):
 
         failures: list[tuple[str, bool]] = []
         actions: tuple[tuple[str, Callable[[str], dict[str, Any]]], ...] = (
-            ("memory", lambda attempt: self._commit_memory(archive, group_id, attempt)),
             (
                 "behavior",
                 self._skipped_action
@@ -249,7 +233,6 @@ class SessionCommitService(_SessionCommitSupport):
             raise DerivedConsumerError(
                 tuple((name, item.retryable) for name, item in group.consumers.items() if item.status != "completed")
             )
-        self._validate_persisted_memory_effects(group)
         self._write_outputs(archive, group, complete=True)
         if tracking:
             self._record_projection(archive, tenant_id=tenant_id, status="PENDING")

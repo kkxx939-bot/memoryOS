@@ -23,8 +23,6 @@ class DocumentEditPlan:
     new_relative_path: str = ""
     expected_new_state: RawPathState = ABSENT
     expected_registration_document_id: str = ""
-
-
 @dataclass(frozen=True)
 class DocumentChangeEvent:
     event_id: str

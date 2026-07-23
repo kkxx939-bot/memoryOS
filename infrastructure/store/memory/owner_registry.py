@@ -21,7 +21,7 @@ def discover_owner_ids(layout: RuntimeLayout, *, limit: int) -> tuple[str, ...]:
             raise RuntimeError("memory owner root is unsafe")
         for child in parent.iterdir():
             if child.name == "sealed-proposals":
-                continue
+                raise RuntimeError("legacy sealed-proposals residue must be removed explicitly")
             if child.is_symlink() or not child.is_dir():
                 raise RuntimeError("memory owner entry is unsafe")
             candidates.add(MemoryDocumentPathPolicy.trusted_segment(child.name, "owner_user_id"))

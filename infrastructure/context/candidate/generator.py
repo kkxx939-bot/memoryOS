@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from foundation.scope import scope_keys_from_payloads
@@ -122,6 +122,45 @@ class CandidateGenerator:
             source_reads=vector_source_reads,
             degraded_modes=modes,
         )
+
+    def generate_cold_lexical(
+        self,
+        plan: RetrievalQueryPlan,
+        *,
+        limit: int,
+    ) -> tuple[RetrievalCandidate, ...]:
+        """CURRENT 主阶段不足时，只从冷层执行一次有界词法查询。"""
+
+        bounded_limit = min(max(0, int(limit)), plan.candidate_limit)
+        if (
+            plan.query_intent is not RetrievalQueryIntent.CURRENT
+            or not plan.semantic_query
+            or bounded_limit == 0
+        ):
+            return ()
+        cold_tiers = {ServingTier.COLD.value, ServingTier.ARCHIVED.value}
+        filters = self._filters(plan)
+        filters["serving_tier"] = tuple(sorted(cold_tiers))
+        results: list[RetrievalCandidate] = []
+        seen: set[str] = set()
+        for hit in self._search_catalog(plan.semantic_query, filters, bounded_limit):
+            candidate = self.mapper.from_hit(hit)
+            if (
+                candidate.record_key in seen
+                or str(candidate.metadata.get("serving_tier") or "") not in cold_tiers
+            ):
+                continue
+            seen.add(candidate.record_key)
+            results.append(
+                replace(
+                    candidate,
+                    branch_scores={"lexical": self._finite_score(hit.score)},
+                    branch_ranks={},
+                )
+            )
+            if len(results) >= bounded_limit:
+                break
+        return tuple(results)
 
     def _structured_records(
         self,
@@ -280,9 +319,12 @@ class CandidateGenerator:
             if not 0.0 <= minimum_lexical_relevance <= 1.0:
                 raise ValueError("minimum_lexical_relevance must be between 0 and 1")
             filters["minimum_lexical_relevance"] = minimum_lexical_relevance
-        if plan.query_intent in {
+        if plan.query_intent is RetrievalQueryIntent.CURRENT:
+            filters["serving_tier"] = (ServingTier.HOT.value, ServingTier.WARM.value)
+        elif plan.query_intent in {
             RetrievalQueryIntent.HISTORY,
             RetrievalQueryIntent.OPEN_RECALL,
+            RetrievalQueryIntent.EXACT,
         }:
             filters["serving_tier"] = tuple(item.value for item in ServingTier)
         return filters
@@ -415,6 +457,9 @@ class CandidateGenerator:
         source_kinds = tuple(str(item) for item in filters.get("source_kinds", ()) or ())
         hit_source_kind = str(metadata.get("source_kind") or connect.get("source_kind") or "")
         if source_kinds and hit_source_kind not in source_kinds:
+            return False
+        allowed_tiers = {str(item) for item in filters.get("serving_tier", ()) or ()}
+        if allowed_tiers and str(metadata.get("serving_tier") or "") not in allowed_tiers:
             return False
         for filter_name, metadata_name in (
             ("record_kinds", "record_kind"),

@@ -79,7 +79,7 @@ class MemoryDocumentProjectionWorker(
                     job,
                     type(exc).__name__,
                     max_retries=5,
-                    retryable=not isinstance(exc, (DocumentErasedError, ValueError)),
+                    retryable=not isinstance(exc, DocumentErasedError | ValueError),
                 )
         return MemoryProjectionRun(tuple(processed), tuple(stale), tuple(failed))
 

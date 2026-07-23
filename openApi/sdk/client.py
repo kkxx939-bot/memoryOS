@@ -39,7 +39,6 @@ from infrastructure.store.model.context.context_uri import ContextURI
 from infrastructure.store.model.context.lifecycle import LifecycleState
 from memory.execute.command_service import MemoryCommandService
 from memory.execute.pending_review_service import MemoryEditReviewService
-from memory.ports import MemoryExtractorBackend
 from openApi.memory_contract import validate_memory_request, validate_memory_response
 from openApi.retrieval_contract import parse_retrieval_options
 from openApi.session_service import SessionApplicationService
@@ -68,7 +67,6 @@ class MemoryOSClient:
         embedding_provider: EmbeddingProvider | None = None,
         hybrid_search: HybridSearch | None = None,
         reranker: Reranker | None = None,
-        memory_extractor: MemoryExtractorBackend | None = None,
         model_config: ModelConfig | None = None,
         model_client: ModelClient | None = None,
         mode: str = "local",
@@ -101,7 +99,6 @@ class MemoryOSClient:
                 hybrid_search=hybrid_search,
                 reranker=reranker,
                 model_client=model_client,
-                memory_extractor=memory_extractor,
             ),
         ).build()
         runtime.start()

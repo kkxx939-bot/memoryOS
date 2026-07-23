@@ -25,11 +25,7 @@ class SessionCommitResult:
     done: bool = False
     state: SessionCommitState = SessionCommitState.QUEUED
     commit_group_id: str = ""
-    memory_committed: bool = False
     commit_group_status: dict[str, Any] = field(default_factory=dict)
     archive_committed: bool = False
-    memory_document_change_count: int = 0
-    edit_proposal_count: int = 0
-    edit_proposal_ids: tuple[str, ...] = ()
     session_projection_status: str = "not_configured"
     session_projected_count: int = 0

@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import cast
 
 from infrastructure.context.projection.memory_document import MemoryDocumentProjector
-from infrastructure.context.retrieval.memory_document_candidates import find_related_memory_documents
 from infrastructure.store.contracts.index import MemoryDocumentProjectionStore
 from infrastructure.store.contracts.path_lock import PathLock
 from infrastructure.store.filesystem.memory_document_store import FileSystemMemoryDocumentStore
@@ -18,11 +17,10 @@ from infrastructure.store.memory import (
     MemoryDocumentScanner,
     MemoryEditReviewStore,
 )
-from infrastructure.store.memory.evidence import SealedProposalEraseBackend, SealedProposalStore
 from infrastructure.store.trace import RecallTraceEraseBackend
 from memory.commit import MemoryDocumentCommitter, MemoryDocumentConsolidator, MemoryDocumentEraser
 from memory.commit.evidence.lineage import independent_session_archives
-from memory.execute import MemoryDocumentPlanner
+from memory.commit.remember_plan import ExplicitRememberPlanner
 from memory.execute.command_service import MemoryCommandService
 from memory.execute.external_change import publish_external_change as publish_external_memory_change
 from memory.execute.pending_review_service import MemoryEditReviewService
@@ -58,19 +56,11 @@ def wire_memory(
         max_front_matter_bytes=config.memory_front_matter_max_bytes,
         max_front_matter_depth=config.memory_front_matter_max_depth,
     )
-    planner = MemoryDocumentPlanner(
+    compiler = ExplicitRememberPlanner(
         document_store,
         max_front_matter_bytes=config.memory_front_matter_max_bytes,
         max_front_matter_depth=config.memory_front_matter_max_depth,
         max_edit_bytes=config.memory_document_max_bytes,
-        related_document_finder=lambda tenant, owner, proposal, limit: find_related_memory_documents(
-            stores.index,
-            tenant_id=tenant,
-            owner_user_id=owner,
-            proposal=proposal,
-            limit=limit,
-        ),
-        max_related_documents=8,
     )
     erasure_store = MemoryDocumentEraseStore(root)
     committer = MemoryDocumentCommitter(
@@ -102,7 +92,6 @@ def wire_memory(
         cast(ConsolidationProjectionReader, stores.index),
         saga_store=consolidation_store,
     )
-    proposal_store = SealedProposalStore(root, tenant_id=config.tenant_id)
     eraser = MemoryDocumentEraser(
         document_store,
         control_store,
@@ -111,12 +100,11 @@ def wire_memory(
         review_store=review_store,
         cleanup_backends=(
             MemoryDocumentCatalogEraseBackend(projection_worker),
-            SealedProposalEraseBackend(proposal_store),
             RecallTraceEraseBackend(root),
         ),
     )
     command_service = MemoryCommandService(
-        planner,
+        compiler,
         committer,
         eraser,
         bootstrapper=bootstrapper,
@@ -169,7 +157,7 @@ def wire_memory(
         revision_store=revision_store,
         review_store=review_store,
         bootstrapper=bootstrapper,
-        planner=planner,
+        compiler=compiler,
         committer=committer,
         erasure_store=erasure_store,
         consolidation_store=consolidation_store,
@@ -182,7 +170,6 @@ def wire_memory(
         eraser=eraser,
         command_service=command_service,
         review_service=review_service,
-        proposal_store=proposal_store,
     )
 
 

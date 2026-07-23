@@ -107,6 +107,11 @@ class _DocumentCommitPublication(_DocumentCommitRecovery):
             if any(isinstance(state, UnsafePath) for state in live):
                 self._mark_conflicted(current, "live document vector contains an UNSAFE path state")
             if live == before:
+                if current.status is not DocumentIntentStatus.PREPARED:
+                    self._mark_conflicted(
+                        current,
+                        "durable document intent advanced but live bytes returned to the before state",
+                    )
                 self._install(current)
                 self._verify_existing_root_identity(
                     current.tenant_id,
@@ -123,11 +128,12 @@ class _DocumentCommitPublication(_DocumentCommitRecovery):
                 current.tenant_id,
                 current.owner_user_id,
             )
-            current = self.control_store.update_intent(
-                current,
-                DocumentIntentStatus.INSTALLED,
-                updated_at=self.clock(),
-            )
+            if current.status is DocumentIntentStatus.PREPARED:
+                current = self.control_store.update_intent(
+                    current,
+                    DocumentIntentStatus.INSTALLED,
+                    updated_at=self.clock(),
+                )
             return self._complete_tail(current, recovered=recovered)
 
     def _install(self, intent: DocumentCommitIntent) -> None:
@@ -229,31 +235,56 @@ class _DocumentCommitPublication(_DocumentCommitRecovery):
             self._mark_conflicted(intent, "document registration no longer matches the expected raw state")
 
     def _complete_tail(self, intent: DocumentCommitIntent, *, recovered: bool) -> DocumentCommitResult:
-        event = self._event(intent)
-        self.control_store.append_event(intent, event)
-        self._notify("event_appended", intent)
-        intent = self.control_store.update_intent(
-            intent,
-            DocumentIntentStatus.EVENT_APPENDED,
-            updated_at=self.clock(),
-        )
-        revision = self.revision_store.record_revision(intent, event)
-        self._notify("revision_recorded", intent)
-        control = self._control_record(intent, event)
-        self.control_store.write_control(control)
-        self._notify("control_recorded", intent)
-        self.projection_queue.enqueue(self._projection_job(intent, event))
-        self._notify("projection_enqueued", intent)
-        intent = self.control_store.update_intent(
-            intent,
-            DocumentIntentStatus.PROJECTION_ENQUEUED,
-            updated_at=self.clock(),
-        )
-        intent = self.control_store.update_intent(
-            intent,
-            DocumentIntentStatus.COMPLETED,
-            updated_at=self.clock(),
-        )
+        if intent.status is DocumentIntentStatus.INSTALLED:
+            event = self._event(intent)
+            self.control_store.append_event(intent, event)
+            self._notify("event_appended", intent)
+            intent = self.control_store.update_intent(
+                intent,
+                DocumentIntentStatus.EVENT_APPENDED,
+                updated_at=self.clock(),
+            )
+        else:
+            event = self.control_store.load_event(intent)
+            if event is None:
+                raise DocumentControlIntegrityError("advanced document intent has no durable change event")
+
+        if intent.status is DocumentIntentStatus.EVENT_APPENDED:
+            revision = self.revision_store.record_revision(intent, event)
+            self._notify("revision_recorded", intent)
+            control = self._control_record(intent, event)
+            self.control_store.write_control(control)
+            self._notify("control_recorded", intent)
+            self.projection_queue.enqueue(self._projection_job(intent, event))
+            self._notify("projection_enqueued", intent)
+            intent = self.control_store.update_intent(
+                intent,
+                DocumentIntentStatus.PROJECTION_ENQUEUED,
+                updated_at=self.clock(),
+            )
+        else:
+            revision = self.revision_store.load_revision(
+                intent.tenant_id,
+                intent.owner_user_id,
+                intent.document_id,
+                intent.logical_revision,
+            )
+            control = self.control_store.load_control(
+                intent.tenant_id,
+                intent.owner_user_id,
+                intent.document_id,
+            )
+            if revision is None or control is None:
+                raise DocumentControlIntegrityError("projection-enqueued intent has incomplete durable metadata")
+
+        if intent.status is DocumentIntentStatus.PROJECTION_ENQUEUED:
+            intent = self.control_store.update_intent(
+                intent,
+                DocumentIntentStatus.COMPLETED,
+                updated_at=self.clock(),
+            )
+        elif intent.status is not DocumentIntentStatus.COMPLETED:
+            raise DocumentControlIntegrityError(f"unsupported document tail recovery state: {intent.status.value}")
         self._notify("completed", intent)
         return DocumentCommitResult(
             intent_id=intent.intent_id,
@@ -492,18 +523,16 @@ class _DocumentCommitPublication(_DocumentCommitRecovery):
     def _is_retryable_interruption(self, exc: BaseException) -> bool:
         if isinstance(
             exc,
-            (
-                DocumentCommitConflict,
-                DocumentControlIntegrityError,
-                DocumentNotFoundError,
-                DocumentUnsafeError,
-                PermissionError,
-                ValueError,
-                TypeError,
-            ),
+            DocumentCommitConflict
+            | DocumentControlIntegrityError
+            | DocumentNotFoundError
+            | DocumentUnsafeError
+            | PermissionError
+            | ValueError
+            | TypeError,
         ):
             return False
-        if isinstance(exc, (DocumentConflictError, OSError)):
+        if isinstance(exc, DocumentConflictError | OSError):
             return True
         explicit = getattr(exc, "retryable", None)
         if isinstance(explicit, bool):

@@ -62,8 +62,7 @@ class MemoryEditReviewResult:
     consolidation_status: str = ""
     target_projection_generation: int = 0
     target_projection_confirmed: bool = False
-    soft_forgotten_document_ids: tuple[str, ...] = ()
-    pending_document_ids: tuple[str, ...] = ()
+    preserved_source_document_ids: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -543,10 +542,9 @@ class MemoryEditReviewService:
             target_projection_confirmed=(
                 consolidation.target_projection_confirmed if consolidation is not None else False
             ),
-            soft_forgotten_document_ids=(
-                consolidation.soft_forgotten_document_ids if consolidation is not None else ()
+            preserved_source_document_ids=(
+                consolidation.preserved_source_document_ids if consolidation is not None else ()
             ),
-            pending_document_ids=(consolidation.pending_document_ids if consolidation is not None else ()),
         )
 
     def _require_ready(self) -> None:

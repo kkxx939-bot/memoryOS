@@ -223,7 +223,7 @@ class MemoryDocumentScanWorker:
         if self.owner_user_ids is None or limit <= 0:
             return ()
         raw = self.owner_user_ids(self.storage_namespace, self.owner_enumeration_limit)
-        if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        if not isinstance(raw, Sequence) or isinstance(raw, str | bytes):
             raise TypeError("memory document owner provider returned an invalid result")
         if len(raw) > self.owner_enumeration_limit:
             raise RuntimeError("memory document owner enumeration exceeded its bound")

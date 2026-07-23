@@ -531,7 +531,7 @@ def _pop_sequence(raw: dict[str, Any], key: str) -> tuple[Any, ...]:
 def _sequence_value(value: Any, key: str) -> tuple[Any, ...]:
     if value is None:
         return ()
-    if isinstance(value, (str, Enum)):
+    if isinstance(value, str | Enum):
         return (value,)
     if not isinstance(value, Sequence):
         raise TypeError(f"{key} must be a sequence")

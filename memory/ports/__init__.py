@@ -7,7 +7,6 @@ from memory.ports.document_store import (
     MemoryDocumentStore,
     MemoryDocumentStoreError,
 )
-from memory.ports.extractor import MemoryExtractionModelProvider, MemoryExtractorBackend
 
 __all__ = [
     "DocumentConflictError",
@@ -15,6 +14,4 @@ __all__ = [
     "DocumentUnsafeError",
     "MemoryDocumentStore",
     "MemoryDocumentStoreError",
-    "MemoryExtractionModelProvider",
-    "MemoryExtractorBackend",
 ]

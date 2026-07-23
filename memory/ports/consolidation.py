@@ -10,11 +10,11 @@ from enum import Enum
 from typing import Protocol
 
 from foundation.integrity import canonical_json
-from memory.core.model import DocumentEditPlan, PresentPath, raw_state_to_dict
+from memory.core.model import DocumentEditPlan, raw_state_to_dict
 from memory.core.structure.frontmatter import validate_document_id
 from memory.core.structure.path_policy import MemoryDocumentPathPolicy
 
-_SAGA_SCHEMA = "memory_document_consolidation_v1"
+_SAGA_SCHEMA = "memory_document_consolidation_v2"
 _MAX_SAGA_BYTES = 1024 * 1024
 _MAX_SOURCES = 1_000
 _MAX_SAGAS_PER_OWNER = 10_000
@@ -30,9 +30,7 @@ class ConsolidationInputRequired(RuntimeError):
 
 class ConsolidationStatus(str, Enum):
     PREPARED = "PREPARED"
-    TARGET_COMMITTED = "TARGET_COMMITTED"
     AWAITING_TARGET_PROJECTION = "AWAITING_TARGET_PROJECTION"
-    SOFT_FORGETTING = "SOFT_FORGETTING"
     COMPLETED = "COMPLETED"
 
 
@@ -53,10 +51,6 @@ class ConsolidationSource:
         if self.size < 0:
             raise ValueError("consolidation source size cannot be negative")
 
-    @property
-    def expected_state(self) -> PresentPath:
-        return PresentPath(self.relative_path, self.raw_sha256, self.size)
-
     def to_dict(self) -> dict[str, object]:
         return {
             "document_id": self.document_id,
@@ -67,6 +61,8 @@ class ConsolidationSource:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> ConsolidationSource:
+        if set(payload) != {"document_id", "relative_path", "raw_sha256", "size"}:
+            raise ConsolidationIntegrityError("consolidation source fields are invalid")
         try:
             return cls(
                 document_id=str(payload["document_id"]),
@@ -97,7 +93,6 @@ class ConsolidationSagaRecord:
     status: ConsolidationStatus
     target_projection_generation: int
     target_projection_confirmed_at: str
-    next_source_index: int
     created_at: str
     updated_at: str
 
@@ -122,20 +117,17 @@ class ConsolidationSagaRecord:
         source_ids = tuple(source.document_id for source in self.sources)
         if len(set(source_ids)) != len(source_ids) or target in source_ids:
             raise ValueError("consolidation sources must be unique and cannot include the target")
-        if not 0 <= self.next_source_index <= len(self.sources):
-            raise ValueError("consolidation source cursor is invalid")
         if self.target_projection_generation < 0:
             raise ValueError("target projection generation cannot be negative")
         if self.status == ConsolidationStatus.PREPARED and self.target_projection_generation:
             raise ValueError("a prepared consolidation cannot claim a target generation")
         if self.status != ConsolidationStatus.PREPARED and self.target_projection_generation <= 0:
             raise ValueError("an advanced consolidation requires a target generation")
-        if self.target_projection_confirmed_at and self.target_projection_generation <= 0:
-            raise ValueError("target projection confirmation requires a generation")
-        if self.next_source_index and not self.target_projection_confirmed_at:
-            raise ValueError("source deletion cannot precede target projection confirmation")
-        if self.status == ConsolidationStatus.COMPLETED and self.next_source_index != len(self.sources):
-            raise ValueError("a completed consolidation must finish every source")
+        if self.status == ConsolidationStatus.COMPLETED:
+            if not self.target_projection_confirmed_at:
+                raise ValueError("a completed consolidation requires target projection confirmation")
+        elif self.target_projection_confirmed_at:
+            raise ValueError("only a completed consolidation may claim projection confirmation")
         if not self.created_at or not self.updated_at:
             raise ValueError("consolidation timestamps must be non-empty")
         expected_saga_id = consolidation_saga_id(tenant, owner, self.idempotency_digest)
@@ -170,7 +162,6 @@ class ConsolidationSagaRecord:
             "status": self.status.value,
             "target_projection_generation": self.target_projection_generation,
             "target_projection_confirmed_at": self.target_projection_confirmed_at,
-            "next_source_index": self.next_source_index,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -179,6 +170,28 @@ class ConsolidationSagaRecord:
     def from_dict(cls, payload: Mapping[str, object]) -> ConsolidationSagaRecord:
         if payload.get("schema") != _SAGA_SCHEMA:
             raise ConsolidationIntegrityError("consolidation schema is unsupported")
+        required = {
+            "schema",
+            "saga_id",
+            "identity_digest",
+            "idempotency_digest",
+            "tenant_id",
+            "owner_user_id",
+            "actor_binding",
+            "target_document_id",
+            "target_relative_path",
+            "target_source_digest",
+            "target_plan_digest",
+            "target_intent_id",
+            "sources",
+            "status",
+            "target_projection_generation",
+            "target_projection_confirmed_at",
+            "created_at",
+            "updated_at",
+        }
+        if set(payload) != required:
+            raise ConsolidationIntegrityError("consolidation journal fields are invalid")
         raw_sources = payload.get("sources")
         if not isinstance(raw_sources, list):
             raise ConsolidationIntegrityError("consolidation sources must be an array")
@@ -202,7 +215,6 @@ class ConsolidationSagaRecord:
                     "target projection generation",
                 ),
                 target_projection_confirmed_at=str(payload.get("target_projection_confirmed_at") or ""),
-                next_source_index=_coerce_int(payload["next_source_index"], "consolidation source cursor"),
                 created_at=str(payload["created_at"]),
                 updated_at=str(payload["updated_at"]),
             )
@@ -212,7 +224,7 @@ class ConsolidationSagaRecord:
 
 def consolidation_saga_id(tenant_id: str, owner_user_id: str, idempotency_digest: str) -> str:
     encoded = canonical_json(
-        ["memory_document_consolidation_v1", tenant_id, owner_user_id, idempotency_digest]
+        ["memory_document_consolidation_v2", tenant_id, owner_user_id, idempotency_digest]
     ).encode()
     return f"memsaga_{hashlib.sha256(encoded).hexdigest()}"
 
@@ -228,8 +240,7 @@ class ConsolidationResult:
     target_document_id: str
     target_projection_generation: int
     target_projection_confirmed: bool
-    soft_forgotten_document_ids: tuple[str, ...]
-    pending_document_ids: tuple[str, ...]
+    preserved_source_document_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -254,7 +265,7 @@ ConsolidationFaultHook = Callable[[str, ConsolidationSagaRecord], None]
 
 
 class ConsolidationProjectionReader(Protocol):
-    """删除来源文档前所需的最小派生状态证明。"""
+    """完成合并前所需的目标投影状态证明。"""
 
     def get_memory_document_projection_state(
         self,
@@ -330,12 +341,9 @@ def _mapping(value: object) -> dict[str, object]:
 
 
 def _coerce_int(value: object, label: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, (int, str, bytes, bytearray)):
+    if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{label} must be an integer")
-    try:
-        return int(value)
-    except ValueError as exc:
-        raise ValueError(f"{label} must be an integer") from exc
+    return value
 
 
 def _require_digest(value: str, label: str) -> None:
@@ -352,10 +360,8 @@ def _validate_prefixed_digest(value: str, prefix: str, label: str) -> None:
 def _status_rank(status: ConsolidationStatus) -> int:
     return {
         ConsolidationStatus.PREPARED: 0,
-        ConsolidationStatus.TARGET_COMMITTED: 1,
-        ConsolidationStatus.AWAITING_TARGET_PROJECTION: 2,
-        ConsolidationStatus.SOFT_FORGETTING: 3,
-        ConsolidationStatus.COMPLETED: 4,
+        ConsolidationStatus.AWAITING_TARGET_PROJECTION: 1,
+        ConsolidationStatus.COMPLETED: 2,
     }[status]
 
 

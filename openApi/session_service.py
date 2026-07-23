@@ -268,7 +268,6 @@ class SessionApplicationService:
             "queue_store": operational_state,
             "worker": worker_status,
             "worker_health": worker_health,
-            "memory_extractor": optional_state(self.session_commit_service.memory_planner.extractor),
             "model_client": optional_state(self.model_client),
             "embedding": optional_state(self.embedding_provider),
             "vector_store": optional_state(self.vector_store),

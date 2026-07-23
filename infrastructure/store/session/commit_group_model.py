@@ -8,43 +8,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from foundation.ids import require_safe_path_segment
-from memory.core.structure.frontmatter import validate_document_id
 
-CONSUMERS = ("memory", "behavior", "action_policy", "context")
-_SCHEMA = "session_commit_group_v1"
+CONSUMERS = ("behavior", "action_policy", "context")
+_SCHEMA = "session_commit_group_v2"
 _TERMINAL = {"completed", "dead_letter", "quarantine"}
-
-
-@dataclass(frozen=True)
-class MemoryDocumentEffect:
-    """唯一允许持久化的 Memory 副作用，不保存 Markdown 或渲染计划字节。"""
-
-    document_id: str
-    change_event_id: str
-    change_digest: str
-
-    def __post_init__(self) -> None:
-        validate_document_id(self.document_id)
-        if not self.change_event_id.startswith("memchg_") or not _is_hex(
-            self.change_event_id.removeprefix("memchg_"), 64
-        ):
-            raise ValueError("memory document change event ID is invalid")
-        _require_digest(self.change_digest, "document change digest")
-
-    def to_dict(self) -> dict[str, str]:
-        return {
-            "document_id": self.document_id,
-            "change_event_id": self.change_event_id,
-            "change_digest": self.change_digest,
-        }
-
-    @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> MemoryDocumentEffect:
-        return cls(
-            document_id=str(payload["document_id"]),
-            change_event_id=str(payload["change_event_id"]),
-            change_digest=str(payload["change_digest"]),
-        )
 
 
 @dataclass
@@ -115,7 +82,6 @@ class CommitGroupStatus:
     archive_digest: str
     manifest_digest: str
     consumers: dict[str, ConsumerStatus] = field(default_factory=lambda: {name: ConsumerStatus() for name in CONSUMERS})
-    memory_effects: list[MemoryDocumentEffect] = field(default_factory=list)
     created_at: str = ""
     updated_at: str = ""
 
@@ -130,8 +96,6 @@ class CommitGroupStatus:
             raise ValueError("commit group archive URI crosses its owner boundary")
         if set(self.consumers) != set(CONSUMERS):
             raise ValueError("commit group consumers do not match the greenfield schema")
-        if len({effect.change_event_id for effect in self.memory_effects}) != len(self.memory_effects):
-            raise ValueError("commit group has duplicate memory document change event IDs")
         for name, consumer in self.consumers.items():
             _validate_summary(name, consumer.summary)
         if not self.created_at or not self.updated_at:
@@ -145,10 +109,6 @@ class CommitGroupStatus:
     def terminal(self) -> bool:
         return all(item.status in _TERMINAL for item in self.consumers.values())
 
-    @property
-    def memory_committed(self) -> bool:
-        return self.consumers["memory"].status == "completed"
-
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema": _SCHEMA,
@@ -160,7 +120,6 @@ class CommitGroupStatus:
             "archive_digest": self.archive_digest,
             "manifest_digest": self.manifest_digest,
             "consumers": {name: self.consumers[name].to_dict() for name in CONSUMERS},
-            "memory_effects": [effect.to_dict() for effect in self.memory_effects],
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "complete": self.complete,
@@ -172,9 +131,8 @@ class CommitGroupStatus:
         if payload.get("schema") != _SCHEMA:
             raise ValueError("commit group schema is unsupported; reset is required")
         raw_consumers = payload.get("consumers")
-        raw_effects = payload.get("memory_effects")
-        if not isinstance(raw_consumers, dict) or not isinstance(raw_effects, list):
-            raise ValueError("commit group consumer or memory effect collection is malformed")
+        if not isinstance(raw_consumers, dict):
+            raise ValueError("commit group consumer collection is malformed")
         consumers = {
             name: ConsumerStatus.from_dict(_mapping(raw_consumers.get(name), f"{name} consumer")) for name in CONSUMERS
         }
@@ -187,20 +145,12 @@ class CommitGroupStatus:
             archive_digest=str(payload["archive_digest"]),
             manifest_digest=str(payload["manifest_digest"]),
             consumers=consumers,
-            memory_effects=[MemoryDocumentEffect.from_dict(_mapping(item, "memory effect")) for item in raw_effects],
             created_at=str(payload["created_at"]),
             updated_at=str(payload["updated_at"]),
         )
 
 def _validate_summary(consumer: str, summary: Mapping[str, Any]) -> None:
     allowed = {
-        "memory": {
-            "status",
-            "edit_proposal_count",
-            "edit_proposal_ids",
-            "document_change_count",
-            "no_op_count",
-        },
         "behavior": {"status", "operation_count", "operation_ids", "diff_id", "skipped"},
         "action_policy": {"status", "operation_count", "operation_ids", "diff_id", "skipped"},
         "context": {"status", "operation_count", "operation_ids", "diff_id", "skipped"},
@@ -214,7 +164,7 @@ def _validate_summary(consumer: str, summary: Mapping[str, Any]) -> None:
             raise ValueError("commit-group summary status must be a content-free code")
         if key == "diff_id" and value and not _is_identifier(value):
             raise ValueError("commit-group diff ID is invalid")
-        if key in {"edit_proposal_count", "document_change_count", "no_op_count", "operation_count"} and (
+        if key == "operation_count" and (
             isinstance(value, bool) or not isinstance(value, int) or value < 0
         ):
             raise ValueError("commit-group summary counter is invalid")
@@ -222,11 +172,6 @@ def _validate_summary(consumer: str, summary: Mapping[str, Any]) -> None:
             not isinstance(value, list) or any(not isinstance(item, str) or not _is_identifier(item) for item in value)
         ):
             raise ValueError("commit-group operation IDs are invalid")
-        if key == "edit_proposal_ids" and (
-            not isinstance(value, list)
-            or any(not isinstance(item, str) or not item.startswith("mdreview_") or not _is_identifier(item) for item in value)
-        ):
-            raise ValueError("commit-group edit proposal IDs are invalid")
         if key == "skipped" and not isinstance(value, bool):
             raise ValueError("commit-group skipped flag is invalid")
 
@@ -262,5 +207,4 @@ __all__ = [
     "CONSUMERS",
     "CommitGroupStatus",
     "ConsumerStatus",
-    "MemoryDocumentEffect",
 ]

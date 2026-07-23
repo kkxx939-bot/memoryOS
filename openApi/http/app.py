@@ -106,10 +106,6 @@ def handle(
             "done": result.done,
             "state": result.state.value,
             "commit_group_id": result.commit_group_id,
-            "memory_committed": result.memory_committed,
-            "memory_document_change_count": result.memory_document_change_count,
-            "edit_proposal_count": result.edit_proposal_count,
-            "edit_proposal_ids": list(result.edit_proposal_ids),
             "archive_committed": result.archive_committed,
             "session_projection_status": result.session_projection_status,
             "session_projected_count": result.session_projected_count,
@@ -576,8 +572,8 @@ def _local_context_from_env(
     adapter_id: str | None = None,
 ) -> LocalUserContext:
     return LocalUserContext(
-        user_id=user_id or os.environ.get("MEMORYOS_USER_ID", "local-user"),
-        adapter_id=adapter_id or os.environ.get("MEMORYOS_ADAPTER_ID", "codex"),
+        user_id=user_id or os.environ.get("MEMORYOS_USER_ID") or "local-user",
+        adapter_id=adapter_id or os.environ.get("MEMORYOS_ADAPTER_ID") or "codex",
         workspace_id=os.environ.get("MEMORYOS_WORKSPACE_ID", ""),
     )
 

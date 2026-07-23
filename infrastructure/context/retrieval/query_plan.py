@@ -395,7 +395,7 @@ def _normalize_paths(values: Sequence[str] | str | None) -> tuple[str, ...]:
 def _as_sequence(value: Any, label: str) -> tuple[Any, ...]:
     if value is None:
         return ()
-    if isinstance(value, (str, Enum)):
+    if isinstance(value, str | Enum):
         return (value,)
     if not isinstance(value, Sequence):
         raise TypeError(f"{label} must be a sequence")
@@ -521,7 +521,7 @@ def _normalize_json_mapping(value: Mapping[str, Any] | None) -> dict[str, Any]:
 def _normalize_json_value(value: Any, *, depth: int) -> Any:
     if depth > _MAX_METADATA_DEPTH:
         raise ValueError(f"metadata_filters exceeds the maximum depth of {_MAX_METADATA_DEPTH}")
-    if value is None or isinstance(value, (str, bool, int)):
+    if value is None or isinstance(value, str | bool | int):
         return value
     if isinstance(value, float):
         if not math.isfinite(value):
@@ -529,7 +529,7 @@ def _normalize_json_value(value: Any, *, depth: int) -> Any:
         return value
     if isinstance(value, Mapping):
         return _normalize_json_mapping_at_depth(value, depth=depth + 1)
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         if len(value) > MAX_FILTER_VALUES:
             raise ValueError(f"metadata_filters list exceeds the maximum of {MAX_FILTER_VALUES} values")
         return [_normalize_json_value(item, depth=depth + 1) for item in value]

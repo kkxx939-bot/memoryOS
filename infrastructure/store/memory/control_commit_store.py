@@ -75,10 +75,14 @@ class ControlCommitStoreMixin(ControlFileMixin):
             raise DocumentControlIntegrityError("document intent update is detached from its immutable identity")
         if current.status in {DocumentIntentStatus.COMPLETED, DocumentIntentStatus.CONFLICTED}:
             if current.status != status:
-                return current
+                raise DocumentControlIntegrityError("terminal document intent cannot be re-executed")
             return current
-        if status != DocumentIntentStatus.CONFLICTED and _status_rank(status) < _status_rank(current.status):
+        if status == current.status:
             return current
+        if status not in _INTENT_SUCCESSORS[current.status]:
+            raise DocumentControlIntegrityError(
+                f"illegal document intent transition {current.status.value}->{status.value}"
+            )
         updated = replace(current, status=status, updated_at=updated_at, conflict_reason=conflict_reason[:500])
         atomic_write_json(
             self._intent_path(updated.tenant_id, updated.owner_user_id, updated.intent_id),
@@ -111,7 +115,7 @@ class ControlCommitStoreMixin(ControlFileMixin):
         return tuple(
             intent
             for intent in self.intents(tenant_id, owner_user_id)
-            if intent.status != DocumentIntentStatus.COMPLETED
+            if intent.status not in {DocumentIntentStatus.COMPLETED, DocumentIntentStatus.CONFLICTED}
         )
 
     def append_event(self, intent: DocumentCommitIntent, event: DocumentChangeEvent) -> None:
@@ -276,15 +280,22 @@ class ControlCommitStoreMixin(ControlFileMixin):
         return tuple(records)
 
 
-def _status_rank(status: DocumentIntentStatus) -> int:
-    return {
-        DocumentIntentStatus.PREPARED: 0,
-        DocumentIntentStatus.INSTALLED: 1,
-        DocumentIntentStatus.EVENT_APPENDED: 2,
-        DocumentIntentStatus.PROJECTION_ENQUEUED: 3,
-        DocumentIntentStatus.COMPLETED: 4,
-        DocumentIntentStatus.CONFLICTED: 5,
-    }[status]
+_INTENT_SUCCESSORS: dict[DocumentIntentStatus, frozenset[DocumentIntentStatus]] = {
+    DocumentIntentStatus.PREPARED: frozenset(
+        {DocumentIntentStatus.INSTALLED, DocumentIntentStatus.CONFLICTED}
+    ),
+    DocumentIntentStatus.INSTALLED: frozenset(
+        {DocumentIntentStatus.EVENT_APPENDED, DocumentIntentStatus.CONFLICTED}
+    ),
+    DocumentIntentStatus.EVENT_APPENDED: frozenset(
+        {DocumentIntentStatus.PROJECTION_ENQUEUED, DocumentIntentStatus.CONFLICTED}
+    ),
+    DocumentIntentStatus.PROJECTION_ENQUEUED: frozenset(
+        {DocumentIntentStatus.COMPLETED, DocumentIntentStatus.CONFLICTED}
+    ),
+    DocumentIntentStatus.COMPLETED: frozenset(),
+    DocumentIntentStatus.CONFLICTED: frozenset(),
+}
 
 
 def _event_matches_intent(event: DocumentChangeEvent, intent: DocumentCommitIntent) -> bool:

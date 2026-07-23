@@ -26,7 +26,6 @@ from infrastructure.store.session.commit_group_model import (
     CONSUMERS,
     CommitGroupStatus,
     ConsumerStatus,
-    MemoryDocumentEffect,
     _content_free_error,
     _mapping,
     _validate_summary,
@@ -152,34 +151,6 @@ class CommitGroupStore:
     def start_consumer(self, group_id: str, consumer: str) -> CommitGroupStatus:
         self.claim_consumer(group_id, consumer, attempt_id=uuid.uuid4().hex)
         return self._required_unlocked(group_id)
-
-    def record_memory_effect(
-        self,
-        group_id: str,
-        effect: MemoryDocumentEffect,
-        *,
-        attempt_id: str,
-    ) -> CommitGroupStatus:
-        with self.group_lock(group_id):
-            status = self._required_unlocked(group_id)
-            memory = self._consumer(status, "memory")
-            self._assert_attempt(memory, attempt_id)
-            existing = next(
-                (item for item in status.memory_effects if item.change_event_id == effect.change_event_id),
-                None,
-            )
-            if existing is not None:
-                if existing != effect:
-                    raise CommitGroupIntegrityError(
-                        "memory change event ID is bound to another document effect"
-                    )
-                return status
-            status.memory_effects.append(effect)
-            status.updated_at = utc_now()
-            self._write(status)
-            if self.test_hook is not None:
-                self.test_hook("after_memory_effect_record", group_id)
-            return status
 
     def complete_consumer(
         self,
@@ -439,5 +410,4 @@ __all__ = [
     "CommitGroupStatus",
     "CommitGroupStore",
     "ConsumerStatus",
-    "MemoryDocumentEffect",
 ]

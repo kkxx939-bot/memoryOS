@@ -6,7 +6,6 @@ from infrastructure.store.session.commit_group import (
     CommitGroupStatus,
     CommitGroupStore,
     ConsumerStatus,
-    MemoryDocumentEffect,
 )
 
 __all__ = [
@@ -15,5 +14,4 @@ __all__ = [
     "CommitGroupStatus",
     "CommitGroupStore",
     "ConsumerStatus",
-    "MemoryDocumentEffect",
 ]

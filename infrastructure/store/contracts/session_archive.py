@@ -19,7 +19,6 @@ class SessionArchiveStore(Protocol):
         archive_uri: str,
         abstract: str,
         overview: str,
-        memory_diff: dict,
         behavior_diff: dict,
         action_policy_diff: dict,
         context_diff: dict,

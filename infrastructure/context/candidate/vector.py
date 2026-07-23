@@ -10,7 +10,7 @@ from infrastructure.context.retrieval.fusion import RetrievalCandidate
 from infrastructure.context.retrieval.query_plan import RetrievalQueryPlan
 from infrastructure.store.contracts.index import IndexStore
 from infrastructure.store.contracts.vector import VectorHit, VectorStore, vector_capabilities, vector_row_id
-from infrastructure.store.model.catalog import CatalogRecord
+from infrastructure.store.model.catalog import CatalogRecord, ServingTier
 from sanitization.context_projection import ContextProjectionSanitizer
 
 
@@ -47,6 +47,12 @@ class VectorCandidateSource:
 
         if self.vector_store is None or self.embedding_provider is None or not plan.semantic_query:
             return (), "", 0, 0
+        eligible_tiers = {ServingTier.HOT.value, ServingTier.WARM.value}
+        candidates = tuple(
+            item
+            for item in candidates
+            if str(item.metadata.get("serving_tier") or "") in eligible_tiers
+        )
         vector_limit = min(plan.candidate_limit, self.MAX_OVERFETCH)
         capabilities = vector_capabilities(self.vector_store)
         native_filtering = all(
@@ -75,7 +81,7 @@ class VectorCandidateSource:
             return (), f"vector_fallback:{type(exc).__name__}", 0, len(bounded)
         if (
             not isinstance(raw_hits, Sequence)
-            or isinstance(raw_hits, (str, bytes, bytearray))
+            or isinstance(raw_hits, str | bytes | bytearray)
             or any(not isinstance(hit, VectorHit) for hit in raw_hits)
         ):
             return (), "vector_fallback:InvalidResponse", 0, len(bounded)
@@ -101,7 +107,10 @@ class VectorCandidateSource:
         embedding_provider = self.embedding_provider
         if not callable(filtered_search) or not callable(lister) or embedding_provider is None:
             return (), "vector_filtered_contract_missing", 0, 0
-        filters = self.filters_for_plan(plan)
+        filters = {
+            **self.filters_for_plan(plan),
+            "serving_tier": (ServingTier.HOT.value, ServingTier.WARM.value),
+        }
         try:
             embedding = embedding_provider.embed(self._provider_query(plan.semantic_query))
             raw_hits: Any = filtered_search(
@@ -114,7 +123,7 @@ class VectorCandidateSource:
             return (), f"vector_fallback:{type(exc).__name__}", 0, vector_limit
         if (
             not isinstance(raw_hits, Sequence)
-            or isinstance(raw_hits, (str, bytes, bytearray))
+            or isinstance(raw_hits, str | bytes | bytearray)
             or any(not isinstance(hit, VectorHit) for hit in raw_hits)
         ):
             return (), "vector_fallback:InvalidResponse", 0, vector_limit

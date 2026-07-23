@@ -30,14 +30,11 @@ class _SessionCommitState:
     archive_store: Any
     queue_store: Any
     committer: Any
-    memory_planner: Any
     behavior_planner: Any
     action_policy_planner: Any
     context_planner: Any
     session_projector: Any
     commit_group_store: Any
-    memory_committer: Any
-    document_planner: Any
     projection_journal: Any
     _startup_recovery_group: Any
 
@@ -59,28 +56,10 @@ class _SessionCommitState:
     def _bind_archive_tenant(self, *args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError
 
-    def _validate_persisted_memory_effects(self, *args: Any, **kwargs: Any) -> Any:
-        raise NotImplementedError
-
     def _startup_recovery_scope(self, *args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError
 
     def _tenant_id(self, *args: Any, **kwargs: Any) -> Any:
-        raise NotImplementedError
-
-    def _is_sha256(self, *args: Any, **kwargs: Any) -> Any:
-        raise NotImplementedError
-
-    def _validate_document_plan(self, *args: Any, **kwargs: Any) -> Any:
-        raise NotImplementedError
-
-    def _effect_from_document_result(self, *args: Any, **kwargs: Any) -> Any:
-        raise NotImplementedError
-
-    def _actor_binding(self, *args: Any, **kwargs: Any) -> Any:
-        raise NotImplementedError
-
-    def _evidence_reference(self, *args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError
 
     def _stabilize_operations(self, *args: Any, **kwargs: Any) -> Any:

@@ -7,7 +7,6 @@ from collections.abc import Callable, Sequence
 from dataclasses import replace
 
 from foundation.clock import utc_now
-from foundation.integrity import canonical_json
 from infrastructure.store.memory.control_store import document_intent_id
 from memory.commit.document_commit import DocumentCommitResult, MemoryDocumentCommitter
 from memory.core.model import DocumentEditKind, DocumentEditPlan, PresentPath
@@ -58,7 +57,7 @@ class MemoryDocumentConsolidator:
         idempotency_key: str,
         actor_binding: str,
     ) -> ConsolidationResult:
-        """先提交并确认目标投影，再按顺序软删除来源文档。"""
+        """提交并确认目标投影；来源 Markdown 始终保留。"""
 
         prepared = self._prepare_record(
             target_plan,
@@ -103,7 +102,7 @@ class MemoryDocumentConsolidator:
         """使用已封存的操作者绑定，在上限内恢复所有待处理 Saga。
 
         如果 PREPARED Saga 没有耐久目标 Intent，仅凭无正文日志无法重建；
-        此时将其报告为等待输入并保持不动，尤其不能开始删除来源文档。
+        此时将其报告为等待输入并保持不动。
         """
 
         pending = self.saga_store.list_pending(tenant_id, owner_user_id, limit=limit)
@@ -138,8 +137,7 @@ class MemoryDocumentConsolidator:
         target_plan: DocumentEditPlan | None,
     ) -> ConsolidationResult:
         if record.status == ConsolidationStatus.COMPLETED:
-            self._require_target_live(record)
-            return self._result(record, projection_confirmed=self._target_projection_matches(record))
+            return self._result(record)
 
         if record.target_projection_generation == 0:
             target_result = self._commit_target(record, target_plan)
@@ -154,7 +152,7 @@ class MemoryDocumentConsolidator:
             record = self.saga_store.save(
                 replace(
                     record,
-                    status=ConsolidationStatus.TARGET_COMMITTED,
+                    status=ConsolidationStatus.AWAITING_TARGET_PROJECTION,
                     target_projection_generation=control.projection_generation,
                     updated_at=self.clock(),
                 )
@@ -163,62 +161,19 @@ class MemoryDocumentConsolidator:
 
         self._require_target_live(record)
         if not self._target_projection_matches(record):
-            if record.status in {
-                ConsolidationStatus.TARGET_COMMITTED,
-                ConsolidationStatus.AWAITING_TARGET_PROJECTION,
-            }:
-                record = self.saga_store.save(
-                    replace(
-                        record,
-                        status=ConsolidationStatus.AWAITING_TARGET_PROJECTION,
-                        updated_at=self.clock(),
-                    )
-                )
-            return self._result(record, projection_confirmed=False)
+            return self._result(record)
 
         if not record.target_projection_confirmed_at:
-            final_status = ConsolidationStatus.COMPLETED if not record.sources else ConsolidationStatus.SOFT_FORGETTING
             record = self.saga_store.save(
                 replace(
                     record,
-                    status=final_status,
+                    status=ConsolidationStatus.COMPLETED,
                     target_projection_confirmed_at=self.clock(),
                     updated_at=self.clock(),
                 )
             )
             self._notify("after_projection_checkpoint", record)
-
-        while record.next_source_index < len(record.sources):
-            self._require_target_live(record)
-            if not self._target_projection_matches(record):
-                return self._result(record, projection_confirmed=False)
-            source_index = record.next_source_index
-            source = record.sources[source_index]
-            source_plan = self._source_delete_plan(record, source, source_index)
-            result = self.committer.commit(
-                source_plan,
-                actor_binding=record.actor_binding,
-                evidence_reference=f"consolidation:{record.saga_id}:source:{source_index}",
-            )
-            if result.control is None or result.control.status != "deleted":
-                raise DocumentConflictError("consolidation source soft-forget did not install ABSENT")
-            self._notify("after_source_commit", record)
-            next_index = source_index + 1
-            status = (
-                ConsolidationStatus.COMPLETED
-                if next_index == len(record.sources)
-                else ConsolidationStatus.SOFT_FORGETTING
-            )
-            record = self.saga_store.save(
-                replace(
-                    record,
-                    status=status,
-                    next_source_index=next_index,
-                    updated_at=self.clock(),
-                )
-            )
-            self._notify("after_source_checkpoint", record)
-        return self._result(record, projection_confirmed=True)
+        return self._result(record)
 
     def _commit_target(
         self,
@@ -336,58 +291,19 @@ class MemoryDocumentConsolidator:
             status=ConsolidationStatus.PREPARED,
             target_projection_generation=0,
             target_projection_confirmed_at="",
-            next_source_index=0,
             created_at=now,
             updated_at=now,
         )
 
     @staticmethod
-    def _source_delete_plan(
-        record: ConsolidationSagaRecord,
-        source: ConsolidationSource,
-        source_index: int,
-    ) -> DocumentEditPlan:
-        evidence_digest = hashlib.sha256(
-            canonical_json(
-                [
-                    "memory_document_consolidation_source_v1",
-                    record.saga_id,
-                    source_index,
-                    source.document_id,
-                    source.relative_path,
-                    source.raw_sha256,
-                ]
-            ).encode()
-        ).hexdigest()
-        return DocumentEditPlan(
-            idempotency_key=f"consolidation:{record.saga_id}:soft-forget:{source_index}",
-            tenant_id=record.tenant_id,
-            owner_user_id=record.owner_user_id,
-            edit_kind=DocumentEditKind.DELETE,
-            expected_state=source.expected_state,
-            evidence_digest=evidence_digest,
-            edit_summary="consolidation soft forget redundant source",
-            document_id=source.document_id,
-            relative_path=source.relative_path,
-            expected_registration_document_id=source.document_id,
-        )
-
-    @staticmethod
-    def _result(
-        record: ConsolidationSagaRecord,
-        *,
-        projection_confirmed: bool,
-    ) -> ConsolidationResult:
+    def _result(record: ConsolidationSagaRecord) -> ConsolidationResult:
         return ConsolidationResult(
             saga_id=record.saga_id,
             status=record.status,
             target_document_id=record.target_document_id,
             target_projection_generation=record.target_projection_generation,
-            target_projection_confirmed=projection_confirmed,
-            soft_forgotten_document_ids=tuple(
-                source.document_id for source in record.sources[: record.next_source_index]
-            ),
-            pending_document_ids=tuple(source.document_id for source in record.sources[record.next_source_index :]),
+            target_projection_confirmed=bool(record.target_projection_confirmed_at),
+            preserved_source_document_ids=tuple(source.document_id for source in record.sources),
         )
 
     def _notify(self, stage: str, record: ConsolidationSagaRecord) -> None:

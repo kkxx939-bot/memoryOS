@@ -22,7 +22,7 @@ def recover_session_commit_groups(service: SessionCommitService) -> dict[str, An
             tenant_id=group.tenant_id,
         )
         result = service.resume_startup_commit_group(archive, group_id=group.group_id)
-        if not result.done or not result.memory_committed:
+        if not result.done:
             raise RuntimeError(f"Session commit group remains incomplete: {group.group_id}")
         resumed += 1
     return {"abandoned_leases": abandoned, "expired_consumers": expired, "resumed": resumed}

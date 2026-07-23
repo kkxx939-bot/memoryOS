@@ -68,8 +68,6 @@ class MemoryDocumentConsolidationStore:
         current = self.load(record.tenant_id, record.owner_user_id, record.saga_id)
         if current is None or current.identity_digest != record.identity_digest:
             raise ConsolidationIntegrityError("consolidation update is detached from its immutable identity")
-        if record.next_source_index < current.next_source_index:
-            raise ConsolidationIntegrityError("consolidation source cursor cannot move backward")
         if (
             current.target_projection_generation
             and record.target_projection_generation != current.target_projection_generation

@@ -107,7 +107,12 @@ class ContextSelector:
 
         ordered = sorted(
             candidates,
-            key=lambda item: (self._priority(item, plan), -item.score.final_score, item.record_key),
+            key=lambda item: (
+                self._tier_priority(item, plan),
+                self._priority(item, plan),
+                -item.score.final_score,
+                item.record_key,
+            ),
         )
         for item in ordered:
             if len(selected) >= plan.final_limit:
@@ -232,6 +237,17 @@ class ContextSelector:
             }
             return order.get(record_kind, order.get(source_kind, 6))
         return 4
+
+    @staticmethod
+    def _tier_priority(item: RetrievalCandidate, plan: RetrievalQueryPlan) -> int:
+        if plan.query_intent is not RetrievalQueryIntent.CURRENT:
+            return 0
+        tier = str(item.metadata.get("serving_tier") or "")
+        if tier in {"HOT", "WARM"}:
+            return 0
+        if tier in {"COLD", "ARCHIVED"}:
+            return 1
+        return 2
 
     @staticmethod
     def _ordinary_resource_l2_eligible(item: RetrievalCandidate) -> bool:

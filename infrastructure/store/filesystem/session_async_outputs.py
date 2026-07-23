@@ -33,13 +33,12 @@ try:  # pragma: no cover - 生产使用的 POSIX 平台均提供 fcntl。
 except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
 
-ASYNC_OUTPUT_MANIFEST_SCHEMA_VERSION = "session_async_output_manifest_v1"
-ASYNC_OUTPUT_HEAD_SCHEMA_VERSION = "session_async_output_head_v1"
+ASYNC_OUTPUT_MANIFEST_SCHEMA_VERSION = "session_async_output_manifest_v2"
+ASYNC_OUTPUT_HEAD_SCHEMA_VERSION = "session_async_output_head_v2"
 
 ASYNC_OUTPUT_FILES = (
     "abstract.md",
     "overview.md",
-    "memory_diff.json",
     "behavior_diff.json",
     "action_policy_diff.json",
     "context_diff.json",
@@ -73,7 +72,6 @@ class SessionAsyncOutputStore:
         archive_uri: str,
         abstract: str,
         overview: str,
-        memory_diff: dict,
         behavior_diff: dict,
         action_policy_diff: dict,
         context_diff: dict,
@@ -87,12 +85,11 @@ class SessionAsyncOutputStore:
 
         directory = self.layout.directory(archive_uri, tenant_id=tenant_id)
         resolved_task_id = require_safe_path_segment(
-            task_id or memory_diff.get("task_id"),
+            task_id or context_diff.get("task_id"),
             "async output task_id",
         )
         resolved_tenant = tenant_id or self.layout.tenant_id
         json_payloads = {
-            "memory_diff.json": memory_diff,
             "behavior_diff.json": behavior_diff,
             "action_policy_diff.json": action_policy_diff,
             "context_diff.json": context_diff,

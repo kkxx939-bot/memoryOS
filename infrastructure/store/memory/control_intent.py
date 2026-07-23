@@ -65,6 +65,8 @@ class DocumentPathEffect:
             before=raw_state_from_dict(_mapping(payload.get("before"), "intent before state")),
             after=raw_state_from_dict(_mapping(payload.get("after"), "intent after state")),
         )
+
+
 @dataclass(frozen=True)
 class DocumentCommitIntent:
     """针对一个文档身份、且不含正文的前滚日志。"""
@@ -268,6 +270,37 @@ class DocumentCommitIntent:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> DocumentCommitIntent:
+        required = {
+            "schema",
+            "intent_id",
+            "idempotency_digest",
+            "tenant_id",
+            "owner_user_id",
+            "document_id",
+            "edit_kind",
+            "effects",
+            "after_blob_digest",
+            "revision_blob_digest",
+            "revision_blob_role",
+            "logical_revision",
+            "projection_generation",
+            "event_id",
+            "projection_job_id",
+            "old_relative_path",
+            "new_relative_path",
+            "actor_binding",
+            "evidence_reference",
+            "evidence_digest",
+            "edit_summary",
+            "restored_from_deletion_generation",
+            "created_at",
+            "identity_digest",
+            "status",
+            "updated_at",
+            "conflict_reason",
+        }
+        if set(payload) != required:
+            raise DocumentControlIntegrityError("document intent is malformed")
         if payload.get("schema") != _INTENT_SCHEMA:
             raise DocumentControlIntegrityError("document intent schema is unsupported")
         try:
@@ -301,9 +334,7 @@ class DocumentCommitIntent:
                 status=DocumentIntentStatus(str(payload["status"])),
                 created_at=str(payload["created_at"]),
                 updated_at=str(payload["updated_at"]),
-                restored_from_deletion_generation=int(
-                    payload.get("restored_from_deletion_generation", 0)
-                ),
+                restored_from_deletion_generation=int(payload.get("restored_from_deletion_generation", 0)),
                 conflict_reason=str(payload.get("conflict_reason") or ""),
             )
         except (KeyError, TypeError, ValueError) as exc:
@@ -334,7 +365,5 @@ def deletion_event_digest(
     validate_document_id(document_id)
     if not _is_hex(before_raw_digest, 64) or projection_generation <= 0:
         raise ValueError("deletion event requires an exact before digest and positive generation")
-    material = "\x1f".join(
-        (event_id, document_id, before_raw_digest, str(projection_generation))
-    )
+    material = "\x1f".join((event_id, document_id, before_raw_digest, str(projection_generation)))
     return hashlib.sha256(material.encode()).hexdigest()

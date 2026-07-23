@@ -62,7 +62,11 @@ class _DocumentCommitRecovery(_DocumentCommitPreparation):
                 self.control_store.intents(tenant_id, owner_user_id),
             )
         completed: list[DocumentCommitResult] = []
-        conflicted: list[str] = []
+        conflicted = [
+            intent.intent_id
+            for intent in self.control_store.intents(tenant_id, owner_user_id)
+            if intent.status is DocumentIntentStatus.CONFLICTED
+        ]
         for intent in self.control_store.incomplete_intents(tenant_id, owner_user_id):
             try:
                 completed.append(self._resume_existing(intent, recovered=True))

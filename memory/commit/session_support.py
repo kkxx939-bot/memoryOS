@@ -7,84 +7,15 @@ from contextlib import AbstractContextManager, contextmanager
 from typing import Any, cast
 
 from foundation.ids import stable_hash
-from foundation.integrity import canonical_digest
 from infrastructure.store.contracts.queue import QueueJob
-from infrastructure.store.memory.control_store import (
-    DocumentDeletionStatus,
-    DocumentIntentStatus,
-)
-from infrastructure.store.session.commit_group import (
-    CommitGroupStatus,
-    MemoryDocumentEffect,
-)
-from memory.commit.document_commit import (
-    DocumentCommitResult,
-)
 from memory.commit.errors import RevisionConflictError
 from memory.commit.session_consumers import _SessionCommitConsumers
-from memory.core.model import DocumentEditPlan
 from memory.ports.document_store import DocumentConflictError
 from pre.session import SessionArchive
 from transaction.model.context_operation import ContextOperation
 
 
 class _SessionCommitSupport(_SessionCommitConsumers):
-    def _validate_persisted_memory_effects(self, group: CommitGroupStatus) -> None:
-        if not group.memory_effects:
-            return
-        if self.memory_committer is None:
-            raise RuntimeError("durable memory effects require MemoryDocumentCommitter")
-        for effect in group.memory_effects:
-            binding = self.memory_committer.control_store.load_event_binding(
-                group.tenant_id,
-                group.user_id,
-                effect.document_id,
-                effect.change_event_id,
-            )
-            if binding is None:
-                barrier = self.memory_committer.control_store.load_publication_barrier(
-                    group.tenant_id,
-                    group.user_id,
-                    effect.document_id,
-                )
-                if barrier is not None and barrier.status is DocumentDeletionStatus.HARD_ERASED:
-                    continue
-                raise RuntimeError("commit-group memory effect is detached from its change event")
-            intent, event = binding
-            if intent.status is not DocumentIntentStatus.COMPLETED:
-                raise RuntimeError("commit-group memory effect is detached from its completed intent")
-            if canonical_digest(event.to_dict()) != effect.change_digest:
-                raise RuntimeError("commit-group memory effect is detached from its change event")
-            job = self.memory_committer.projection_queue.get(intent.projection_job_id)
-            if (
-                job is None
-                or job.queue_name != "memory_projection"
-                or job.action != "memory_committed"
-                or job.payload.get("intent_id") != intent.intent_id
-                or job.payload.get("document_id") != intent.document_id
-                or job.payload.get("event_id") != intent.event_id
-            ):
-                raise RuntimeError("completed memory intent has no durable projection job")
-
-    def _effect_from_document_result(self, result: DocumentCommitResult) -> MemoryDocumentEffect:
-        if result.status is not DocumentIntentStatus.COMPLETED or result.event is None:
-            raise RuntimeError("document committer did not complete its source and projection enqueue")
-        if result.event.document_id == "":
-            raise RuntimeError("document change event has no document identity")
-        return MemoryDocumentEffect(
-            document_id=result.event.document_id,
-            change_event_id=result.event.event_id,
-            change_digest=canonical_digest(result.event.to_dict()),
-        )
-
-    def _validate_document_plan(self, plan: DocumentEditPlan, archive: SessionArchive) -> None:
-        if plan.tenant_id != self._tenant_id(archive) or plan.owner_user_id != archive.user_id:
-            raise PermissionError("document plan crosses the archived Session boundary")
-        if not self._is_sha256(plan.evidence_digest):
-            raise ValueError("document plan evidence digest is invalid")
-        if not plan.idempotency_key:
-            raise ValueError("document plan idempotency key is empty")
-
     def _stabilize_operations(
         self,
         archive: SessionArchive,
@@ -173,8 +104,6 @@ class _SessionCommitSupport(_SessionCommitConsumers):
     def _require_runtime_ready(self) -> None:
         committer = getattr(self.committer, "delegate", self.committer)
         source_store = getattr(committer, "source_store", None)
-        if source_store is None:
-            source_store = getattr(self.memory_planner, "source_store", None)
         readiness = getattr(source_store, "readiness", None)
         require_ready = getattr(readiness, "require_ready", None)
         if not callable(require_ready) or self._startup_recovery_group.get():
@@ -240,15 +169,6 @@ class _SessionCommitSupport(_SessionCommitConsumers):
                 raise RuntimeError(f"SessionArchive {field} is not materialized")
 
     @staticmethod
-    def _actor_binding(archive: SessionArchive) -> str:
-        return f"session:{archive.task_id}:{archive.user_id}"
-
-    @staticmethod
-    def _evidence_reference(archive: SessionArchive, position: int) -> str:
-        manifest = archive.manifest_uri or f"{archive.archive_uri}#manifest={archive.manifest_digest}"
-        return f"{manifest}:memory-edit:{position}"
-
-    @staticmethod
     def _skipped_action(_attempt_id: str) -> dict[str, Any]:
         return {
             "status": "skipped",
@@ -268,8 +188,4 @@ class _SessionCommitSupport(_SessionCommitConsumers):
         explicit = getattr(exc, "retryable", None)
         if isinstance(explicit, bool):
             return explicit
-        return isinstance(exc, (OSError, TimeoutError, RevisionConflictError, DocumentConflictError))
-
-    @staticmethod
-    def _is_sha256(value: str) -> bool:
-        return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+        return isinstance(exc, OSError | TimeoutError | RevisionConflictError | DocumentConflictError)

@@ -81,8 +81,7 @@ def readiness_for_session_service(service: Any) -> Any | None:
     readiness = readiness_for_source_store(getattr(committer, "source_store", None))
     if readiness is not None:
         return readiness
-    planner = getattr(service, "memory_planner", None)
-    return readiness_for_source_store(getattr(planner, "source_store", None))
+    return None
 
 
 def require_source_store_ready(source_store: Any) -> None:

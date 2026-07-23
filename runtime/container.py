@@ -34,11 +34,9 @@ from infrastructure.store.memory import (
     MemoryEditReviewStore,
     RuntimeLayout,
 )
-from infrastructure.store.memory.evidence import SealedProposalStore
 from memory.commit import MemoryDocumentCommitter, MemoryDocumentConsolidator, MemoryDocumentEraser
-from memory.commit.planner import MemoryCommitPlanner
+from memory.commit.remember_plan import ExplicitRememberPlanner
 from memory.commit.session_commit import SessionCommitService
-from memory.execute import MemoryDocumentPlanner
 from memory.execute.command_service import MemoryCommandService
 from memory.execute.pending_review_service import MemoryEditReviewService
 from memory.worker.document_edit import MemoryDocumentEditWorker
@@ -91,7 +89,7 @@ class MemoryRuntime:
     revision_store: MemoryDocumentRevisionStore
     review_store: MemoryEditReviewStore
     bootstrapper: MemoryDocumentBootstrapper
-    planner: MemoryDocumentPlanner
+    compiler: ExplicitRememberPlanner
     committer: MemoryDocumentCommitter
     erasure_store: MemoryDocumentEraseStore
     consolidation_store: MemoryDocumentConsolidationStore
@@ -104,15 +102,13 @@ class MemoryRuntime:
     eraser: MemoryDocumentEraser
     command_service: MemoryCommandService
     review_service: MemoryEditReviewService
-    proposal_store: SealedProposalStore
 
 
 @dataclass(frozen=True)
 class SessionRuntime:
-    """会话证据归档、记忆规划和提交对象。"""
+    """会话证据归档和普通派生提交对象。"""
 
     archive_store: SessionArchiveStore
-    memory_planner: MemoryCommitPlanner
     commit_service: SessionCommitService
 
 

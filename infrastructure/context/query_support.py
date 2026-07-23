@@ -91,7 +91,7 @@ def _prepare_retrieval_options(
         requested: list[str] = []
     elif isinstance(raw_scope_keys, str):
         requested = [raw_scope_keys]
-    elif isinstance(raw_scope_keys, (list, tuple, set, frozenset)):
+    elif isinstance(raw_scope_keys, list | tuple | set | frozenset):
         requested = [str(item).strip() for item in raw_scope_keys]
     else:
         raise TypeError("applicability_scope_keys must be a sequence")

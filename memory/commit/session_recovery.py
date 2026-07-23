@@ -135,7 +135,7 @@ class _SessionCommitRecovery(_SessionCommitState):
         *,
         group_id: str,
     ) -> SessionCommitResult:
-        """精确校验归档和文档副作用后，重放一个耐久提交组。"""
+        """精确校验归档身份后，重放一个耐久提交组。"""
 
         expected_group = f"commit_group_{archive.task_id}"
         if group_id != expected_group:
@@ -162,14 +162,13 @@ class _SessionCommitRecovery(_SessionCommitState):
         )
         if identity != durable:
             raise RuntimeError("startup archive is detached from its durable commit group")
-        self._validate_persisted_memory_effects(group)
         with self._startup_recovery_scope(group_id):
             return self.async_commit(archive)
 
     def resumable_commit_groups(self, *, limit: int = 256) -> tuple[CommitGroupStatus, ...]:
         """发现未完成提交组，以及缺少异步输出的已完成提交组。
 
-        四个消费者全部耐久完成后、异步输出头发布前，进程仍可能退出。此时提交组
+        三个消费者全部耐久完成后、异步输出头发布前，进程仍可能退出。此时提交组
         在消费者存储中已经终结，``CommitGroupStore.pending()`` 无法发现它；恢复逻辑
         因而必须检查每个已完成提交组指向的精确不可变归档，再判断是否已经没有工作。
 

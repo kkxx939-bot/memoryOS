@@ -8,12 +8,8 @@ from typing import Any
 __all__ = [
     "AdoptResult",
     "MemoryCommandService",
-    "MemoryDocumentPlanner",
     "MemoryEditReviewPreview",
     "MemoryEditReviewService",
-    "RelatedDocumentCandidate",
-    "RelatedDocumentFinder",
-    "explicit_evidence_digest",
 ]
 
 _EXPORTS = {
@@ -26,16 +22,6 @@ _EXPORTS = {
     "MemoryEditReviewService": (
         "memory.execute.pending_review_service",
         "MemoryEditReviewService",
-    ),
-    "MemoryDocumentPlanner": ("memory.execute.write_planner", "MemoryDocumentPlanner"),
-    "RelatedDocumentCandidate": (
-        "memory.execute.write_planner",
-        "RelatedDocumentCandidate",
-    ),
-    "RelatedDocumentFinder": ("memory.execute.write_planner", "RelatedDocumentFinder"),
-    "explicit_evidence_digest": (
-        "memory.execute.write_planner",
-        "explicit_evidence_digest",
     ),
 }
 

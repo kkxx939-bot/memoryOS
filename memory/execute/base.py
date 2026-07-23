@@ -14,9 +14,9 @@ from infrastructure.store.memory.review import MemoryEditReviewStore
 from memory.commit.consolidation import MemoryDocumentConsolidator
 from memory.commit.document_commit import DocumentCommitResult, MemoryDocumentCommitter
 from memory.commit.erase import MemoryDocumentEraser
+from memory.commit.remember_plan import ExplicitRememberPlanner
 from memory.core.model import ABSENT, AbsentPath, DocumentEditPlan, ManagedDocument, PresentPath
 from memory.core.structure.path_policy import MemoryDocumentPathPolicy
-from memory.execute.write_planner import MemoryDocumentPlanner
 from memory.ports.document_store import DocumentConflictError, DocumentNotFoundError
 
 IndependentEvidenceLocator = Callable[[str, str, str, str], Sequence[str]]
@@ -53,7 +53,7 @@ class MemoryCommandBase:
 
     def __init__(
         self,
-        planner: MemoryDocumentPlanner,
+        planner: ExplicitRememberPlanner,
         committer: MemoryDocumentCommitter,
         eraser: MemoryDocumentEraser,
         *,

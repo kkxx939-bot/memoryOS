@@ -35,18 +35,27 @@
 14. 后台任务不建立跨领域的 `memoryos.workers` 聚合包。统一轮询和窄运行时协议归 `runtime/worker`，事务恢复归 `runtime/recovery`，记忆提交、编辑、扫描与投影归 `memory/worker`，Context 派生层维护归 `infrastructure/context/maintenance`，行为冷却执行归 `behavior/execute`；具体 Worker 只能调用其所属领域的公开服务或端口。
 15. 公共进程配置只归根级 `config.py`，并且只定义数据根目录、运行模式和日志级别；模型连接配置归 `infrastructure/model/config.py`，HTTP、MCP、Agent Hook 和 Runtime 专属配置归各自模块。禁止恢复 `memoryos/config.py` 或通过兼容模块转发配置。
 16. `memoryos` 只作为发行名称、CLI 命令前缀和 `memoryos://` URI scheme 保留，不再对应 Python 聚合包。对外 Python 能力统一从 `openApi` 及其 `sdk`、`http`、`mcp`、`cli` 子模块导入；禁止恢复根级 `memoryos/` 目录或兼容导出包。
+17. 禁止自动记忆形成。SessionArchive、LiveSession、Tool Result 和普通 Context 只能作为历史事实源与召回输入，不能自动生成、修改、合并、遗忘或删除用户长期记忆。长期记忆耐久写入只允许由本地用户显式发起的 remember、edit、rename、merge、forget、restore 等命令触发。
+18. 显式记忆命令必须经过确定性身份与目标解析、当前 Markdown exact-byte 读取、DocumentEditPlan 编译和 CAS commit；LLM 可以辅助显式命令的内容整理，但不能根据会话自行决定是否写入、目标路径、document ID、Owner/Workspace、删除动作或最终 authority。
+19. `EvidenceSlice`、Session evidence window、Formation scheduler、MemoryEditor 自动形成链、自动演化计划/产物和自动提交消费者必须从源码、配置、Schema 与公开契约中完整删除，不保留兼容别名、反序列化分支、禁用状态、空实现或新旧双轨。
+20. HOT/WARM/COLD/ARCHIVED 只改变召回优先级，不改变事实是否存在。active 冷层仍保留 FTS；CURRENT 先查 HOT/WARM，仅在已验证结果不足时用剩余预算做一次 COLD/ARCHIVED 词法回退，冷层不得进入 Vector。Consolidation 不得用删除源 Markdown 实现降温。
 
 统一模型是：
 
 ```text
-Evidence Plane (immutable SessionArchive or explicit local-user command)
-    -> sealed semantic memory proposal
-    -> deterministic document routing and read-before-write planning
+Explicit local-user memory command
+    -> deterministic identity, target and authority validation
+    -> read current Markdown exact bytes
+    -> deterministic DocumentEditPlan compilation
     -> Markdown document CAS commit
     -> durable projection job
     -> Unified Context Catalog / Tree / Graph
     -> Unified Retrieval Orchestration
     -> bounded L0 / L1 / L2 Context Selection and Assembly
+
+SessionArchive / LiveSession / Tool Result
+    -> sanitized immutable Context projection
+    -> bounded retrieval only; never an implicit memory write trigger
 ```
 
 `SQLiteIndexStore.contexts` 是统一 Serving Catalog；不得新增保存同一 Serving 状态的第二张主表。普通 Context 的事实源仍是 SourceStore 或不可变 SessionArchive。Memory document 的 live Markdown 是其正文事实源，受保护的 revision/after blob 只服务恢复并必须可由 hard erase 枚举删除。控制数据只能保存身份、路径、digest、generation、状态和时间，不得成为语义 current pointer。
@@ -74,8 +83,10 @@ SessionArchive -> ContextProjectionSanitizer -> SessionContextProjector
 Memory 写链：
 
 ```text
-Evidence -> sealed semantic proposal -> deterministic document router
--> read-before-write DocumentEditPlan -> MemoryDocumentCommitter
+Explicit local-user remember / edit / rename / merge / forget / restore
+-> deterministic target resolution and current Markdown read
+-> deterministic DocumentEditPlan
+-> MemoryDocumentCommitter
 -> live Markdown -> durable projection job
 -> contexts / FTS / context_paths / optional bounded Vector
 ```

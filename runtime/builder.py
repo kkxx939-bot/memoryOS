@@ -53,9 +53,7 @@ class RuntimeBuilder:
         session = wire_session(
             base.stores,
             transaction,
-            memory,
             self.config,
-            self.dependencies,
             tenant_root=base.layout.tenant_root,
         )
         context = wire_context(

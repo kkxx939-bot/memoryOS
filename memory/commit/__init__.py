@@ -1,4 +1,4 @@
-"""Memory 形成规划与 Session 派生提交协调，公开符号按需加载。"""
+"""显式 Memory 提交与 Session 普通派生协调，公开符号按需加载。"""
 
 from __future__ import annotations
 
@@ -37,12 +37,7 @@ if TYPE_CHECKING:
         EraseBackendProgress,
         MemoryDocumentEraser,
     )
-    from memory.commit.planner import (
-        MemoryCommitPlanner,
-        MemoryDocumentPlanningResult,
-        MemoryExtractionBackendError,
-        PlannedMemoryEdit,
-    )
+    from memory.commit.remember_plan import ExplicitRememberPlanner, RememberTarget, RememberTargetKind
     from memory.commit.session_commit import DerivedConsumerError, SessionCommitService
 
 __all__ = [
@@ -69,13 +64,12 @@ __all__ = [
     "DocumentEraseStatus",
     "DocumentRecoveryReport",
     "EraseBackendProgress",
-    "MemoryCommitPlanner",
-    "MemoryDocumentPlanningResult",
-    "MemoryExtractionBackendError",
+    "ExplicitRememberPlanner",
     "MemoryDocumentCommitter",
     "MemoryDocumentConsolidator",
     "MemoryDocumentEraser",
-    "PlannedMemoryEdit",
+    "RememberTarget",
+    "RememberTargetKind",
     "SessionCommitService",
 ]
 
@@ -108,10 +102,9 @@ _EXPORTS = {
     "DocumentEraseStatus": ("memory.commit.erase", "DocumentEraseStatus"),
     "EraseBackendProgress": ("memory.commit.erase", "EraseBackendProgress"),
     "MemoryDocumentEraser": ("memory.commit.erase", "MemoryDocumentEraser"),
-    "MemoryCommitPlanner": ("memory.commit.planner", "MemoryCommitPlanner"),
-    "MemoryDocumentPlanningResult": ("memory.commit.planner", "MemoryDocumentPlanningResult"),
-    "MemoryExtractionBackendError": ("memory.commit.planner", "MemoryExtractionBackendError"),
-    "PlannedMemoryEdit": ("memory.commit.planner", "PlannedMemoryEdit"),
+    "ExplicitRememberPlanner": ("memory.commit.remember_plan", "ExplicitRememberPlanner"),
+    "RememberTarget": ("memory.commit.remember_plan", "RememberTarget"),
+    "RememberTargetKind": ("memory.commit.remember_plan", "RememberTargetKind"),
     "DerivedConsumerError": ("memory.commit.session_commit", "DerivedConsumerError"),
     "SessionCommitService": ("memory.commit.session_commit", "SessionCommitService"),
 }

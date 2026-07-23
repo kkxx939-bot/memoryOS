@@ -14,7 +14,6 @@ from infrastructure.store.contracts.queue import QueueStore
 from infrastructure.store.contracts.relation import RelationStore
 from infrastructure.store.contracts.source import SourceStore
 from infrastructure.store.contracts.vector import VectorStore
-from memory.ports import MemoryExtractorBackend
 from policy.action_policy.execution.tool_registry import ToolRegistry
 
 
@@ -33,7 +32,6 @@ class RuntimeDependencies:
     hybrid_search: HybridSearch | None = None
     reranker: Reranker | None = None
     model_client: ModelClient | None = None
-    memory_extractor: MemoryExtractorBackend | None = None
 
 
 __all__ = ["RuntimeDependencies"]

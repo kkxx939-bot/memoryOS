@@ -242,7 +242,7 @@ class HybridSearch:
             if not callable(getter):
                 continue
             raw_records: Any = getter(public_uri, tenant_id=tenant_id, limit=16)
-            if not isinstance(raw_records, Sequence) or isinstance(raw_records, (str, bytes, bytearray)):
+            if not isinstance(raw_records, Sequence) or isinstance(raw_records, str | bytes | bytearray):
                 raise TypeError("Catalog vector identity lookup returned an invalid result")
             for record in raw_records:
                 if not isinstance(record, CatalogRecord) or record.tenant_id != tenant_id or record.uri != public_uri:

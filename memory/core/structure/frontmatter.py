@@ -110,7 +110,7 @@ def parse_front_matter(
     try:
         yaml_text = yaml_bytes.decode("utf-8", errors="strict")
         for token in yaml.scan(yaml_text, Loader=_UniqueKeySafeLoader):
-            if isinstance(token, (yaml.tokens.AnchorToken, yaml.tokens.AliasToken, yaml.tokens.TagToken)):
+            if isinstance(token, yaml.tokens.AnchorToken | yaml.tokens.AliasToken | yaml.tokens.TagToken):
                 raise FrontMatterError("front matter anchors, aliases and explicit tags are forbidden")
         documents = list(yaml.load_all(yaml_text, Loader=_UniqueKeySafeLoader))
     except FrontMatterError:

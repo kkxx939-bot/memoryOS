@@ -395,8 +395,7 @@ class SchemaManager:
         ineligible = conn.execute(
             "SELECT 1 FROM context_fts_map AS m LEFT JOIN contexts AS c "
             "ON c.tenant_id = m.tenant_id AND c.record_key = m.record_key "
-            "WHERE c.record_key IS NULL OR c.serving_tier NOT IN ('HOT', 'WARM') "
-            "OR c.projection_status NOT IN ('PROJECTED', 'DEGRADED') "
+            "WHERE c.record_key IS NULL OR c.projection_status NOT IN ('PROJECTED', 'DEGRADED') "
             "OR c.lifecycle_state IN ('deleted', 'archived', 'obsolete') LIMIT 1"
         ).fetchone()
         if ineligible is not None:
@@ -404,8 +403,7 @@ class SchemaManager:
         missing = conn.execute(
             "SELECT 1 FROM contexts AS c LEFT JOIN context_fts_map AS m "
             "ON m.tenant_id = c.tenant_id AND m.record_key = c.record_key "
-            "WHERE c.serving_tier IN ('HOT', 'WARM') "
-            "AND c.projection_status IN ('PROJECTED', 'DEGRADED') "
+            "WHERE c.projection_status IN ('PROJECTED', 'DEGRADED') "
             "AND c.lifecycle_state NOT IN ('deleted', 'archived', 'obsolete') "
             "AND m.record_key IS NULL LIMIT 1"
         ).fetchone()

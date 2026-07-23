@@ -28,13 +28,12 @@ class SessionCommitWorker:
     def process_archive(self, archive: SessionArchive) -> dict[str, object]:
         require_session_service_ready(self.service)
         result = self.service.async_commit(archive)
-        if not result.done or not result.memory_committed:
-            raise RuntimeError("Session commit did not complete its memory consumer")
+        if not result.done:
+            raise RuntimeError("Session commit did not complete")
         return {
             "task_id": result.task_id,
             "status": result.status,
             "done": result.done,
-            "memory_committed": result.memory_committed,
         }
 
     def process_pending(
@@ -69,7 +68,7 @@ class SessionCommitWorker:
                     archive,
                     group_id=group.group_id,
                 )
-                if not result.done or not result.memory_committed:
+                if not result.done:
                     raise RuntimeError("recovered Session group is incomplete")
                 recovered += 1
             except Exception:
@@ -107,7 +106,7 @@ class SessionCommitWorker:
             try:
                 archive = self._archive_for_job(job)
                 result = self.service.async_commit(archive)
-                if result.done and result.memory_committed:
+                if result.done:
                     if not session_service_is_ready(self.service):
                         failed += 1
                         released.extend(self._release_unattempted(jobs[position:]))

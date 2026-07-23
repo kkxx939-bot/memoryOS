@@ -12,7 +12,6 @@ from infrastructure.store.sqlite._common import (
     CatalogRecord,
     Mapping,
     Sequence,
-    ServingTier,
     _path_ancestors,
     _PreparedCatalogRecord,
     lexical_terms,
@@ -374,8 +373,6 @@ class CatalogWriteOperationsMixin:
 
     def _replace_fts(self, conn: sqlite3.Connection, item: _PreparedCatalogRecord) -> None:
         self._store._delete_fts_record(conn, item.record.tenant_id, item.record.record_key)
-        if item.record.serving_tier not in {ServingTier.HOT.value, ServingTier.WARM.value}:
-            return
         if item.record.projection_status not in {
             CatalogProjectionStatus.PROJECTED.value,
             CatalogProjectionStatus.DEGRADED.value,
