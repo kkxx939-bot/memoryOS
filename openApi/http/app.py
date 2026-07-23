@@ -173,11 +173,9 @@ class MemoryOSASGI:
 
         if method == "GET" and path == "/health":
             return self.client.health()
-        # Health is the only public endpoint available before startup recovery
-        # has established a complete context and projection serving state.
-        # Session event/checkpoint routes write durable staging files directly
-        # through AgentSessionService, so relying only on SDK method-level
-        # gates would let those routes mutate state while NOT_READY.
+        # 启动恢复尚未建立完整的上下文和投影服务状态时，健康检查是唯一可用的公开端点。
+        # 会话事件和检查点路由会通过 AgentSessionService 直接写入耐久暂存文件，
+        # 因此只依赖 SDK 方法级门控，会让这些路由在 NOT_READY 状态下修改数据。
         self.client.runtime.readiness.require_ready()
         if method == "POST" and path == "/v1/context/search":
             return handle(

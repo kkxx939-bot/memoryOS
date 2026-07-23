@@ -1,4 +1,4 @@
-"""Tenant-scoped quarantine for corrupt durable control files."""
+"""在租户范围内隔离损坏的耐久控制文件。"""
 
 from __future__ import annotations
 
@@ -50,9 +50,8 @@ def quarantine_control_file(
     requested = path.expanduser()
     if not requested.is_absolute():
         requested = requested.absolute()
-    # Resolve only the parent. Resolving the final component would follow a
-    # forged control-file symlink and quarantine its target instead of the
-    # offending directory entry.
+    # 只解析父目录。解析末级路径会跟随伪造的控制文件符号链接，
+    # 从而错误隔离其目标，而不是有问题的目录项。
     source = requested.parent.resolve() / requested.name
     try:
         relative = source.relative_to(root)

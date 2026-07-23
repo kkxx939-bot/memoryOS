@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from typing import Any, Protocol
 
-from infrastructure.model.config import ModelConfig
+from LLMClient.config import ModelConfig
 from openApi.mcp.config import MCPServerConfig
 from openApi.mcp.server import MemoryOSMCPServer
 from openApi.sdk.http_client import HTTPMemoryOSClient

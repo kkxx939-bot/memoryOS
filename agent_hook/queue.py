@@ -17,13 +17,13 @@ from sanitization import sanitize_error_text
 _fcntl: Any
 try:
     import fcntl as _fcntl
-except ImportError:  # pragma: no cover - exercised by monkeypatch on POSIX CI.
+except ImportError:  # pragma: no cover - 由 POSIX CI 上的 monkeypatch 覆盖。
     _fcntl = None
 
 _msvcrt: Any
 try:
     import msvcrt as _msvcrt
-except ImportError:  # pragma: no cover - exercised by monkeypatch on POSIX CI.
+except ImportError:  # pragma: no cover - 由 POSIX CI 上的 monkeypatch 覆盖。
     _msvcrt = None
 
 HOOK_ALLOWED_TOOLS = {
@@ -35,7 +35,7 @@ HOOK_ALLOWED_TOOLS = {
 
 
 class PendingQueueIntegrityError(RuntimeError):
-    """A persisted hook queue cannot be trusted and has been quarantined."""
+    """持久化 Hook 队列不可信，已被隔离。"""
 
 
 @dataclass
@@ -211,8 +211,7 @@ class PendingQueue:
         return items
 
     def _quarantine_corrupt_queue(self, error: BaseException) -> NoReturn:
-        # Local import keeps the lightweight hook package out of the canonical
-        # commit module's import cycle.
+        # 局部导入可避免轻量 Hook 包进入规范提交模块的循环导入链。
         from infrastructure.store.filesystem.durable_io.quarantine import quarantine_control_file
 
         if self.path.exists():

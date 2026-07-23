@@ -312,7 +312,7 @@ def catalog_vector_metadata(
     if not isinstance(safe, Mapping):
         raise ValueError("vector metadata sanitizer returned a non-object")
     result = dict(safe)
-    # ``record_key`` is a server-owned join/CAS identity, not free-form
+    # ``record_key`` 是服务端持有的关联/CAS 身份，不是自由格式字段；
     # 通用凭证清洗不能让可信向量身份脱离其 Catalog 所有者。
     result["catalog_record_key"] = record.record_key
     return result

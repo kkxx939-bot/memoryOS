@@ -1,6 +1,5 @@
 """m2bOS 长期记忆域。"""
 
-from memory.editor import MemoryEditBatch, MemoryEditSchemaError, MemoryEditSource
 from memory.schema import (
     MemoryFieldRole,
     MemoryFieldSchema,
@@ -15,9 +14,6 @@ from memory.tree import MemoryAddress, MemoryKind, MemoryTree, MemoryTreeIntegri
 
 __all__ = [
     "MemoryAddress",
-    "MemoryEditBatch",
-    "MemoryEditSchemaError",
-    "MemoryEditSource",
     "MemoryFieldRole",
     "MemoryFieldSchema",
     "MemoryFieldType",

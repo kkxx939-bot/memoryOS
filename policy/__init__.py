@@ -1,4 +1,4 @@
-"""MemoryOS policy domains.
+"""MemoryOS 策略领域。
 
-The concrete action-policy domain lives in :mod:`policy.action_policy`.
+具体的动作策略领域位于 :mod:`policy.action_policy`。
 """

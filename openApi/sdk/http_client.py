@@ -220,7 +220,7 @@ def _remote_http_error(
     request_id: str,
     operation: str,
 ) -> dict[str, Any]:
-    """Preserve a bounded structured server error without trusting its body."""
+    """在不信任响应正文的前提下，保留有界的结构化服务端错误。"""
 
     remote: dict[str, Any] = {}
     try:
@@ -249,8 +249,6 @@ def _remote_http_error(
 
 class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
     """拒绝跨源跳转，防止本地用户标识和请求数据被转发到其他服务。"""
-
-    """Allow redirects only when scheme, host, and effective port are unchanged."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001, ANN201
         if _origin(req.full_url) != _origin(newurl):
@@ -289,7 +287,7 @@ def _raise_remote_error(response: dict[str, Any]) -> None:
 
 
 def _without_request_id(response: dict[str, Any]) -> dict[str, Any]:
-    """The ASGI request id is transport metadata, not command result data."""
+    """ASGI 请求 ID 是传输元数据，不属于命令结果数据。"""
 
     payload = dict(response)
     payload.pop("request_id", None)

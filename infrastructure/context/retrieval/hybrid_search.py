@@ -406,5 +406,5 @@ class HybridSearch:
 
 
 # 本模块仅供内部规划器和聚焦测试导入，不提供公开通配导出。产品入口统一通过
-# RetrievalOptions → QueryPlanner → UnifiedRetrievalOrchestrator。
+# 统一调用链：检索选项 → 查询规划器 → 统一检索编排器。
 __all__: list[str] = []

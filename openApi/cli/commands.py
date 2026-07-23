@@ -16,7 +16,7 @@ from typing import Any
 from config import MemoryOSConfig
 from foundation.identity import LocalUserContext
 from foundation.readiness import RuntimeNotReadyError
-from infrastructure.model.config import ModelConfig
+from LLMClient.config import ModelConfig
 from openApi.version import __version__
 from policy.action_policy.decision.request import PredictionRequest
 from pre.connect import ConnectMetadata, ConnectType, PipelineMode

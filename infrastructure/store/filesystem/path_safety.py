@@ -1,4 +1,4 @@
-"""Lexical path integrity checks for durable local artifacts."""
+"""耐久本地产物的词法路径完整性检查。"""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 class DurablePathIntegrityError(RuntimeError):
-    """A durable artifact path escapes or traverses an in-boundary symlink."""
+    """耐久产物路径越出边界，或穿越边界内的符号链接。"""
 
 
 def require_safe_artifact_path(
@@ -16,7 +16,7 @@ def require_safe_artifact_path(
     *,
     label: str,
 ) -> Path:
-    """Validate one exact lexical path without following boundary aliases."""
+    """校验一个精确的词法路径，不跟随边界别名。"""
 
     boundary = Path(root).expanduser().absolute()
     candidate = Path(path).expanduser().absolute()
@@ -37,13 +37,12 @@ def require_safe_artifact_path(
 
 
 def validate_authoritative_tree(root: str | Path, *, label: str) -> int:
-    """Reject directory aliases anywhere in an authoritative tree.
+    """拒绝权威目录树中任何位置的目录别名。
 
-    Quarantined payloads are evidence and may intentionally be symlinks moved
-    without following their target.  The quarantine directory itself remains
-    authoritative and must still be a real directory.  Leaf artifacts remain
-    the responsibility of their typed validator, which can distinguish an
-    authoritative proof from disposable projection state and repair the latter.
+    被隔离的载荷属于事实记录，可能是未跟随目标而直接移动的符号链接。
+    隔离目录本身仍是权威目录，因此必须是真实目录。叶子产物仍由各自的
+    类型校验器负责；类型校验器可以区分权威证明和可丢弃的投影状态，
+    并修复后者。
     """
 
     boundary = Path(root).expanduser().absolute()

@@ -7,7 +7,7 @@ import os
 from dataclasses import dataclass, field
 
 from config import MemoryOSConfig, RuntimeMode
-from infrastructure.model.config import ModelConfig
+from LLMClient.config import ModelConfig
 
 
 @dataclass(frozen=True, kw_only=True)

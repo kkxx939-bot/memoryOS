@@ -1,9 +1,1 @@
-"""Conversation 到长期记忆之间的结构化候选变更契约。"""
-
-from memory.editor.model import (
-    MemoryEditBatch,
-    MemoryEditSchemaError,
-    MemoryEditSource,
-)
-
-__all__ = ["MemoryEditBatch", "MemoryEditSchemaError", "MemoryEditSource"]
+"""Memory Editor 领域包，具体职责与实现等待逐项确认。"""

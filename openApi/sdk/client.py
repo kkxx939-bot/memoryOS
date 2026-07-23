@@ -26,8 +26,6 @@ from infrastructure.context.reranking import Reranker
 from infrastructure.context.retrieval.embedding import EmbeddingProvider
 from infrastructure.context.retrieval.hybrid_search import HybridSearch
 from infrastructure.context.retrieval.query_plan import RetrievalOptions
-from infrastructure.model import ModelClient
-from infrastructure.model.config import ModelConfig
 from infrastructure.store.contracts.index import IndexStore
 from infrastructure.store.contracts.lock import LockStore
 from infrastructure.store.contracts.queue import QueueStore
@@ -37,6 +35,8 @@ from infrastructure.store.contracts.vector import VectorStore
 from infrastructure.store.model.context.context_type import ContextType
 from infrastructure.store.model.context.context_uri import ContextURI
 from infrastructure.store.model.context.lifecycle import LifecycleState
+from LLMClient import LLMClient
+from LLMClient.config import ModelConfig
 from openApi.retrieval_contract import parse_retrieval_options
 from openApi.session_service import SessionApplicationService
 from policy.action_policy.decision.request import PredictionRequest
@@ -65,7 +65,7 @@ class MemoryOSClient:
         hybrid_search: HybridSearch | None = None,
         reranker: Reranker | None = None,
         model_config: ModelConfig | None = None,
-        model_client: ModelClient | None = None,
+        model_client: LLMClient | None = None,
         mode: str = "local",
         user_id: str = "local-user",
         adapter_id: str = "local_sdk",
@@ -550,4 +550,4 @@ class MemoryOSClient:
 
 
 class LocalMemoryOSClient(MemoryOSClient):
-    """Local compatibility name for the in-process client."""
+    """进程内客户端的本地兼容名称。"""

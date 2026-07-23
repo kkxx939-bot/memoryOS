@@ -1,4 +1,4 @@
-"""Fail-closed opening for local durable lock files."""
+"""以故障关闭方式打开本地耐久锁文件。"""
 
 from __future__ import annotations
 
@@ -8,11 +8,11 @@ from pathlib import Path
 
 
 class FileLockIntegrityError(RuntimeError):
-    """A lock path is unsafe or no longer names a private regular file."""
+    """锁路径不安全，或已不再指向私有普通文件。"""
 
 
 def open_private_lock(path: str | Path, *, root: str | Path) -> int:
-    """Open one lock without following a final or in-root directory symlink."""
+    """打开一个锁，不跟随末级或根目录内的目录符号链接。"""
 
     lock_path = Path(path).expanduser()
     lexical_boundary = Path(root).expanduser()
@@ -27,11 +27,10 @@ def open_private_lock(path: str | Path, *, root: str | Path) -> int:
         relative_parent = lock_path.parent.relative_to(lexical_boundary)
         boundary = lexical_boundary
     except ValueError:
-        # Some trusted path builders normalize a host alias before returning
-        # their result (macOS maps /var to /private/var).  Accept that exact
-        # root normalization, but never resolve the untrusted child path: the
-        # openat/O_NOFOLLOW walk below must still see and reject every symlink
-        # inside the artifact boundary.
+        # 某些可信路径构建器会先规范化主机路径别名再返回结果，
+        # 例如 macOS 会把 /var 映射为 /private/var。这里接受这种精确的
+        # 根目录规范化，但绝不解析不可信的子路径：下方基于
+        # openat/O_NOFOLLOW 的逐级遍历仍必须识别并拒绝产物边界内的每个符号链接。
         try:
             relative_parent = lock_path.parent.relative_to(resolved_boundary)
             boundary = resolved_boundary

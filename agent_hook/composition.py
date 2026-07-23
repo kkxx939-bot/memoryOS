@@ -1,4 +1,4 @@
-"""Agent-hook transport protocol and explicit composition registration."""
+"""Agent Hook 传输协议和显式装配注册。"""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ class AgentHookTransport(Protocol):
 
 
 class AgentHookCompositionError(RuntimeError):
-    """Raised when a delivery entrypoint did not register its transport."""
+    """交付入口未注册传输实现时抛出。"""
 
 
 AgentHookTransportFactory = Callable[[AgentHookConfig], AgentHookTransport]

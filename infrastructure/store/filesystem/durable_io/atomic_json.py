@@ -1,4 +1,4 @@
-"""Canonical, crash-safe JSON publication."""
+"""规范且崩溃安全的 JSON 发布。"""
 
 from __future__ import annotations
 
@@ -14,13 +14,13 @@ from infrastructure.store.filesystem.path_safety import DurablePathIntegrityErro
 
 
 def atomic_create_json(path: Path, payload: dict[str, Any], *, artifact_root: str | Path) -> bool:
-    """Create one canonical JSON artifact without ever replacing it."""
+    """创建一个规范 JSON 产物，且永不替换已有产物。"""
 
     return atomic_create_bytes(path, canonical_json(payload).encode("utf-8"), artifact_root=artifact_root)
 
 
 def atomic_write_json(path: Path, payload: dict[str, Any], *, artifact_root: str | Path) -> None:
-    """Publish one JSON file without exposing a partial control record."""
+    """发布一个 JSON 文件，不暴露写入不完整的控制记录。"""
 
     try:
         parent_descriptor = _open_control_parent(path, artifact_root)
@@ -35,7 +35,7 @@ def atomic_write_json(path: Path, payload: dict[str, Any], *, artifact_root: str
             view = memoryview(encoded)
             while view:
                 written = os.write(descriptor, view)
-                if written <= 0:  # pragma: no cover - defensive OS contract.
+                if written <= 0:  # pragma: no cover - 对操作系统契约的防御性检查。
                     raise OSError("JSON artifact write made no progress")
                 view = view[written:]
             os.fsync(descriptor)

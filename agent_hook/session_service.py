@@ -28,13 +28,13 @@ logger = logging.getLogger(__name__)
 _fcntl: Any
 try:
     import fcntl as _fcntl
-except ImportError:  # pragma: no cover - Windows only.
+except ImportError:  # pragma: no cover - 仅适用于 Windows。
     _fcntl = None
 
 _msvcrt: Any
 try:
     import msvcrt as _msvcrt
-except ImportError:  # pragma: no cover - POSIX only.
+except ImportError:  # pragma: no cover - 仅适用于 POSIX。
     _msvcrt = None
 
 

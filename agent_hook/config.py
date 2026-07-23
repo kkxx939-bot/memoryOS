@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from config import MemoryOSConfig, RuntimeMode
-from infrastructure.model.config import ModelConfig
+from LLMClient.config import ModelConfig
 
 
 @dataclass(frozen=True, kw_only=True)

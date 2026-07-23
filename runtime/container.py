@@ -14,7 +14,6 @@ from infrastructure.context.maintenance.tombstone import ProjectionTombstoneServ
 from infrastructure.context.reranking import Reranker
 from infrastructure.context.retrieval.embedding import EmbeddingProvider
 from infrastructure.context.retrieval.hybrid_search import HybridSearch
-from infrastructure.model import ModelClient
 from infrastructure.store.contracts.index import IndexStore
 from infrastructure.store.contracts.lock import LockStore
 from infrastructure.store.contracts.queue import QueueStore
@@ -23,6 +22,7 @@ from infrastructure.store.contracts.source import SourceStore
 from infrastructure.store.contracts.vector import VectorStore
 from infrastructure.store.filesystem.session_archive import SessionArchiveStore
 from infrastructure.store.runtime_layout import RuntimeLayout
+from LLMClient import LLMClient
 from policy.action_policy.decision.engine import PredictionEngine
 from policy.action_policy.execution.executor import ActionExecutor
 from runtime.config import RuntimeConfig
@@ -49,7 +49,7 @@ class StoreRuntime:
     embedding: EmbeddingProvider | None
     hybrid_search: HybridSearch | None
     reranker: Reranker | None
-    model_client: ModelClient | None
+    model_client: LLMClient | None
 
 
 @dataclass(frozen=True)

@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 
 from config import MemoryOSConfig, RuntimeMode
 from foundation.identity import LocalUserContext
-from infrastructure.model.config import ModelConfig
+from LLMClient.config import ModelConfig
 from pre.connect import ConnectMetadata, ConnectType, PipelineMode
 
 DEFAULT_AGENT_ADAPTERS = ("codex", "claude_code", "cursor", "windsurf", "cline", "continue", "generic_agent")

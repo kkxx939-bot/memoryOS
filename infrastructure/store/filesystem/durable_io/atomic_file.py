@@ -1,4 +1,4 @@
-"""Atomic durable byte-file operations within a trusted root."""
+"""可信根目录内的原子耐久字节文件操作。"""
 
 from __future__ import annotations
 
@@ -14,14 +14,14 @@ from infrastructure.store.filesystem.path_safety import (
 
 
 class ImmutableArtifactConflictError(ValueError):
-    """A create-only artifact identity is already bound to different bytes."""
+    """仅允许创建的产物身份已绑定到不同字节内容。"""
 
 
 def _write_all(descriptor: int, encoded: bytes) -> None:
     view = memoryview(encoded)
     while view:
         written = os.write(descriptor, view)
-        if written <= 0:  # pragma: no cover - defensive OS contract.
+        if written <= 0:  # pragma: no cover - 对操作系统契约的防御性检查。
             raise OSError("durable artifact write made no progress")
         view = view[written:]
 
@@ -100,7 +100,7 @@ def _read_regular_file_at(directory_descriptor: int, name: str) -> bytes:
 
 
 def atomic_create_bytes(path: Path, encoded: bytes, *, artifact_root: str | Path) -> bool:
-    """Create immutable bytes once; identical replay is a no-op."""
+    """仅创建一次不可变字节；相同内容的重放不产生变更。"""
 
     try:
         parent_descriptor = _open_control_parent(path, artifact_root)
@@ -140,7 +140,7 @@ def atomic_create_bytes(path: Path, encoded: bytes, *, artifact_root: str | Path
 
 
 def atomic_replace_bytes(path: Path, encoded: bytes, *, artifact_root: str | Path) -> None:
-    """Atomically create or replace one mutable regular file."""
+    """原子创建或替换一个可变普通文件。"""
 
     parent_descriptor = _open_control_parent(path, artifact_root)
     temporary_name = f".{path.name}.{uuid.uuid4().hex}.tmp"
@@ -182,7 +182,7 @@ def read_regular_bytes(
     artifact_root: str | Path,
     max_bytes: int,
 ) -> bytes:
-    """Read one bounded regular file without following its final symlink."""
+    """有界读取一个普通文件，不跟随末级符号链接。"""
 
     maximum = int(max_bytes)
     if maximum <= 0:

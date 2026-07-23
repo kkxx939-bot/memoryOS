@@ -7,13 +7,13 @@ from dataclasses import dataclass
 from infrastructure.context.reranking import Reranker
 from infrastructure.context.retrieval.embedding import EmbeddingProvider
 from infrastructure.context.retrieval.hybrid_search import HybridSearch
-from infrastructure.model import ModelClient
 from infrastructure.store.contracts.index import IndexStore
 from infrastructure.store.contracts.lock import LockStore
 from infrastructure.store.contracts.queue import QueueStore
 from infrastructure.store.contracts.relation import RelationStore
 from infrastructure.store.contracts.source import SourceStore
 from infrastructure.store.contracts.vector import VectorStore
+from LLMClient import LLMClient
 from policy.action_policy.execution.tool_registry import ToolRegistry
 
 
@@ -31,7 +31,7 @@ class RuntimeDependencies:
     embedding_provider: EmbeddingProvider | None = None
     hybrid_search: HybridSearch | None = None
     reranker: Reranker | None = None
-    model_client: ModelClient | None = None
+    model_client: LLMClient | None = None
 
 
 __all__ = ["RuntimeDependencies"]
