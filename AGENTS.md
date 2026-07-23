@@ -7,7 +7,7 @@
 - 旧长期记忆树、写入链、文档身份、编辑/删除命令、投影和公开接口已经退出；不保留别名、迁移读取、禁用分支、空实现或新旧双轨。
 - 新记忆树的基础目录已经确认：`profile.md`、`preferences/{topic}.md`、`entities/{category}/{name}.md`、`tools/{tool_name}.md`、`events/YYYY/MM/DD/{event_name}.md`、`intentions/{intent_name}.md`。当前实现记忆地址、路径、Markdown 原文读写删除和有界枚举；不得加入旧实现或兼容入口。
 - 六类长期记忆内容 Schema 使用独立声明，限定字段角色、字段类型、路径模板、Markdown 模板、操作模式和未来合并策略。Schema 不得包含 owner、稳定文档 ID、tag、置信度、EvidenceSlice、链接或反向链接。
-- Memory Editor 结构化操作 Schema、实际 merge 执行、索引、链接和压缩机制尚未设计完成；当前不得提前实现或用占位逻辑推断。
+- Memory Editor 第一阶段数据契约位于 `memory/editor/model.py`：`MemoryEditBatch` 绑定不可变 Conversation Segment 来源，并按六类现有 Memory Schema 保存结构化候选内容；不包含自由路径、删除、EvidenceSlice、tag、置信度、链接或落盘动作。LLM 调用、相关旧记忆检索、实际 merge、写入编排、索引、链接和压缩机制仍未设计完成；当前不得提前实现或用占位逻辑推断。
 - Conversation 使用 `pre/conversation/messages` 与 `pre/conversation/summaries` 两层：messages 保存完整、严格区分 prompt、completion、tool_call、tool_result 的原始会话事实；summaries 保存绑定不可变消息片段的宽语义历史过程，不能替代原文参与记忆解析。
 - Conversation Schema 继续只放在 `pre/conversation`；旧 SessionArchive projector、旧本地文件读写和单会话覆盖式摘要已经退出。正式路径、live 追加、读取和 history 封存统一由 `memory/conversation` 实现，并复用通用 PathLock 与耐久原子文件能力；不得恢复旧入口或在 `pre` 中写存储逻辑。LLM 摘要生成、周期压缩、保留期删除和长期记忆写入仍未实现。
 - Conversation 生命周期主链为 `live.jsonl -> history/{segment_id}.jsonl -> summaries/{segment_id}.json`：消息先进入有界 live 窗口，完整片段封存为不可变 history，再从该 history 派生 summary。history 是有保留期的原文层，不是永久层；只有对应 summary 成功、通过来源绑定与结构校验并满足后续保留策略后，history 才可删除。history 与 segment summary 在原文保留期间通过 `conversation_id`、`segment_id` 和 `source_message_digest` 一一绑定，但 summary 在生成期间允许暂时不存在或处于失败状态。
