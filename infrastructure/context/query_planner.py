@@ -28,8 +28,6 @@ _KNOWN_LEGACY_KEYS = frozenset(
         "connect_metadata",
         "context_type",
         "context_types",
-        "document_ids",
-        "document_kinds",
         "event_time_from",
         "event_time_to",
         "expand_relations",
@@ -251,12 +249,6 @@ def merge_retrieval_options(primary: RetrievalOptions, fallback: RetrievalOption
         context_types=_merge_compatible_collection(primary.context_types, fallback.context_types, "context_types"),
         source_kinds=_merge_compatible_collection(primary.source_kinds, fallback.source_kinds, "source_kinds"),
         record_kinds=_merge_compatible_collection(primary.record_kinds, fallback.record_kinds, "record_kinds"),
-        document_ids=_merge_compatible_collection(primary.document_ids, fallback.document_ids, "document_ids"),
-        document_kinds=_merge_compatible_collection(
-            primary.document_kinds,
-            fallback.document_kinds,
-            "document_kinds",
-        ),
         tenant_id=_merge_explicit_scalar(primary.tenant_id, fallback.tenant_id, "tenant_id"),
         owner_user_id=_merge_explicit_scalar(
             primary.owner_user_id,
@@ -329,8 +321,6 @@ def retrieval_options_from_legacy(flat_kwargs: Mapping[str, Any]) -> RetrievalOp
     context_types = _coalesce_type_filters(raw)
     source_kinds = _coalesce_sequence_alias(raw, "source_kinds", "source_kind")
     record_kinds = _pop_sequence(raw, "record_kinds")
-    document_ids = _pop_sequence(raw, "document_ids")
-    document_kinds = _pop_sequence(raw, "document_kinds")
 
     target_uris = _pop_sequence(raw, "target_uris")
     target_paths = _pop_sequence(raw, "target_paths")
@@ -363,8 +353,6 @@ def retrieval_options_from_legacy(flat_kwargs: Mapping[str, Any]) -> RetrievalOp
         context_types=context_types,
         source_kinds=source_kinds,
         record_kinds=record_kinds,
-        document_ids=document_ids,
-        document_kinds=document_kinds,
         tenant_id=raw.pop("tenant_id", None),
         owner_user_id=owner_user_id,
         workspace_ids=workspace_ids,

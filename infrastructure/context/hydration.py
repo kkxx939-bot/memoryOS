@@ -8,18 +8,14 @@ from collections.abc import Sequence
 from dataclasses import replace
 from typing import Any
 
-from foundation.ids import stable_hash
-from infrastructure.context.layers.memory_document_overlay import MemoryDocumentContextOverlay
 from infrastructure.context.retrieval.fusion import RetrievalCandidate
 from infrastructure.context.retrieval.query_plan import RetrievalQueryPlan
 from infrastructure.context.selection import ContextSelector
-from infrastructure.store.contracts.queue import QueueJob, QueueStore
 from infrastructure.store.contracts.session_archive import SessionArchiveStore
 from infrastructure.store.contracts.source import SourceStore
 from infrastructure.store.model.catalog import CatalogRecord, CatalogRecordKind
 from infrastructure.store.model.context.context_type import ContextType
 from infrastructure.store.model.context.lifecycle import LifecycleState
-from memory.ports.document_store import DocumentConflictError, DocumentNotFoundError, DocumentUnsafeError
 from sanitization.context_projection import (
     ContextProjectionSanitizationError,
     ContextProjectionSanitizer,
@@ -34,17 +30,13 @@ class ContextHydrator:
         *,
         source_store: SourceStore | None,
         session_archive_store: SessionArchiveStore | None,
-        queue_store: QueueStore | None,
         selector: ContextSelector,
         sanitizer: ContextProjectionSanitizer,
-        document_overlay: MemoryDocumentContextOverlay | None,
     ) -> None:
         self.source_store = source_store
         self.session_archive_store = session_archive_store
-        self.queue_store = queue_store
         self.selector = selector
         self.sanitizer = sanitizer
-        self.document_overlay = document_overlay
 
     def hydrate(
         self,
@@ -57,36 +49,13 @@ class ContextHydrator:
         int,
         tuple[str, ...],
         tuple[dict[str, Any], ...],
-        int,
     ]:
         result: list[RetrievalCandidate] = []
         dropped: list[dict[str, Any]] = []
         degraded_modes: list[str] = []
         reads = 0
-        memory_validated = 0
         l2_resource_keys = frozenset(self.selector.l2_hydration_record_keys(candidates, plan=plan))
-        memory_l2_remaining = self.selector.policy.max_l2_items
         for item in candidates:
-            if item.document_id:
-                if reads >= source_read_budget:
-                    degraded_modes.append("memory_source_read_bound")
-                    dropped.append(self._drop(item, "memory_source_read_bound"))
-                    continue
-                reads += 1
-                hydrated, drop = self._memory_document(
-                    item,
-                    plan=plan,
-                    include_l2=memory_l2_remaining > 0,
-                )
-                if drop is not None:
-                    dropped.append(drop)
-                    self._schedule_document_rescan(item, plan=plan)
-                    continue
-                memory_validated += 1
-                if hydrated.text:
-                    memory_l2_remaining -= 1
-                result.append(hydrated)
-                continue
             if item.record_key in l2_resource_keys:
                 hydrated, used_reads, mode = self._resource_l2(
                     item,
@@ -137,52 +106,6 @@ class ContextHydrator:
             reads,
             tuple(dict.fromkeys(degraded_modes)),
             tuple(dropped),
-            memory_validated,
-        )
-
-    def _memory_document(
-        self,
-        item: RetrievalCandidate,
-        *,
-        plan: RetrievalQueryPlan,
-        include_l2: bool,
-    ) -> tuple[RetrievalCandidate, dict[str, Any] | None]:
-        relative_path = str(item.metadata.get("relative_path") or "")
-        if self.document_overlay is None or not relative_path or not item.source_digest:
-            return item, self._drop(item, "memory_source_unavailable")
-        try:
-            view = self.document_overlay.read(
-                tenant_id=str(plan.tenant_id or "default"),
-                owner_user_id=str(plan.owner_user_id or item.owner_user_id),
-                document_uri=item.source_uri or item.uri,
-                relative_path=relative_path,
-                expected_source_digest=item.source_digest,
-            )
-        except (DocumentConflictError, DocumentNotFoundError, DocumentUnsafeError, PermissionError, ValueError):
-            return item, self._drop(item, "stale_memory_document_projection")
-        try:
-            safe = self.sanitizer.sanitize(
-                title=item.title,
-                l0_text=item.l0_text,
-                l1_text=view.markdown if include_l2 else item.l1_text,
-                metadata=dict(item.metadata),
-                source_kind="memory_document",
-            )
-        except ContextProjectionSanitizationError:
-            return item, self._drop(item, "memory_document_sanitization_failed")
-        return (
-            replace(
-                item,
-                text=safe.l1_text if include_l2 else "",
-                l0_text=safe.l0_text,
-                l1_text=item.l1_text or safe.l1_text,
-                metadata={
-                    **safe.metadata,
-                    "relative_path": relative_path,
-                    "source_validation_status": "live_digest_verified",
-                },
-            ),
-            None,
         )
 
     def _ordinary(
@@ -346,24 +269,6 @@ class ContextHydrator:
             source_kind="session",
         )
         return safe.l1_text
-
-    def _schedule_document_rescan(self, item: RetrievalCandidate, *, plan: RetrievalQueryPlan) -> None:
-        if self.queue_store is None:
-            return
-        self.queue_store.enqueue(
-            QueueJob(
-                job_id=f"memory_rescan_{stable_hash((plan.tenant_id, item.owner_user_id, item.document_id, item.source_digest), 32)}",
-                queue_name="memory_document_scan",
-                action="rescan",
-                target_uri=item.source_uri or item.uri,
-                payload={
-                    "tenant_id": str(plan.tenant_id or "default"),
-                    "owner_user_id": str(plan.owner_user_id or item.owner_user_id),
-                    "document_id": item.document_id,
-                    "observed_source_digest": item.source_digest,
-                },
-            )
-        )
 
     @staticmethod
     def _drop(item: RetrievalCandidate, reason: str) -> dict[str, Any]:

@@ -1,6 +1,6 @@
-"""将不可变 SessionArchive 幂等投影到统一 Context Serving Catalog。
+"""将 SessionArchive 幂等投影到统一 Context Serving Catalog。
 
-归档始终是不可变证据源；这里生成的记录只是经过清洗、有数量上限、
+归档始终是只读历史事实源；这里生成的记录只是经过清洗、有数量上限、
 可删除并可重建的 Serving 投影。
 """
 
@@ -27,7 +27,6 @@ from infrastructure.store.model.catalog import (
     CatalogRecordKind,
     catalog_vector_metadata,
 )
-from pre.evidence import EvidenceEpisode, SessionArchiveEpisodeAdapter
 from pre.session import SessionArchive
 from sanitization.context_projection import ContextProjectionSanitizer
 
@@ -39,6 +38,28 @@ _COLLECTION_KIND = {
     "feedback": CatalogRecordKind.EVENT.value,
     "session": CatalogRecordKind.EVENT.value,
 }
+
+_ARCHIVE_COLLECTIONS = (
+    ("message", "messages"),
+    ("observation", "observations"),
+    ("tool_result", "tool_results"),
+    ("action_result", "action_results"),
+    ("feedback", "feedback"),
+)
+
+
+@dataclass(frozen=True)
+class _ArchiveProjectionRow:
+    """Context 投影所需的最小归档行，不是公共会话或证据模型。"""
+
+    category: str
+    payload: Mapping[str, Any]
+    event_id: str
+    digest: str
+    occurred_at: str
+    ingested_at: str
+    sequence: int
+    ordinal: int
 
 
 def workspace_id_from_session_metadata(metadata: Mapping[str, Any]) -> str:
@@ -118,10 +139,8 @@ class SessionContextProjector(SessionRecordBuilderMixin):
         if not archive.archive_digest or not archive.manifest_digest:
             raise ValueError("SessionArchive must be durably written before projection")
         tenant_id = str(archive.metadata.get("tenant_id") or "default")
-        episode = SessionArchiveEpisodeAdapter().adapt(archive)
         expected_records = self.build_records(
             archive,
-            episode=episode,
             async_outputs=async_outputs,
         )
         records = expected_records
@@ -287,22 +306,22 @@ class SessionContextProjector(SessionRecordBuilderMixin):
         self,
         archive: SessionArchive,
         *,
-        episode: EvidenceEpisode | None = None,
         async_outputs: Mapping[str, Any] | None = None,
     ) -> tuple[CatalogRecord, ...]:
-        episode = episode or SessionArchiveEpisodeAdapter().adapt(archive)
-        tenant_id = episode.tenant_id
+        projection_rows = self._archive_projection_rows(archive)
+        tenant_id = str(archive.metadata.get("tenant_id") or "default")
         owner_user_id = archive.user_id
         workspace_id = workspace_id_from_session_metadata(archive.metadata)
-        adapter_id = episode.origin.adapter_id
+        adapter_id = self._adapter_id(archive.metadata)
+        started_at = projection_rows[0].occurred_at if projection_rows else self._normalized_time(archive.created_at)
         base_paths = self._base_paths(
             archive,
-            event_time=episode.started_at,
+            event_time=started_at,
             workspace_id=workspace_id,
             adapter_id=adapter_id,
         )
         created_at = self._iso(archive.created_at)
-        event_texts = [self._event_text(event.content) for event in episode.events]
+        event_texts = [self._event_text(event.payload) for event in projection_rows]
         joined = "\n".join(text for text in event_texts if text)
         abstract = l0_abstract(joined or f"Session {archive.session_id}")
         overview = l1_overview(
@@ -367,7 +386,7 @@ class SessionContextProjector(SessionRecordBuilderMixin):
                 record_kind=CatalogRecordKind.SESSION_ROOT.value,
                 parent_uri="",
                 tree_paths=base_paths,
-                event_time=self._iso(episode.started_at),
+                event_time=started_at,
                 ingested_at=created_at,
                 title=f"Session {archive.session_id}",
                 l0_text=abstract,
@@ -390,7 +409,7 @@ class SessionContextProjector(SessionRecordBuilderMixin):
                 record_kind=CatalogRecordKind.SESSION_L0.value,
                 parent_uri=root_uri,
                 tree_paths=base_paths,
-                event_time=self._iso(episode.started_at),
+                event_time=started_at,
                 ingested_at=created_at,
                 title=f"Session {archive.session_id} abstract",
                 l0_text=abstract,
@@ -411,7 +430,7 @@ class SessionContextProjector(SessionRecordBuilderMixin):
                 record_kind=CatalogRecordKind.SESSION_L1.value,
                 parent_uri=root_uri,
                 tree_paths=base_paths,
-                event_time=self._iso(episode.started_at),
+                event_time=started_at,
                 ingested_at=created_at,
                 title=f"Session {archive.session_id} overview",
                 l0_text=abstract,
@@ -427,17 +446,14 @@ class SessionContextProjector(SessionRecordBuilderMixin):
         ]
 
         event_records: list[CatalogRecord] = []
-        for ordinal, event in enumerate(episode.events):
-            category = str(event.metadata.get("category") or "event").casefold()
+        for ordinal, event in enumerate(projection_rows):
+            category = event.category
             record_kind = _COLLECTION_KIND.get(category, CatalogRecordKind.EVENT.value)
-            raw = dict(event.content)
+            raw = dict(event.payload)
             text = self._event_text(raw)
             paths = self._event_paths(
                 archive,
-                raw.get("occurred_at")
-                or raw.get("event_time")
-                or raw.get("created_at")
-                or event.occurred_at,
+                event.occurred_at,
                 base_paths=base_paths,
                 raw=raw,
             )
@@ -455,8 +471,8 @@ class SessionContextProjector(SessionRecordBuilderMixin):
                 record_kind=record_kind,
                 parent_uri=root_uri,
                 tree_paths=paths,
-                event_time=self._iso(event.occurred_at),
-                ingested_at=self._iso(event.ingested_at or event.occurred_at),
+                event_time=event.occurred_at,
+                ingested_at=event.ingested_at,
                 title=title,
                 l0_text=l0_abstract(text or title),
                 l1_text=text,
@@ -485,7 +501,7 @@ class SessionContextProjector(SessionRecordBuilderMixin):
                 common=common,
                 root_uri=root_uri,
                 base_paths=base_paths,
-                fallback_event_time=episode.started_at,
+                fallback_event_time=started_at,
             )
         )
         records.extend(
@@ -496,13 +512,96 @@ class SessionContextProjector(SessionRecordBuilderMixin):
                 common=common,
                 root_uri=root_uri,
                 base_paths=base_paths,
-                fallback_event_time=episode.started_at,
+                fallback_event_time=started_at,
             )
         )
         keys = [record.record_key for record in records]
         if len(keys) != len(set(keys)):
             raise ValueError("session projection produced duplicate record keys")
         return tuple(records)
+
+    def _archive_projection_rows(self, archive: SessionArchive) -> tuple[_ArchiveProjectionRow, ...]:
+        rows: list[_ArchiveProjectionRow] = []
+        ordinal = 0
+        for category, attribute in _ARCHIVE_COLLECTIONS:
+            values = getattr(archive, attribute)
+            for value in values:
+                if not isinstance(value, Mapping):
+                    raise TypeError(f"SessionArchive {attribute} entries must be objects")
+                raw = dict(value)
+                event_id = str(
+                    raw.get("event_id")
+                    or raw.get("id")
+                    or raw.get("message_id")
+                    or f"{category}:{ordinal}"
+                )
+                ingested_at = self._normalized_time(raw.get("ingested_at"), fallback=archive.created_at)
+                occurred_at = self._normalized_time(
+                    raw.get("occurred_at") or raw.get("event_time") or raw.get("created_at"),
+                    fallback=ingested_at,
+                )
+                try:
+                    sequence = int(raw.get("sequence", raw.get("source_sequence", ordinal)))
+                except (TypeError, ValueError):
+                    sequence = ordinal
+                digest = self.sanitizer.digest(
+                    {
+                        "category": category,
+                        "event_id": event_id,
+                        "ordinal": ordinal,
+                        "payload": raw,
+                    }
+                )
+                rows.append(
+                    _ArchiveProjectionRow(
+                        category=category,
+                        payload=raw,
+                        event_id=event_id,
+                        digest=digest,
+                        occurred_at=occurred_at,
+                        ingested_at=ingested_at,
+                        sequence=sequence,
+                        ordinal=ordinal,
+                    )
+                )
+                ordinal += 1
+        return tuple(
+            sorted(
+                rows,
+                key=lambda item: (
+                    item.occurred_at,
+                    item.ingested_at,
+                    item.sequence,
+                    item.ordinal,
+                    item.event_id,
+                ),
+            )
+        )
+
+    @classmethod
+    def _normalized_time(cls, value: object, *, fallback: object | None = None) -> str:
+        candidate = value if value not in (None, "") else fallback
+        try:
+            return cls._iso(candidate)
+        except (TypeError, ValueError):
+            if fallback not in (None, "") and candidate != fallback:
+                return cls._iso(fallback)
+            return "1970-01-01T00:00:00+00:00"
+
+    @staticmethod
+    def _adapter_id(metadata: Mapping[str, Any]) -> str:
+        connect = metadata.get("connect")
+        connect_map = dict(connect) if isinstance(connect, Mapping) else {}
+        scope = metadata.get("scope")
+        scope_map = dict(scope) if isinstance(scope, Mapping) else {}
+        origin = metadata.get("origin") or scope_map.get("origin")
+        origin_map = dict(origin) if isinstance(origin, Mapping) else {}
+        return str(
+            origin_map.get("adapter_id")
+            or connect_map.get("adapter_id")
+            or metadata.get("adapter_id")
+            or "generic_agent"
+        )
 
 
 

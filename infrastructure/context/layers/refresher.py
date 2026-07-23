@@ -14,7 +14,6 @@ from infrastructure.store.contracts.domain import ContextDomainClassifier, NoCon
 from infrastructure.store.contracts.source import SourceStore
 from infrastructure.store.model.context.context_layer import ContextLayers
 from infrastructure.store.model.context.context_object import ContextObject
-from infrastructure.store.model.context.context_type import ContextType
 from sanitization.context_projection import ContextProjectionSanitizer
 
 
@@ -48,8 +47,6 @@ class LayerRefresher:
         content: str,
         bullets: list[str] | None = None,
     ) -> LayerRefreshResult:
-        if obj.context_type is ContextType.MEMORY or "/memory/documents/" in obj.uri:
-            raise PermissionError("Markdown memory layers are owned by MemoryDocumentProjector")
         if self.domain_classifier.owns_object(obj):
             raise ValueError("domain-owned layers require their authoritative projector")
         base = obj.uri

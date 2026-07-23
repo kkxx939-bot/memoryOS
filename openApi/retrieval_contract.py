@@ -40,8 +40,6 @@ RETRIEVAL_OPTIONS_JSON_SCHEMA: dict[str, Any] = {
         },
         "source_kinds": _STRING_ARRAY,
         "record_kinds": _STRING_ARRAY,
-        "document_ids": _STRING_ARRAY,
-        "document_kinds": _STRING_ARRAY,
         "owner_user_id": {"type": ["string", "null"]},
         "workspace_ids": _STRING_ARRAY,
         "session_ids": _STRING_ARRAY,

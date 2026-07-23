@@ -148,37 +148,6 @@ class SQLiteRelationStore:
             self._delete_rows(conn, resolved_tenant, rows)
         return len(rows)
 
-    def delete_memory_document_relations(
-        self,
-        uri: str,
-        *,
-        tenant_id: str,
-        owner_user_id: str,
-        limit: int,
-    ) -> int:
-        """删除涉及一个记忆文档 URI、归属明确的有界关系批次。"""
-
-        resolved_tenant = self._require_tenant(tenant_id)
-        resolved_owner = str(owner_user_id or "").strip()
-        if not resolved_owner:
-            raise ValueError("owner_user_id is required")
-        maximum = max(1, min(int(limit), 1_000))
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            rows = conn.execute(
-                """
-                SELECT source_uri, relation_type, target_uri
-                FROM relations
-                WHERE tenant_id = ? AND owner_user_id = ?
-                  AND (source_uri = ? OR target_uri = ?)
-                ORDER BY source_uri, relation_type, target_uri
-                LIMIT ?
-                """,
-                (resolved_tenant, resolved_owner, str(uri), str(uri), maximum),
-            ).fetchall()
-            self._delete_rows(conn, resolved_tenant, rows)
-        return len(rows)
-
     def delete_uri_relations(
         self,
         uri: str,

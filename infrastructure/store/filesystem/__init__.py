@@ -1,8 +1,4 @@
-"""文件系统存储实现的延迟导出入口。
-
-延迟加载使会话证据归档可以独立使用，不会因为包级导入而初始化完整的
-Markdown 记忆文档领域。
-"""
+"""文件系统存储实现的延迟导出入口。"""
 
 from __future__ import annotations
 
@@ -10,9 +6,6 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from infrastructure.store.filesystem.memory_document_store import (
-        FileSystemMemoryDocumentStore as FileSystemMemoryDocumentStore,
-    )
     from infrastructure.store.filesystem.session_archive import (
         SessionArchiveStore as SessionArchiveStore,
     )
@@ -27,10 +20,6 @@ _PUBLIC_ATTRS = {
     "BundleIntegrityError": (
         "infrastructure.store.filesystem.source_store",
         "BundleIntegrityError",
-    ),
-    "FileSystemMemoryDocumentStore": (
-        "infrastructure.store.filesystem.memory_document_store",
-        "FileSystemMemoryDocumentStore",
     ),
     "FileSystemSourceStore": (
         "infrastructure.store.filesystem.source_store",

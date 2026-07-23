@@ -46,16 +46,7 @@ class BaseFilterBuilder:
             add_values(column, normalized[filter_name])
         for filter_name, column in _PLURAL_FILTER_ALIASES.items():
             if filter_name in normalized:
-                if filter_name == "document_kinds" and normalized.get("document_kinds_apply_to_documents_only"):
-                    continue
                 add_values(column, normalized[filter_name])
-        if normalized.get("document_kinds_apply_to_documents_only"):
-            document_kinds = self._store._filter_values(normalized.get("document_kinds"))
-            placeholders = ", ".join("?" for _ in document_kinds)
-            clauses.append(
-                f"(c.record_kind NOT IN ('memory_document', 'memory_block') OR c.document_kind IN ({placeholders}))"
-            )
-            params.extend(document_kinds)
         for filter_name, column in (
             ("uri", "uri"),
             ("source_uri", "source_uri"),

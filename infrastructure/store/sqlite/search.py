@@ -105,15 +105,15 @@ class CatalogSearchOperations:
         filter_sql, params = self._store._base_filter_sql(filters)
         sql = (
             "SELECT c.* FROM contexts AS c WHERE ("
-            "c.record_key = ? OR c.uri = ? OR c.source_uri = ? OR c.document_id = ? "
-            "OR c.block_id = ? OR c.scene_key = ? OR c.action = ? OR c.support_anchor_uri = ?) "
+            "c.record_key = ? OR c.uri = ? OR c.source_uri = ? "
+            "OR c.scene_key = ? OR c.action = ? OR c.support_anchor_uri = ?) "
             f"{filter_sql} ORDER BY c.updated_at DESC, c.record_key LIMIT ?"
         )
         with self._store._connect() as conn:
             rows = self._store._online_fetchall(
                 conn,
                 sql,
-                [raw, raw, raw, raw, raw, raw, raw, raw, *params, self._store._bounded_limit(limit)],
+                [raw, raw, raw, raw, raw, raw, *params, self._store._bounded_limit(limit)],
             )
         return [self._hit_from_row(row, identity=1.0, identity_rank=1.0) for row in rows]
 
@@ -140,11 +140,6 @@ class CatalogSearchOperations:
                 "event_time": record.event_time,
                 "transaction_time": record.transaction_time,
                 "updated_at": record.updated_at,
-                "document_id": record.document_id,
-                "block_id": record.block_id,
-                "document_kind": record.document_kind,
-                "document_revision": record.document_revision,
-                "projection_generation": record.projection_generation,
                 "serving_tier": record.serving_tier,
                 "projection_status": record.projection_status,
             },
@@ -185,11 +180,6 @@ class CatalogSearchOperations:
                 "updated_at": str(row["updated_at"]),
                 "source_uri": str(row["source_uri"]),
                 "source_digest": str(row["source_digest"]),
-                "document_id": str(row["document_id"]),
-                "block_id": str(row["block_id"]),
-                "document_kind": str(row["document_kind"]),
-                "document_revision": int(row["document_revision"]),
-                "projection_generation": int(row["projection_generation"]),
                 "serving_tier": str(row["serving_tier"]),
                 "projection_status": str(row["projection_status"]),
                 "score_components": components,

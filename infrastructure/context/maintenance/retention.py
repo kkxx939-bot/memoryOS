@@ -1,13 +1,11 @@
-"""管理可重建上下文投影的生命周期、压缩与垃圾回收。"""
+"""管理可重建上下文投影的生命周期与垃圾回收。"""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-from typing import Any
 
-from infrastructure.context.layers.generator import l0_abstract, l1_overview
 from infrastructure.context.maintenance.retention_policy import (
     RetentionCatalogStore,
     RetentionPolicy,
@@ -19,9 +17,7 @@ from infrastructure.store.contracts.vector import vector_row_id
 from infrastructure.store.model.catalog import (
     CatalogProjectionStatus,
     CatalogRecord,
-    CatalogRecordKind,
     ServingTier,
-    normalize_tree_path,
 )
 from sanitization.context_projection import ContextProjectionSanitizer
 
@@ -89,12 +85,6 @@ class CatalogRetentionManager:
                         updated_at=effective_now.isoformat(),
                         metadata=metadata,
                     )
-                    if record.record_kind in {
-                        CatalogRecordKind.MEMORY_DOCUMENT.value,
-                        CatalogRecordKind.MEMORY_BLOCK.value,
-                    }:
-                        cursor = record.record_key
-                        continue
                     self.catalog_store.upsert_catalog(updated, tenant_id=tenant_id)
                     changes += 1
                 cursor = record.record_key
@@ -116,173 +106,6 @@ class CatalogRetentionManager:
         if age <= self.policy.cold_for:
             return ServingTier.COLD
         return ServingTier.ARCHIVED
-
-    def compact_session(
-        self,
-        *,
-        tenant_id: str,
-        session_id: str,
-        owner_user_id: str = "",
-        now: datetime | None = None,
-    ) -> CatalogRecord | None:
-        filters: dict[str, Any] = {
-            "tenant_id": tenant_id,
-            "session_id": session_id,
-            "include_inactive": True,
-            "serving_tier": _ALL_SERVING_TIERS,
-        }
-        if owner_user_id:
-            filters["owner_user_id"] = owner_user_id
-        records = self.catalog_store.scan_catalog_batch(
-            tenant_id=tenant_id,
-            filters=filters,
-            limit=self.policy.max_compaction_sources,
-        )
-        sources = [
-            record
-            for record in records
-            if record.record_kind
-            in {
-                CatalogRecordKind.SEMANTIC_SEGMENT.value,
-                CatalogRecordKind.MESSAGE.value,
-                CatalogRecordKind.TOOL_RESULT.value,
-                CatalogRecordKind.OBSERVATION.value,
-                CatalogRecordKind.ACTION_RESULT.value,
-                CatalogRecordKind.EVENT.value,
-            }
-        ]
-        if not sources:
-            return None
-        owners = {record.owner_user_id for record in sources if record.owner_user_id}
-        if owner_user_id:
-            owners.add(owner_user_id)
-        if len(owners) != 1:
-            raise ValueError("session compaction requires exactly one owner")
-        owner = next(iter(owners))
-        effective_now = self._utc(now or datetime.now(timezone.utc)).isoformat()
-        sources.sort(key=lambda record: (record.event_time, record.record_key))
-        summary_lines = [record.l0_text or record.title for record in sources if record.l0_text or record.title]
-        source_digest = self.sanitizer.digest(
-            [(record.record_key, record.source_digest, record.source_revision) for record in sources]
-        )
-        session_path = f"sessions/{self._safe_path_segment(session_id)}"
-        timeline_paths = [path for record in sources for path in record.tree_paths if path.startswith("timeline/")]
-        tree_paths = tuple(dict.fromkeys((session_path, *timeline_paths)))[:8]
-        uri = f"memoryos://user/{owner}/sessions/history/{self._safe_path_segment(session_id)}/context/compacted"
-        compacted = CatalogRecord(
-            record_key=f"compaction:session:{tenant_id}:{owner}:{session_id}",
-            uri=uri,
-            tenant_id=tenant_id,
-            owner_user_id=owner,
-            workspace_id=next((record.workspace_id for record in sources if record.workspace_id), ""),
-            session_id=session_id,
-            adapter_id=next((record.adapter_id for record in sources if record.adapter_id), ""),
-            context_type="session",
-            source_kind="session_compaction",
-            record_kind=CatalogRecordKind.SESSION_L1.value,
-            lifecycle_state="active",
-            tree_paths=tree_paths,
-            created_at=min(record.created_at for record in sources if record.created_at),
-            updated_at=effective_now,
-            event_time=min(record.event_time for record in sources if record.event_time),
-            ingested_at=effective_now,
-            transaction_time=effective_now,
-            title=f"Session {session_id} compacted overview",
-            l0_text=l0_abstract(" ".join(summary_lines)),
-            l1_text=l1_overview(
-                f"Session {session_id}",
-                summary_lines,
-                max_bullets=12,
-            ),
-            l2_uri=next((record.l2_uri for record in sources if record.l2_uri), ""),
-            source_uri=next((record.source_uri for record in sources if record.source_uri), ""),
-            source_digest=source_digest,
-            source_revision=max(record.source_revision for record in sources),
-            serving_tier=ServingTier.WARM.value,
-            projection_status=CatalogProjectionStatus.PROJECTED.value,
-            metadata={
-                "compaction_kind": "session_segment",
-                "source_count": len(sources),
-                "source_record_digest": self.sanitizer.digest([record.record_key for record in sources]),
-                "vector_eligible": False,
-            },
-        ).with_sanitized_projection(self.sanitizer)
-        self.catalog_store.upsert_catalog(compacted, tenant_id=tenant_id)
-        for source in sources:
-            target = (
-                ServingTier.WARM if source.record_kind == CatalogRecordKind.SEMANTIC_SEGMENT.value else ServingTier.COLD
-            )
-            if source.serving_tier != target.value:
-                updated = replace(source, serving_tier=target.value, updated_at=effective_now)
-                self.catalog_store.upsert_catalog(updated, tenant_id=tenant_id)
-                if not self._retains_vector(updated):
-                    self._enqueue_vector_delete(updated, reason="retention-vector-delete")
-        return compacted
-
-    def compact_timeline(
-        self,
-        *,
-        tenant_id: str,
-        owner_user_id: str,
-        timeline_path: str,
-        now: datetime | None = None,
-    ) -> CatalogRecord | None:
-        normalized_path = normalize_tree_path(timeline_path)
-        if not normalized_path.startswith("timeline/") or len(normalized_path.split("/")) != 4:
-            raise ValueError("timeline compaction requires a day path")
-        sources = self.catalog_store.scan_catalog_batch(
-            tenant_id=tenant_id,
-            filters={
-                "tenant_id": tenant_id,
-                "owner_user_id": owner_user_id,
-                "target_paths": (normalized_path,),
-                "include_inactive": True,
-                "serving_tier": _ALL_SERVING_TIERS,
-            },
-            limit=self.policy.max_compaction_sources,
-        )
-        sources = [
-            record
-            for record in sources
-            if record.record_kind != CatalogRecordKind.TREE_OVERVIEW.value and (record.l0_text or record.title)
-        ]
-        if not sources:
-            return None
-        effective_now = self._utc(now or datetime.now(timezone.utc)).isoformat()
-        sources.sort(key=lambda record: (record.event_time, record.record_key))
-        bullets = [record.l0_text or record.title for record in sources]
-        path_digest = self.sanitizer.digest((tenant_id, owner_user_id, normalized_path))
-        record = CatalogRecord(
-            record_key=f"compaction:timeline:{path_digest}",
-            uri=f"memoryos://user/{owner_user_id}/catalog/timeline/{path_digest[:20]}",
-            tenant_id=tenant_id,
-            owner_user_id=owner_user_id,
-            context_type="session",
-            source_kind="timeline_compaction",
-            record_kind=CatalogRecordKind.TREE_OVERVIEW.value,
-            lifecycle_state="active",
-            tree_paths=(normalized_path,),
-            created_at=min(item.created_at for item in sources if item.created_at),
-            updated_at=effective_now,
-            event_time=min(item.event_time for item in sources if item.event_time),
-            ingested_at=effective_now,
-            transaction_time=effective_now,
-            title=f"Timeline overview {normalized_path.removeprefix('timeline/')}",
-            l0_text=l0_abstract(" ".join(bullets)),
-            l1_text=l1_overview("Timeline overview", bullets, max_bullets=12),
-            source_uri=next((item.source_uri for item in sources if item.source_uri), ""),
-            source_digest=self.sanitizer.digest([(item.record_key, item.source_digest) for item in sources]),
-            source_revision=max(item.source_revision for item in sources),
-            serving_tier=ServingTier.WARM.value,
-            projection_status=CatalogProjectionStatus.PROJECTED.value,
-            metadata={
-                "compaction_kind": "timeline_overview",
-                "source_count": len(sources),
-                "vector_eligible": False,
-            },
-        ).with_sanitized_projection(self.sanitizer)
-        self.catalog_store.upsert_catalog(record, tenant_id=tenant_id)
-        return record
 
     def restore_cold_record(
         self,
@@ -307,11 +130,6 @@ class CatalogRetentionManager:
             updated_at=effective_now,
             metadata=metadata,
         )
-        if record.record_kind in {
-            CatalogRecordKind.MEMORY_DOCUMENT.value,
-            CatalogRecordKind.MEMORY_BLOCK.value,
-        }:
-            raise ValueError("memory document serving state must be restored by its projector")
         self.catalog_store.upsert_catalog(restored, tenant_id=tenant_id)
         return restored
 
@@ -338,11 +156,6 @@ class CatalogRetentionManager:
                     or record.projection_status == CatalogProjectionStatus.TOMBSTONED.value
                 )
                 if not stale:
-                    continue
-                if record.record_kind in {
-                    CatalogRecordKind.MEMORY_DOCUMENT.value,
-                    CatalogRecordKind.MEMORY_BLOCK.value,
-                }:
                     continue
                 tombstone = self.catalog_store.enqueue_tombstone(
                     tenant_id=tenant_id,
@@ -500,13 +313,6 @@ class CatalogRetentionManager:
         if target_failures or incomplete:
             raise RuntimeError("retention tombstone cleanup is durable but incomplete; retry the retention cycle")
         return len(completed), len(target_failures)
-
-    @staticmethod
-    def _safe_path_segment(value: str) -> str:
-        # Session ID 通常来自已校验 URI；摘要后备值确保压缩路径仍位于受控目录树内。
-        if value and all(character.isalnum() or character in "._:-" for character in value):
-            return value[:160]
-        return "id-" + ContextProjectionSanitizer().digest(value)[:20]
 
     @classmethod
     def _reference_time(cls, record: CatalogRecord) -> datetime | None:

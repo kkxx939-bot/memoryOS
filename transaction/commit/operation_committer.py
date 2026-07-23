@@ -1,8 +1,4 @@
-"""普通对象和领域扩展对象的耐久事务提交器。
-
-Markdown 记忆文档由 ``MemoryDocumentCommitter`` 独占；本提交器会在创建
-Redo 意图前拒绝这类写入。
-"""
+"""普通对象和领域扩展对象的耐久事务提交器。"""
 
 from __future__ import annotations
 
@@ -16,8 +12,6 @@ from infrastructure.store.contracts.path_lock import PathLock
 from infrastructure.store.contracts.relation import RelationStore
 from infrastructure.store.contracts.source import SourceStore
 from infrastructure.store.model.context.context_object import ContextObject
-from infrastructure.store.model.context.context_type import ContextType
-from infrastructure.store.model.context.context_uri import ContextURI
 from transaction.commit.audit_diff import CommitAuditDiff
 from transaction.commit.control import OperationControlStores
 from transaction.commit.coordinator import CommitCoordinator
@@ -116,49 +110,6 @@ class OperationCommitter(
 
     def _domain_handler_for_object(self, obj: ContextObject) -> OperationDomainHandler | None:
         return self.domain_extensions.handler_for_object(obj)
-
-    @staticmethod
-    def _is_document_owned_uri(uri: str) -> bool:
-        parsed = ContextURI.parse(uri)
-        return parsed.authority == "user" and parsed.segments[1:3] == ("memory", "documents")
-
-    def _reject_document_owned_uri(self, uri: str) -> None:
-        if self._is_document_owned_uri(uri):
-            raise PermissionError(
-                "Markdown memory documents cannot pass through OperationCommitter; use MemoryDocumentCommitter"
-            )
-
-    def _reject_document_owned_operation(self, operation: ContextOperation) -> None:
-        if operation.context_type == ContextType.MEMORY:
-            raise PermissionError(
-                "ContextType.MEMORY is reserved for Markdown document projections; use MemoryDocumentCommitter"
-            )
-        if operation.target_uri:
-            self._reject_document_owned_uri(operation.target_uri)
-        raw = operation.payload.get("context_object")
-        if not isinstance(raw, dict):
-            return
-        uri = raw.get("uri")
-        if isinstance(uri, str) and uri:
-            self._reject_document_owned_uri(uri)
-        for relation in raw.get("relations", []) or []:
-            if not isinstance(relation, dict):
-                continue
-            for key in ("source_uri", "target_uri"):
-                endpoint = relation.get(key)
-                if isinstance(endpoint, str) and endpoint.startswith("memoryos://"):
-                    self._reject_document_owned_uri(endpoint)
-        if self.context_effects is None:
-            return
-        try:
-            obj = ContextObject.from_dict(raw)
-        except (KeyError, TypeError, ValueError):
-            return
-        for spec in self.context_effects.relation_specs_for_object(obj):
-            for key in ("source_uri", "target_uri"):
-                endpoint = str(spec.get(key) or "")
-                if endpoint.startswith("memoryos://"):
-                    self._reject_document_owned_uri(endpoint)
 
     def _validate_domain_operation(self, operation: ContextOperation) -> bool:
         handler = self._domain_handler_for(operation)

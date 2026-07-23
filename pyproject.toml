@@ -27,6 +27,9 @@ version = {attr = "openApi.version.__version__"}
 [tool.setuptools.packages.find]
 include = ["pre*", "memory*", "behavior*", "openApi*", "policy*", "agent_hook*", "infrastructure*", "foundation*", "runtime*", "sanitization*", "transaction*"]
 
+[tool.setuptools.package-data]
+"memory.schema.definitions" = ["*.yaml"]
+
 [tool.ruff]
 line-length = 120
 target-version = "py310"

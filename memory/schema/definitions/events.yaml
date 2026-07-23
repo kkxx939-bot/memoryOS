@@ -1,0 +1,45 @@
+memory_type: event
+description: >-
+  每个文件保存一个已经发生或明确确认的原子事件，例如决定、承诺、安排、状态变化或结果。
+  对话只是信息来源，不把聊天本身当作事件，也不把多个独立变化合并为宽泛主题。
+path_template: events/{event_date:%Y}/{event_date:%m}/{event_date:%d}/{event_name}.md
+operation_mode: add_only
+markdown_template: |
+  # {event_name}
+
+  **Date:** {event_date}
+
+  ## Summary
+  {summary}
+
+  ## Details
+  {details}
+fields:
+  - name: event_date
+    type: date
+    role: address
+    required: true
+    merge: immutable
+    description: >-
+      事件对应的明确日历日期，使用 YYYY-MM-DD；相对时间必须先解析成具体日期。
+  - name: event_name
+    type: string
+    role: address
+    required: true
+    merge: immutable
+    description: >-
+      一个具体原子事件的简洁名称，不包含日期，不使用“聊天、讨论、安排”等宽泛名称。
+  - name: summary
+    type: string
+    role: content
+    required: true
+    merge: immutable
+    description: >-
+      用间接陈述记录谁做了什么、确认了什么或产生了什么结果，保留具体日期、责任人和状态。
+  - name: details
+    type: string
+    role: content
+    required: false
+    merge: immutable
+    description: >-
+      仅补充理解该事件所需的少量事实；不复制原始对话，也不保存消息索引或对话片段。

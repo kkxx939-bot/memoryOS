@@ -7,24 +7,14 @@ from infrastructure.context.maintenance.index_service import (
 from infrastructure.context.maintenance.lifecycle_service import ContextLifecycleService
 from infrastructure.context.maintenance.retention import CatalogRetentionManager
 from infrastructure.context.maintenance.retention_policy import RetentionPolicy, RetentionRunResult
-from infrastructure.context.maintenance.serving import (
-    CallbackDocumentServingMaintenance,
-    CatalogDocumentProjectionVerifier,
-    DerivedServingMaintenanceService,
-    DocumentOwnerServingResult,
-    DocumentServingMaintenance,
-)
+from infrastructure.context.maintenance.serving import DerivedServingMaintenanceService
 from infrastructure.context.maintenance.tombstone import ProjectionTombstoneService, TombstoneRunResult
 
 __all__ = [
-    "CallbackDocumentServingMaintenance",
-    "CatalogDocumentProjectionVerifier",
     "CatalogRetentionManager",
     "ContextAdministrationService",
     "ContextLifecycleService",
     "DerivedServingMaintenanceService",
-    "DocumentOwnerServingResult",
-    "DocumentServingMaintenance",
     "GenericContextMaintenance",
     "ProjectionTombstoneService",
     "RetentionPolicy",

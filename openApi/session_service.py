@@ -17,8 +17,7 @@ from infrastructure.store.contracts.session_archive import SessionArchiveStore
 from infrastructure.store.contracts.vector import VectorStore
 from infrastructure.store.model.context.context_type import ContextType
 from infrastructure.store.model.context.context_uri import ContextURI
-from memory.commit.evidence.errors import EvidenceArchiveIntegrityError
-from memory.commit.session_commit import SessionCommitService
+from infrastructure.store.session.archive_errors import SessionArchiveIntegrityError
 from openApi.ingress import (
     sanitize_ingress_messages,
     sanitize_ingress_tool_results,
@@ -27,6 +26,7 @@ from openApi.ingress import (
 )
 from pre.connect import ConnectMetadata
 from pre.session import SessionArchive
+from runtime.session.commit_service import SessionCommitService
 from sanitization.context_projection import ContextProjectionSanitizer
 
 
@@ -126,17 +126,14 @@ class SessionApplicationService:
         contexts = search(
             query,
             options=RetrievalOptions(
-                context_types=(ContextType.SESSION, ContextType.MEMORY),
+                context_types=(ContextType.SESSION,),
                 record_kinds=(
                     "session_root",
                     "session_l0",
                     "session_l1",
                     "message",
                     "semantic_segment",
-                    "memory_document",
-                    "memory_block",
                 ),
-                document_kinds=("episode", "topic", "entity"),
                 tenant_id=tenant_id,
                 owner_user_id=user_id,
                 workspace_ids=((project_id,) if project_id else ()),
@@ -154,22 +151,15 @@ class SessionApplicationService:
         for item in contexts:
             metadata = dict(item.get("metadata", {}) or {})
             archive_uri = str(metadata.get("archive_uri") or item.get("source_uri") or "")
-            record_kind = str(metadata.get("record_kind") or item.get("record_kind") or "")
-            if record_kind in {"memory_document", "memory_block"}:
-                preview = str(item.get("content") or item.get("text") or "")[:500]
-                results.append({**dict(item), "preview": preview})
-                if len(results) >= limit:
-                    break
-                continue
             if not archive_uri or archive_uri in seen_archives:
                 continue
             seen_archives.add(archive_uri)
-            # 兼容读取只处理候选集中的精确归档，用不可变证据校验结果，不恢复旧的递归目录扫描。
+            # 只处理候选集中的精确归档，用摘要校验结果，不恢复旧的递归目录扫描。
             try:
                 reader = archive_read or self.archive_read
                 archive_payload = reader(archive_uri, caller=caller)
-            except EvidenceArchiveIntegrityError as exc:
-                raise EvidenceArchiveIntegrityError(f"archive commit head evidence is invalid: {exc}") from exc
+            except SessionArchiveIntegrityError as exc:
+                raise SessionArchiveIntegrityError(f"archive commit head is invalid: {exc}") from exc
             archive_manifest = dict(archive_payload.get("archive", {}) or {})
             # 统一目录已经在脱敏投影上完成词法和语义匹配，不再对完整归档执行第二轮字符串扫描。
             catalog_preview = str(item.get("content") or item.get("text") or "")

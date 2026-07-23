@@ -9,9 +9,6 @@ if TYPE_CHECKING:
     from infrastructure.store.contracts.index import CatalogStore as CatalogStore
     from infrastructure.store.contracts.index import IndexHit as IndexHit
     from infrastructure.store.contracts.index import IndexStore as IndexStore
-    from infrastructure.store.contracts.index import (
-        MemoryDocumentProjectionStore as MemoryDocumentProjectionStore,
-    )
     from infrastructure.store.contracts.lock import LockStore as LockStore
     from infrastructure.store.contracts.lock import LockToken as LockToken
     from infrastructure.store.contracts.queue import QueueJob as QueueJob
@@ -26,10 +23,6 @@ _EXPORTS = {
     "CatalogStore": ("infrastructure.store.contracts.index", "CatalogStore"),
     "IndexHit": ("infrastructure.store.contracts.index", "IndexHit"),
     "IndexStore": ("infrastructure.store.contracts.index", "IndexStore"),
-    "MemoryDocumentProjectionStore": (
-        "infrastructure.store.contracts.index",
-        "MemoryDocumentProjectionStore",
-    ),
     "LockStore": ("infrastructure.store.contracts.lock", "LockStore"),
     "LockToken": ("infrastructure.store.contracts.lock", "LockToken"),
     "QueueJob": ("infrastructure.store.contracts.queue", "QueueJob"),

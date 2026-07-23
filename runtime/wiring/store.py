@@ -10,8 +10,7 @@ from infrastructure.context.retrieval.hybrid_search import HybridSearch
 from infrastructure.model import build_model_client
 from infrastructure.store.contracts.vector import require_production_vector_capabilities
 from infrastructure.store.filesystem import FileSystemSourceStore
-from infrastructure.store.filesystem.memory_document_store import FileSystemMemoryDocumentStore
-from infrastructure.store.memory import RuntimeLayout
+from infrastructure.store.runtime_layout import RuntimeLayout
 from infrastructure.store.sqlite import SQLiteIndexStore, SQLiteLockStore, SQLiteQueueStore, SQLiteRelationStore
 from runtime.config import RuntimeConfig
 from runtime.container import StoreRuntime
@@ -20,16 +19,15 @@ from runtime.dependencies import RuntimeDependencies
 
 @dataclass(frozen=True)
 class StoreAssembly:
-    """基础存储装配的结果，以及必须先探测的 Markdown Store。"""
+    """基础存储装配结果。"""
 
     layout: RuntimeLayout
     readiness: RuntimeReadiness
     stores: StoreRuntime
-    document_store: FileSystemMemoryDocumentStore
 
 
 def wire_stores(config: RuntimeConfig, dependencies: RuntimeDependencies) -> StoreAssembly:
-    """先验证 RuntimeLayout 和文件能力，再创建任何 SQLite serving 状态。"""
+    """先验证 RuntimeLayout，再创建 SQLite serving 状态。"""
 
     root = config.root_path
     layout = RuntimeLayout.open(root, tenant_id=config.tenant_id)
@@ -39,15 +37,6 @@ def wire_stores(config: RuntimeConfig, dependencies: RuntimeDependencies) -> Sto
         RuntimeReadinessState.RECOVERING,
         details={"runtime_layout": layout_details},
     )
-    document_store = FileSystemMemoryDocumentStore(
-        root,
-        max_file_bytes=config.memory_document_max_bytes,
-        max_front_matter_bytes=config.memory_front_matter_max_bytes,
-        max_front_matter_depth=config.memory_front_matter_max_depth,
-        max_scan_files=config.memory_scan_max_files,
-    )
-    document_store.probe_write_capabilities(config.tenant_id)
-
     source = dependencies.source_store or FileSystemSourceStore(root, tenant_id=config.tenant_id)
     source_tenant = str(getattr(source, "tenant_id", config.tenant_id))
     if source_tenant != config.tenant_id:
@@ -83,7 +72,7 @@ def wire_stores(config: RuntimeConfig, dependencies: RuntimeDependencies) -> Sto
         reranker=dependencies.reranker,
         model_client=model_client,
     )
-    return StoreAssembly(layout=layout, readiness=readiness, stores=stores, document_store=document_store)
+    return StoreAssembly(layout=layout, readiness=readiness, stores=stores)
 
 
 __all__ = ["StoreAssembly", "wire_stores"]

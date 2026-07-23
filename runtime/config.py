@@ -49,12 +49,6 @@ class RetentionConfig:
 class RuntimeConfig(MemoryOSConfig):
     """只描述运行参数，不持有 Store、模型客户端或测试替身。"""
 
-    memory_document_max_bytes: int = 2 * 1024 * 1024
-    memory_front_matter_max_bytes: int = 32 * 1024
-    memory_front_matter_max_depth: int = 12
-    memory_scan_stability_seconds: float = 1.0
-    memory_scan_max_files: int = 10_000
-    memory_mass_delete_threshold: int = 50
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
     retention: RetentionConfig = field(default_factory=RetentionConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
@@ -76,20 +70,6 @@ class RuntimeConfig(MemoryOSConfig):
             raise TypeError("retention must be a RetentionConfig")
         if not isinstance(self.model, ModelConfig):
             raise TypeError("model must be a ModelConfig")
-        for field_name in (
-            "memory_document_max_bytes",
-            "memory_front_matter_max_bytes",
-            "memory_front_matter_max_depth",
-            "memory_scan_max_files",
-            "memory_mass_delete_threshold",
-        ):
-            value = getattr(self, field_name)
-            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-                raise ValueError(f"{field_name} must be a positive integer")
-        if self.memory_front_matter_max_bytes >= self.memory_document_max_bytes:
-            raise ValueError("memory_front_matter_max_bytes must be smaller than memory_document_max_bytes")
-        if self.memory_scan_stability_seconds < 0:
-            raise ValueError("memory_scan_stability_seconds cannot be negative")
 
     @classmethod
     def from_env(

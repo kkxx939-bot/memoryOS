@@ -59,8 +59,6 @@ class RetrievalOptions:
     context_types: tuple[ContextType, ...] = ()
     source_kinds: tuple[str, ...] = ()
     record_kinds: tuple[str, ...] = ()
-    document_ids: tuple[str, ...] = ()
-    document_kinds: tuple[str, ...] = ()
 
     tenant_id: str | None = None
     owner_user_id: str | None = None
@@ -114,7 +112,7 @@ class RetrievalOptions:
             "source_kinds",
             _normalize_source_kinds(self.source_kinds),
         )
-        for field_name in ("record_kinds", "document_ids", "document_kinds"):
+        for field_name in ("record_kinds",):
             object.__setattr__(
                 self,
                 field_name,
@@ -237,8 +235,6 @@ class RetrievalOptions:
             "context_types": [item.value for item in self.context_types],
             "source_kinds": list(self.source_kinds),
             "record_kinds": list(self.record_kinds),
-            "document_ids": list(self.document_ids),
-            "document_kinds": list(self.document_kinds),
             "tenant_id": self.tenant_id,
             "owner_user_id": self.owner_user_id,
             "workspace_ids": list(self.workspace_ids),

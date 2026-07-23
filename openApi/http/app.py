@@ -21,7 +21,6 @@ from infrastructure.context.orchestrator import RetrievalUnavailableError
 from infrastructure.context.retrieval.limits import MAX_RETRIEVAL_LIMIT, bounded_int
 from openApi.http.config import HTTPServerConfig
 from openApi.ingress import local_agent_metadata, sanitize_ingress_messages
-from openApi.memory_contract import validate_memory_request, validate_memory_response
 from openApi.retrieval_contract import parse_retrieval_options
 from policy.action_policy.decision.request import PredictionRequest
 from policy.action_policy.model.action_policy import ActionPolicy
@@ -76,8 +75,6 @@ def handle(
             project_id=str(payload.get("project_id") or ""),
             applicability_scopes=payload.get("applicability_scopes"),
             record_kinds=payload.get("record_kinds"),
-            document_ids=payload.get("document_ids"),
-            document_kinds=payload.get("document_kinds"),
             query_intent=payload.get("query_intent"),
             caller=caller,
         )
@@ -177,7 +174,7 @@ class MemoryOSASGI:
         if method == "GET" and path == "/health":
             return self.client.health()
         # Health is the only public endpoint available before startup recovery
-        # has established a complete document and projection serving state.
+        # has established a complete context and projection serving state.
         # Session event/checkpoint routes write durable staging files directly
         # through AgentSessionService, so relying only on SDK method-level
         # gates would let those routes mutate state while NOT_READY.
@@ -230,91 +227,6 @@ class MemoryOSASGI:
             )
             self.sessions.finalize(session_key, commit_state="COMMITTED" if result.get("done") else "QUEUED")
             return result
-        if method == "POST" and path == "/v1/memories/remember":
-            request = validate_memory_request("remember", payload)
-            return validate_memory_response(
-                "remember",
-                self.client.remember(**request, caller=caller),
-            )
-        if method == "POST" and path == "/v1/memories/adopt":
-            request = validate_memory_request("adopt", payload)
-            return validate_memory_response(
-                "adopt",
-                self.client.adopt_memory_document(
-                    **request,
-                    caller=caller,
-                ),
-            )
-        if method == "POST" and path == "/v1/memories/edit":
-            request = validate_memory_request("edit", payload)
-            return validate_memory_response(
-                "edit",
-                self.client.edit_memory_document(**request, caller=caller),
-            )
-        if method == "POST" and path == "/v1/memories/rename":
-            request = validate_memory_request("rename", payload)
-            return validate_memory_response(
-                "rename",
-                self.client.rename_memory_document(**request, caller=caller),
-            )
-        if method == "POST" and path == "/v1/memories/merge/propose":
-            request = validate_memory_request("merge_propose", payload)
-            return validate_memory_response(
-                "merge_propose",
-                self.client.propose_memory_consolidation(
-                    **request,
-                    caller=caller,
-                ),
-            )
-        if method == "POST" and path == "/v1/memories/merge":
-            request = validate_memory_request("merge", payload)
-            return validate_memory_response(
-                "merge",
-                self.client.merge_memory_documents(**request, caller=caller),
-            )
-        if method == "POST" and path == "/v1/memories/merge/resume":
-            request = validate_memory_request("merge_resume", payload)
-            return validate_memory_response(
-                "merge_resume",
-                self.client.resume_memory_consolidation(
-                    **request,
-                    caller=caller,
-                ),
-            )
-        if method == "POST" and path == "/v1/memories/forget":
-            request = validate_memory_request("forget", payload)
-            return validate_memory_response(
-                "forget",
-                self.client.forget(**request, caller=caller),
-            )
-        if method == "GET" and path == "/v1/memories/history":
-            query = parse_qs(scope.get("query_string", b"").decode())
-            request = validate_memory_request(
-                "history",
-                {"document_uri": str(query.get("document_uri", [""])[0])},
-            )
-            return validate_memory_response(
-                "history",
-                self.client.list_memory_history(**request, caller=caller),
-            )
-        if method == "POST" and path == "/v1/memories/restore":
-            request = validate_memory_request("restore", payload)
-            return validate_memory_response(
-                "restore",
-                self.client.restore_memory_revision(**request, caller=caller),
-            )
-        if method == "POST" and path == "/v1/memories/review":
-            request = validate_memory_request("review", payload)
-            return validate_memory_response(
-                "review",
-                self.client.review_memory_edit(**request, caller=caller),
-            )
-        if method == "POST" and path == "/v1/memories/review/preview":
-            request = validate_memory_request("review_preview", payload)
-            return validate_memory_response(
-                "review_preview",
-                self.client.preview_memory_edit(**request, caller=caller),
-            )
         if method == "GET" and path == "/v1/context/read":
             query = parse_qs(scope.get("query_string", b"").decode())
             return self.client.read(
@@ -468,8 +380,6 @@ def _search_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
         "project_id": str(payload.get("project_id") or ""),
         "applicability_scopes": payload.get("applicability_scopes"),
         "record_kinds": payload.get("record_kinds"),
-        "document_ids": payload.get("document_ids"),
-        "document_kinds": payload.get("document_kinds"),
         "query_intent": payload.get("query_intent"),
     }
 

@@ -6,8 +6,6 @@ export type MemoryRequest = (path:string, body?:unknown, method?:string) => Prom
 export function createMemoryTools(request: MemoryRequest) {
   return {
     memory_recall:(args:Record<string,unknown>)=>request("/v1/context/search",args),
-    memory_store:(args:Record<string,unknown>)=>request("/v1/memories/remember",args),
-    memory_forget:(args:Record<string,unknown>)=>request("/v1/memories/forget",args),
     memory_read:(args:Record<string,unknown>)=>request(`/v1/context/read?uri=${encodeURIComponent(String(args.uri ?? ""))}`,undefined,"GET"),
   };
 }
@@ -51,8 +49,6 @@ export async function MemoryOSOpenCodePlugin({directory}:{directory:string}) {
     },
     tool:{
       memory_recall:defineTool("Search MemoryOS context",{query:{type:"string"}},(args)=>rawTools.memory_recall(args)),
-      memory_store:defineTool("Store an explicit MemoryOS memory",{content:{type:"string"},memory_type:{type:"string",optional:true},project_id:{type:"string",optional:true}},(args)=>rawTools.memory_store({user_id:userId,project_id:args.project_id ?? projectId,...args})),
-      memory_forget:defineTool("Forget an exact MemoryOS URI",{uri:{type:"string"}},(args)=>rawTools.memory_forget({user_id:userId,...args})),
       memory_read:defineTool("Read an exact MemoryOS URI",{uri:{type:"string"}},(args)=>rawTools.memory_read(args)),
     },
     "experimental.session.compacting":async(input:{sessionID:string})=>{await sync.append("PRE_COMPACT",eventPayload(input.sessionID));return sync.checkpoint(sessionKey(input.sessionID));},

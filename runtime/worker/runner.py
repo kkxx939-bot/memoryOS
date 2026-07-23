@@ -15,17 +15,14 @@ from infrastructure.context.maintenance.semantic_worker import SemanticWorker
 from infrastructure.store.filesystem.durable_io import atomic_write_json
 from infrastructure.store.filesystem.durable_io.quarantine import list_quarantine_records
 from infrastructure.store.trace import RecallTraceRepository, recall_trace_root
-from memory.worker.session_commit import SessionCommitWorker
 from runtime.worker.contracts import WorkerRuntime
+from runtime.worker.session_commit import SessionCommitWorker
 
 
 class WorkerRunner:
     _ORDINARY_KINDS = frozenset(
         {
             "session-commit",
-            "memory-document-edit",
-            "memory-document-scan",
-            "memory-projection",
             "semantic",
             "embedding",
         }
@@ -75,28 +72,6 @@ class WorkerRunner:
                 batch_size=self.batch_size,
                 lease_seconds=self.lease_seconds,
                 max_retries=self.max_retries,
-            )
-            if self._stop_if_not_ready(result, allow_result=kind == "all"):
-                return result
-        if kind in {"memory-document-edit", "all"}:
-            result["memory_document_edit"] = self.client.runtime.memory.edit_worker.process_pending(
-                batch_size=self.batch_size,
-                lease_seconds=self.lease_seconds,
-                max_retries=self.max_retries,
-            )
-            if self._stop_if_not_ready(result, allow_result=kind == "all"):
-                return result
-        if kind in {"memory-document-scan", "all"}:
-            result["memory_document_scan"] = self.client.runtime.memory.scan_worker.process_pending(
-                batch_size=self.batch_size,
-                lease_seconds=self.lease_seconds,
-                max_retries=self.max_retries,
-            )
-            if self._stop_if_not_ready(result, allow_result=kind == "all"):
-                return result
-        if kind in {"memory-projection", "all"}:
-            result["memory_projection"] = self.client.runtime.memory.projection_worker.process_pending(
-                limit=self.batch_size
             )
             if self._stop_if_not_ready(result, allow_result=kind == "all"):
                 return result

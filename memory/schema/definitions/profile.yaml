@@ -1,0 +1,19 @@
+memory_type: profile
+description: >-
+  保存相对稳定的用户自我事实，例如职业背景、长期能力、沟通方式和工作习惯。
+  不保存短期情绪、一次性事件、偏好、计划或模型推测。
+path_template: profile.md
+operation_mode: upsert
+markdown_template: |
+  # Profile
+
+  {content}
+fields:
+  - name: content
+    type: string
+    role: content
+    required: true
+    merge: patch
+    description: >-
+      使用简洁、自包含的 Markdown bullet 保存用户明确陈述或确认的稳定事实；
+      合并重复事实，发生冲突时保留较新的明确陈述，不记录推测和敏感信息。

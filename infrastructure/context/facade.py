@@ -97,8 +97,6 @@ class ContextDB:
 
     def _add_relation_unfenced(self, relation: ContextRelation) -> None:
         self._require_ready()
-        if self._document_owned_uri(relation.source_uri) or self._document_owned_uri(relation.target_uri):
-            raise PermissionError("Markdown document relations can only be published by the document projector")
         domain_source = self._domain_owned_uri(relation.source_uri)
         endpoint_objects: dict[str, ContextObject] = {}
         for uri in (relation.source_uri, relation.target_uri):
@@ -107,8 +105,6 @@ class ContextDB:
             except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
                 continue
             endpoint_objects[uri] = endpoint
-            if self._document_owned_object(endpoint):
-                raise PermissionError("Markdown document relations can only be published by the document projector")
             if uri == relation.source_uri and self._domain_owned_object(endpoint):
                 domain_source = True
         if domain_source:
@@ -343,15 +339,5 @@ class ContextDB:
 
     def _domain_owned_uri(self, uri: str) -> bool:
         return self.domain_overlay.owns_uri(uri)
-
-    @staticmethod
-    def _document_owned_object(obj: ContextObject) -> bool:
-        return obj.context_type is ContextType.MEMORY or ContextDB._document_owned_uri(obj.uri)
-
-    @staticmethod
-    def _document_owned_uri(uri: str) -> bool:
-        raw = str(uri or "")
-        return raw.startswith("memoryos://user/") and "/memory/documents/" in raw
-
 
 __all__ = ["ContextDB"]

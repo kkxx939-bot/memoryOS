@@ -27,7 +27,6 @@ from openApi.mcp.schemas import (
     require_process_observation_metadata,
     required_str,
 )
-from openApi.memory_contract import validate_memory_request, validate_memory_response
 from openApi.retrieval_contract import parse_retrieval_options
 from openApi.version import __version__
 from policy.action_policy.decision.request import PredictionRequest
@@ -62,76 +61,6 @@ class MCPToolRouter:
                         layer=str(args.get("layer") or "L2"),
                         **self._local_caller_kwargs(),
                     )
-                )
-            if name == "memoryos_adopt_memory_document":
-                return self._memory_command(
-                    "adopt",
-                    "adopt_memory_document",
-                    args,
-                )
-            if name == "memoryos_remember":
-                return self._memory_command("remember", "remember", args)
-            if name == "memoryos_edit_memory_document":
-                return self._memory_command(
-                    "edit",
-                    "edit_memory_document",
-                    args,
-                )
-            if name == "memoryos_rename_memory_document":
-                return self._memory_command(
-                    "rename",
-                    "rename_memory_document",
-                    args,
-                )
-            if name == "memoryos_merge_memory_documents":
-                return self._memory_command(
-                    "merge",
-                    "merge_memory_documents",
-                    args,
-                )
-            if name == "memoryos_propose_memory_consolidation":
-                return self._memory_command(
-                    "merge_propose",
-                    "propose_memory_consolidation",
-                    args,
-                )
-            if name == "memoryos_resume_memory_consolidation":
-                return self._memory_command(
-                    "merge_resume",
-                    "resume_memory_consolidation",
-                    args,
-                )
-            if name == "memoryos_forget":
-                request = validate_memory_request("forget", args)
-                return self._memory_command(
-                    "forget",
-                    "forget",
-                    request,
-                    already_validated=True,
-                )
-            if name == "memoryos_memory_history":
-                request = validate_memory_request("history", args)
-                return _validated_memory_payload(
-                    "history",
-                    self.client.list_memory_history(**request, **self._local_caller_kwargs()),
-                )
-            if name == "memoryos_restore_memory_revision":
-                return self._memory_command(
-                    "restore",
-                    "restore_memory_revision",
-                    args,
-                )
-            if name == "memoryos_review_memory_edit":
-                return self._memory_command(
-                    "review",
-                    "review_memory_edit",
-                    args,
-                )
-            if name == "memoryos_preview_memory_edit":
-                request = validate_memory_request("review_preview", args)
-                return _validated_memory_payload(
-                    "review_preview",
-                    self.client.preview_memory_edit(**request, **self._local_caller_kwargs()),
                 )
             if name == "memoryos_archive_search":
                 return ok_payload(
@@ -174,23 +103,6 @@ class MCPToolRouter:
         except Exception as exc:  # 工具层是外部 Agent 的最后一道安全边界。
             return exception_payload(exc)
 
-    def _memory_command(
-        self,
-        operation: str,
-        method_name: str,
-        args: dict[str, Any],
-        *,
-        already_validated: bool = False,
-    ) -> dict[str, Any]:
-        """统一校验并执行本地用户记忆命令。"""
-
-        request = args if already_validated else validate_memory_request(operation, args)
-        method = getattr(self.client, method_name)
-        return _validated_memory_payload(
-            operation,
-            method(**request, **self._local_caller_kwargs()),
-        )
-
     def search_context(self, args: dict[str, Any]) -> dict[str, Any]:
         """校验检索范围并调用统一检索能力。"""
 
@@ -227,8 +139,6 @@ class MCPToolRouter:
             project_id=project_id,
             applicability_scopes=[dict(item) for item in optional_list(args, "applicability_scopes") or []],
             record_kinds=[str(item) for item in optional_list(args, "record_kinds") or []],
-            document_ids=[str(item) for item in optional_list(args, "document_ids") or []],
-            document_kinds=[str(item) for item in optional_list(args, "document_kinds") or []],
             query_intent=str(args.get("query_intent")) if args.get("query_intent") else None,
             **self._local_caller_kwargs(),
         )
@@ -282,8 +192,6 @@ class MCPToolRouter:
             project_id=project_id,
             applicability_scopes=[dict(item) for item in optional_list(args, "applicability_scopes") or []],
             record_kinds=[str(item) for item in optional_list(args, "record_kinds") or []],
-            document_ids=[str(item) for item in optional_list(args, "document_ids") or []],
-            document_kinds=[str(item) for item in optional_list(args, "document_kinds") or []],
             query_intent=str(args.get("query_intent")) if args.get("query_intent") else None,
             **self._local_caller_kwargs(),
         )
@@ -456,14 +364,6 @@ def _client_payload(value: dict[str, Any]) -> dict[str, Any]:
     if value.get("error"):
         return value
     return ok_payload(value)
-
-
-def _validated_memory_payload(operation: str, value: dict[str, Any]) -> dict[str, Any]:
-    """Preserve a structured remote error; validate only successful payloads."""
-
-    if value.get("error"):
-        return _client_payload(value)
-    return _client_payload(validate_memory_response(operation, value))
 
 
 def _to_payload(value: Any) -> Any:

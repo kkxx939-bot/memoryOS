@@ -5,16 +5,8 @@ from __future__ import annotations
 from infrastructure.store.sqlite._common import (
     _MAX_FILTER_VALUES,
     Any,
-    CatalogRecordKind,
     Mapping,
     Sequence,
-)
-
-_DOCUMENT_RECORD_KINDS = frozenset(
-    {
-        CatalogRecordKind.MEMORY_DOCUMENT.value,
-        CatalogRecordKind.MEMORY_BLOCK.value,
-    }
 )
 
 
@@ -92,11 +84,9 @@ class TombstoneOperations:
                 if immutable != requested:
                     raise ValueError("tombstone_id is bound to a different immutable identity")
             current = conn.execute(
-                "SELECT uri, record_kind FROM contexts WHERE tenant_id = ? AND record_key = ?",
+                "SELECT uri FROM contexts WHERE tenant_id = ? AND record_key = ?",
                 (resolved_tenant, str(record_key)),
             ).fetchone()
-            if current is not None and str(current["record_kind"]) in _DOCUMENT_RECORD_KINDS:
-                raise ValueError("memory document projections require tombstone_memory_document_projection()")
             effective_uri = self._store._safe_reference_uri(str(uri or (current["uri"] if current is not None else "")))
             conn.execute(
                 """
@@ -239,12 +229,10 @@ class TombstoneOperations:
             terminal = {"APPLIED", "STALE"}
             if status not in terminal | {"CLEANING"}:
                 current = conn.execute(
-                    "SELECT record_kind, source_revision, source_digest, projection_effect_hash, updated_at "
+                    "SELECT source_revision, source_digest, projection_effect_hash, updated_at "
                     "FROM contexts WHERE tenant_id = ? AND record_key = ?",
                     (resolved_tenant, str(row["record_key"])),
                 ).fetchone()
-                if current is not None and str(current["record_kind"]) in _DOCUMENT_RECORD_KINDS:
-                    raise ValueError("memory document projections require tombstone_memory_document_projection()")
                 payload = self._store._json_mapping(row["payload_json"])
                 stale = bool(
                     current is not None

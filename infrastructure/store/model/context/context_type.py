@@ -6,7 +6,6 @@ from enum import Enum
 
 
 class ContextType(str, Enum):
-    MEMORY = "memory"
     BEHAVIOR_SUPPORT = "behavior_support"
     ACTION_POLICY_SUPPORT = "action_policy_support"
     BEHAVIOR_CASE = "behavior_case"

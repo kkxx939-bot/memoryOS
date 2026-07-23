@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from infrastructure.store.model.context.context_uri import ContextURI
-from memory.commit.evidence.errors import EvidenceArchiveIntegrityError
+from infrastructure.store.session.archive_errors import SessionArchiveIntegrityError
 from pre.session import SessionArchive
 
 
@@ -32,10 +32,10 @@ class SessionArchiveLayout:
         direct = str(metadata.get("tenant_id") or "")
         scoped = str(scope.get("tenant_id") or "")
         if direct and scoped and direct != scoped:
-            raise EvidenceArchiveIntegrityError("session archive metadata has conflicting tenants")
+            raise SessionArchiveIntegrityError("session archive metadata has conflicting tenants")
         claimed = direct or scoped
         if claimed and claimed != self.tenant_id:
-            raise EvidenceArchiveIntegrityError("session archive tenant does not match the bound archive store")
+            raise SessionArchiveIntegrityError("session archive tenant does not match the bound archive store")
         return self.tenant_id
 
     def materialize_archive_tenant(self, archive: SessionArchive, tenant_id: str) -> None:
@@ -47,7 +47,7 @@ class SessionArchiveLayout:
             str(value) for value in (metadata.get("tenant_id"), scope.get("tenant_id")) if value not in (None, "")
         )
         if any(value != tenant_id for value in claimed):
-            raise EvidenceArchiveIntegrityError("session archive metadata tenant mismatch")
+            raise SessionArchiveIntegrityError("session archive metadata tenant mismatch")
         metadata["tenant_id"] = tenant_id
         if "scope" in metadata:
             scope["tenant_id"] = tenant_id

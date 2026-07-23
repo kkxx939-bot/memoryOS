@@ -10,14 +10,12 @@ from typing import Any
 from foundation.readiness import RuntimeReadiness
 from infrastructure.context.candidate import CandidateGenerator
 from infrastructure.context.hydration import ContextHydrator
-from infrastructure.context.layers.memory_document_overlay import MemoryDocumentContextOverlay
 from infrastructure.context.reranking import Reranker
 from infrastructure.context.retrieval.embedding import EmbeddingProvider
 from infrastructure.context.retrieval.fusion import FusionRanker, RetrievalCandidate
 from infrastructure.context.retrieval.query_plan import RetrievalQueryIntent, RetrievalQueryPlan
 from infrastructure.context.selection import ContextSelector
 from infrastructure.store.contracts.index import IndexStore
-from infrastructure.store.contracts.queue import QueueStore
 from infrastructure.store.contracts.relation import RelationStore
 from infrastructure.store.contracts.session_archive import SessionArchiveStore
 from infrastructure.store.contracts.source import SourceStore
@@ -47,8 +45,6 @@ class RetrievalMetrics:
     relation_candidates: int = 0
     fusion_candidates: int = 0
     rerank_count: int = 0
-    memory_candidates: int = 0
-    memory_validated: int = 0
     source_reads: int = 0
     selected_count: int = 0
     dropped_count: int = 0
@@ -92,7 +88,6 @@ class UnifiedRetrievalOrchestrator:
         *,
         source_store: SourceStore | None,
         relation_store: RelationStore | None,
-        queue_store: QueueStore | None,
         session_archive_store: SessionArchiveStore | None,
         readiness: RuntimeReadiness | None = None,
         serving_lock: RLock | None = None,
@@ -100,7 +95,6 @@ class UnifiedRetrievalOrchestrator:
         vector_store: Any = None,
         embedding_provider: EmbeddingProvider | None = None,
         reranker: Reranker | None = None,
-        document_overlay: MemoryDocumentContextOverlay | None = None,
     ) -> None:
         self.readiness = readiness
         self.serving_lock = serving_lock
@@ -117,14 +111,11 @@ class UnifiedRetrievalOrchestrator:
         )
         self.fusion = FusionRanker()
         self.selector = ContextSelector()
-        self.document_overlay = document_overlay
         self.hydrator = ContextHydrator(
             source_store=source_store,
             session_archive_store=session_archive_store,
-            queue_store=queue_store,
             selector=self.selector,
             sanitizer=self.sanitizer,
-            document_overlay=self.document_overlay,
         )
 
     def execute(self, plan: RetrievalQueryPlan) -> UnifiedRetrievalResult:
@@ -153,7 +144,7 @@ class UnifiedRetrievalOrchestrator:
             )
         fused = self.fusion.fuse(generated.branches, plan=plan)
         reranked, reranker_fallback = self._rerank(plan, fused)
-        hydrated, source_reads, hydration_modes, hydration_drops, memory_validated = self.hydrator.hydrate(
+        hydrated, source_reads, hydration_modes, hydration_drops = self.hydrator.hydrate(
             reranked,
             plan=plan,
             source_read_budget=max(0, plan.candidate_limit + SOURCE_READ_BOUND_ALLOWANCE - generated.source_reads),
@@ -183,7 +174,7 @@ class UnifiedRetrievalOrchestrator:
                 for item in hydrated
             )
         selection = self.selector.select(hydrated, plan=plan)
-        cold_ranked, cold_hydrated, cold_reads, cold_modes, cold_drops, cold_validated = self._cold_fallback(
+        cold_ranked, cold_hydrated, cold_reads, cold_modes, cold_drops = self._cold_fallback(
             plan,
             primary_candidates=reranked,
             primary_selection=selection,
@@ -212,7 +203,6 @@ class UnifiedRetrievalOrchestrator:
                 hydrated = tuple(by_key.values())
                 selection = self.selector.select(hydrated, plan=plan)
             source_reads += cold_reads
-            memory_validated += cold_validated
             hydration_drops = (*hydration_drops, *cold_drops)
             degraded_modes = tuple(dict.fromkeys((*degraded_modes, *cold_modes)))
         unavailable_modes = tuple(
@@ -226,7 +216,6 @@ class UnifiedRetrievalOrchestrator:
                 degraded_modes=unavailable_modes,
             )
         dropped = (*hydration_drops, *tuple(selection["dropped_contexts"]))
-        memory_candidates = sum(1 for item in reranked if item.document_id)
         metrics = RetrievalMetrics(
             structured_candidates=generated.structured_candidates,
             exact_candidates=generated.exact_candidates,
@@ -235,8 +224,6 @@ class UnifiedRetrievalOrchestrator:
             relation_candidates=generated.relation_candidates,
             fusion_candidates=len(fused) + len(cold_ranked),
             rerank_count=len(reranked) if self.reranker is not None else 0,
-            memory_candidates=memory_candidates + sum(1 for item in cold_ranked if item.document_id),
-            memory_validated=memory_validated,
             source_reads=generated.source_reads + source_reads,
             selected_count=int(selection["selected_count"]),
             dropped_count=len(dropped),
@@ -269,23 +256,22 @@ class UnifiedRetrievalOrchestrator:
         int,
         tuple[str, ...],
         tuple[dict[str, Any], ...],
-        int,
     ]:
         threshold = min(3, plan.final_limit)
         if (
             plan.query_intent is not RetrievalQueryIntent.CURRENT
             or not plan.semantic_query
             or not fts_available
-            or len(self._selected_memory_families(primary_selection)) >= threshold
+            or len(tuple(primary_selection.get("contexts", ()))) >= threshold
         ):
-            return (), (), 0, (), (), 0
+            return (), (), 0, (), ()
         remaining_candidates = max(0, plan.candidate_limit - len(primary_candidates))
         remaining_reads = max(
             0,
             plan.candidate_limit + SOURCE_READ_BOUND_ALLOWANCE - source_reads_used,
         )
         if remaining_candidates == 0 or remaining_reads == 0:
-            return (), (), 0, (), (), 0
+            return (), (), 0, (), ()
         existing = {item.record_key for item in primary_candidates}
         lexical = tuple(
             item
@@ -293,37 +279,14 @@ class UnifiedRetrievalOrchestrator:
             if item.record_key not in existing
         )
         if not lexical:
-            return (), (), 0, (), (), 0
+            return (), (), 0, (), ()
         ranked = tuple(self.fusion.fuse({"lexical": lexical}, plan=plan)[:remaining_candidates])
-        hydrated, reads, modes, drops, validated = self.hydrator.hydrate(
+        hydrated, reads, modes, drops = self.hydrator.hydrate(
             ranked,
             plan=plan,
             source_read_budget=remaining_reads,
         )
-        return ranked, hydrated, reads, modes, drops, validated
-
-    @staticmethod
-    def _selected_memory_families(selection: Mapping[str, Any]) -> frozenset[tuple[str, str, str]]:
-        families: set[tuple[str, str, str]] = set()
-        contexts = selection.get("contexts", ())
-        if not isinstance(contexts, Sequence) or isinstance(contexts, str | bytes):
-            return frozenset()
-        for row in contexts:
-            if not isinstance(row, Mapping):
-                continue
-            metadata = row.get("metadata", {})
-            if not isinstance(metadata, Mapping):
-                continue
-            document_id = str(metadata.get("document_id") or "")
-            if document_id:
-                families.add(
-                    (
-                        str(metadata.get("tenant_id") or row.get("tenant_id") or ""),
-                        str(metadata.get("owner_user_id") or ""),
-                        document_id,
-                    )
-                )
-        return frozenset(families)
+        return ranked, hydrated, reads, modes, drops
 
     def _rerank(
         self,

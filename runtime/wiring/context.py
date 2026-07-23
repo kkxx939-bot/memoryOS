@@ -7,10 +7,7 @@ from threading import RLock
 from typing import cast
 
 from infrastructure.context.facade import ContextDB
-from infrastructure.context.layers import MemoryDocumentContextOverlay
 from infrastructure.context.maintenance import (
-    CallbackDocumentServingMaintenance,
-    CatalogDocumentProjectionVerifier,
     ContextLifecycleService,
     DerivedServingMaintenanceService,
 )
@@ -18,7 +15,7 @@ from infrastructure.context.maintenance.retention import CatalogRetentionManager
 from infrastructure.context.maintenance.retention_policy import RetentionCatalogStore
 from infrastructure.context.maintenance.tombstone import ProjectionTombstoneService
 from runtime.config import RuntimeConfig
-from runtime.container import ContextRuntime, MemoryRuntime, StoreRuntime
+from runtime.container import ContextRuntime, StoreRuntime
 
 
 @dataclass(frozen=True)
@@ -51,11 +48,9 @@ def wire_context(
     *,
     readiness,  # noqa: ANN001
     committer,  # noqa: ANN001
-    memory: MemoryRuntime,
     maintenance: ContextMaintenance,
-    owner_user_ids,  # noqa: ANN001
 ) -> ContextRuntime:
-    """连接 Context 门面、管理服务和 Markdown Memory serving 维护。"""
+    """连接 Context 门面、管理服务和派生层维护。"""
 
     serving_lock = RLock()
     facade = ContextDB(
@@ -67,19 +62,11 @@ def wire_context(
         tenant_id=config.tenant_id,
         serving_lock=serving_lock,
     )
-    document_serving = CallbackDocumentServingMaintenance(
-        full_scan=memory.document_store.full_scan,
-        rebuild_owner=memory.projection_worker.rebuild_owner,
-        verify_owner=CatalogDocumentProjectionVerifier(stores.index),
-        owner_user_ids=owner_user_ids,
-        max_documents_per_owner=config.memory_scan_max_files,
-    )
     administration = DerivedServingMaintenanceService(
         stores.source,
         stores.index,
         stores.relation,
         tenant_id=config.tenant_id,
-        document_serving=document_serving,
         retention_manager=maintenance.retention_manager,
         readiness=readiness,
         domain_overlay=facade.domain_overlay,
@@ -94,16 +81,10 @@ def wire_context(
         readiness=readiness,
         serving_lock=serving_lock,
     )
-    overlay = MemoryDocumentContextOverlay(
-        memory.document_store,
-        max_front_matter_bytes=config.memory_front_matter_max_bytes,
-        max_front_matter_depth=config.memory_front_matter_max_depth,
-    )
     return ContextRuntime(
         facade=facade,
         administration_service=administration,
         lifecycle_service=lifecycle,
-        memory_document_overlay=overlay,
         tombstone_service=maintenance.tombstone_service,
         retention_manager=maintenance.retention_manager,
     )

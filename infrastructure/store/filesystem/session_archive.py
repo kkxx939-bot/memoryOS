@@ -1,6 +1,6 @@
-"""内容寻址、不可变会话证据归档的文件系统编排器。
+"""内容寻址、只读 SessionArchive 的文件系统编排器。
 
-该类负责证据 collection、event、manifest 与 commit head 的领域一致性；
+该类负责 collection、event、manifest 与 commit head 的领域一致性；
 异步派生输出、目录布局和原子文件操作分别由独立组件负责。
 """
 
@@ -12,20 +12,20 @@ from typing import Any
 
 from foundation.ids import require_safe_path_segment
 from foundation.integrity import canonical_digest, canonicalize
-from infrastructure.store.contracts.session_evidence import SessionEvidenceEncoder
+from infrastructure.store.contracts.session_archive_event import SessionArchiveEventEncoder
 from infrastructure.store.filesystem.session_archive_io import SessionArchiveFileIO
 from infrastructure.store.filesystem.session_archive_layout import SessionArchiveLayout
 from infrastructure.store.filesystem.session_async_outputs import SessionAsyncOutputStore
 from infrastructure.store.model.context.context_uri import ContextURI
-from memory.commit.evidence.errors import EvidenceArchiveIntegrityError
+from infrastructure.store.session.archive_errors import SessionArchiveIntegrityError
 from pre.session import SessionArchive
 
-ARCHIVE_MANIFEST_SCHEMA_VERSION = "session_archive_manifest_v2"
-ARCHIVE_HEAD_SCHEMA_VERSION = "session_archive_head_v2"
+ARCHIVE_MANIFEST_SCHEMA_VERSION = "session_archive_manifest_v3"
+ARCHIVE_HEAD_SCHEMA_VERSION = "session_archive_head_v3"
 
 
 class SessionArchiveStore:
-    """持久化不可变会话证据，并通过摘要校验所有读取结果。"""
+    """持久化只读会话归档，并通过摘要校验所有读取结果。"""
 
     _MAX_ENUMERATION_ENTRIES = 10_000
     _COLLECTION_FILES = {
@@ -44,12 +44,12 @@ class SessionArchiveStore:
         root: str | Path,
         tenant_id: str = "default",
         *,
-        evidence_encoder: SessionEvidenceEncoder,
+        event_encoder: SessionArchiveEventEncoder,
         test_hook: Callable[[str, str], None] | None = None,
     ) -> None:
         self.root = Path(root)
         self.tenant_id = tenant_id
-        self.evidence_encoder = evidence_encoder
+        self.event_encoder = event_encoder
         self.test_hook = test_hook
         self._layout = SessionArchiveLayout(self.root, tenant_id)
         self._files = SessionArchiveFileIO(self.root)
@@ -66,14 +66,14 @@ class SessionArchiveStore:
         return self._async_outputs.last_error
 
     def write_sync_archive(self, archive: SessionArchive) -> Path:
-        """写入不可变证据对象与 manifest，最后原子发布 commit head。"""
+        """写入内容寻址对象与 manifest，最后原子发布 commit head。"""
 
         tenant_id = self._layout.archive_tenant(archive)
         self._layout.materialize_archive_tenant(archive, tenant_id)
         directory = self._dir(archive.archive_uri, tenant_id=tenant_id)
         head_path = directory / "commit_head.json"
         if head_path.is_symlink():
-            raise EvidenceArchiveIntegrityError("session archive head cannot be a symbolic link")
+            raise SessionArchiveIntegrityError("session archive head cannot be a symbolic link")
         self._files.secure_directory(directory)
 
         collections: dict[str, str] = {}
@@ -81,15 +81,15 @@ class SessionArchiveStore:
             payload = canonicalize(getattr(archive, name))
             digest = canonical_digest(payload)
             self._files.write_immutable_json(
-                directory / "evidence" / "objects" / f"{digest}.json",
+                directory / "objects" / f"{digest}.json",
                 payload,
             )
             collections[name] = digest
 
         event_refs = []
-        for event in self.evidence_encoder.encode(archive):
+        for event in self.event_encoder.encode(archive):
             self._files.write_immutable_json(
-                directory / "evidence" / "events" / f"{event.event_digest}.json",
+                directory / "events" / f"{event.event_digest}.json",
                 event.payload,
             )
             event_refs.append(event.manifest_reference())
@@ -123,7 +123,7 @@ class SessionArchiveStore:
         manifest_digest = canonical_digest(manifest_core)
         manifest = {**manifest_core, "manifest_digest": manifest_digest}
         self._files.write_immutable_json(
-            directory / "evidence" / "manifests" / f"{manifest_digest}.json",
+            directory / "manifests" / f"{manifest_digest}.json",
             manifest,
         )
 
@@ -199,27 +199,27 @@ class SessionArchiveStore:
         directory = self._dir(archive_uri, tenant_id=tenant_id)
         head_path = directory / "commit_head.json"
         if not manifest_digest and head_path.is_symlink():
-            raise EvidenceArchiveIntegrityError("session archive head cannot be a symbolic link")
+            raise SessionArchiveIntegrityError("session archive head cannot be a symbolic link")
         head = {} if manifest_digest else dict(self._files.read_json(head_path) or {})
         if head and str(head.get("schema_version") or "") != ARCHIVE_HEAD_SCHEMA_VERSION:
-            raise EvidenceArchiveIntegrityError("unsupported session archive head schema")
+            raise SessionArchiveIntegrityError("unsupported session archive head schema")
         if head and str(head.get("archive_uri") or "") != archive_uri:
-            raise EvidenceArchiveIntegrityError("session archive head URI mismatch")
+            raise SessionArchiveIntegrityError("session archive head URI mismatch")
         if head and str(head.get("tenant_id") or "") != effective_tenant:
-            raise EvidenceArchiveIntegrityError("session archive head tenant mismatch")
+            raise SessionArchiveIntegrityError("session archive head tenant mismatch")
         if head and str(head.get("user_id") or "") != str(parsed_uri.user_id or ""):
-            raise EvidenceArchiveIntegrityError("session archive head user mismatch")
+            raise SessionArchiveIntegrityError("session archive head user mismatch")
         selected = manifest_digest or str(head.get("manifest_digest") or "")
         if not selected:
-            raise EvidenceArchiveIntegrityError("session archive head has no manifest digest")
-        archive = self._read_v2_archive(
+            raise SessionArchiveIntegrityError("session archive head has no manifest digest")
+        archive = self._read_v3_archive(
             directory,
             archive_uri,
             selected,
             tenant_id=effective_tenant,
         )
         if head and str(head.get("archive_digest") or "") != archive.archive_digest:
-            raise EvidenceArchiveIntegrityError("session archive head aggregate digest mismatch")
+            raise SessionArchiveIntegrityError("session archive head aggregate digest mismatch")
         return archive
 
     def read_archive_from_commit_head(
@@ -232,32 +232,32 @@ class SessionArchiveStore:
         """证明枚举出的 head 路径身份后再读取对应归档。"""
 
         if head_path.is_symlink():
-            raise EvidenceArchiveIntegrityError("archive commit head cannot be a symbolic link")
+            raise SessionArchiveIntegrityError("archive commit head cannot be a symbolic link")
         try:
             head = self._files.read_json(head_path)
-        except EvidenceArchiveIntegrityError as exc:
-            raise EvidenceArchiveIntegrityError(f"archive commit head is unreadable: {head_path}") from exc
+        except SessionArchiveIntegrityError as exc:
+            raise SessionArchiveIntegrityError(f"archive commit head is unreadable: {head_path}") from exc
         if not isinstance(head, dict):
-            raise EvidenceArchiveIntegrityError("archive commit head must be a JSON object")
+            raise SessionArchiveIntegrityError("archive commit head must be a JSON object")
         if str(head.get("schema_version") or "") != ARCHIVE_HEAD_SCHEMA_VERSION:
-            raise EvidenceArchiveIntegrityError("archive commit head schema is invalid")
+            raise SessionArchiveIntegrityError("archive commit head schema is invalid")
         if str(head.get("tenant_id") or "") != tenant_id:
-            raise EvidenceArchiveIntegrityError("archive commit head tenant mismatch")
+            raise SessionArchiveIntegrityError("archive commit head tenant mismatch")
         if str(head.get("user_id") or "") != user_id:
-            raise EvidenceArchiveIntegrityError("archive commit head user mismatch")
+            raise SessionArchiveIntegrityError("archive commit head user mismatch")
         archive_uri = str(head.get("archive_uri") or "")
         try:
             parsed_uri = ContextURI.parse(archive_uri)
         except ValueError as exc:
-            raise EvidenceArchiveIntegrityError("archive commit head URI is invalid") from exc
+            raise SessionArchiveIntegrityError("archive commit head URI is invalid") from exc
         if parsed_uri.user_id != user_id:
-            raise EvidenceArchiveIntegrityError("archive commit head URI user mismatch")
+            raise SessionArchiveIntegrityError("archive commit head URI user mismatch")
         expected_path = self._dir(archive_uri, tenant_id=tenant_id) / "commit_head.json"
         if head_path.is_symlink() or head_path.resolve() != expected_path.resolve():
-            raise EvidenceArchiveIntegrityError("archive commit head path identity mismatch")
+            raise SessionArchiveIntegrityError("archive commit head path identity mismatch")
         archive = self.read_archive(archive_uri, tenant_id=tenant_id)
         if archive.user_id != user_id:
-            raise EvidenceArchiveIntegrityError("archive manifest user mismatch")
+            raise SessionArchiveIntegrityError("archive manifest user mismatch")
         return archive
 
     def list_archives(
@@ -303,7 +303,7 @@ class SessionArchiveStore:
                     continue
                 candidates.append((head_path, user_id))
                 if len(candidates) > self._MAX_ENUMERATION_ENTRIES:
-                    raise EvidenceArchiveIntegrityError("Session archive tree exceeded its enumeration bound")
+                    raise SessionArchiveIntegrityError("Session archive tree exceeded its enumeration bound")
         archives = sorted(
             (
                 self.read_archive_from_commit_head(
@@ -337,7 +337,7 @@ class SessionArchiveStore:
 
         path = self._dir(archive_uri, tenant_id=tenant_id) / "commit_head.json"
         if path.is_symlink():
-            raise EvidenceArchiveIntegrityError("session archive head cannot be a symbolic link")
+            raise SessionArchiveIntegrityError("session archive head cannot be a symbolic link")
         return path.exists()
 
     def archive_tenant(self, archive: SessionArchive) -> str:
@@ -355,11 +355,11 @@ class SessionArchiveStore:
         """按摘要读取单个不可变事件，并验证事件自声明摘要。"""
 
         directory = self._dir(archive_uri, tenant_id=tenant_id)
-        payload = self._files.read_json(directory / "evidence" / "events" / f"{event_digest}.json")
+        payload = self._files.read_json(directory / "events" / f"{event_digest}.json")
         claimed = str(payload.get("event_digest") or "")
         body = {key: value for key, value in payload.items() if key != "event_digest"}
         if claimed != event_digest or canonical_digest(body) != event_digest:
-            raise EvidenceArchiveIntegrityError(f"immutable event digest mismatch: {event_digest}")
+            raise SessionArchiveIntegrityError(f"immutable event digest mismatch: {event_digest}")
         return payload
 
     def current_manifest(self, archive_uri: str, *, tenant_id: str | None = None) -> dict[str, Any]:
@@ -369,24 +369,24 @@ class SessionArchiveStore:
         head = self._files.read_json(directory / "commit_head.json")
         digest = str(head.get("manifest_digest") or "")
         if not digest:
-            raise EvidenceArchiveIntegrityError("session archive head has no manifest digest")
+            raise SessionArchiveIntegrityError("session archive head has no manifest digest")
         return self._read_manifest(directory, digest)
 
     def _bounded_child_directories(self, parent: Path, *, label: str) -> tuple[Path, ...]:
         if parent.is_symlink() or not parent.is_dir():
-            raise EvidenceArchiveIntegrityError(f"{label} is unsafe")
+            raise SessionArchiveIntegrityError(f"{label} is unsafe")
         children: list[Path] = []
         for child in parent.iterdir():
             if child.is_symlink():
-                raise EvidenceArchiveIntegrityError(f"{label} contains a symbolic link")
+                raise SessionArchiveIntegrityError(f"{label} contains a symbolic link")
             if not child.is_dir():
-                raise EvidenceArchiveIntegrityError(f"{label} contains a non-directory entry")
+                raise SessionArchiveIntegrityError(f"{label} contains a non-directory entry")
             children.append(child)
             if len(children) > self._MAX_ENUMERATION_ENTRIES:
-                raise EvidenceArchiveIntegrityError(f"{label} exceeded its enumeration bound")
+                raise SessionArchiveIntegrityError(f"{label} exceeded its enumeration bound")
         return tuple(sorted(children, key=lambda path: path.name))
 
-    def _read_v2_archive(
+    def _read_v3_archive(
         self,
         directory: Path,
         archive_uri: str,
@@ -396,13 +396,13 @@ class SessionArchiveStore:
     ) -> SessionArchive:
         manifest = self._read_manifest(directory, manifest_digest)
         if str(manifest.get("schema_version") or "") != ARCHIVE_MANIFEST_SCHEMA_VERSION:
-            raise EvidenceArchiveIntegrityError("unsupported session archive manifest schema")
+            raise SessionArchiveIntegrityError("unsupported session archive manifest schema")
         if str(manifest.get("archive_uri")) != archive_uri:
-            raise EvidenceArchiveIntegrityError("session archive manifest URI mismatch")
+            raise SessionArchiveIntegrityError("session archive manifest URI mismatch")
         if str(manifest.get("tenant_id") or "") != tenant_id:
-            raise EvidenceArchiveIntegrityError("session archive manifest tenant mismatch")
+            raise SessionArchiveIntegrityError("session archive manifest tenant mismatch")
         if str(manifest.get("user_id") or "") != str(ContextURI.parse(archive_uri).user_id or ""):
-            raise EvidenceArchiveIntegrityError("session archive manifest user mismatch")
+            raise SessionArchiveIntegrityError("session archive manifest user mismatch")
         for event_ref in manifest.get("events", []) or []:
             self.read_event(
                 archive_uri,
@@ -411,12 +411,12 @@ class SessionArchiveStore:
             )
         collection_refs = dict(manifest.get("collections", {}) or {})
         if set(collection_refs) != set(self._COLLECTION_FILES):
-            raise EvidenceArchiveIntegrityError("session archive manifest collections are incomplete")
+            raise SessionArchiveIntegrityError("session archive manifest collections are incomplete")
         collections = {
             name: self._read_content_object(directory, str(digest)) for name, digest in collection_refs.items()
         }
         if any(not isinstance(payload, list) for payload in collections.values()):
-            raise EvidenceArchiveIntegrityError("session archive collection must be a list")
+            raise SessionArchiveIntegrityError("session archive collection must be a list")
         archive = SessionArchive(
             user_id=str(manifest["user_id"]),
             session_id=str(manifest["session_id"]),
@@ -432,7 +432,7 @@ class SessionArchiveStore:
             metadata=dict(manifest.get("metadata", {}) or {}),
             task_id=str(manifest["task_id"]),
             created_at=str(manifest.get("created_at", "")),
-            schema_version=str(manifest.get("archive_schema_version") or "session_archive_v2"),
+            schema_version=str(manifest.get("archive_schema_version") or "session_archive_v3"),
             archive_digest=str(manifest.get("archive_digest") or ""),
             manifest_digest=manifest_digest,
             manifest_uri=self._layout.manifest_uri(archive_uri, manifest_digest),
@@ -451,22 +451,22 @@ class SessionArchiveStore:
             }
         )
         if archive.archive_digest != expected_archive_digest:
-            raise EvidenceArchiveIntegrityError("session archive aggregate digest mismatch")
+            raise SessionArchiveIntegrityError("session archive aggregate digest mismatch")
         self._layout.materialize_archive_tenant(archive, tenant_id)
         return archive
 
     def _read_manifest(self, directory: Path, digest: str) -> dict[str, Any]:
-        manifest = self._files.read_json(directory / "evidence" / "manifests" / f"{digest}.json")
+        manifest = self._files.read_json(directory / "manifests" / f"{digest}.json")
         claimed = str(manifest.get("manifest_digest") or "")
         body = {key: value for key, value in manifest.items() if key != "manifest_digest"}
         if claimed != digest or canonical_digest(body) != digest:
-            raise EvidenceArchiveIntegrityError(f"immutable manifest digest mismatch: {digest}")
+            raise SessionArchiveIntegrityError(f"immutable manifest digest mismatch: {digest}")
         return manifest
 
     def _read_content_object(self, directory: Path, digest: str) -> Any:
-        payload = self._files.read_json(directory / "evidence" / "objects" / f"{digest}.json")
+        payload = self._files.read_json(directory / "objects" / f"{digest}.json")
         if canonical_digest(payload) != digest:
-            raise EvidenceArchiveIntegrityError(f"immutable archive object digest mismatch: {digest}")
+            raise SessionArchiveIntegrityError(f"immutable archive object digest mismatch: {digest}")
         return payload
 
     def _dir(self, archive_uri: str, *, tenant_id: str | None = None) -> Path:

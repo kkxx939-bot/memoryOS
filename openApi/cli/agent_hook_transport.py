@@ -89,30 +89,6 @@ class AgentHookTransportClient:
                 return self.remote.health()
             if name == "memoryos_read":
                 return self.remote.read(str(arguments.get("uri") or ""), layer=str(arguments.get("layer") or "L2"))
-            if name == "memoryos_adopt_memory_document":
-                return self.remote.adopt_memory_document(**arguments)
-            if name == "memoryos_remember":
-                return self.remote.remember(**arguments)
-            if name == "memoryos_edit_memory_document":
-                return self.remote.edit_memory_document(**arguments)
-            if name == "memoryos_rename_memory_document":
-                return self.remote.rename_memory_document(**arguments)
-            if name == "memoryos_merge_memory_documents":
-                return self.remote.merge_memory_documents(**arguments)
-            if name == "memoryos_propose_memory_consolidation":
-                return self.remote.propose_memory_consolidation(**arguments)
-            if name == "memoryos_resume_memory_consolidation":
-                return self.remote.resume_memory_consolidation(**arguments)
-            if name == "memoryos_forget":
-                return self.remote.forget(**arguments)
-            if name == "memoryos_memory_history":
-                return self.remote.list_memory_history(**arguments)
-            if name == "memoryos_restore_memory_revision":
-                return self.remote.restore_memory_revision(**arguments)
-            if name == "memoryos_review_memory_edit":
-                return self.remote.review_memory_edit(**arguments)
-            if name == "memoryos_preview_memory_edit":
-                return self.remote.preview_memory_edit(**arguments)
             if name == "memoryos_recall_trace":
                 return self.remote.recall_trace(str(arguments.get("trace_id") or ""))
             return {

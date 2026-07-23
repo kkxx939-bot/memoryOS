@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING
 from agent_hook.session_service import AgentSessionService
 from foundation.readiness import RuntimeReadiness
 from infrastructure.context.facade import ContextDB
-from infrastructure.context.layers import MemoryDocumentContextOverlay
 from infrastructure.context.maintenance import ContextAdministrationService, ContextLifecycleService
 from infrastructure.context.maintenance.retention import CatalogRetentionManager
 from infrastructure.context.maintenance.tombstone import ProjectionTombstoneService
@@ -22,35 +21,17 @@ from infrastructure.store.contracts.queue import QueueStore
 from infrastructure.store.contracts.relation import RelationStore
 from infrastructure.store.contracts.source import SourceStore
 from infrastructure.store.contracts.vector import VectorStore
-from infrastructure.store.filesystem.memory_document_store import FileSystemMemoryDocumentStore
 from infrastructure.store.filesystem.session_archive import SessionArchiveStore
-from infrastructure.store.memory import (
-    MemoryDocumentBootstrapper,
-    MemoryDocumentConsolidationStore,
-    MemoryDocumentControlStore,
-    MemoryDocumentEraseStore,
-    MemoryDocumentRevisionStore,
-    MemoryDocumentScanner,
-    MemoryEditReviewStore,
-    RuntimeLayout,
-)
-from memory.commit import MemoryDocumentCommitter, MemoryDocumentConsolidator, MemoryDocumentEraser
-from memory.commit.remember_plan import ExplicitRememberPlanner
-from memory.commit.session_commit import SessionCommitService
-from memory.execute.command_service import MemoryCommandService
-from memory.execute.pending_review_service import MemoryEditReviewService
-from memory.worker.document_edit import MemoryDocumentEditWorker
-from memory.worker.document_scan import MemoryDocumentScanWorker
-from memory.worker.projection.worker import MemoryDocumentProjectionWorker
+from infrastructure.store.runtime_layout import RuntimeLayout
 from policy.action_policy.decision.engine import PredictionEngine
 from policy.action_policy.execution.executor import ActionExecutor
 from runtime.config import RuntimeConfig
 from runtime.recovery.transaction_worker import RecoveryWorker
+from runtime.session.commit_service import SessionCommitService
 from transaction.commit.operation_committer import OperationCommitter
 from transaction.commit.recovery import RecoveryService
 
 if TYPE_CHECKING:
-    from infrastructure.context.projection.memory_document import MemoryDocumentProjector
     from runtime.lifecycle import RuntimeLifecycle
     from runtime.recovery.report import RecoveryReport
 
@@ -81,32 +62,8 @@ class TransactionRuntime:
 
 
 @dataclass(frozen=True)
-class MemoryRuntime:
-    """Markdown Memory 的写入、维护、恢复和后台对象。"""
-
-    document_store: FileSystemMemoryDocumentStore
-    control_store: MemoryDocumentControlStore
-    revision_store: MemoryDocumentRevisionStore
-    review_store: MemoryEditReviewStore
-    bootstrapper: MemoryDocumentBootstrapper
-    compiler: ExplicitRememberPlanner
-    committer: MemoryDocumentCommitter
-    erasure_store: MemoryDocumentEraseStore
-    consolidation_store: MemoryDocumentConsolidationStore
-    consolidator: MemoryDocumentConsolidator
-    projector: MemoryDocumentProjector
-    scanner: MemoryDocumentScanner
-    edit_worker: MemoryDocumentEditWorker
-    scan_worker: MemoryDocumentScanWorker
-    projection_worker: MemoryDocumentProjectionWorker
-    eraser: MemoryDocumentEraser
-    command_service: MemoryCommandService
-    review_service: MemoryEditReviewService
-
-
-@dataclass(frozen=True)
 class SessionRuntime:
-    """会话证据归档和普通派生提交对象。"""
+    """会话归档和普通派生提交对象。"""
 
     archive_store: SessionArchiveStore
     commit_service: SessionCommitService
@@ -119,7 +76,6 @@ class ContextRuntime:
     facade: ContextDB
     administration_service: ContextAdministrationService
     lifecycle_service: ContextLifecycleService
-    memory_document_overlay: MemoryDocumentContextOverlay
     tombstone_service: ProjectionTombstoneService
     retention_manager: CatalogRetentionManager
 
@@ -148,7 +104,6 @@ class RuntimeContainer:
     readiness: RuntimeReadiness
     stores: StoreRuntime
     transaction: TransactionRuntime
-    memory: MemoryRuntime
     session: SessionRuntime
     context: ContextRuntime
     policy: PolicyRuntime
@@ -169,7 +124,6 @@ class RuntimeContainer:
 __all__ = [
     "AgentRuntime",
     "ContextRuntime",
-    "MemoryRuntime",
     "PolicyRuntime",
     "RuntimeContainer",
     "SessionRuntime",

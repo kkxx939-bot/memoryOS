@@ -97,11 +97,6 @@ class CatalogWriteOperationsMixin:
             "source_uri": safe.source_uri,
             "source_digest": safe.source_digest,
             "source_revision": int(safe.source_revision),
-            "document_id": safe.document_id,
-            "block_id": safe.block_id,
-            "document_kind": safe.document_kind,
-            "document_revision": int(safe.document_revision),
-            "projection_generation": int(safe.projection_generation),
             "projection_effect_hash": safe.projection_effect_hash,
             "hotness": safe.hotness,
             "semantic_hotness": safe.semantic_hotness,
@@ -213,9 +208,9 @@ class CatalogWriteOperationsMixin:
                 """
                 INSERT INTO context_paths(
                   tenant_id, record_key, uri, owner_user_id, workspace_id, workspace_shared,
-                  context_type, record_kind, document_id, document_kind, event_time,
+                  context_type, record_kind, event_time,
                   transaction_time, path, path_kind, depth, is_primary, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.tenant_id,
@@ -226,8 +221,6 @@ class CatalogWriteOperationsMixin:
                     1 if record.workspace_shared else 0,
                     record.context_type,
                     record.record_kind,
-                    record.document_id,
-                    record.document_kind,
                     record.event_time,
                     record.transaction_time,
                     path,
@@ -245,9 +238,9 @@ class CatalogWriteOperationsMixin:
                       tenant_id, record_key, path, ancestor_path,
                       owner_user_id, workspace_id, workspace_shared, scope_signature,
                       uri, context_type, source_kind, record_kind, adapter_id,
-                      adapter_access_id, session_id, document_id, document_kind,
+                      adapter_access_id, session_id,
                       event_time, transaction_time, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         record.tenant_id,
@@ -265,8 +258,6 @@ class CatalogWriteOperationsMixin:
                         record.adapter_id,
                         self._adapter_access_value(record),
                         record.session_id,
-                        record.document_id,
-                        record.document_kind,
                         record.event_time,
                         record.transaction_time,
                         now,

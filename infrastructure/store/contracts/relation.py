@@ -38,15 +38,6 @@ class RelationStore(Protocol):
         limit: int,
     ) -> int: ...
 
-    def delete_memory_document_relations(
-        self,
-        uri: str,
-        *,
-        tenant_id: str,
-        owner_user_id: str,
-        limit: int,
-    ) -> int: ...
-
     def delete_uri_relations(self, uri: str, *, tenant_id: str, limit: int) -> int: ...
 
     def clear_ordinary_relations(self, *, tenant_id: str, limit: int) -> int: ...

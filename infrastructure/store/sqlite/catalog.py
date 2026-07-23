@@ -8,26 +8,17 @@ from infrastructure.store.sqlite._common import (
     _CATALOG_SCHEMA_VERSION,
     Any,
     CatalogRecord,
-    CatalogRecordKind,
     ContextObject,
     Mapping,
     Sequence,
     replace,
 )
-from infrastructure.store.sqlite.catalog_documents import CatalogDocumentOperationsMixin
+from infrastructure.store.sqlite.catalog_writes import CatalogWriteOperationsMixin
 
 if TYPE_CHECKING:
     from infrastructure.store.sqlite.index_store import SQLiteIndexStore
 
-_DOCUMENT_RECORD_KINDS = frozenset(
-    {
-        CatalogRecordKind.MEMORY_DOCUMENT.value,
-        CatalogRecordKind.MEMORY_BLOCK.value,
-    }
-)
-
-
-class CatalogStoreOperations(CatalogDocumentOperationsMixin):
+class CatalogStoreOperations(CatalogWriteOperationsMixin):
     """管理事务写入和租户范围内的有界 Catalog 读取。"""
 
     def __init__(self, store: SQLiteIndexStore) -> None:
@@ -51,11 +42,9 @@ class CatalogStoreOperations(CatalogDocumentOperationsMixin):
         with self._store._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
-                "SELECT record_key, record_kind FROM contexts WHERE tenant_id = ? AND uri = ? ORDER BY record_key",
+                "SELECT record_key FROM contexts WHERE tenant_id = ? AND uri = ? ORDER BY record_key",
                 (resolved_tenant, str(uri)),
             ).fetchall()
-            if any(str(row["record_kind"]) in _DOCUMENT_RECORD_KINDS for row in rows):
-                raise ValueError("memory document projections require tombstone_memory_document_projection()")
             for row in rows:
                 self._delete_catalog_in_transaction(
                     conn,
@@ -88,11 +77,6 @@ class CatalogStoreOperations(CatalogDocumentOperationsMixin):
             "tenant_id": str(row["tenant_id"]),
             "owner_user_id": str(row["owner_user_id"]),
             "context_type": str(row["context_type"]),
-            "document_id": str(row["document_id"]),
-            "block_id": str(row["block_id"]),
-            "document_kind": str(row["document_kind"]),
-            "document_revision": int(row["document_revision"]),
-            "projection_generation": int(row["projection_generation"]),
             "index_content_digest": self._store._content_digest(str(row["content_text"])),
         }
 
@@ -149,21 +133,6 @@ class CatalogStoreOperations(CatalogDocumentOperationsMixin):
                     str(row["record_key"]),
                     tenant_id=resolved_tenant,
                 )
-            conn.execute(
-                """
-                UPDATE memory_document_projection_state SET
-                  source_digest='',
-                  projection_generation=0,
-                  projection_status=CASE
-                    WHEN deletion_status <> '' THEN 'TOMBSTONED'
-                    ELSE 'PENDING'
-                  END,
-                  projected_at='',
-                  last_error=''
-                WHERE tenant_id = ?
-                """,
-                (resolved_tenant,),
-            )
             conn.execute(
                 "UPDATE context_projection_journal SET status = 'PENDING', last_error = '', updated_at = ? "
                 "WHERE tenant_id = ?",
@@ -229,20 +198,11 @@ class CatalogStoreOperations(CatalogDocumentOperationsMixin):
         for record in coerced:
             if record.tenant_id != resolved_tenant:
                 raise ValueError("Catalog record tenant does not match tenant_id")
-            if record.record_kind in _DOCUMENT_RECORD_KINDS:
-                raise ValueError("memory document projections require replace_memory_document_projection()")
         prepared = tuple(self._prepare_record(record) for record in coerced)
         if not prepared:
             return 0
         with self._store._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            for item in prepared:
-                existing = conn.execute(
-                    "SELECT record_kind FROM contexts WHERE tenant_id = ? AND record_key = ?",
-                    (resolved_tenant, item.record.record_key),
-                ).fetchone()
-                if existing is not None and str(existing["record_kind"]) in _DOCUMENT_RECORD_KINDS:
-                    raise ValueError("memory document projections require replace_memory_document_projection()")
             for item in prepared:
                 self._upsert_prepared(conn, item)
         return len(prepared)
@@ -387,12 +347,6 @@ class CatalogStoreOperations(CatalogDocumentOperationsMixin):
         resolved_tenant = self._require_tenant(tenant_id)
         with self._store._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            existing = conn.execute(
-                "SELECT record_kind FROM contexts WHERE tenant_id = ? AND record_key = ?",
-                (resolved_tenant, str(record_key)),
-            ).fetchone()
-            if existing is not None and str(existing["record_kind"]) in _DOCUMENT_RECORD_KINDS:
-                raise ValueError("memory document projections require tombstone_memory_document_projection()")
             return self._delete_catalog_in_transaction(
                 conn,
                 str(record_key),

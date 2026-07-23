@@ -1,7 +1,7 @@
 """MemoryOS 运维、诊断、Worker 与预测命令协议。
 
 CLI 只负责解析参数、创建公开 SDK 客户端、调用对应能力并输出安全结果；具体
-业务规则由 Runtime 组合的 Memory、Context、Behavior 和 ActionPolicy 服务执行。
+业务规则由 Runtime 组合的 Context、Behavior 和 ActionPolicy 服务执行。
 """
 
 from __future__ import annotations
@@ -39,9 +39,6 @@ def run(argv: list[str] | None = None) -> int:
         choices=[
             "recovery",
             "session-commit",
-            "memory-document-edit",
-            "memory-document-scan",
-            "memory-projection",
             "semantic",
             "embedding",
             "maintenance",
@@ -88,7 +85,7 @@ def run(argv: list[str] | None = None) -> int:
                     "product": "MemoryOS",
                     "positioning": "Predictive Context Database for AI Agents",
                     "production_entrypoint": "MemoryOSClient.process_observation",
-                    "planes": ["ContextDB", "Memory", "Behavior", "ActionPolicy", "Operation Plane"],
+                    "planes": ["ContextDB", "Behavior", "ActionPolicy", "Operation Plane"],
                 },
                 ensure_ascii=False,
                 indent=2,

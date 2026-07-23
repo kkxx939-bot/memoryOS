@@ -10,7 +10,6 @@ from foundation.identity import LocalUserContext
 from foundation.readiness import RuntimeReadiness
 from infrastructure.context.contracts import ContextObjectReader
 from infrastructure.context.exact_reader import ContextExactReader
-from infrastructure.context.layers.memory_document_overlay import MemoryDocumentContextOverlay
 from infrastructure.context.orchestrator import UnifiedRetrievalOrchestrator, UnifiedRetrievalResult
 from infrastructure.context.query_planner import QueryPlanner, retrieval_options_from_legacy
 from infrastructure.context.query_support import (
@@ -25,7 +24,6 @@ from infrastructure.context.query_support import (
 )
 from infrastructure.context.retrieval.query_plan import RetrievalOptions
 from infrastructure.context.trace import RecallTraceService
-from infrastructure.store.contracts.index import IndexStore
 from infrastructure.store.contracts.source import SourceStore
 from infrastructure.store.trace import RecallTraceRepository, recall_trace_root
 from pre.connect import ConnectMetadata
@@ -40,9 +38,7 @@ class ContextQueryService:
         root: str,
         tenant_id: str,
         source_store: SourceStore | None,
-        index_store: IndexStore | None,
         context_reader: ContextObjectReader,
-        document_overlay: MemoryDocumentContextOverlay | None,
         readiness: RuntimeReadiness | None,
         effective_tenant: Callable[[LocalUserContext | None, str | None], str],
         connect_filters_from_metadata: Callable[[dict[str, Any] | None], dict[str, str]],
@@ -65,9 +61,7 @@ class ContextQueryService:
         self._set_last_recall_trace_id = set_last_recall_trace_id
         self._exact_reader = ContextExactReader(
             source_store=source_store,
-            index_store=index_store,
             context_reader=context_reader,
-            document_overlay=document_overlay,
             require_exact_read_scope=require_exact_read_scope,
         )
 
@@ -90,8 +84,6 @@ class ContextQueryService:
         tenant_id: str | None = None,
         applicability_scopes: list[dict[str, Any]] | None = None,
         record_kinds: list[str] | None = None,
-        document_ids: list[str] | None = None,
-        document_kinds: list[str] | None = None,
         query_intent: str | None = None,
         caller: LocalUserContext | None = None,
     ) -> list[dict[str, Any]]:
@@ -111,8 +103,6 @@ class ContextQueryService:
             tenant_id=tenant_id,
             applicability_scopes=applicability_scopes,
             record_kinds=record_kinds,
-            document_ids=document_ids,
-            document_kinds=document_kinds,
             query_intent=query_intent,
             caller=caller,
         )
@@ -133,8 +123,6 @@ class ContextQueryService:
         tenant_id: str | None = None,
         applicability_scopes: list[dict[str, Any]] | None = None,
         record_kinds: list[str] | None = None,
-        document_ids: list[str] | None = None,
-        document_kinds: list[str] | None = None,
         query_intent: str | None = None,
         caller: LocalUserContext | None = None,
     ) -> dict[str, Any]:
@@ -154,8 +142,6 @@ class ContextQueryService:
             tenant_id=tenant_id,
             applicability_scopes=applicability_scopes,
             record_kinds=record_kinds,
-            document_ids=document_ids,
-            document_kinds=document_kinds,
             query_intent=query_intent,
             caller=caller,
         )
@@ -191,8 +177,6 @@ class ContextQueryService:
         tenant_id: str | None,
         applicability_scopes: list[dict[str, Any]] | None,
         record_kinds: list[str] | None,
-        document_ids: list[str] | None,
-        document_kinds: list[str] | None,
         query_intent: str | None,
         caller: LocalUserContext | None,
     ) -> tuple[UnifiedRetrievalResult, str, ConnectMetadata]:
@@ -238,8 +222,6 @@ class ContextQueryService:
                 "tenant_id": effective_tenant,
                 "applicability_scope_keys": _scope_keys(applicability_scopes) or None,
                 "record_kinds": record_kinds,
-                "document_ids": document_ids,
-                "document_kinds": document_kinds,
                 "query_intent": query_intent,
             }
         )

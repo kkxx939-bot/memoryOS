@@ -1,6 +1,6 @@
 """会话异步派生输出的 generation 发布与完整性校验。
 
-异步输出不是不可变证据本体。它们按 task_id 写入独立 generation，只有完整
+异步输出不是 SessionArchive 本体。它们按 task_id 写入独立 generation，只有完整
 manifest 写入后才允许原子切换 current head；损坏的控制文件会被隔离。
 """
 
@@ -22,9 +22,9 @@ from infrastructure.store.filesystem.durable_io.quarantine import quarantine_con
 from infrastructure.store.filesystem.file_lock import open_private_lock
 from infrastructure.store.filesystem.session_archive_io import SessionArchiveFileIO
 from infrastructure.store.filesystem.session_archive_layout import SessionArchiveLayout
-from memory.commit.evidence.errors import (
-    AsyncOutputIntegrityError,
-    EvidenceArchiveConflictError,
+from infrastructure.store.session.archive_errors import (
+    SessionArchiveConflictError,
+    SessionAsyncOutputIntegrityError,
 )
 from pre.session import SessionArchive
 
@@ -122,7 +122,7 @@ class SessionAsyncOutputStore:
                     if isinstance(details, dict)
                 }
                 if desired_digests != existing_digests:
-                    raise EvidenceArchiveConflictError(
+                    raise SessionArchiveConflictError(
                         "published async output task cannot be overwritten with different bytes"
                     )
                 return generation
@@ -194,7 +194,7 @@ class SessionAsyncOutputStore:
         except FileNotFoundError:
             self.last_error = ""
             return False
-        except AsyncOutputIntegrityError as exc:
+        except SessionAsyncOutputIntegrityError as exc:
             self.last_error = type(exc).__name__
             self._quarantine_controls(directory, archive, exc)
             return False
@@ -215,7 +215,7 @@ class SessionAsyncOutputStore:
         self.files.secure_directory(async_root)
         lock_path = async_root / ".publish.lock"
         if lock_path.is_symlink():
-            raise AsyncOutputIntegrityError("async output lock cannot be a symbolic link")
+            raise SessionAsyncOutputIntegrityError("async output lock cannot be a symbolic link")
         if fcntl is None:  # pragma: no cover
             key = str(lock_path)
             with self._fallback_guard:
@@ -251,23 +251,23 @@ class SessionAsyncOutputStore:
 
     def _read_head_optional(self, path: Path) -> dict[str, Any] | None:
         if path.is_symlink():
-            raise AsyncOutputIntegrityError("async output head cannot be a symbolic link")
+            raise SessionAsyncOutputIntegrityError("async output head cannot be a symbolic link")
         if not path.exists():
             return None
         try:
             head = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise AsyncOutputIntegrityError("async output head is unreadable") from exc
+            raise SessionAsyncOutputIntegrityError("async output head is unreadable") from exc
         if not isinstance(head, dict):
-            raise AsyncOutputIntegrityError("async output head must be a JSON object")
+            raise SessionAsyncOutputIntegrityError("async output head must be a JSON object")
         core = {key: value for key, value in head.items() if key != "head_digest"}
         if head.get("schema_version") != ASYNC_OUTPUT_HEAD_SCHEMA_VERSION or head.get(
             "head_digest"
         ) != canonical_digest(core):
-            raise AsyncOutputIntegrityError("async output head digest is corrupt")
+            raise SessionAsyncOutputIntegrityError("async output head digest is corrupt")
         task_id = require_safe_path_segment(head.get("task_id"), "async output head task_id")
         if head.get("manifest_relative_path") != f"{task_id}/manifest.json":
-            raise AsyncOutputIntegrityError("async output head manifest path is invalid")
+            raise SessionAsyncOutputIntegrityError("async output head manifest path is invalid")
         return head
 
     def _read_generation(
@@ -280,13 +280,13 @@ class SessionAsyncOutputStore:
         generation = directory / "async_outputs" / safe_task
         manifest_path = generation / "manifest.json"
         if generation.is_symlink() or manifest_path.is_symlink():
-            raise AsyncOutputIntegrityError("async output generation cannot be a symbolic link")
+            raise SessionAsyncOutputIntegrityError("async output generation cannot be a symbolic link")
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise AsyncOutputIntegrityError("async output manifest is unreadable") from exc
+            raise SessionAsyncOutputIntegrityError("async output manifest is unreadable") from exc
         if not isinstance(manifest, dict):
-            raise AsyncOutputIntegrityError("async output manifest must be a JSON object")
+            raise SessionAsyncOutputIntegrityError("async output manifest must be a JSON object")
         core = {key: value for key, value in manifest.items() if key != "manifest_digest"}
         if (
             manifest.get("schema_version") != ASYNC_OUTPUT_MANIFEST_SCHEMA_VERSION
@@ -297,36 +297,36 @@ class SessionAsyncOutputStore:
             or manifest.get("task_id") != safe_task
             or manifest.get("complete") is not True
         ):
-            raise AsyncOutputIntegrityError("async output manifest identity or digest is corrupt")
+            raise SessionAsyncOutputIntegrityError("async output manifest identity or digest is corrupt")
         files = manifest.get("files")
         if not isinstance(files, dict) or set(files) != set(ASYNC_OUTPUT_FILES):
-            raise AsyncOutputIntegrityError("async output manifest file set is incomplete")
+            raise SessionAsyncOutputIntegrityError("async output manifest file set is incomplete")
         result: dict[str, Any] = {"head": head, "manifest": manifest}
         for filename in ASYNC_OUTPUT_FILES:
             details = files.get(filename)
             if not isinstance(details, dict):
-                raise AsyncOutputIntegrityError("async output file proof is invalid")
+                raise SessionAsyncOutputIntegrityError("async output file proof is invalid")
             path = generation / filename
             if path.is_symlink():
-                raise AsyncOutputIntegrityError("async output file cannot be a symbolic link")
+                raise SessionAsyncOutputIntegrityError("async output file cannot be a symbolic link")
             try:
                 raw = path.read_bytes()
             except OSError as exc:
-                raise AsyncOutputIntegrityError("async output file is missing") from exc
+                raise SessionAsyncOutputIntegrityError("async output file is missing") from exc
             if details.get("digest") != _digest_bytes(raw) or details.get("size") != len(raw):
-                raise AsyncOutputIntegrityError("async output file digest is corrupt")
+                raise SessionAsyncOutputIntegrityError("async output file digest is corrupt")
             if filename.endswith(".json"):
                 try:
                     payload = json.loads(raw.decode("utf-8"))
                 except (UnicodeError, json.JSONDecodeError) as exc:
-                    raise AsyncOutputIntegrityError("async output JSON is corrupt") from exc
+                    raise SessionAsyncOutputIntegrityError("async output JSON is corrupt") from exc
                 if not isinstance(payload, dict) or payload.get("task_id") != safe_task:
-                    raise AsyncOutputIntegrityError("async output file task identity is mixed")
+                    raise SessionAsyncOutputIntegrityError("async output file task identity is mixed")
                 if filename == "commit_group_status.json" and (
                     payload.get("archive_uri") != head.get("archive_uri")
                     or payload.get("tenant_id") != head.get("tenant_id")
                 ):
-                    raise AsyncOutputIntegrityError("async output commit group identity is mixed")
+                    raise SessionAsyncOutputIntegrityError("async output commit group identity is mixed")
                 result[filename.removesuffix(".json")] = payload
             else:
                 result[filename.removesuffix(".md")] = raw.decode("utf-8")

@@ -173,7 +173,6 @@ class CommitStateMachine:
             if any(value != self.tenant_id for _, value in declarations):
                 paths = ", ".join(path for path, value in declarations if value != self.tenant_id)
                 raise ValueError(f"operation tenant does not match bound tenant: {paths}")
-            self._reject_document_owned_operation(operation)
         for operation in operations:
             operation.payload.setdefault("tenant_id", self.tenant_id)
             obj = operation.payload.get("context_object")
@@ -197,7 +196,7 @@ class CommitStateMachine:
         try:
             self._validate_and_bind_operations(user_id, [operation])
         except (PermissionError, ValueError) as exc:
-            raise RedoIntegrityError("redo operation crosses its ordinary user, tenant, or document boundary") from exc
+            raise RedoIntegrityError("redo operation crosses its ordinary user, tenant, or object boundary") from exc
         self._validate_recovery_artifact_tenant(source_effect, "redo source effect")
         self._validate_recovery_artifact_tenant(relation_manifest, "redo relation manifest")
 

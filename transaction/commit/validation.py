@@ -89,7 +89,6 @@ class RegularOperationValidator:
             except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
                 current_target = None
         if desired_obj is not None:
-            self._reject_document_owned_uri(desired_obj.uri)
             if desired_obj.owner_user_id not in {None, "", operation.user_id}:
                 raise ValueError("regular operation context_object owner mismatch")
             if str(desired_obj.tenant_id or "default") != self.tenant_id:

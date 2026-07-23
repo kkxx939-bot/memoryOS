@@ -8,12 +8,12 @@ from behavior.execute.session_commit_planner import BehaviorCommitPlanner
 from infrastructure.context.projection_journal import SessionProjectionJournal
 from infrastructure.context.session_projector import CatalogProjectionStore, SessionContextProjector
 from infrastructure.store.filesystem.session_archive import SessionArchiveStore
+from infrastructure.store.session.archive_event_encoder import CanonicalSessionArchiveEventEncoder
 from infrastructure.store.session.commit_group import CommitGroupStore
-from memory.commit.evidence.archive_encoder import SessionEvidenceArchiveEncoder
-from memory.commit.session_commit import SessionCommitService
 from policy.action_policy.planning.session_commit_planner import ActionPolicyCommitPlanner
 from runtime.config import RuntimeConfig
 from runtime.container import SessionRuntime, StoreRuntime, TransactionRuntime
+from runtime.session.commit_service import SessionCommitService
 
 
 def wire_session(
@@ -23,12 +23,12 @@ def wire_session(
     *,
     tenant_root,  # noqa: ANN001
 ) -> SessionRuntime:
-    """创建会话证据 Store，并把领域编码器作为显式依赖传入。"""
+    """创建 SessionArchive Store，并把事件编码器作为显式依赖传入。"""
 
     archive_store = SessionArchiveStore(
         config.root_path,
         tenant_id=config.tenant_id,
-        evidence_encoder=SessionEvidenceArchiveEncoder(),
+        event_encoder=CanonicalSessionArchiveEventEncoder(),
     )
     session_projector = SessionContextProjector(
         cast(CatalogProjectionStore, stores.index),

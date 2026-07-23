@@ -1,4 +1,4 @@
-"""不可变 Session 证据归档的持久化协议。"""
+"""只读 SessionArchive 的持久化协议。"""
 
 from __future__ import annotations
 

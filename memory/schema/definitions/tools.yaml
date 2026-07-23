@@ -1,0 +1,76 @@
+memory_type: tool
+description: >-
+  只保存 Agent 实际使用具体工具后形成的稳定工具知识，使后续调用减少重复试错。
+  不保存逐次工具调用流水、临时参数、下载内容、敏感值、调用次数或成功率统计。
+path_template: tools/{tool_name}.md
+operation_mode: upsert
+markdown_template: |
+  # {tool_name}
+
+  ## Purpose
+  {purpose}
+
+  ## When to Use
+  {when_to_use}
+
+  ## Stable Invocation
+  {invocation}
+
+  ## Constraints
+  {constraints}
+
+  ## Failure and Recovery
+  {failure_recovery}
+
+  ## Verification
+  {verification}
+fields:
+  - name: tool_name
+    type: string
+    role: address
+    required: true
+    merge: immutable
+    description: >-
+      工具注册表中的真实名称，保持原样，不把工具知识转换成 Skill。
+  - name: purpose
+    type: string
+    role: content
+    required: true
+    merge: replace
+    description: >-
+      工具的稳定用途和能力边界；更新时结合旧内容完整重写。
+  - name: when_to_use
+    type: string
+    role: content
+    required: true
+    merge: patch
+    description: >-
+      适合调用该工具的可复用场景、前置条件和不适用场景。
+  - name: invocation
+    type: string
+    role: content
+    required: true
+    merge: patch
+    description: >-
+      已实际验证的参数形态、调用顺序和最小示例；不得记录一次性值、密钥或完整调用流水。
+  - name: constraints
+    type: string
+    role: content
+    required: false
+    merge: patch
+    description: >-
+      已确认的权限、大小、格式、平台、超时或并发限制。
+  - name: failure_recovery
+    type: string
+    role: content
+    required: false
+    merge: patch
+    description: >-
+      可复现的常见失败模式、判断信号和已验证恢复办法，不保存无结论的偶发错误。
+  - name: verification
+    type: string
+    role: content
+    required: false
+    merge: patch
+    description: >-
+      判断调用是否真正成功的稳定检查方法和期望结果。

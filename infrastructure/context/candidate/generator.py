@@ -22,14 +22,6 @@ from sanitization.context_projection import ContextProjectionSanitizer
 
 _PRINCIPAL_ONLY_WORKSPACE = "__memoryos_principal_only__"
 _TEMPORAL_TEXT_SATISFACTION_SCORE = 0.5
-_DOCUMENT_RECORD_KINDS = frozenset(
-    {
-        CatalogRecordKind.MEMORY_DOCUMENT.value,
-        CatalogRecordKind.MEMORY_BLOCK.value,
-    }
-)
-
-
 @dataclass(frozen=True)
 class CandidateGenerationResult:
     branches: Mapping[str, tuple[RetrievalCandidate, ...]]
@@ -236,8 +228,6 @@ class CandidateGenerator:
             ("context_types", tuple(item.value for item in plan.context_types)),
             ("source_kinds", plan.source_kinds),
             ("record_kinds", self._record_kinds(plan)),
-            ("document_ids", plan.document_ids),
-            ("document_kinds", plan.document_kinds),
             ("target_uris", plan.target_uris),
             ("target_paths", plan.target_paths),
             ("event_time_from", plan.event_time_from),
@@ -302,15 +292,6 @@ class CandidateGenerator:
             filters["retrieval_views"] = metadata["retrieval_views"]
         if metadata.get("include_candidates"):
             filters["include_candidates"] = True
-        requested_record_kinds = set(plan.record_kinds)
-        if (
-            plan.document_kinds
-            and requested_record_kinds.intersection(_DOCUMENT_RECORD_KINDS)
-            and requested_record_kinds.difference(_DOCUMENT_RECORD_KINDS)
-        ):
-            # Session 与 Markdown 混合查询只用 document_kind 缩小文档投影；普通
-            # Session 记录没有该字段，仍应保留候选资格。
-            filters["document_kinds_apply_to_documents_only"] = True
         if metadata.get("minimum_lexical_relevance") is not None:
             try:
                 minimum_lexical_relevance = float(metadata["minimum_lexical_relevance"])
@@ -461,21 +442,10 @@ class CandidateGenerator:
         allowed_tiers = {str(item) for item in filters.get("serving_tier", ()) or ()}
         if allowed_tiers and str(metadata.get("serving_tier") or "") not in allowed_tiers:
             return False
-        for filter_name, metadata_name in (
-            ("record_kinds", "record_kind"),
-            ("document_ids", "document_id"),
-        ):
+        for filter_name, metadata_name in (("record_kinds", "record_kind"),):
             allowed = {str(item) for item in filters.get(filter_name, ()) or ()}
             if allowed and str(metadata.get(metadata_name) or "") not in allowed:
                 return False
-        allowed_document_kinds = {str(item) for item in filters.get("document_kinds", ()) or ()}
-        document_kind_is_scoped = bool(filters.get("document_kinds_apply_to_documents_only"))
-        if (
-            allowed_document_kinds
-            and (not document_kind_is_scoped or str(metadata.get("record_kind") or "") in _DOCUMENT_RECORD_KINDS)
-            and str(metadata.get("document_kind") or "") not in allowed_document_kinds
-        ):
-            return False
         connect_filters = filters.get("connect_filters")
         if isinstance(connect_filters, Mapping):
             for key, value in connect_filters.items():

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -72,39 +72,4 @@ class CatalogStore(Protocol):
     def delete_catalog(self, record_key: str, *, tenant_id: str) -> bool: ...
 
 
-class MemoryDocumentProjectionStore(Protocol):
-    """单个 Markdown 文档的原子 Serving 发布协议。"""
-
-    def get_memory_document_projection_state(
-        self,
-        *,
-        tenant_id: str,
-        owner_user_id: str,
-        document_id: str,
-    ) -> Mapping[str, object] | None: ...
-
-    def replace_memory_document_projection(
-        self,
-        document_record: CatalogRecord | Mapping[str, object],
-        block_records: Sequence[CatalogRecord | Mapping[str, object]],
-        expected_previous_generation: int | None,
-        *,
-        tenant_id: str,
-        owner_user_id: str,
-        restore_soft_deleted: bool = False,
-    ) -> tuple[str, ...]: ...
-
-    def tombstone_memory_document_projection(
-        self,
-        *,
-        tenant_id: str,
-        owner_user_id: str,
-        document_id: str,
-        deletion_generation: int,
-        deletion_event_digest: str,
-        deletion_status: str,
-        relative_path: str = "",
-    ) -> tuple[str, ...]: ...
-
-
-__all__ = ["CatalogStore", "IndexHit", "IndexStore", "MemoryDocumentProjectionStore"]
+__all__ = ["CatalogStore", "IndexHit", "IndexStore"]

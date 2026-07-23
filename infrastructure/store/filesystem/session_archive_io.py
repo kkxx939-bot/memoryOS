@@ -9,9 +9,9 @@ from pathlib import Path
 from typing import Any
 
 from foundation.integrity import canonical_json
-from memory.commit.evidence.errors import (
-    EvidenceArchiveConflictError,
-    EvidenceArchiveIntegrityError,
+from infrastructure.store.session.archive_errors import (
+    SessionArchiveConflictError,
+    SessionArchiveIntegrityError,
 )
 
 
@@ -43,12 +43,12 @@ class SessionArchiveFileIO:
                 self.fsync_directory(path.parent)
             except FileExistsError:
                 if path.is_symlink():
-                    raise EvidenceArchiveConflictError(
-                        f"immutable evidence path cannot be a symbolic link: {path}"
+                    raise SessionArchiveConflictError(
+                        f"immutable archive path cannot be a symbolic link: {path}"
                     ) from None
                 if compare_existing and path.read_bytes() != payload:
-                    raise EvidenceArchiveConflictError(
-                        f"immutable evidence path contains different content: {path}"
+                    raise SessionArchiveConflictError(
+                        f"immutable archive path contains different content: {path}"
                     ) from None
         finally:
             temporary.unlink(missing_ok=True)
@@ -57,7 +57,7 @@ class SessionArchiveFileIO:
         """原子替换可变控制 head，并拒绝符号链接目标。"""
 
         if path.is_symlink():
-            raise EvidenceArchiveIntegrityError("session archive head cannot be a symbolic link")
+            raise SessionArchiveIntegrityError("session archive head cannot be a symbolic link")
         self.secure_directory(path.parent)
         temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
         try:
@@ -67,7 +67,7 @@ class SessionArchiveFileIO:
                 handle.flush()
                 os.fsync(handle.fileno())
             if path.is_symlink():
-                raise EvidenceArchiveIntegrityError("session archive head cannot be a symbolic link")
+                raise SessionArchiveIntegrityError("session archive head cannot be a symbolic link")
             os.replace(temporary, path)
             os.chmod(path, 0o600)
             self.fsync_directory(path.parent)
@@ -78,7 +78,7 @@ class SessionArchiveFileIO:
         """以私有权限原子安装一份可替换的输出文件。"""
 
         if path.is_symlink():
-            raise EvidenceArchiveIntegrityError("session archive output cannot be a symbolic link")
+            raise SessionArchiveIntegrityError("session archive output cannot be a symbolic link")
         self.secure_directory(path.parent)
         temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
         try:
@@ -88,7 +88,7 @@ class SessionArchiveFileIO:
                 handle.flush()
                 os.fsync(handle.fileno())
             if path.is_symlink():
-                raise EvidenceArchiveIntegrityError("session archive output cannot be a symbolic link")
+                raise SessionArchiveIntegrityError("session archive output cannot be a symbolic link")
             os.replace(temporary, path)
             try:
                 path.chmod(0o600)
@@ -102,13 +102,13 @@ class SessionArchiveFileIO:
         """读取归档 JSON，并把路径或编码问题统一映射为完整性错误。"""
 
         if path.is_symlink():
-            raise EvidenceArchiveIntegrityError(f"evidence archive path cannot be a symbolic link: {path}")
+            raise SessionArchiveIntegrityError(f"session archive path cannot be a symbolic link: {path}")
         try:
             return json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError as exc:
-            raise EvidenceArchiveIntegrityError(f"missing evidence archive object: {path}") from exc
+            raise SessionArchiveIntegrityError(f"missing session archive object: {path}") from exc
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise EvidenceArchiveIntegrityError(f"invalid evidence archive JSON: {path}") from exc
+            raise SessionArchiveIntegrityError(f"invalid session archive JSON: {path}") from exc
 
     def secure_directory(self, directory: Path) -> None:
         """创建目录并把归档根目录以内的路径权限收紧为 0700。"""

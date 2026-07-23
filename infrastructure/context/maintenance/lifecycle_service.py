@@ -110,29 +110,6 @@ class ContextLifecycleService:
                 "auxiliary": asdict(auxiliary),
             }
 
-    def compact_session_context(
-        self,
-        session_id: str,
-        *,
-        owner_user_id: str = "",
-        now: datetime | None = None,
-    ) -> dict[str, Any] | None:
-        """生成有界 Session L1 投影，不删除归档证据。"""
-
-        with self._mutation_fence():
-            self._require_ready()
-            manager = self._retention_manager()
-            record = manager.compact_session(
-                tenant_id=self.tenant_id,
-                session_id=session_id,
-                owner_user_id=owner_user_id,
-                now=now,
-            )
-            if record is None:
-                return None
-            manager.gc_vectors(tenant_id=self.tenant_id)
-            return record.to_dict()
-
     def restore_cold_context(self, record_key: str, *, now: datetime | None = None) -> dict[str, Any]:
         """把一条精确冷层记录恢复为有界热访问。"""
 
@@ -143,25 +120,6 @@ class ContextLifecycleService:
                 tenant_id=self.tenant_id,
                 now=now,
             ).to_dict()
-
-    def compact_timeline_context(
-        self,
-        timeline_path: str,
-        *,
-        owner_user_id: str,
-        now: datetime | None = None,
-    ) -> dict[str, Any] | None:
-        """根据数据库过滤后的时间线成员生成一天的派生概览。"""
-
-        with self._mutation_fence():
-            self._require_ready()
-            record = self._retention_manager().compact_timeline(
-                tenant_id=self.tenant_id,
-                owner_user_id=owner_user_id,
-                timeline_path=timeline_path,
-                now=now,
-            )
-            return record.to_dict() if record is not None else None
 
     def enqueue_context_tombstones(
         self,

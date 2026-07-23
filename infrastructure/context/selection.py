@@ -44,8 +44,6 @@ class ContextSelectionPolicy:
     """用条目数量限制单一来源占比，避免检索结果被某一分支淹没。"""
 
     max_per_session: int = 5
-    max_per_document: int = 3
-    max_blocks_per_document: int = 3
     max_per_resource_branch: int = 3
     max_l2_items: int = 3
 
@@ -99,8 +97,6 @@ class ContextSelector:
         dropped: list[dict[str, Any]] = []
         type_counts: Counter[str] = Counter()
         session_counts: Counter[str] = Counter()
-        document_counts: Counter[tuple[str, str, str]] = Counter()
-        block_counts: Counter[tuple[str, str, str]] = Counter()
         resource_counts: Counter[str] = Counter()
         l2_count = 0
         type_quotas = self._type_quotas(plan)
@@ -121,13 +117,6 @@ class ContextSelector:
             session_key = item.manifest_digest or item.archive_digest or item.session_id
             if session_key and session_counts[session_key] >= self.policy.max_per_session:
                 dropped.append(self._drop(item, "session_quota"))
-                continue
-            document_key = (item.tenant_id, item.owner_user_id, item.document_id)
-            if item.document_id and document_counts[document_key] >= self.policy.max_per_document:
-                dropped.append(self._drop(item, "document_quota"))
-                continue
-            if item.block_id and block_counts[document_key] >= self.policy.max_blocks_per_document:
-                dropped.append(self._drop(item, "document_block_quota"))
                 continue
             quota = type_quotas.get(item.context_type, type_quotas.get("*", plan.final_limit))
             if type_counts[item.context_type] >= quota:
@@ -165,10 +154,6 @@ class ContextSelector:
             type_counts[item.context_type] += 1
             if session_key:
                 session_counts[session_key] += 1
-            if item.document_id:
-                document_counts[document_key] += 1
-            if item.block_id:
-                block_counts[document_key] += 1
             if resource_branch:
                 resource_counts[resource_branch] += 1
             if layer == "L2":
@@ -205,22 +190,15 @@ class ContextSelector:
 
     @staticmethod
     def _priority(item: RetrievalCandidate, plan: RetrievalQueryPlan) -> int:
-        document_kind = item.document_kind or str(item.metadata.get("document_kind") or "")
         record_kind = item.record_kind
         source_kind = item.source_kind
         if ContextSelector._is_coding_agent(plan):
-            if document_kind in {"preferences", "profile"}:
-                return 0
-            if document_kind in {"entity", "topic"}:
-                return 1
             if record_kind == "resource_reference" or source_kind in {"resource", "resource_reference"}:
-                return 2
+                return 0
             if record_kind in {"session_root", "session_l0", "session_l1", "semantic_segment"}:
-                return 3 if item.session_id and item.session_id in plan.session_ids else 5
-            if document_kind == "experience":
-                return 4
+                return 1 if item.session_id and item.session_id in plan.session_ids else 3
         if plan.query_intent == RetrievalQueryIntent.CURRENT:
-            order = {"memory_document": 0, "memory_block": 1, "resource": 5}
+            order = {"resource": 0, "session_root": 1, "semantic_segment": 1}
             return order.get(record_kind, order.get(source_kind, 8))
         if plan.query_intent in {RetrievalQueryIntent.OPEN_RECALL, RetrievalQueryIntent.HISTORY}:
             order = {
@@ -228,8 +206,6 @@ class ContextSelector:
                 "session_l0": 0,
                 "session_l1": 0,
                 "semantic_segment": 0,
-                "memory_block": 1,
-                "memory_document": 1,
                 "event": 1,
                 "resource": 2,
                 "resource_reference": 2,
@@ -255,7 +231,6 @@ class ContextSelector:
             item.context_type == ContextType.RESOURCE.value
             and item.record_kind == CatalogRecordKind.CONTEXT.value
             and item.source_kind in {"context", "resource"}
-            and not item.document_id
             and (item.l2_uri or item.source_uri or item.uri)
         )
 
@@ -270,7 +245,7 @@ class ContextSelector:
     def _type_quotas(plan: RetrievalQueryPlan) -> dict[str, int]:
         limit = max(1, plan.final_limit)
         if plan.query_intent == RetrievalQueryIntent.CURRENT:
-            return {"memory": max(1, limit // 2), "resource": max(1, limit // 3), "*": max(1, limit // 4)}
+            return {"resource": max(1, limit // 2), "session": max(1, limit // 3), "*": max(1, limit // 3)}
         if plan.query_intent in {RetrievalQueryIntent.OPEN_RECALL, RetrievalQueryIntent.HISTORY}:
             return {"session": max(1, limit // 2), "resource": max(1, limit // 3), "*": max(1, limit // 3)}
         return {"*": limit}

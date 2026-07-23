@@ -10,7 +10,6 @@ from typing import Any
 
 from openApi.mcp.config import MCPServerConfig
 from openApi.mcp.errors import ToolValidationError
-from openApi.memory_contract import memory_request_schema
 from openApi.retrieval_contract import retrieval_options_json_schema
 from pre.connect import CapabilityProfile, ConnectMetadata, ConnectType, PipelineMode
 
@@ -44,8 +43,6 @@ TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "retrieval_views": {"type": "array", "items": {"type": "string"}},
             "applicability_scopes": {"type": "array", "items": {"type": "object"}},
             "record_kinds": {"type": "array", "items": {"type": "string"}},
-            "document_ids": {"type": "array", "items": {"type": "string"}},
-            "document_kinds": {"type": "array", "items": {"type": "string"}},
             "query_intent": {"type": "string"},
             "connect_metadata": {"type": "object"},
         },
@@ -64,8 +61,6 @@ TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "retrieval_views": {"type": "array", "items": {"type": "string"}},
             "applicability_scopes": {"type": "array", "items": {"type": "object"}},
             "record_kinds": {"type": "array", "items": {"type": "string"}},
-            "document_ids": {"type": "array", "items": {"type": "string"}},
-            "document_kinds": {"type": "array", "items": {"type": "string"}},
             "query_intent": {"type": "string"},
             "connect_metadata": {"type": "object"},
         },
@@ -94,18 +89,6 @@ TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
         "properties": {"uri": {"type": "string"}, "layer": {"type": "string"}},
         "required": ["uri"],
     },
-    "memoryos_adopt_memory_document": memory_request_schema("adopt"),
-    "memoryos_remember": memory_request_schema("remember"),
-    "memoryos_edit_memory_document": memory_request_schema("edit"),
-    "memoryos_rename_memory_document": memory_request_schema("rename"),
-    "memoryos_merge_memory_documents": memory_request_schema("merge"),
-    "memoryos_propose_memory_consolidation": memory_request_schema("merge_propose"),
-    "memoryos_resume_memory_consolidation": memory_request_schema("merge_resume"),
-    "memoryos_forget": memory_request_schema("forget"),
-    "memoryos_memory_history": memory_request_schema("history"),
-    "memoryos_restore_memory_revision": memory_request_schema("restore"),
-    "memoryos_review_memory_edit": memory_request_schema("review"),
-    "memoryos_preview_memory_edit": memory_request_schema("review_preview"),
     "memoryos_archive_search": {
         "type": "object",
         "properties": {
@@ -161,24 +144,6 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "memoryos_commit_session": "Commit a sanitized agent session archive.",
     "memoryos_health": "Check MemoryOS availability.",
     "memoryos_read": "Read one exact MemoryOS URI at L0, L1, or L2.",
-    "memoryos_adopt_memory_document": (
-        "Explicitly adopt one safe caller-owned UNMANAGED Markdown file by relative path and exact raw digest."
-    ),
-    "memoryos_remember": "Commit explicit content to a managed Markdown memory document.",
-    "memoryos_edit_memory_document": "CAS replace one managed Markdown memory document body.",
-    "memoryos_rename_memory_document": (
-        "CAS rename, with an optional same-effect body edit, while preserving the document URI and ID."
-    ),
-    "memoryos_merge_memory_documents": "Roll forward a bounded exact-digest multi-document merge.",
-    "memoryos_propose_memory_consolidation": (
-        "Seal and preview a copy-on-write exact-digest multi-document consolidation without mutating live Markdown."
-    ),
-    "memoryos_resume_memory_consolidation": "Resume a sealed multi-document merge after projection or restart.",
-    "memoryos_forget": "Soft-forget or hard-erase one exact memory document URI.",
-    "memoryos_memory_history": "List retained revisions for one memory document URI.",
-    "memoryos_restore_memory_revision": "Restore one retained memory document revision with CAS.",
-    "memoryos_review_memory_edit": "Approve, reject or correct one sealed document edit proposal.",
-    "memoryos_preview_memory_edit": "Read the bounded proposed diff for one caller-owned edit proposal.",
     "memoryos_archive_search": "Search archived coding-agent sessions.",
     "memoryos_archive_read": "Read one exact archived session.",
     "memoryos_recall_trace": "Explain a recall trace.",
@@ -257,7 +222,6 @@ def normalize_agent_metadata(payload: dict[str, Any] | None, config: MCPServerCo
         if not isinstance(raw.get("modality"), str)
         else (str(raw.get("modality")),),
         capabilities=CapabilityProfile(
-            can_write_memory=True,
             can_search_context=True,
             can_reduce_context=True,
             can_predict_behavior=False,

@@ -418,8 +418,6 @@ class ContextProjectionSanitizer:
             return 0
         if parts[0] in {"sessions", "projects", "skills", "agents"}:
             return 1
-        if parts[0] == "memories":
-            return min(2, len(parts))
         if parts[0] in {"timeline", "resources"}:
             return len(parts)
         return 0

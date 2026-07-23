@@ -13,8 +13,6 @@ _AUXILIARY_TABLE_COLUMNS = {
             "workspace_shared",
             "context_type",
             "record_kind",
-            "document_id",
-            "document_kind",
             "event_time",
             "transaction_time",
             "path",
@@ -62,8 +60,6 @@ _AUXILIARY_TABLE_COLUMNS = {
             "adapter_id",
             "adapter_access_id",
             "session_id",
-            "document_id",
-            "document_kind",
             "event_time",
             "transaction_time",
             "updated_at",
@@ -150,22 +146,6 @@ _AUXILIARY_TABLE_COLUMNS = {
             "updated_at",
         }
     ),
-    "memory_document_projection_state": frozenset(
-        {
-            "tenant_id",
-            "owner_user_id",
-            "document_id",
-            "relative_path",
-            "source_digest",
-            "projection_generation",
-            "projection_status",
-            "projected_at",
-            "last_error",
-            "deletion_generation",
-            "deletion_event_digest",
-            "deletion_status",
-        }
-    ),
 }
 
 _AUXILIARY_TABLE_PRIMARY_KEYS = {
@@ -186,12 +166,10 @@ _AUXILIARY_TABLE_PRIMARY_KEYS = {
     "context_projection_state": ("tenant_id", "record_key"),
     "context_tombstones": ("tenant_id", "tombstone_id"),
     "context_projection_journal": ("tenant_id", "projector_kind", "source_uri"),
-    "memory_document_projection_state": ("tenant_id", "owner_user_id", "document_id"),
 }
 
 _AUXILIARY_TABLE_UNIQUE_IDENTITIES = {
     "context_fts_map": frozenset({("fts_rowid",)}),
-    "memory_document_projection_state": frozenset({("tenant_id", "owner_user_id", "relative_path")}),
 }
 
 

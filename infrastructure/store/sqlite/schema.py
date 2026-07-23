@@ -80,11 +80,6 @@ class SchemaManager:
               source_uri TEXT NOT NULL DEFAULT '',
               source_digest TEXT NOT NULL DEFAULT '',
               source_revision INTEGER NOT NULL DEFAULT 0,
-              document_id TEXT NOT NULL DEFAULT '',
-              block_id TEXT NOT NULL DEFAULT '',
-              document_kind TEXT NOT NULL DEFAULT '',
-              document_revision INTEGER NOT NULL DEFAULT 0,
-              projection_generation INTEGER NOT NULL DEFAULT 0,
               projection_effect_hash TEXT NOT NULL DEFAULT '',
               hotness REAL NOT NULL DEFAULT 0,
               semantic_hotness REAL NOT NULL DEFAULT 0,
@@ -115,8 +110,6 @@ class SchemaManager:
               workspace_shared INTEGER NOT NULL DEFAULT 0 CHECK(workspace_shared IN (0, 1)),
               context_type TEXT NOT NULL DEFAULT '',
               record_kind TEXT NOT NULL DEFAULT 'context',
-              document_id TEXT NOT NULL DEFAULT '',
-              document_kind TEXT NOT NULL DEFAULT '',
               event_time TEXT NOT NULL DEFAULT '',
               transaction_time TEXT NOT NULL DEFAULT '',
               path TEXT NOT NULL,
@@ -166,8 +159,6 @@ class SchemaManager:
               adapter_id TEXT NOT NULL DEFAULT '',
               adapter_access_id TEXT NOT NULL DEFAULT '',
               session_id TEXT NOT NULL DEFAULT '',
-              document_id TEXT NOT NULL DEFAULT '',
-              document_kind TEXT NOT NULL DEFAULT '',
               event_time TEXT NOT NULL DEFAULT '',
               transaction_time TEXT NOT NULL DEFAULT '',
               updated_at TEXT NOT NULL DEFAULT '',
@@ -268,24 +259,6 @@ class SchemaManager:
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL,
               PRIMARY KEY (tenant_id, projector_kind, source_uri)
-            )
-            """,
-            """
-            CREATE TABLE IF NOT EXISTS memory_document_projection_state (
-              tenant_id TEXT NOT NULL,
-              owner_user_id TEXT NOT NULL,
-              document_id TEXT NOT NULL,
-              relative_path TEXT NOT NULL,
-              source_digest TEXT NOT NULL,
-              projection_generation INTEGER NOT NULL,
-              projection_status TEXT NOT NULL,
-              projected_at TEXT NOT NULL,
-              last_error TEXT NOT NULL DEFAULT '',
-              deletion_generation INTEGER NOT NULL DEFAULT 0,
-              deletion_event_digest TEXT NOT NULL DEFAULT '',
-              deletion_status TEXT NOT NULL DEFAULT '',
-              PRIMARY KEY (tenant_id, owner_user_id, document_id),
-              UNIQUE (tenant_id, owner_user_id, relative_path)
             )
             """,
         )
@@ -434,18 +407,12 @@ class SchemaManager:
             "CREATE INDEX IF NOT EXISTS idx_contexts_tenant_workspace_updated ON contexts(tenant_id, workspace_id, updated_at DESC, record_key)",
             "CREATE INDEX IF NOT EXISTS idx_contexts_tenant_session_updated ON contexts(tenant_id, session_id, updated_at DESC, record_key)",
             "CREATE INDEX IF NOT EXISTS idx_contexts_tenant_record_kind_updated ON contexts(tenant_id, record_kind, updated_at DESC, record_key)",
-            "CREATE INDEX IF NOT EXISTS idx_contexts_tenant_document ON contexts(tenant_id, owner_user_id, document_id, projection_generation, source_digest, record_key)",
-            "CREATE INDEX IF NOT EXISTS idx_contexts_tenant_document_id ON contexts(tenant_id, document_id, record_kind, record_key)",
-            "CREATE INDEX IF NOT EXISTS idx_contexts_tenant_block_id ON contexts(tenant_id, block_id, record_key)",
-            "CREATE INDEX IF NOT EXISTS idx_contexts_tenant_document_kind ON contexts(tenant_id, owner_user_id, document_kind, record_kind, updated_at DESC, record_key)",
             "CREATE INDEX IF NOT EXISTS idx_contexts_tenant_event_time ON contexts(tenant_id, event_time, record_key)",
             "CREATE INDEX IF NOT EXISTS idx_contexts_tenant_transaction_time ON contexts(tenant_id, transaction_time, record_key)",
             "CREATE INDEX IF NOT EXISTS idx_contexts_tenant_scene_key ON contexts(tenant_id, scene_key, record_key)",
             "CREATE INDEX IF NOT EXISTS idx_contexts_tenant_action ON contexts(tenant_id, action, record_key)",
             "CREATE INDEX IF NOT EXISTS idx_contexts_tenant_support_anchor ON contexts(tenant_id, support_anchor_uri, record_key)",
             "CREATE INDEX IF NOT EXISTS idx_contexts_projection_evidence ON contexts(tenant_id, source_uri, projection_effect_hash, record_key)",
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_document_projection ON contexts(tenant_id, owner_user_id, document_id) WHERE record_kind = 'memory_document'",
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_block_projection ON contexts(tenant_id, owner_user_id, document_id, block_id) WHERE record_kind = 'memory_block'",
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_context_paths_primary ON context_paths(tenant_id, record_key) WHERE is_primary = 1",
             "CREATE INDEX IF NOT EXISTS idx_context_paths_tenant_path ON context_paths(tenant_id, path, record_key)",
             "CREATE INDEX IF NOT EXISTS idx_context_paths_owner_path ON context_paths(tenant_id, owner_user_id, path, record_key)",
@@ -458,7 +425,6 @@ class SchemaManager:
             "CREATE INDEX IF NOT EXISTS idx_context_tombstones_status ON context_tombstones(tenant_id, status, updated_at, tombstone_id)",
             "CREATE INDEX IF NOT EXISTS idx_context_tombstones_uri ON context_tombstones(tenant_id, uri, status, tombstone_id)",
             "CREATE INDEX IF NOT EXISTS idx_projection_journal_status ON context_projection_journal(tenant_id, projector_kind, status, updated_at, source_uri)",
-            "CREATE INDEX IF NOT EXISTS idx_memory_document_projection_status ON memory_document_projection_state(tenant_id, owner_user_id, projection_status, projected_at, document_id)",
         )
         for statement in statements:
             conn.execute(statement)

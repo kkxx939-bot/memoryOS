@@ -106,7 +106,6 @@ def local_agent_metadata(payload: Any, context: LocalUserContext) -> dict[str, A
         if not isinstance(raw.get("modality"), str)
         else [str(raw["modality"])],
         "capabilities": {
-            "can_write_memory": True,
             "can_search_context": True,
             "can_reduce_context": True,
             "can_predict_behavior": False,
@@ -126,7 +125,6 @@ def _drop_authority_fields(payload: dict[str, Any]) -> None:
         "authority",
         "effect_authority",
         "source_role",
-        "structured_memory_command",
         "subjects",
     ):
         payload.pop(key, None)

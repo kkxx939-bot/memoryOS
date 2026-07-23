@@ -1,0 +1,66 @@
+memory_type: intention
+description: >-
+  保存仍然有效的未来导向事项，包括目标、开放事项、承诺、下一步和阻塞。
+  文件描述当前状态，不保存完整执行轨迹；完成、取消和长期失效后的处理策略不在本 Schema 中定义。
+path_template: intentions/{intent_name}.md
+operation_mode: upsert
+markdown_template: |
+  # {intent_name}
+
+  ## Objective
+  {objective}
+
+  ## Current Status
+  {status}
+
+  ## Next Step
+  {next_step}
+
+  ## Blockers or Constraints
+  {blockers}
+
+  ## Target Time
+  {target_time}
+fields:
+  - name: intent_name
+    type: string
+    role: address
+    required: true
+    merge: immutable
+    description: >-
+      简洁、自然且能稳定指向同一未来事项的名称。
+  - name: objective
+    type: string
+    role: content
+    required: true
+    merge: replace
+    description: >-
+      当前希望达成的具体结果；目标改变时读取旧内容后完整更新。
+  - name: status
+    type: string
+    role: content
+    required: true
+    merge: replace
+    description: >-
+      当前可观察状态，例如进行中、等待输入或受阻；不在 Schema 中强制固定枚举。
+  - name: next_step
+    type: string
+    role: content
+    required: false
+    merge: replace
+    description: >-
+      当前最具体、可执行的下一步，不展开成执行轨迹。
+  - name: blockers
+    type: string
+    role: content
+    required: false
+    merge: replace
+    description: >-
+      当前仍有效的阻塞、依赖、约束或等待对象。
+  - name: target_time
+    type: string
+    role: content
+    required: false
+    merge: replace
+    description: >-
+      用户明确表达的期限或目标时间；没有明确时间时保持为空，不推测。

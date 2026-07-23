@@ -1,4 +1,4 @@
-"""业务前置阶段的 Session 原始归档模型。"""
+"""业务前置阶段的原始 SessionArchive。"""
 
 from pre.session.archive import SessionArchive
 

@@ -32,7 +32,7 @@ from infrastructure.store.query import (
 )
 from sanitization.context_projection import ContextProjectionSanitizer
 
-_CATALOG_SCHEMA_VERSION = 1
+_CATALOG_SCHEMA_VERSION = 2
 _INVALID_SCOPE_KEY = "__memoryos_invalid_scope__"
 _MAX_FILTER_VALUES = 900
 _MAX_QUERY_LIMIT = 1_000
@@ -52,9 +52,6 @@ _SAFE_FTS_METADATA_KEYS = frozenset(
         "file_name",
         "filename",
         "keywords",
-        "block_id",
-        "document_id",
-        "document_kind",
         "resource_location",
         "resource_name",
         "scene_key",
@@ -97,11 +94,6 @@ _CONTEXT_COLUMNS = (
     "source_uri",
     "source_digest",
     "source_revision",
-    "document_id",
-    "block_id",
-    "document_kind",
-    "document_revision",
-    "projection_generation",
     "projection_effect_hash",
     "hotness",
     "semantic_hotness",
@@ -128,11 +120,6 @@ _SIMPLE_FILTER_FIELDS = {
     "source_kind": "source_kind",
     "record_kind": "record_kind",
     "lifecycle_state": "lifecycle_state",
-    "document_id": "document_id",
-    "block_id": "block_id",
-    "document_kind": "document_kind",
-    "document_revision": "document_revision",
-    "projection_generation": "projection_generation",
     "serving_tier": "serving_tier",
     "projection_status": "projection_status",
     "scene_key": "scene_key",
@@ -150,9 +137,6 @@ _PLURAL_FILTER_ALIASES = {
     "source_kinds": "source_kind",
     "source_uris": "source_uri",
     "record_kinds": "record_kind",
-    "document_ids": "document_id",
-    "block_ids": "block_id",
-    "document_kinds": "document_kind",
 }
 
 

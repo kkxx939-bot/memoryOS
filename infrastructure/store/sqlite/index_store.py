@@ -149,59 +149,6 @@ class SQLiteIndexStore:
     ) -> int:
         return self._catalog.upsert_catalog_batch(records, tenant_id=tenant_id)
 
-    def replace_memory_document_projection(
-        self,
-        document_record: CatalogRecord | Mapping[str, Any],
-        block_records: Sequence[CatalogRecord | Mapping[str, Any]],
-        expected_previous_generation: int | None,
-        *,
-        tenant_id: str,
-        owner_user_id: str,
-        restore_soft_deleted: bool = False,
-    ) -> tuple[str, ...]:
-        return self._catalog.replace_memory_document_projection(
-            document_record,
-            block_records,
-            expected_previous_generation,
-            tenant_id=tenant_id,
-            owner_user_id=owner_user_id,
-            restore_soft_deleted=restore_soft_deleted,
-        )
-
-    def get_memory_document_projection_state(
-        self,
-        *,
-        tenant_id: str,
-        owner_user_id: str,
-        document_id: str,
-    ) -> dict[str, Any] | None:
-        return self._catalog.get_memory_document_projection_state(
-            tenant_id=tenant_id,
-            owner_user_id=owner_user_id,
-            document_id=document_id,
-        )
-
-    def tombstone_memory_document_projection(
-        self,
-        *,
-        tenant_id: str,
-        owner_user_id: str,
-        document_id: str,
-        deletion_generation: int,
-        deletion_event_digest: str,
-        deletion_status: str,
-        relative_path: str = "",
-    ) -> tuple[str, ...]:
-        return self._catalog.tombstone_memory_document_projection(
-            tenant_id=tenant_id,
-            owner_user_id=owner_user_id,
-            document_id=document_id,
-            deletion_generation=deletion_generation,
-            deletion_event_digest=deletion_event_digest,
-            deletion_status=deletion_status,
-            relative_path=relative_path,
-        )
-
     def get_catalog(self, record_key: str, *, tenant_id: str) -> CatalogRecord | None:
         return self._catalog.get_catalog(record_key, tenant_id=tenant_id)
 

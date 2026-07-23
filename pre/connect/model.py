@@ -16,18 +16,16 @@ class ConnectType:
 
 
 class PipelineMode:
-    MEMORY_ONLY = "memory_only"
     CONTEXT_REDUCTION = "context_reduction"
     ACTION_CAPABLE = "action_capable"
 
     @classmethod
     def values(cls) -> set[str]:
-        return {cls.MEMORY_ONLY, cls.CONTEXT_REDUCTION, cls.ACTION_CAPABLE}
+        return {cls.CONTEXT_REDUCTION, cls.ACTION_CAPABLE}
 
 
 @dataclass(frozen=True)
 class CapabilityProfile:
-    can_write_memory: bool = True
     can_search_context: bool = True
     can_reduce_context: bool = True
     can_predict_behavior: bool = False
@@ -37,7 +35,6 @@ class CapabilityProfile:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "can_write_memory": self.can_write_memory,
             "can_search_context": self.can_search_context,
             "can_reduce_context": self.can_reduce_context,
             "can_predict_behavior": self.can_predict_behavior,
@@ -53,7 +50,6 @@ class CapabilityProfile:
         if not isinstance(payload, dict):
             raise ValueError("capabilities must be an object")
         return cls(
-            can_write_memory=_strict_bool(payload, "can_write_memory", True),
             can_search_context=_strict_bool(payload, "can_search_context", True),
             can_reduce_context=_strict_bool(payload, "can_reduce_context", True),
             can_predict_behavior=_strict_bool(payload, "can_predict_behavior", False),
@@ -152,7 +148,6 @@ class ConnectMetadata:
             source_kind="robot",
             modality=("text", "sensor", "action"),
             capabilities=CapabilityProfile(
-                can_write_memory=True,
                 can_search_context=True,
                 can_reduce_context=True,
                 can_predict_behavior=True,

@@ -1,0 +1,26 @@
+memory_type: preference
+description: >-
+  按动态语义 topic 分文件保存用户可复用的喜欢、不喜欢、习惯和选择倾向。
+  不同主题分开，重叠或同义主题应合并，不保存事件、计划或支持证据。
+path_template: preferences/{topic}.md
+operation_mode: upsert
+markdown_template: |
+  # {topic}
+
+  {content}
+fields:
+  - name: topic
+    type: string
+    role: address
+    required: true
+    merge: immutable
+    description: >-
+      简洁、自然且稳定的动态语义主题；不附加额外分类层级或检索元数据。
+  - name: content
+    type: string
+    role: content
+    required: true
+    merge: patch
+    description: >-
+      每条 Markdown bullet 表达一个独立、明确、可复用的偏好；去重并保留必要条件，
+      不写事件经过、日期、计划或推断。

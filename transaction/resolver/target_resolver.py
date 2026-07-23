@@ -27,12 +27,7 @@ class ResolveResult:
 
 
 class TargetResolver:
-    """校验普通 SourceStore 对象的显式事务目标。
-
-    即使自定义 SourceStore 能够接受 Markdown 文档 URI，它也不能成为这里的
-    合法目标；记忆文档必须走自己的提交事务。缺少目标时默认转入人工复核，
-    不在事务内核中发起检索。
-    """
+    """校验 SourceStore 对象的显式事务目标。"""
 
     def __init__(
         self,
@@ -182,8 +177,6 @@ class TargetResolver:
             return "invalid_target_uri"
         if parsed.authority == "user" and parsed.user_id != commit_user:
             return "target_owner_mismatch"
-        if parsed.authority == "user" and parsed.segments[1:3] == ("memory", "documents"):
-            return "document_target_forbidden"
         return ""
 
     @staticmethod

@@ -27,7 +27,7 @@ class SessionArchive:
     metadata: dict[str, Any] = field(default_factory=dict)
     task_id: str = field(default_factory=lambda: new_id("commit"))
     created_at: str = field(default_factory=utc_now)
-    schema_version: str = "session_archive_v2"
+    schema_version: str = "session_archive_v3"
     archive_digest: str = ""
     manifest_digest: str = ""
     manifest_uri: str = ""
@@ -49,9 +49,9 @@ class SessionArchive:
             "phase": "sync_archive",
             "files": [
                 "commit_head.json",
-                "evidence/events/",
-                "evidence/objects/",
-                "evidence/manifests/",
+                "events/",
+                "objects/",
+                "manifests/",
             ],
         }
 

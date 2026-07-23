@@ -3,15 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any, cast
+from typing import Any
 
 from foundation.identity import LocalUserContext
 from infrastructure.context.contracts import ContextObjectReader
-from infrastructure.context.layers.memory_document_overlay import MemoryDocumentContextOverlay
-from infrastructure.store.contracts.index import CatalogStore, IndexStore
 from infrastructure.store.contracts.source import SourceStore
 from infrastructure.store.model.context.context_uri import ContextURI
-from memory.core.structure.path_policy import MemoryDocumentPathPolicy
 from sanitization.context_projection import ContextProjectionSanitizer
 
 
@@ -22,15 +19,11 @@ class ContextExactReader:
         self,
         *,
         source_store: SourceStore | None,
-        index_store: IndexStore | None,
         context_reader: ContextObjectReader,
-        document_overlay: MemoryDocumentContextOverlay | None,
         require_exact_read_scope: Callable[[str, Any, LocalUserContext], None],
     ) -> None:
         self.source_store = source_store
-        self.catalog_store = cast(CatalogStore | None, index_store)
         self.context_reader = context_reader
-        self.document_overlay = document_overlay
         self.require_exact_read_scope = require_exact_read_scope
         self.sanitizer = ContextProjectionSanitizer()
 
@@ -43,8 +36,6 @@ class ContextExactReader:
         caller: LocalUserContext | None,
     ) -> dict[str, Any]:
         parsed = ContextURI.parse(uri)
-        if len(parsed.segments) == 4 and parsed.segments[1:3] == ("memory", "documents"):
-            return self._memory_document(uri, layer=layer, tenant_id=tenant_id, caller=caller)
         obj = self.context_reader.read_object(uri)
         if caller is not None:
             self.require_exact_read_scope(uri, obj, caller)
@@ -68,61 +59,6 @@ class ContextExactReader:
             title=obj.title,
             metadata=dict(obj.metadata or {}),
             source_kind=str(obj.metadata.get("source_kind") or obj.context_type.value),
-            layer=requested_layer,
-            content=content,
-        )
-
-    def _memory_document(
-        self,
-        uri: str,
-        *,
-        layer: str,
-        tenant_id: str,
-        caller: LocalUserContext | None,
-    ) -> dict[str, Any]:
-        if self.catalog_store is None:
-            raise FileNotFoundError(uri)
-        owner_user_id, document_id = MemoryDocumentPathPolicy.parse_document_uri(uri)
-        if caller is not None and owner_user_id != caller.user_id:
-            raise FileNotFoundError(uri)
-        records = self.catalog_store.get_catalog_by_uri(
-            tenant_id=tenant_id,
-            uri=uri,
-            limit=2,
-        )
-        document_records = [
-            record
-            for record in records
-            if record.record_kind == "memory_document" and record.document_id == document_id
-        ]
-        if len(document_records) != 1:
-            raise FileNotFoundError(uri)
-        record = document_records[0]
-        if record.owner_user_id != owner_user_id:
-            raise FileNotFoundError(uri)
-        requested_layer = layer.upper()
-        if requested_layer == "L0":
-            content = record.l0_text
-        elif requested_layer == "L1":
-            content = record.l1_text
-        elif requested_layer == "L2":
-            if self.document_overlay is None:
-                raise FileNotFoundError(uri)
-            view = self.document_overlay.read(
-                tenant_id=tenant_id,
-                owner_user_id=owner_user_id,
-                document_uri=uri,
-                relative_path=str(record.metadata.get("relative_path") or ""),
-                expected_source_digest=record.source_digest,
-            )
-            content = view.markdown
-        else:
-            raise FileNotFoundError(f"layer unavailable: {layer}")
-        return self._public_result(
-            object_payload=record.to_dict(),
-            title=record.title,
-            metadata=dict(record.metadata),
-            source_kind=record.source_kind or "memory_document",
             layer=requested_layer,
             content=content,
         )

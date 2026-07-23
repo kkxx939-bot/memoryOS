@@ -1,0 +1,44 @@
+memory_type: entity
+description: >-
+  为用户提及的真实人物、组织、地点、作品、产品、动物、项目或概念保存稳定实体卡片。
+  重点保留实体是什么以及与用户或其他事实的持久关系。
+path_template: entities/{category}/{name}.md
+operation_mode: upsert
+markdown_template: |
+  # {name}
+
+  **Category:** {category}
+
+  {summary}
+
+  {details}
+fields:
+  - name: category
+    type: string
+    role: address
+    required: true
+    merge: immutable
+    description: >-
+      简洁、自然的实体类别，用于目录分组；类别由内容语义产生，不依赖受控 registry。
+  - name: name
+    type: string
+    role: address
+    required: true
+    merge: immutable
+    description: >-
+      用户能够识别的实体名称，保持原有专名，不生成额外文件身份。
+  - name: summary
+    type: string
+    role: content
+    required: true
+    merge: replace
+    description: >-
+      用一个普通句子说明实体是什么及其主要关系；更新时读取旧内容后完整重写该句。
+  - name: details
+    type: string
+    role: content
+    required: true
+    merge: patch
+    description: >-
+      使用自然的 H2 section 和 bullet 保存稳定事实、角色、关系以及以后可能精确询问的名称、
+      数量、日期和地点；去重但不把具体事实泛化丢失。

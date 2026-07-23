@@ -51,11 +51,6 @@ class RetrievalCandidate:
     owner_user_id: str = ""
     session_id: str = ""
     workspace_id: str = ""
-    document_id: str = ""
-    block_id: str = ""
-    document_kind: str = ""
-    document_revision: int = 0
-    projection_generation: int = 0
     archive_digest: str = ""
     manifest_digest: str = ""
     event_time: str = ""
@@ -169,13 +164,9 @@ class FusionRanker:
         *,
         plan: RetrievalQueryPlan,
         per_session_limit: int = 5,
-        per_document_limit: int = 3,
-        blocks_per_document_limit: int = 3,
     ) -> list[RetrievalCandidate]:
         seen: set[tuple[Any, ...]] = set()
         session_counts: dict[str, int] = {}
-        document_counts: dict[tuple[str, str, str], int] = {}
-        block_counts: dict[tuple[str, str, str], int] = {}
         result: list[RetrievalCandidate] = []
         for candidate in candidates:
             identity = self._identity(candidate, plan.query_intent)
@@ -187,17 +178,6 @@ class FusionRanker:
                 if count >= per_session_limit:
                     continue
                 session_counts[session_key] = count + 1
-            if candidate.document_id:
-                document_key = (candidate.tenant_id, candidate.owner_user_id, candidate.document_id)
-                count = document_counts.get(document_key, 0)
-                if count >= per_document_limit:
-                    continue
-                if candidate.block_id:
-                    block_count = block_counts.get(document_key, 0)
-                    if block_count >= blocks_per_document_limit:
-                        continue
-                    block_counts[document_key] = block_count + 1
-                document_counts[document_key] = count + 1
             seen.add(identity)
             result.append(candidate)
             if len(result) >= plan.candidate_limit:
@@ -207,23 +187,6 @@ class FusionRanker:
     @staticmethod
     def _identity(candidate: RetrievalCandidate, intent: RetrievalQueryIntent) -> tuple[Any, ...]:
         del intent
-        if candidate.document_id and candidate.block_id:
-            return (
-                "memory_block",
-                candidate.tenant_id,
-                candidate.owner_user_id,
-                candidate.document_id,
-                candidate.block_id,
-                candidate.source_digest,
-            )
-        if candidate.document_id:
-            return (
-                "memory_document",
-                candidate.tenant_id,
-                candidate.owner_user_id,
-                candidate.document_id,
-                candidate.projection_generation,
-            )
         if candidate.source_kind in {"resource", "resource_reference"}:
             resource_uri = str(candidate.metadata.get("resource_uri") or candidate.source_uri)
             return ("resource", resource_uri, candidate.source_digest)
