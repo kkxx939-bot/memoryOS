@@ -1,4 +1,4 @@
-"""上下文数据库里的SQLite锁存储。"""
+"""使用独立 SQLite 文件提供跨进程路径锁。"""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ class SQLiteLockStore:
     def __init__(
         self,
         path: str | Path,
-        owner: str = "memoryos",
+        owner: str = "m2bos",
         *,
         sqlite_timeout_seconds: float = 5.0,
     ) -> None:

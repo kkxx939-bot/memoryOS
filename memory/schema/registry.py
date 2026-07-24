@@ -8,6 +8,7 @@ from typing import Any
 
 import yaml
 
+from memory.model import MemoryAddress, MemoryKind
 from memory.schema.model import (
     MemoryFieldRole,
     MemoryFieldSchema,
@@ -17,7 +18,6 @@ from memory.schema.model import (
     MemorySchemaError,
     MemoryTypeSchema,
 )
-from memory.tree.model import MemoryAddress, MemoryKind
 
 _SCHEMA_FILES = {
     MemoryKind.PROFILE: "profile.yaml",
@@ -34,8 +34,27 @@ _TYPE_KEYS = {
     "markdown_template",
     "operation_mode",
     "fields",
+    "min_non_empty_content_fields",
+    "omit_empty_sections",
 }
-_FIELD_KEYS = {"name", "type", "role", "required", "merge", "description"}
+_REQUIRED_TYPE_KEYS = {
+    "memory_type",
+    "description",
+    "path_template",
+    "markdown_template",
+    "operation_mode",
+    "fields",
+}
+_FIELD_KEYS = {
+    "name",
+    "type",
+    "role",
+    "required",
+    "merge",
+    "description",
+    "allowed_values",
+}
+_REQUIRED_FIELD_KEYS = {"name", "type", "role", "required", "merge", "description"}
 
 
 class MemorySchemaRegistry:
@@ -88,8 +107,7 @@ def _load_schema(source: str, filename: str) -> MemoryTypeSchema:
         raise MemorySchemaError(f"invalid YAML in {filename}") from exc
     payload = _mapping(raw, f"schema {filename}")
     _reject_unknown(payload, _TYPE_KEYS, f"schema {filename}")
-    required = _TYPE_KEYS
-    missing = required - set(payload)
+    missing = _REQUIRED_TYPE_KEYS - set(payload)
     if missing:
         raise MemorySchemaError(f"schema {filename} is missing fields: {sorted(missing)}")
     raw_fields = payload["fields"]
@@ -103,13 +121,21 @@ def _load_schema(source: str, filename: str) -> MemoryTypeSchema:
         markdown_template=_string(payload["markdown_template"], "memory markdown template"),
         operation_mode=MemoryOperationMode(str(payload["operation_mode"])),
         fields=fields,
+        min_non_empty_content_fields=_non_negative_integer(
+            payload.get("min_non_empty_content_fields", 0),
+            "memory min_non_empty_content_fields",
+        ),
+        omit_empty_sections=_boolean(
+            payload.get("omit_empty_sections", False),
+            "memory omit_empty_sections",
+        ),
     )
 
 
 def _load_field(raw: Any, filename: str) -> MemoryFieldSchema:
     payload = _mapping(raw, f"field in {filename}")
     _reject_unknown(payload, _FIELD_KEYS, f"field in {filename}")
-    missing = _FIELD_KEYS - set(payload)
+    missing = _REQUIRED_FIELD_KEYS - set(payload)
     if missing:
         raise MemorySchemaError(f"field in {filename} is missing keys: {sorted(missing)}")
     return MemoryFieldSchema(
@@ -119,6 +145,10 @@ def _load_field(raw: Any, filename: str) -> MemoryFieldSchema:
         required=payload["required"],
         merge_strategy=MemoryMergeStrategy(str(payload["merge"])),
         description=_string(payload["description"], "memory field description"),
+        allowed_values=_string_tuple(
+            payload.get("allowed_values", []),
+            "memory field allowed_values",
+        ),
     )
 
 
@@ -132,6 +162,24 @@ def _string(value: Any, label: str) -> str:
     if not isinstance(value, str) or not value:
         raise MemorySchemaError(f"{label} must be a non-empty string")
     return value
+
+
+def _non_negative_integer(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise MemorySchemaError(f"{label} must be a non-negative integer")
+    return value
+
+
+def _boolean(value: Any, label: str) -> bool:
+    if not isinstance(value, bool):
+        raise MemorySchemaError(f"{label} must be boolean")
+    return value
+
+
+def _string_tuple(value: Any, label: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise MemorySchemaError(f"{label} must be a list of strings")
+    return tuple(value)
 
 
 def _reject_unknown(payload: Mapping[str, Any], allowed: set[str], label: str) -> None:

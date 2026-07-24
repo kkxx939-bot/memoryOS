@@ -9,7 +9,15 @@ from collections.abc import Iterator
 from datetime import date
 from pathlib import Path
 
-from memory.tree.model import MemoryAddress, MemoryKind
+from memory.document import (
+    MemoryDocument,
+    MemoryDocumentCodec,
+    MemoryDocumentConfig,
+    MemoryDocumentIntegrityError,
+    MemoryDocumentLimitError,
+)
+from memory.model import MemoryAddress, MemoryDirectory, MemoryKind, MemoryLevel
+from memory.uri import MemoryURI, MemoryURINodeType
 
 
 class MemoryTreeIntegrityError(ValueError):
@@ -17,16 +25,32 @@ class MemoryTreeIntegrityError(ValueError):
 
 
 class MemoryTree:
-    """解析并持久化记忆树中的 Markdown 原文，不解释正文语义。"""
+    """安全持久化结构化 L2 文档和可重建的目录语义层。"""
 
     _STATIC_DIRECTORIES = ("preferences", "entities", "tools", "events", "intentions")
     _MAX_CHILDREN_PER_DIRECTORY = 10_000
 
-    def __init__(self, root: str | Path) -> None:
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        document_codec: MemoryDocumentCodec | None = None,
+        document_config: MemoryDocumentConfig | None = None,
+    ) -> None:
         requested = Path(root).expanduser().absolute()
         if requested.is_symlink():
             raise MemoryTreeIntegrityError("memory tree root cannot be a symbolic link")
         self.root = requested.resolve(strict=False)
+        if document_codec is None:
+            from memory.schema import MemorySchemaRegistry
+
+            document_codec = MemoryDocumentCodec(MemorySchemaRegistry.load_default())
+        if not isinstance(document_codec, MemoryDocumentCodec):
+            raise TypeError("document_codec must be a MemoryDocumentCodec")
+        self._document_codec = document_codec
+        if document_config is not None and not isinstance(document_config, MemoryDocumentConfig):
+            raise TypeError("document_config must be MemoryDocumentConfig")
+        self.document_config = document_config or MemoryDocumentConfig()
 
     def initialize(self) -> Path:
         """只创建静态目录；没有真实内容时不创建空的 profile.md。"""
@@ -46,26 +70,97 @@ class MemoryTree:
         self._require_inside_root(candidate)
         return candidate
 
-    def write(self, address: MemoryAddress, markdown: str) -> Path:
-        """原子写入 Markdown 原文；更新同一地址时替换完整文件。"""
+    def directory_path(self, directory: MemoryDirectory) -> Path:
+        """把受控目录地址映射到记忆树内的真实目录。"""
 
-        if not isinstance(markdown, str):
-            raise TypeError("memory markdown must be a string")
+        if not isinstance(directory, MemoryDirectory):
+            raise TypeError("directory must be a MemoryDirectory")
+        candidate = self.root.joinpath(*directory.parts)
+        self._require_inside_root(candidate)
+        return candidate
+
+    def layer_path(self, directory: MemoryDirectory, level: MemoryLevel) -> Path:
+        """返回目录 L0 或 L1 侧车文件的确定性路径。"""
+
+        normalized = MemoryLevel(level)
+        return self.directory_path(directory) / normalized.sidecar_filename
+
+    def path_for_uri(self, uri: MemoryURI | str) -> Path:
+        """把合法 ``memory://`` 节点确定性映射为树内物理路径。"""
+
+        parsed = MemoryURI.parse(uri)
+        if parsed.node_type is MemoryURINodeType.DOCUMENT:
+            return self.path_for(parsed.to_address())
+        if parsed.node_type is MemoryURINodeType.DIRECTORY:
+            return self.directory_path(parsed.to_directory())
+        directory, level = parsed.to_layer()
+        return self.layer_path(directory, level)
+
+    def write(
+        self,
+        document: MemoryDocument,
+    ) -> MemoryDocument:
+        """原子写入已由上层构造的规范 L2；不读取旧记忆或推进版本。"""
+
+        if not isinstance(document, MemoryDocument):
+            raise TypeError("document must be a MemoryDocument")
+        encoded = self._document_codec.encode(document).encode("utf-8")
+        self.document_config.validate_body(document.markdown_body)
+        self.document_config.validate_encoded(encoded)
         self.initialize()
-        path = self.path_for(address)
+        path = self.path_for(document.address)
         self._ensure_directory(path.parent)
-        self._atomic_write(path, markdown.encode("utf-8"))
-        return path
+        self._atomic_write(path, encoded)
+        return document
 
-    def read(self, address: MemoryAddress) -> str:
-        """逐字节读取一个普通 Markdown 文件并按 UTF-8 解码。"""
+    def write_layers(
+        self,
+        directory: MemoryDirectory,
+        *,
+        abstract: str,
+        overview: str,
+    ) -> tuple[Path, Path]:
+        """在已有目录中先写 L1、再写由它派生的 L0。"""
 
-        path = self.path_for(address)
-        self._require_regular_file(path)
-        try:
-            return path.read_bytes().decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise MemoryTreeIntegrityError("memory file is not valid UTF-8") from exc
+        if not isinstance(abstract, str) or not isinstance(overview, str):
+            raise TypeError("memory semantic layers must be strings")
+        if not abstract.strip() or not overview.strip():
+            raise ValueError("memory semantic layers must be non-empty")
+        directory_path = self.directory_path(directory)
+        self._require_directory(directory_path)
+        overview_path = self.layer_path(directory, MemoryLevel.OVERVIEW)
+        abstract_path = self.layer_path(directory, MemoryLevel.ABSTRACT)
+        self._atomic_write(overview_path, overview.encode("utf-8"))
+        self._atomic_write(abstract_path, abstract.encode("utf-8"))
+        return abstract_path, overview_path
+
+    def read(self, address: MemoryAddress) -> MemoryDocument:
+        """读取并完整验证一个结构化 L2 文档。"""
+
+        return self._read_document(address)
+
+    def read_layer(self, directory: MemoryDirectory, level: MemoryLevel) -> str:
+        """读取目录 L0 或 L1 的 UTF-8 Markdown 原文。"""
+
+        return self._read_utf8(
+            self.layer_path(directory, level),
+            label="memory semantic layer",
+        )
+
+    def read_layer_bounded(
+        self,
+        directory: MemoryDirectory,
+        level: MemoryLevel,
+        *,
+        max_bytes: int,
+    ) -> str:
+        """在读取前校验字节上限，避免加载损坏或异常膨胀的派生层。"""
+
+        return self._read_utf8(
+            self.layer_path(directory, level),
+            label="memory semantic layer",
+            max_bytes=max_bytes,
+        )
 
     def exists(self, address: MemoryAddress) -> bool:
         path = self.path_for(address)
@@ -74,6 +169,24 @@ class MemoryTree:
         if not path.exists():
             return False
         self._require_regular_file(path)
+        return True
+
+    def layer_exists(self, directory: MemoryDirectory, level: MemoryLevel) -> bool:
+        path = self.layer_path(directory, level)
+        if path.is_symlink():
+            raise MemoryTreeIntegrityError("memory semantic layer cannot be a symbolic link")
+        if not path.exists():
+            return False
+        self._require_regular_file(path)
+        return True
+
+    def directory_exists(self, directory: MemoryDirectory) -> bool:
+        path = self.directory_path(directory)
+        if path.is_symlink():
+            raise MemoryTreeIntegrityError("memory directory cannot be a symbolic link")
+        if not path.exists():
+            return False
+        self._require_directory(path)
         return True
 
     def delete(self, address: MemoryAddress) -> bool:
@@ -89,6 +202,111 @@ class MemoryTree:
         self._fsync_directory(path.parent)
         self._prune_dynamic_directories(address, path.parent)
         return True
+
+    def delete_layers(self, directory: MemoryDirectory) -> bool:
+        """删除目录的派生 L0/L1，不触碰任何 L2。"""
+
+        changed = False
+        directory_path = self.directory_path(directory)
+        if not directory_path.exists():
+            return False
+        self._require_directory(directory_path)
+        for level in (MemoryLevel.ABSTRACT, MemoryLevel.OVERVIEW):
+            path = self.layer_path(directory, level)
+            if path.is_symlink():
+                raise MemoryTreeIntegrityError("memory semantic layer cannot be a symbolic link")
+            if not path.exists():
+                continue
+            self._require_regular_file(path)
+            path.unlink()
+            changed = True
+        if changed:
+            self._fsync_directory(directory_path)
+        return changed
+
+    def direct_addresses(
+        self,
+        directory: MemoryDirectory,
+        *,
+        limit: int = 1_000,
+    ) -> tuple[MemoryAddress, ...]:
+        """有界枚举目录中直接存在的 L2 地址，不递归进入子目录。"""
+
+        maximum = self._directory_limit(limit)
+        path = self.directory_path(directory)
+        if not path.exists():
+            return ()
+        parts = directory.parts
+        addresses: tuple[MemoryAddress, ...]
+        if not parts:
+            children = self._content_children(path)
+            allowed_directories = set(self._STATIC_DIRECTORIES)
+            for child in children:
+                if child.name == "profile.md" and child.is_file():
+                    continue
+                if child.name in allowed_directories and child.is_dir():
+                    continue
+                raise MemoryTreeIntegrityError("memory root contains an unsupported entry")
+            profile = self.root / "profile.md"
+            addresses = (MemoryAddress.profile(),) if profile.exists() else ()
+        elif parts == ("preferences",):
+            addresses = tuple(
+                MemoryAddress.preference(name) for name in self._markdown_names(path)
+            )
+        elif parts[0] == "entities" and len(parts) == 2:
+            addresses = tuple(
+                MemoryAddress.entity(parts[1], name) for name in self._markdown_names(path)
+            )
+        elif parts == ("tools",):
+            addresses = tuple(MemoryAddress.tool(name) for name in self._markdown_names(path))
+        elif parts[0] == "events" and len(parts) == 4:
+            event_date = date(int(parts[1]), int(parts[2]), int(parts[3]))
+            addresses = tuple(
+                MemoryAddress.event(event_date, name) for name in self._markdown_names(path)
+            )
+        elif parts == ("intentions",):
+            addresses = tuple(
+                MemoryAddress.intention(name) for name in self._markdown_names(path)
+            )
+        else:
+            if any(child.is_file() for child in self._content_children(path)):
+                raise MemoryTreeIntegrityError("memory branch directory cannot contain L2 files")
+            addresses = ()
+        if len(addresses) > maximum:
+            raise MemoryTreeIntegrityError("memory directory exceeded its direct L2 bound")
+        return addresses
+
+    def child_directories(
+        self,
+        directory: MemoryDirectory,
+        *,
+        limit: int = 1_000,
+    ) -> tuple[MemoryDirectory, ...]:
+        """有界枚举目录的直接子目录，不读取更深层内容。"""
+
+        maximum = self._directory_limit(limit)
+        path = self.directory_path(directory)
+        if not path.exists():
+            return ()
+        parts = directory.parts
+        if not parts:
+            children = tuple(MemoryDirectory((name,)) for name in self._STATIC_DIRECTORIES)
+        elif parts == ("entities",):
+            children = tuple(
+                MemoryDirectory.entities(child.name) for child in self._directories(path)
+            )
+        elif parts and parts[0] == "events" and len(parts) < 4:
+            children = tuple(
+                MemoryDirectory((*parts, child.name)) for child in self._directories(path)
+            )
+        else:
+            if any(child.is_dir() for child in self._content_children(path)):
+                raise MemoryTreeIntegrityError("memory leaf directory cannot contain subdirectories")
+            children = ()
+        existing = tuple(child for child in children if self.directory_exists(child))
+        if len(existing) > maximum:
+            raise MemoryTreeIntegrityError("memory directory exceeded its child directory bound")
+        return existing
 
     def list_addresses(
         self,
@@ -181,17 +399,32 @@ class MemoryTree:
 
     def _markdown_names(self, directory: Path) -> tuple[str, ...]:
         names: list[str] = []
-        for child in self._children(directory):
-            if not child.is_file() or child.suffix.casefold() != ".md" or not child.stem:
+        for child in self._content_children(directory):
+            if not child.is_file() or child.suffix != ".md" or not child.stem:
                 raise MemoryTreeIntegrityError("memory leaf directory may contain only Markdown files")
             names.append(child.stem)
         return tuple(names)
 
     def _directories(self, directory: Path) -> tuple[Path, ...]:
-        children = self._children(directory)
+        children = self._content_children(directory)
         if any(not child.is_dir() for child in children):
             raise MemoryTreeIntegrityError("memory branch may contain only directories")
         return children
+
+    def _content_children(self, directory: Path) -> tuple[Path, ...]:
+        content: list[Path] = []
+        semantic_names = {
+            MemoryLevel.ABSTRACT.sidecar_filename,
+            MemoryLevel.OVERVIEW.sidecar_filename,
+        }
+        for child in self._children(directory):
+            if child.name in semantic_names:
+                self._require_regular_file(child)
+                continue
+            if child.name.startswith("."):
+                raise MemoryTreeIntegrityError("memory directory contains an unsupported hidden entry")
+            content.append(child)
+        return tuple(content)
 
     def _children(self, directory: Path) -> tuple[Path, ...]:
         if not directory.exists():
@@ -243,6 +476,43 @@ class MemoryTree:
         if not stat.S_ISREG(metadata.st_mode):
             raise MemoryTreeIntegrityError("memory path is not a regular file")
 
+    def _read_utf8(
+        self,
+        path: Path,
+        *,
+        label: str,
+        max_bytes: int | None = None,
+    ) -> str:
+        self._require_regular_file(path)
+        if max_bytes is not None:
+            if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
+                raise ValueError("max_bytes must be a positive integer")
+            if path.stat().st_size > max_bytes:
+                raise MemoryTreeIntegrityError(f"{label} exceeds its configured read bound")
+        try:
+            payload = path.read_bytes()
+            if max_bytes is not None and len(payload) > max_bytes:
+                raise MemoryTreeIntegrityError(f"{label} exceeds its configured read bound")
+            return payload.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise MemoryTreeIntegrityError(f"{label} is not valid UTF-8") from exc
+
+    def _read_document(
+        self,
+        address: MemoryAddress,
+    ) -> MemoryDocument:
+        raw = self._read_utf8(
+            self.path_for(address),
+            label="memory document",
+            max_bytes=self.document_config.max_encoded_bytes,
+        )
+        try:
+            document = self._document_codec.decode(raw, expected_address=address)
+            self.document_config.validate_body(document.markdown_body)
+            return document
+        except (MemoryDocumentIntegrityError, MemoryDocumentLimitError) as exc:
+            raise MemoryTreeIntegrityError("memory L2 document failed integrity validation") from exc
+
     @staticmethod
     def _require_directory(path: Path) -> None:
         if path.is_symlink() or not path.is_dir():
@@ -279,12 +549,30 @@ class MemoryTree:
             return
         current = parent
         while current != stop:
+            if self._content_children(current):
+                break
+            for filename in (
+                MemoryLevel.ABSTRACT.sidecar_filename,
+                MemoryLevel.OVERVIEW.sidecar_filename,
+            ):
+                sidecar = current / filename
+                if sidecar.exists():
+                    self._require_regular_file(sidecar)
+                    sidecar.unlink()
+            self._fsync_directory(current)
             try:
                 current.rmdir()
             except OSError:
                 break
             self._fsync_directory(current.parent)
             current = current.parent
+
+    @staticmethod
+    def _directory_limit(limit: int) -> int:
+        maximum = int(limit)
+        if isinstance(limit, bool) or maximum <= 0 or maximum > 10_000:
+            raise ValueError("memory directory limit must be between 1 and 10000")
+        return maximum
 
     @staticmethod
     def _fsync_directory(directory: Path) -> None:

@@ -1,27 +1,28 @@
-"""Memory Editor 已确认的旧记忆读取入口。"""
+"""从 ConversationSegment 选择并读取相关旧记忆的领域入口。"""
 
-from memory.editor.reader import (
-    MemorySnapshot,
-    MemorySnapshotBatch,
-    MemorySnapshotReader,
-)
-from memory.editor.retrieval import (
-    ConversationSegmentQueryBuilder,
-    MemoryRelatedContext,
-    MemoryRelatedRetriever,
-    MemoryRetrievalConfig,
-    MemoryRetrievalError,
-    MemorySearchHit,
-    MemorySearchMode,
-    MemorySemanticSearch,
-    MemorySemanticSearchConfig,
-    MemorySemanticSearchEngine,
+from memory.editor.retrieval.factory import build_memory_semantic_search
+from memory.editor.retrieval.index import (
     MemoryTreeVectorIndex,
     MemoryVectorIndex,
     MemoryVectorIndexConfig,
     MemoryVectorIndexError,
     MemoryVectorMatch,
-    build_memory_semantic_search,
+)
+from memory.editor.retrieval.model import (
+    MemoryRelatedContext,
+    MemoryRetrievalConfig,
+    MemoryRetrievalError,
+    MemorySearchHit,
+)
+from memory.editor.retrieval.query import ConversationSegmentQueryBuilder
+from memory.editor.retrieval.retriever import (
+    MemoryRelatedRetriever,
+    MemorySemanticSearch,
+)
+from memory.editor.retrieval.search import (
+    MemorySearchMode,
+    MemorySemanticSearchConfig,
+    MemorySemanticSearchEngine,
 )
 
 __all__ = [
@@ -35,9 +36,6 @@ __all__ = [
     "MemorySemanticSearch",
     "MemorySemanticSearchConfig",
     "MemorySemanticSearchEngine",
-    "MemorySnapshot",
-    "MemorySnapshotBatch",
-    "MemorySnapshotReader",
     "MemoryTreeVectorIndex",
     "MemoryVectorIndex",
     "MemoryVectorIndexConfig",

@@ -1,16 +1,16 @@
 memory_type: intention
 description: >-
-  保存仍然有效的未来导向事项，包括目标、开放事项、承诺、下一步和阻塞。
-  文件描述当前状态，不保存完整执行轨迹；完成、取消和长期失效后的处理策略不在本 Schema 中定义。
+  只保存 ConversationSegment 结束时仍未完成，并且未来仍需推进或等待触发的明确事项。
+  事项必须来自用户明确表达、用户确认，或用户任务直接产生的未完成工作；不保存已完成请求、
+  未经确认的建议、假设、模型推测、偏好、历史事件或执行轨迹。每次更新完整覆盖为最新状态快照，
+  不追加状态历史；completed 表示事项已经完成并终止生效，但仍保留该文件。
 path_template: intentions/{intent_name}.md
 operation_mode: upsert
+omit_empty_sections: true
 markdown_template: |
   # {intent_name}
 
-  ## Objective
-  {objective}
-
-  ## Current Status
+  ## Status
   {status}
 
   ## Next Step
@@ -28,39 +28,39 @@ fields:
     required: true
     merge: immutable
     description: >-
-      简洁、自然且能稳定指向同一未来事项的名称。
-  - name: objective
-    type: string
-    role: content
-    required: true
-    merge: replace
-    description: >-
-      当前希望达成的具体结果；目标改变时读取旧内容后完整更新。
+      简洁、自然且能完整表达事项的动态语义名称；写入前读取相关旧 Intention，
+      同一事项必须复用已有名称，不使用注册表、稳定 ID、tag 或置信度。
   - name: status
     type: string
     role: content
     required: true
     merge: replace
+    allowed_values:
+      - open
+      - waiting
+      - blocked
+      - completed
     description: >-
-      当前可观察状态，例如进行中、等待输入或受阻；不在 Schema 中强制固定枚举。
+      只允许 open、waiting、blocked、completed。open 表示仍需推进，waiting 表示等待输入、
+      时间或外部条件，blocked 表示存在明确阻塞，completed 表示事项完成并终止生效。
   - name: next_step
     type: string
     role: content
     required: false
     merge: replace
     description: >-
-      当前最具体、可执行的下一步，不展开成执行轨迹。
+      对话中已经明确的最具体下一步；没有明确下一步时省略，不得由模型补写，也不展开成执行轨迹。
   - name: blockers
     type: string
     role: content
     required: false
     merge: replace
     description: >-
-      当前仍有效的阻塞、依赖、约束或等待对象。
+      对话中明确存在且当前仍有效的阻塞、依赖、约束或等待对象；解除后从最新快照中移除。
   - name: target_time
     type: string
     role: content
     required: false
     merge: replace
     description: >-
-      用户明确表达的期限或目标时间；没有明确时间时保持为空，不推测。
+      用户明确表达的期限或目标时间；没有明确时间时省略，不得推测或自行计算长期失效时间。

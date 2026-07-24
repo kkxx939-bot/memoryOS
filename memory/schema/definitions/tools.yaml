@@ -4,6 +4,8 @@ description: >-
   不保存逐次工具调用流水、临时参数、下载内容、敏感值、调用次数或成功率统计。
 path_template: tools/{tool_name}.md
 operation_mode: upsert
+min_non_empty_content_fields: 1
+omit_empty_sections: true
 markdown_template: |
   # {tool_name}
 
@@ -31,25 +33,26 @@ fields:
     required: true
     merge: immutable
     description: >-
-      工具注册表中的真实名称，保持原样，不把工具知识转换成 Skill。
+      必须逐字复制 Conversation 中真实 tool_call.name，不得由 LLM 翻译、概括或改名，
+      也不依赖工具注册表；不把工具知识转换成 Skill。
   - name: purpose
     type: string
     role: content
-    required: true
+    required: false
     merge: replace
     description: >-
       工具的稳定用途和能力边界；更新时结合旧内容完整重写。
   - name: when_to_use
     type: string
     role: content
-    required: true
+    required: false
     merge: patch
     description: >-
       适合调用该工具的可复用场景、前置条件和不适用场景。
   - name: invocation
     type: string
     role: content
-    required: true
+    required: false
     merge: patch
     description: >-
       已实际验证的参数形态、调用顺序和最小示例；不得记录一次性值、密钥或完整调用流水。

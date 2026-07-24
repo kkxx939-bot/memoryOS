@@ -1,48 +1,21 @@
-"""文件系统存储实现的延迟导出入口。"""
+"""安全文件路径与耐久原子字节操作。"""
 
-from __future__ import annotations
+from infrastructure.store.filesystem.durable_io import (
+    ImmutableArtifactConflictError,
+    atomic_create_bytes,
+    atomic_replace_bytes,
+    read_regular_bytes,
+)
+from infrastructure.store.filesystem.path_safety import (
+    DurablePathIntegrityError,
+    require_safe_artifact_path,
+)
 
-from importlib import import_module
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from infrastructure.store.filesystem.session_archive import (
-        SessionArchiveStore as SessionArchiveStore,
-    )
-    from infrastructure.store.filesystem.source_store import (
-        BundleIntegrityError as BundleIntegrityError,
-    )
-    from infrastructure.store.filesystem.source_store import (
-        FileSystemSourceStore as FileSystemSourceStore,
-    )
-
-_PUBLIC_ATTRS = {
-    "BundleIntegrityError": (
-        "infrastructure.store.filesystem.source_store",
-        "BundleIntegrityError",
-    ),
-    "FileSystemSourceStore": (
-        "infrastructure.store.filesystem.source_store",
-        "FileSystemSourceStore",
-    ),
-    "SessionArchiveStore": (
-        "infrastructure.store.filesystem.session_archive",
-        "SessionArchiveStore",
-    ),
-}
-
-
-def __getattr__(name: str) -> Any:
-    target = _PUBLIC_ATTRS.get(name)
-    if target is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    value = getattr(import_module(target[0]), target[1])
-    globals()[name] = value
-    return value
-
-
-def __dir__() -> list[str]:
-    return sorted({*globals(), *__all__})
-
-
-__all__ = sorted(_PUBLIC_ATTRS)
+__all__ = [
+    "DurablePathIntegrityError",
+    "ImmutableArtifactConflictError",
+    "atomic_create_bytes",
+    "atomic_replace_bytes",
+    "read_regular_bytes",
+    "require_safe_artifact_path",
+]

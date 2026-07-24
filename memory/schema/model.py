@@ -11,7 +11,7 @@ from pathlib import PurePosixPath
 from string import Formatter
 from typing import Any
 
-from memory.tree.model import MemoryAddress, MemoryKind
+from memory.model import MemoryAddress, MemoryKind
 
 _FIELD_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 _CANONICAL_PATH_TEMPLATES = {
@@ -79,6 +79,7 @@ class MemoryFieldSchema:
     required: bool
     merge_strategy: MemoryMergeStrategy
     description: str
+    allowed_values: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not _FIELD_NAME.fullmatch(self.name):
@@ -86,10 +87,20 @@ class MemoryFieldSchema:
         object.__setattr__(self, "field_type", MemoryFieldType(self.field_type))
         object.__setattr__(self, "role", MemoryFieldRole(self.role))
         object.__setattr__(self, "merge_strategy", MemoryMergeStrategy(self.merge_strategy))
+        if isinstance(self.allowed_values, str):
+            raise MemorySchemaError("memory schema allowed_values must be a tuple of strings")
+        allowed_values = tuple(self.allowed_values)
+        object.__setattr__(self, "allowed_values", allowed_values)
         if not isinstance(self.required, bool):
             raise MemorySchemaError("memory schema field required must be boolean")
         if not isinstance(self.description, str) or not self.description.strip():
             raise MemorySchemaError("memory schema field description must be non-empty")
+        if any(not isinstance(value, str) or not value.strip() for value in allowed_values):
+            raise MemorySchemaError("memory schema allowed_values must contain non-empty strings")
+        if len(allowed_values) != len(set(allowed_values)):
+            raise MemorySchemaError("memory schema allowed_values must be unique")
+        if allowed_values and self.field_type is not MemoryFieldType.STRING:
+            raise MemorySchemaError("memory schema allowed_values currently supports string fields only")
         if self.role is MemoryFieldRole.ADDRESS and (
             not self.required or self.merge_strategy is not MemoryMergeStrategy.IMMUTABLE
         ):
@@ -104,12 +115,24 @@ class MemoryTypeSchema:
     markdown_template: str
     operation_mode: MemoryOperationMode
     fields: tuple[MemoryFieldSchema, ...]
+    min_non_empty_content_fields: int = 0
+    omit_empty_sections: bool = False
 
     def __post_init__(self) -> None:
         kind = MemoryKind(self.kind)
         object.__setattr__(self, "kind", kind)
         object.__setattr__(self, "operation_mode", MemoryOperationMode(self.operation_mode))
         object.__setattr__(self, "fields", tuple(self.fields))
+        if (
+            isinstance(self.min_non_empty_content_fields, bool)
+            or not isinstance(self.min_non_empty_content_fields, int)
+            or self.min_non_empty_content_fields < 0
+        ):
+            raise MemorySchemaError(
+                "memory min_non_empty_content_fields must be a non-negative integer"
+            )
+        if not isinstance(self.omit_empty_sections, bool):
+            raise MemorySchemaError("memory omit_empty_sections must be boolean")
         if not isinstance(self.description, str) or not self.description.strip():
             raise MemorySchemaError("memory type description must be non-empty")
         if self.path_template != _CANONICAL_PATH_TEMPLATES[kind]:
@@ -134,6 +157,10 @@ class MemoryTypeSchema:
         content_fields = frozenset(
             field.name for field in self.fields if field.role is MemoryFieldRole.CONTENT
         )
+        if self.min_non_empty_content_fields > len(content_fields):
+            raise MemorySchemaError(
+                "memory min_non_empty_content_fields exceeds the declared content fields"
+            )
         if path_fields != address_fields:
             raise MemorySchemaError("memory path placeholders must exactly match address fields")
         if not markdown_fields <= declared:
@@ -167,7 +194,21 @@ class MemoryTypeSchema:
                 if field.required:
                     raise MemorySchemaError(f"memory payload is missing required field: {field.name}")
                 continue
-            normalized[field.name] = self._validate_value(field, payload[field.name])
+            value = self._validate_value(field, payload[field.name])
+            if field.allowed_values and value not in field.allowed_values:
+                raise MemorySchemaError(
+                    f"memory field {field.name} must be one of {list(field.allowed_values)}"
+                )
+            normalized[field.name] = value
+        present_content_fields = sum(
+            1
+            for field in self.content_fields
+            if field.name in normalized and self._is_non_empty(normalized[field.name])
+        )
+        if present_content_fields < self.min_non_empty_content_fields:
+            raise MemorySchemaError(
+                "memory payload does not contain enough non-empty content fields"
+            )
         self._address_from_normalized(normalized)
         return normalized
 
@@ -183,10 +224,36 @@ class MemoryTypeSchema:
         rendered_fields = {
             field.name: self._render_value(normalized.get(field.name)) for field in self.fields
         }
+        template = (
+            self._without_empty_sections(normalized)
+            if self.omit_empty_sections
+            else self.markdown_template
+        )
         try:
-            return self.markdown_template.format_map(rendered_fields)
+            rendered = template.format_map(rendered_fields)
+            if self.omit_empty_sections:
+                return rendered.rstrip() + "\n"
+            return rendered
         except (KeyError, ValueError) as exc:  # pragma: no cover - 构造时已验证模板。
             raise MemorySchemaError("memory markdown rendering failed") from exc
+
+    def _without_empty_sections(self, payload: Mapping[str, Any]) -> str:
+        """删除全部引用字段为空的二级 Markdown 模板区块。"""
+
+        lines = self.markdown_template.splitlines(keepends=True)
+        starts = [index for index, line in enumerate(lines) if line.startswith("## ")]
+        if not starts:
+            return self.markdown_template
+        boundaries = [*starts, len(lines)]
+        rendered = lines[: starts[0]]
+        for index, start in enumerate(starts):
+            block = lines[start : boundaries[index + 1]]
+            block_source = "".join(block)
+            fields = _template_fields(block_source, "memory Markdown section")
+            if fields and not any(self._is_non_empty(payload.get(name)) for name in fields):
+                continue
+            rendered.extend(block)
+        return "".join(rendered)
 
     def _address_from_normalized(self, payload: Mapping[str, Any]) -> MemoryAddress:
         try:
@@ -247,6 +314,14 @@ class MemoryTypeSchema:
         if isinstance(value, bool):
             return "true" if value else "false"
         return str(value)
+
+    @staticmethod
+    def _is_non_empty(value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, str):
+            return bool(value.strip())
+        return True
 
 
 __all__ = [

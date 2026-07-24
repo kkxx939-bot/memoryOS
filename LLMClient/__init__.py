@@ -29,18 +29,31 @@ from LLMClient.contracts import (
     ToolCall,
     ToolDefinition,
 )
+from LLMClient.embedding import (
+    Embedder,
+    EmbeddingConfig,
+    EmbeddingVector,
+    LiteLLMEmbedder,
+    build_embedder,
+)
 from LLMClient.factory import LLMClientFactory, ModelProviderBuilder, build_llm_client
 from LLMClient.json_parser import JSONParseMode, ParsedJSON, parse_json_response
+from LLMClient.rerank import LiteLLMReranker, RerankConfig, Reranker, build_reranker
 from LLMClient.schema_validation import JSONSchemaValidationError, validate_json_schema
 from LLMClient.structured import StructuredLLMClient, StructuredResponse
 
 __all__ = [
     "ChatMessage",
     "ChatRequest",
+    "Embedder",
+    "EmbeddingConfig",
+    "EmbeddingVector",
     "JSONParseMode",
     "JSONSchemaValidationError",
     "LLMClient",
     "LLMClientFactory",
+    "LiteLLMEmbedder",
+    "LiteLLMReranker",
     "MessageRole",
     "ModelConfig",
     "ModelAuthenticationError",
@@ -63,6 +76,8 @@ __all__ = [
     "ProviderCapabilities",
     "ReasoningOptions",
     "ResponseFormat",
+    "RerankConfig",
+    "Reranker",
     "StreamEventKind",
     "StructuredLLMClient",
     "StructuredResponse",
@@ -70,6 +85,8 @@ __all__ = [
     "ToolCall",
     "ToolDefinition",
     "build_llm_client",
+    "build_embedder",
+    "build_reranker",
     "parse_json_response",
     "validate_json_schema",
 ]
